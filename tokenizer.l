@@ -4,307 +4,212 @@ import stream;
 import vector;
 import map;
 
-namespace Parse is
+import token;
+
+namespace Lexical is
     use System.Object;
     use System.String;
     use System.StringBuffer;
     use System.Exception;
 
-    class TokenBuffer is
-	const int MAX = 32;  // maximum lookahead before we assume we're not in a generic type
+    class TOKEN_BUFFER is
+        const int MAX = 32;  // maximum lookahead before we assume we're not in a generic type
 
-	int read_pos;
-	int write_pos;
+        int read_pos;
+        int write_pos;
 
-	TokenPair[] values, temp;
+        TOKEN_PAIR[] values, temp;
 
-	void init() is
-	    values = new TokenPair[MAX*2];   // additional space to accomodate turning single '>>'
-	    temp = new TokenPair[MAX*2];     // tokens into two token sequence close-generic close-generic
-	    read_pos = 0;
-	    write_pos = 0;
-	si
+        void init() is
+            values = new TOKEN_PAIR[MAX*2];   // additional space to accomodate turning single '>>'
+            temp = new TOKEN_PAIR[MAX*2];     // tokens into two token sequence close-generic close-generic
+            read_pos = 0;
+            write_pos = 0;
+        si
 
-	void reset() is
-	    // IO.Std.err.println( "clear buffer..." );
-	    read_pos = 0;
-	    write_pos = 0;
-	si
+        void reset() is
+            // IO.Std.err.println( "clear buffer..." );
+            read_pos = 0;
+            write_pos = 0;
+        si
 
-	get bool Avail is
-	    return read_pos < write_pos;
-	si
+        get bool avail is
+            return read_pos < write_pos;
+        si
+       
+        get bool is_full is
+            return write_pos >= MAX;
+        si
 
-	get bool IsFull is
-	    return write_pos >= MAX;
-	si
+        void write( TOKEN_PAIR t ) is
+            // IO.Std.err.println( "buffer token: " + cast int(t.token) + ", string: " + t.string );
+            values[write_pos] = t;
+            write_pos = write_pos + 1;
+        si
 
-	void write( TokenPair t ) is
-	    // IO.Std.err.println( "buffer token: " + cast int(t.token) + ", string: " + t.string );
-	    values[write_pos] = t;
-	    write_pos = write_pos + 1;
-	si
-
-	TokenPair read() is
-	    TokenPair result = values[read_pos];
-	    read_pos = read_pos + 1;
-	    // IO.Std.err.println( "read buffered token: " + cast int(result.token) + ", string: " + result.string );
-	    return result;
-	si
-
-	void makeGeneric() is
-	    assert( read_pos == 0 );
-
-	    // convert '<', '>' and '>>' in the buffer to appropriate open + close generic tokens:
-	    int vp = 0, tp = 0;
-
-	    while vp < write_pos do
-		Token r = values[vp].token;
-		if r == Token.LT then
-		    r = Token.OPEN_GENERIC;
-		elif r == Token.GT then
-		    r = Token.CLOSE_GENERIC;
-		elif r == Token.SHIFT_RIGHT then
-		    // treat a previously lexed SHIFT_RIGHT ('>>') token as two CLOSE_GENERIC tokens:
-		    temp[tp] = new TokenPair( Token.CLOSE_GENERIC, null );
-		    tp = tp + 1;
-		    r = Token.CLOSE_GENERIC;
-		fi
-		// copy the previously lexed token+string over:
-		temp[tp] = values[vp];
-		// but override the token to substitute generic brackets where needed:
-		temp[tp].token = r;
-
-		vp = vp + 1;
-		tp = tp + 1;
-	    od
-
-	    TokenPair[] t = values;
-	    values = temp;
-	    temp = t;
-	    write_pos = tp;
-	si
+        TOKEN_PAIR read() is
+            TOKEN_PAIR result = values[read_pos];
+            read_pos = read_pos + 1;
+            // IO.Std.err.println( "read buffered token: " + cast int(result.token) + ", string: " + result.string );
+            return result;
+        si
     si
 
-    class TokenizerException isa Exception is
+    class TOKENIZER_EXCEPTION isa Exception is
         void init( String s ) is
             super.init(s);
         si
     si
 
-    class TokenHolder is
-        public Token token;
-
-        void init( Token token ) is
-            super.init();
-            this.token = token;
-        si
-    si
-
-    class TokenMap is
-        Generic.Map<String,TokenHolder> map;
+    class TOKEN_MAP is
+        Generic.Map<String,TOKEN> map;
 
         void init() is
             super.init();
-            map = new Generic.Map<String,TokenHolder>(223);
+            map = new Generic.Map<String,TOKEN>(223);
         si
 
-        set Token[String s] = t is
-            map[s] = new TokenHolder(t);
+        set TOKEN[String s] = t is
+            map[s] = t;
         si
 
-        get Token[String s] is
-            TokenHolder th = map[s];
-            if th != null then
-                return th.token;
+        get TOKEN[String s] is
+            var t = map[s];
+            if t != cast TOKEN(0) then
+                return t;
             else
-                return Parse.Token.IDENTIFIER;
+                return TOKEN.IDENTIFIER;
             fi
         si
     si
 
-    class TokenPair is
-        public String string;
-        public Token token;
+    class TOKEN_PAIR is
+        public String _string;
+        public TOKEN _token;
 
-        void init( Token token, String string ) is
+        void init( TOKEN token, String string ) is
             super.init();
-            this.token = token;
-            this.string = string;
+            _token = token;
+            _string = string;
         si
 
-        String getString() is
-            return string;
+        get String string is
+            return _string;
         si
 
-        Token getToken() is
-            return token;
+        get TOKEN token is
+            return _token;
         si
     si
 
-    class Tokenizer is
-        Token token;
-        static TokenMap symbol_tokens_l;
-	static TokenMap symbol_tokens_k;
-	TokenMap symbol_tokens;
-	TokenBuffer buffer;
-        String token_string;
+    class TOKENIZER is
+        TOKEN token;
+        static TOKEN_MAP symbol_tokens;
+        TOKEN_BUFFER buffer;
+        String _token_string;
         IO.Reader input;
         bool end_of_file;
-        char prev_char;
+        char _prev_char;
 
-	String current_file;
-	int current_line;
+        String _current_file;
+        int _current_line;
 
-        String[] token_name;
+        String[] _token_name;
 
-	bool want_new_syntax;
+        static void init_symbol_tokens() is
+            if symbol_tokens == null then
+                symbol_tokens = new TOKEN_MAP();
+                symbol_tokens["import"] = TOKEN.IMPORT;
+                symbol_tokens["namespace"] = TOKEN.NAMESPACE;
+                symbol_tokens["class"] = TOKEN.CLASS;
+                symbol_tokens["struct"] = TOKEN.STRUCT;
+                symbol_tokens["enum"] = TOKEN.ENUM;
+                symbol_tokens["public"] = TOKEN.PUBLIC;
+                symbol_tokens["protected"] = TOKEN.PROTECTED;
+                symbol_tokens["private"] = TOKEN.PRIVATE;
+                symbol_tokens["const"] = TOKEN.CONST;
+                symbol_tokens["static"] = TOKEN.STATIC;
+                symbol_tokens["if"] = TOKEN.IF;
+                symbol_tokens["else"] = TOKEN.ELSE;
+                symbol_tokens["while"] = TOKEN.WHILE;
+                symbol_tokens["do"] = TOKEN.DO;
+                symbol_tokens["for"] = TOKEN.FOR;
+                symbol_tokens["foreach"] = TOKEN.FOREACH;
+                symbol_tokens["case"] = TOKEN.CASE;
+                symbol_tokens["default"] = TOKEN.DEFAULT;
+                symbol_tokens["break"] = TOKEN.BREAK;
+                symbol_tokens["continue"] = TOKEN.CONTINUE;
+                symbol_tokens["ref"] = TOKEN.REFERENCE;
+                symbol_tokens["ptr"] = TOKEN.POINTER;
+                symbol_tokens["int"] = TOKEN.INT;
+                symbol_tokens["long"] = TOKEN.LONG;
+                symbol_tokens["word"] = TOKEN.WORD;
+                symbol_tokens["char"] = TOKEN.CHAR;
+                symbol_tokens["bool"] = TOKEN.BOOL;
+                symbol_tokens["void"] = TOKEN.VOID;
+                symbol_tokens["new"] = TOKEN.NEW;
+                symbol_tokens["throw"] = TOKEN.THROW;
+                symbol_tokens["return"] = TOKEN.RETURN;
+                symbol_tokens["cast"] = TOKEN.CAST;
+                symbol_tokens["var"] = TOKEN.VAR;
+                symbol_tokens["try"] = TOKEN.TRY;
+                symbol_tokens["let"] = TOKEN.LET;
+                symbol_tokens["catch"] = TOKEN.CATCH;
+                symbol_tokens["finally"] = TOKEN.FINALLY;
+                symbol_tokens["this"] = TOKEN.THIS;
+                symbol_tokens["super"] = TOKEN.SUPER;
+                symbol_tokens["null"] = TOKEN.CONST_NULL;
+                symbol_tokens["true"] = TOKEN.CONST_TRUE;
+                symbol_tokens["false"] = TOKEN.CONST_FALSE;
+                symbol_tokens["use"] = TOKEN.USE;
+                symbol_tokens["native"] = TOKEN.NATIVE;
+                symbol_tokens["pragma"] = TOKEN.PRAGMA;
+                symbol_tokens["get"] = TOKEN.GET;
+                symbol_tokens["set"] = TOKEN.SET;
+                symbol_tokens["interface"] = TOKEN.INTERFACE;
+                symbol_tokens["proc"] = TOKEN.PROC;
+                symbol_tokens["isa"] = TOKEN.ISA;
+                symbol_tokens["operator"] = TOKEN.OPERATOR;
 
-	static TokenMap initSymbolTokensCommon() is
-	    // IO.Std.err.println( "init tokens for common" );
-	    var symbol_tokens = new TokenMap();
-	    symbol_tokens["import"] = Token.IMPORT;
-	    symbol_tokens["namespace"] = Token.NAMESPACE;
-	    symbol_tokens["class"] = Token.CLASS;
-	    symbol_tokens["struct"] = Token.STRUCT;
-	    symbol_tokens["enum"] = Token.ENUM;
-	    symbol_tokens["public"] = Token.PUBLIC;
-	    symbol_tokens["protected"] = Token.PROTECTED;
-	    symbol_tokens["private"] = Token.PRIVATE;
-	    symbol_tokens["const"] = Token.CONST;
-	    symbol_tokens["static"] = Token.STATIC;
-	    symbol_tokens["if"] = Token.IF;
-	    symbol_tokens["else"] = Token.ELSE;
-	    symbol_tokens["while"] = Token.WHILE;
-	    symbol_tokens["do"] = Token.DO;
-	    symbol_tokens["for"] = Token.FOR;
-	    symbol_tokens["foreach"] = Token.FOREACH;
-	    symbol_tokens["case"] = Token.CASE;
-	    symbol_tokens["default"] = Token.DEFAULT;
-	    symbol_tokens["break"] = Token.BREAK;
-	    symbol_tokens["continue"] = Token.CONTINUE;
-	    symbol_tokens["ref"] = Token.REFERENCE;
-	    symbol_tokens["ptr"] = Token.POINTER;
-	    symbol_tokens["int"] = Token.INT;
-	    symbol_tokens["long"] = Token.LONG;
-	    symbol_tokens["word"] = Token.WORD;
-	    symbol_tokens["char"] = Token.CHAR;
-	    symbol_tokens["bool"] = Token.BOOL;
-	    symbol_tokens["void"] = Token.VOID;
-	    symbol_tokens["new"] = Token.NEW;
-	    symbol_tokens["throw"] = Token.THROW;
-	    symbol_tokens["return"] = Token.RETURN;
-	    symbol_tokens["cast"] = Token.CAST;
-	    symbol_tokens["var"] = Token.VARIABLE;
-	    symbol_tokens["try"] = Token.TRY;
-	    symbol_tokens["catch"] = Token.CATCH;
-	    symbol_tokens["finally"] = Token.FINALLY;
-	    symbol_tokens["this"] = Token.THIS;
-	    symbol_tokens["super"] = Token.SUPER;
-	    symbol_tokens["null"] = Token.CONST_NULL;
-	    symbol_tokens["true"] = Token.CONST_TRUE;
-	    symbol_tokens["false"] = Token.CONST_FALSE;
-	    symbol_tokens["use"] = Token.USE;
-	    symbol_tokens["native"] = Token.NATIVE;
-	    symbol_tokens["pragma"] = Token.PRAGMA;
-	    symbol_tokens["get"] = Token.GET;
-	    symbol_tokens["set"] = Token.SET;
-	    symbol_tokens["interface"] = Token.INTERFACE;
-	    symbol_tokens["proc"] = Token.PROC;
-	    symbol_tokens["isa"] = Token.ISA;
-	    symbol_tokens["operator"] = Token.OPERATOR;
+                symbol_tokens["is"] = TOKEN.IS;
+                symbol_tokens["si"] = TOKEN.SI;
+                symbol_tokens["then"] = TOKEN.THEN;
+                symbol_tokens["elif"] = TOKEN.ELIF;
+                symbol_tokens["fi"] = TOKEN.FI;
+                symbol_tokens["esac"] = TOKEN.ESAC;
 
-	    return symbol_tokens;
-	si
-
-	void initSymbolTokens() is
-	    if want_new_syntax then
-	    	if symbol_tokens_k == null then 
-		    symbol_tokens_k = initSymbolTokensCommon();
-
-		    // IO.Std.err.println( "init tokens for K syntax" );
-		    symbol_tokens_k["is"] = Token.IS;
-		    // symbol_tokens_k["end"] = Token.END;
-		    symbol_tokens_k["si"] = Token.END;
-		    symbol_tokens_k["then"] = Token.THEN;
-		    symbol_tokens_k["elif"] = Token.ELIF;
-		    symbol_tokens_k["fi"] = Token.FI;
-		    symbol_tokens_k["esac"] = Token.ESAC;
-		    
-		    symbol_tokens_k["od"] = Token.OD;
-		    symbol_tokens_k["yrt"] = Token.YRT;
-		fi
-
-		this.symbol_tokens = symbol_tokens_k;		
-	    else
-		if symbol_tokens_l == null then
-		    symbol_tokens_l = initSymbolTokensCommon();
-
-		    // IO.Std.err.println( "init tokens for L syntax" );
-		    symbol_tokens_l["extends"] = Token.EXTENDS;
-		    symbol_tokens_l["implements"] = Token.IMPLEMENTS;		    
-		    symbol_tokens_l["switch"] = Token.SWITCH;		    
-		fi
-	    	this.symbol_tokens = symbol_tokens_l;
-	    fi
-
-	    // IO.Std.err.println( "tokens initialized" );
-
-	si
+                symbol_tokens["od"] = TOKEN.OD;
+                symbol_tokens["yrt"] = TOKEN.YRT;
+           fi
+        si
 
         void init( String current_file, IO.Reader i ) is
             super.init();
-	    want_new_syntax = true;
-	    int t = i.read();
-	    if t == cast int('#') then
-		// IO.Std.err.println( "reading syntax marker..." );
-		int u = i.read();
-		if u == cast int('C') || u == cast int('L') then
-		    want_new_syntax = false;
-		elif u == cast int('K') then
-		    // IO.Std.err.println( "new syntax selected" );
-		    want_new_syntax = true;
-		else
-		    throw new Exception( "unexpected syntax type marker '#" + cast char(u) + "'" );
-		fi
-	    elif t != -1 then
-		i.unRead( t );
-	    fi
-		
-	    buffer = new TokenBuffer();
 
-	    // stack.add( MAYBE_IN_TYPE );
+            buffer = new TOKEN_BUFFER();
 
             end_of_file = false;
             input = i;
-	    this.current_file = current_file;
-	    current_line = 1;
+            _current_file = current_file;
+            _current_line = 1;
 
-	    initSymbolTokens();
-	si
+            init_symbol_tokens();
+        si
 
-	void error( String msg ) is
-            IO.Std.err.println( current_file + ": " + current_line + ": error: " + msg );
-	si
+        void error( String msg ) is
+            IO.Std.err.println( _current_file + ": " + _current_line + ": error: " + msg );
+        si
 
-	get bool WantNewSyntax is
-	    return want_new_syntax;
-	si
-
-        bool isEndOfFile() is
+        bool is_end_of_file() is
             return end_of_file;
         si
 
-        void markInArgumentsDeclaration() is
-	    // generic_state = IN_ARGUMENTS;
-	si
-
-        char nextChar() is
+        char next_char() is
             char c;
-            if prev_char != cast char(0) then
-                c = prev_char;
-                prev_char = cast char(0);
-		// IO.Std.err.print(""+c);
+            if _prev_char != cast char(0) then
+                c = _prev_char;
+                _prev_char = cast char(0);
+                // IO.Std.err.print(""+c);
                 // IO.Std.out.println( "next char: returning buffered: '" + c + "'" );
                 return c;     
             fi
@@ -318,42 +223,36 @@ namespace Parse is
             fi
 
             c = cast char(c0);
-	    if c == '\n' then
-		current_line = current_line + 1;
-	    fi
-	    // IO.Std.err.print(""+c);
-            // IO.Std.out.println( "next char: returning '" + c + "'" );
+            if c == '\n' then
+                _current_line = _current_line + 1;
+            fi
+
             return c;
         si
 
-        void prevChar( char c ) is
-            prev_char = c;
+        void prev_char( char c ) is
+            _prev_char = c;
         si
 
-        String getBuffer() is
-            return token_string;
+        get String token_string is
+            return _token_string;
         si
 
-	Object getValue() is
-	    return getBuffer();
-	si
-
-        String getName(Token t) is
-            return token_name[cast int(t)];
+        get String token_name[TOKEN t] is
+            return _token_name[cast int(t)];
         si
 
-	int getLine() is
-	    return current_line;
-	si
+        get int current_line is
+            return _current_line;
+        si
 
-	String getFile() is
-	    return current_file;
-	si
+        get String current_file is
+            return _current_file;
+        si
 
-        char readEscape() is
-            char c = nextChar();
+        char read_escape() is
+            char c = next_char();
 
-            // IO.Std.out.println( "readEscape: '" + c + "'..." );
             int result = 0;
             if c == 't' then
                 // IO.Std.out.println( "escape tab" );
@@ -361,8 +260,8 @@ namespace Parse is
             elif c == 'n' then
                 // IO.Std.out.println( "escape newline" );
                 return '\n';
-	    elif c == 'r' then
-		return cast char(13);
+            elif c == 'r' then
+                return cast char(13);
             elif c == '\\' then
                 // IO.Std.out.println( "escape backslash" );
                 return '\\';
@@ -370,9 +269,9 @@ namespace Parse is
                 // IO.Std.out.println( "escape octal" );
                 while c >= '0' && c <= '7' do
                     result = 8 * result + cast int(c);
-                    c = nextChar();
+                    c = next_char();
                 od
-                prevChar(c);
+                prev_char(c);
                 return cast char(result);
             else
                 // IO.Std.out.println( "escape literal: '" + c + "'" );
@@ -380,567 +279,411 @@ namespace Parse is
             fi
         si
 
-	int getCurrentToken() is
-	    // IO.Std.err.println( "got: " + YyNameClass.yyName[cast int(token)] );
-	    return cast int(token);
-	si
-
-        bool nextToken() is
-	    token = readToken();
-	    // IO.Std.err.println( "read: " + YyNameClass.yyName[cast int(token)] + ", '" + token_string + "'" );
-            return token != Token.EOF;
+        get TOKEN current_token is
+            // IO.Std.err.println( "got: " + YyNameClass.yyName[cast int(token)] );
+            return token;
         si
 
-	char skipWhiteSpace() is
-	    char c;
-	    do
-                c = nextChar();
+        bool next_token() is
+            token = read_token();
+
+            return token != TOKEN.END_OF_INPUT;
+        si
+
+        char skip_white_space() is
+            char c;
+            do
+                c = next_char();
                 // IO.Std.out.println( "white space: '" + c + "'?" );
                 if ! (!end_of_file && (c == ' ' || c == cast char(9) || c == '\n')) then break; fi
             od
-	
-	    return c;
-	si
+    
+            return c;
+        si
 
-	Token readOperatorMethodToken() is
-	    Token r = readToken2(false);
-	    case r 
-	    is Token.ADD:
-		token_string = "opAdd";
+        TOKEN read_operator_method_token() is
+            TOKEN r = read_token_2(false);
+            case r 
+            is TOKEN.ADD:
+                _token_string = "operator+";
 
-	    is Token.SUB:
-		token_string = "opSub";
+            is TOKEN.SUB:
+                _token_string = "operator-";
 
-	    is Token.MUL:
-		token_string = "opMul";
+            is TOKEN.MUL:
+                _token_string = "operator*";
 
-	    is Token.DIV:
-		token_string = "opDiv";
+            is TOKEN.DIV:
+                _token_string = "operator/";
 
-	    is Token.MOD:
-		token_string = "opMod";
+            is TOKEN.MOD:
+                _token_string = "operator%";
 
-	    is Token.SHIFT_LEFT:
-		token_string = "opShl";
+            is TOKEN.SHIFT_LEFT:
+                _token_string = "operator<<";
 
-	    is Token.SHIFT_RIGHT:
-		token_string = "opShar";
+            is TOKEN.SHIFT_RIGHT:
+                _token_string = "operator>>";
 
-	    is Token.AND:
-		token_string = "opAnd";
+            is TOKEN.AND:
+                 _token_string = "operator&";
 
-	    is Token.OR:
-		token_string = "opOr";
+            is TOKEN.OR:
+                _token_string = "operator|";
 
-	    is Token.XOR:
-		token_string = "opXor";
+            is TOKEN.XOR:
+                _token_string = "operator^";
 
-	    is Token.OBJ_EQ:
-		token_string = "opEquals";
+            is TOKEN.OBJ_EQ:
+                _token_string = "operator=~";
 
-	    is Token.GT:
-		token_string = "opCompare";
+            is TOKEN.GT:
+                _token_string = "operator>";
 
-	    is Token.RANGE:
-		token_string = "opRange";
+            is TOKEN.RANGE:
+                _token_string = "operator..";
 
-	    default:
-		// syntax error:
-		return r;
-	    esac
+            default:
+                // syntax error:
+                return r;
+            esac
 
-	    return Token.IDENTIFIER;
-	si
+            return TOKEN.IDENTIFIER;
+        si
 
-	Token readToken() is
-	    Token r;
+        TOKEN read_token() is
+            TOKEN r;
 
-	    if buffer.Avail then
-		// IO.Std.err.println( "token in buffer..." );
-		TokenPair p = buffer.read();		
-		token_string = p.string;
+            if buffer.avail then
+                // IO.Std.err.println( "token in buffer..." );
+                TOKEN_PAIR p = buffer.read();        
+                _token_string = p.string;
 
-		// IO.Std.err.println( "returning buffered: " + cast int(p.token) );
-		return p.token;
-	    fi
-
-	    r = readToken2(false);
-
-	    if r != Token.LT /* && r != Token.WHILE */ then
-		return r;
-	    fi
-
-	    // nothing in buffer and current token is '<' - may be looking at a generic type, need to look ahead until we can determine if we're
-	    // in a generic type or not. 
-
-	    buffer.reset();
-
-	    buffer.write( new TokenPair( r, token_string ) );
-	    var bracket_stack = new Token[16];
-	    bracket_stack[0] = r;
-	    int generic_level = 0;
-	    // int do_level = 1;
-	    bool is_generic = true;
-
-	    do
-		if buffer.IsFull then
-		    IO.Std.err.println( "" + current_file + ": " + current_line + ": warn: ambiguous input: assuming not a generic type" );
-
-		    // will return first buffered token (which will be Token.LT):
-		    return readToken();
-		fi
-
-		r = readToken2(false);
-
-		// IO.Std.err.println( "token is: " + cast int(r) + ", string: " + token_string );
-
-		buffer.write( new TokenPair(r, token_string) );
-
-		if r == Token.LT then
-		    generic_level = generic_level + 1;
-		    bracket_stack[generic_level] = r;
-		    // IO.Std.err.println( "OK: open angle bracket..." );
-		elif r == Token.GT then
-		    // IO.Std.err.println( "OK: close angle bracket..." );
-		    if bracket_stack[generic_level] != Token.LT then
-			is_generic = false;
-			break;
-		    fi
-		    generic_level = generic_level - 1;
-		elif r == Token.SHIFT_RIGHT then
-		    // IO.Std.err.println( "OK: shift right..." );
-		    if generic_level < 1 || bracket_stack[generic_level] != Token.LT || bracket_stack[generic_level-1] != Token.LT then
-			is_generic = false;
-			break;
-		    fi
-		    generic_level = generic_level - 2;
-		elif r == Token.CLOSE_PAREN then
-		    if bracket_stack[generic_level] != Token.OPEN_PAREN then
-			is_generic = false;
-			break;
-		    fi
-		    generic_level = generic_level - 1;
-		elif r == Token.PROC then
-		    r = readToken2(false);
-		    buffer.write( new TokenPair(r, token_string) );
-
-		    if r != Token.OPEN_PAREN then
-			is_generic = false;
-			break;
-		    else
-			generic_level = generic_level + 1;
-			bracket_stack[generic_level] = r;
-		    fi
-		elif r == Token.DOT || r == Token.COMMA || r == Token.IDENTIFIER ||
-			   (r >= Token.ARRAY_DEF && r <= Token.REFERENCE ) || r == Token.VOID then
-		    // IO.Std.err.println( "OK: basic type, identifier or dot..." );
-		else
-		    // IO.Std.err.println( "" + current_file + ": " + current_line + ": doesn't look like a generic - leaving buffered input alone" );
-		    is_generic = false;
-		    break;
-		fi
-                if !( generic_level >= 0 ) then break; fi
-            od
-
-	    /*
-	    if( generic_level < 0 ) {
-		// IO.Std.err.println( "" + current_file + ": " + current_line + ": doesn't look like a generic - leaving buffered input alone" );
-		is_generic = false;
-	    }
-	    */
-
-	    if is_generic then
-		// IO.Std.err.println( "was generic - convert buffer..." );		
-		buffer.makeGeneric();
-	    fi
-	    // IO.Std.err.println( "read token: " + cast int(r) + " generic state now: " + generic_state + " generic level now: " + generic_level );
-
-	    return readToken();
-	si
-	
-        Token readToken2(bool for_comment) is
-	    Token r;
-
-            char c = skipWhiteSpace();
-            if end_of_file then
-                return Token.EOF;
+                // IO.Std.err.println( "returning buffered: " + cast int(p.token) );
+                return p.token;
             fi
 
-	    int open_line = current_line;
+            return read_token_2(false);
+        si
+    
+        TOKEN read_token_2(bool for_comment) is
+            TOKEN r;
+
+            var c = skip_white_space();
+            if end_of_file then
+                return TOKEN.END_OF_INPUT;
+            fi
+
+            var open_line = _current_line;
 
             StringBuffer buffer = null;
-            token_string = null; // new StringBuffer("");
+            _token_string = null; // new StringBuffer("");
 
             // IO.Std.out.println( "number/letter: '" + c + "'?" );
             if c >= '0' && c <= '9' then
                 // IO.Std.out.println( "number: '" + c + "'" );
                 buffer = new StringBuffer();
-		buffer.append( c );
-		c = nextChar();
-		if c == 'x' || c == 'X' then
-		    buffer.append( c );
-		    c = nextChar();
-		    while (c >= '0' && c <= '9') || 
-			  (c >= 'A' && c <= 'F') || 
-			  (c >= 'a' && c <= 'f') ||
-			  c == 'x' || c == 'w' || c == 'W' || c == 'l' || c == 'L'  do
-			buffer.append(c);
-			c = nextChar();
-		    od
-		    // IO.Std.err.println( "read hex const: '" + buffer + "'" );
-		else
-		    while (c >= '0' && c <= '9') || c == 'x' || c == 'w' || c == 'W' || c == 'l' || c == 'L' || c == 'c' || c == 'C' do
-			buffer.append(c);
-			c = nextChar();
-		    od
-		fi
+                buffer.append( c );
+                c = next_char();
 
-                token_string = buffer.Freeze;
-                prevChar(c);
-		// IO.Std.err.println( "read const int: '" + token_string + "'" );
-                return Token.CONST_INT;
+                if c == 'x' || c == 'X' then
+                    buffer.append( c );
+                    c = next_char();
+                    while (c >= '0' && c <= '9') || 
+                        (c >= 'A' && c <= 'F') || 
+                        (c >= 'a' && c <= 'f') ||
+                         c == 'x' || c == 'w' || c == 'W' || c == 'l' || c == 'L'  do
+                        buffer.append(c);
+                        c = next_char();
+                    od
+                    // IO.Std.err.println( "read hex const: '" + buffer + "'" );
+                else
+                    while (c >= '0' && c <= '9') || c == 'x' || c == 'w' || c == 'W' || c == 'l' || c == 'L' || c == 'c' || c == 'C' do
+                        buffer.append(c);
+                        c = next_char();
+                    od
+                fi
+
+                _token_string = buffer.Freeze;
+                prev_char(c);
+                // IO.Std.err.println( "read const int: '" + _token_string + "'" );
+                return TOKEN.CONST_INT;
             elif (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' then
                 // IO.Std.out.println( "letter: '" + c + "'" );
                 buffer = new StringBuffer();
                 while (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' do
                     buffer.append(c);
-                    c = nextChar();
+                    c = next_char();
                 od
-                token_string = buffer.Freeze;
-                prevChar(c);
-		r = symbol_tokens[token_string];
+                _token_string = buffer.Freeze;
+                prev_char(c);
+                r = symbol_tokens[_token_string];
 
-		if r == Token.OPERATOR then
-		    return readOperatorMethodToken();
-		fi
+                if r == TOKEN.OPERATOR then
+                    return read_operator_method_token();
+                fi
 
-		/*
-		if( r == Token.OF ) {
-		    // IO.Std.err.println( "seen of - in type..." );
-		    in_type = true;
-		    return readToken2();
-		}
-		*/
                 return r;
             fi
-
 
             case c
             is cast char(34): // double quote
                 buffer = new StringBuffer();
-                c = nextChar(); 
+                c = next_char(); 
                 while c != cast char(34) do
                     if c == cast char(92) then // backslash
-                        c = readEscape();
+                        c = read_escape();
                         buffer.append(c);
-                        c = nextChar();
+                        c = next_char();
                     else
                         buffer.append(c);
-                        c = nextChar();
+                        c = next_char();
                     fi
-		    if end_of_file then
-			error( "end of file in string literal at line " + open_line );
-			break;
-		    fi
+
+                    if end_of_file then
+                        error( "end of file in string literal at line " + open_line );
+                        break;
+                    fi
                 od
-                token_string = buffer.Freeze;
-                return Token.CONST_STRING;
+                _token_string = buffer.Freeze;
+                return TOKEN.CONST_STRING;
 
             is cast char(39): // single quote
                 buffer = new StringBuffer();
-                c = nextChar();
+                c = next_char();
                 while c != cast char(39) do
                     if c == cast char(92) then // backslash
-                        c = readEscape();
+                        c = read_escape();
                         buffer.append(c);
-                        c = nextChar();
+                        c = next_char();
                     else
                         buffer.append(c);
-                        c = nextChar();
+                        c = next_char();
                     fi
-		    if end_of_file then
-			error( "end of file in character literal at line " + open_line );
-			break;
-		    fi
+                    if end_of_file then
+                        error( "end of file in character literal at line " + open_line );
+                        break;
+                    fi
                 od
-		if buffer.Length < 1 then
-		    error( "zero length character literal" );
-		fi
-                token_string = buffer.Freeze;
-		// IO.Std.err.println( "const char: '" + token_string + "'" );
-                return Token.CONST_CHAR;
+                if buffer.Length < 1 then
+                    error( "zero length character literal" );
+                fi
 
-	    is '`':
-		buffer = new StringBuffer();
-		c = nextChar();
-		while c != '`' do
-		    if c == cast char(92) then // backslash
-			c = readEscape();
-			buffer.append(c);
-			c = nextChar();
-		    else
-			buffer.append(c);
-			c = nextChar();
-		    fi
+                _token_string = buffer.Freeze;
+                // IO.Std.err.println( "const char: '" + _token_string + "'" );
+                return TOKEN.CONST_CHAR;
 
-		    if end_of_file then
-			error( "end of file in char ptr literal at line " + open_line );
-			break;
-		    fi
-		od
-		token_string = buffer.Freeze;
-		return Token.CONST_CSTRING;
+            is '`':
+                buffer = new StringBuffer();
+                c = next_char();
+                while c != '`' do
+                    if c == cast char(92) then // backslash
+                        c = read_escape();
+                        buffer.append(c);
+                        c = next_char();
+                    else
+                        buffer.append(c);
+                        c = next_char();
+                    fi
+
+                    if end_of_file then
+                        error( "end of file in char ptr literal at line " + open_line );
+                        break;
+                    fi
+                od
+        
+                _token_string = buffer.Freeze;
+                return TOKEN.CONST_CSTRING;
                     
             is '=':
-		/*
-		if( generic_level == 0 ) {
-		    generic_state = IN_OTHER;
-		    // IO.Std.err.println( "seen assign token: cannot be in a type now" );
-		}
-		*/
-
-                c = nextChar();
+                c = next_char();
                 if c == '=' then
-                    return Token.EQ;
+                    return TOKEN.EQ;
                 elif c == '~' then
-		    return Token.OBJ_EQ;
-		else
-                    prevChar(c);
-                    return Token.ASSIGN;
+                    return TOKEN.OBJ_EQ;
+                else
+                    prev_char(c);
+                    return TOKEN.ASSIGN;
                 fi
 
             is '>':
-		/*
-		if( generic_level > 0 ) {
-		    generic_level = generic_level - 1;
-		    if( generic_level == 0 ) {
-			in_type = false;
-		    }
-
-		    // IO.Std.err.println( "in type > is close-generic, genric level now: " + generic_level );
-		    return Token.CLOSE_GENERIC;
-		}
-		*/
-
-		// IO.Std.err.println( "> is not part of type" );
-
-                c = nextChar();
+                c = next_char();
                 if c == '=' then
-                    return Token.GE;
+                    return TOKEN.GE;
                 elif c == '>' then
-                    return Token.SHIFT_RIGHT;
+                    return TOKEN.SHIFT_RIGHT;
                 else
-                    prevChar(c);
-                    return Token.GT;
+                    prev_char(c);
+                    return TOKEN.GT;
                 fi
 
             is '<':
-		/*
-		if( generic_state == IN_ARGUMENTS || generic_state == IN_CAST || generic_state == MAYBE_IN_TYPE ) {
-		    generic_level = generic_level + 1;
-		    return Token.OPEN_GENERIC;
-		}
-		*/
-
-		// IO.Std.err.println( "< is not part of type" );
-
-		/*
-		if( in_type ) {
-		    generic_level = generic_level + 1;
-		    // IO.Std.err.println( "in type < is open-generic, genric level now: " + generic_level );
-		    return Token.OPEN_GENERIC;
-		}
-		*/
-
-                c = nextChar();
+                c = next_char();
                 if c == '=' then
-                    return Token.LE;
+                    return TOKEN.LE;
                 elif c == '<' then
-                    return Token.SHIFT_LEFT;
+                    return TOKEN.SHIFT_LEFT;
                 else
-                    prevChar(c);
-                    return Token.LT;
+                    prev_char(c);
+                    return TOKEN.LT;
                 fi
 
             is '!':
-                c = nextChar();
+                c = next_char();
                 if c == '=' then
-                    return Token.NE;
-		elif c == '~' then
-		    return Token.OBJ_NE;
+                    return TOKEN.NE;
+                elif c == '~' then
+                    return TOKEN.OBJ_NE;
                 else
-                    prevChar(c);
-                    return Token.BOOL_NOT;
+                    prev_char(c);
+                    return TOKEN.BOOL_NOT;
                 fi
 
             is '&':
-                c = nextChar();
+                c = next_char();
                 if c == '&' then
-                    return Token.BOOL_AND;
+                    return TOKEN.BOOL_AND;
                 else
-                    prevChar(c);
-                    return Token.AND;
+                    prev_char(c);
+                    return TOKEN.AND;
                 fi
                 
             is '|':
-                c = nextChar();
+                c = next_char();
                 if c == '|' then
-                    return Token.BOOL_OR;
+                    return TOKEN.BOOL_OR;
                 else
-                    prevChar(c);
-                    return Token.OR;
+                    prev_char(c);
+                    return TOKEN.OR;
                 fi
 
-            is '~': return Token.NOT;
-	    is '^': return Token.XOR;
+            is '~': return TOKEN.NOT;
+            is '^': return TOKEN.XOR;
 
             is '{':
-		// generic_state = MAYBE_IN_TYPE;
-		return Token.START_BLOCK;
+                // generic_state = MAYBE_IN_TYPE;
+                return TOKEN.START_BLOCK;
 
-            is '}': return Token.END_BLOCK;
+            is '}': return TOKEN.END_BLOCK;
 
-            is '(':
-		/*
-		if( generic_state == IN_ARGUMENTS ) {
-		    generic_state = MAYBE_IN_TYPE;
-		} else if( generic_level == 0 ) {
-		    if( generic_state != IN_FOR ) {
-			// IO.Std.err.println( "seen left paren: cannot be in type" );
-			generic_state = IN_OTHER;
-		    }
-		    paren_level = paren_level + 1;
-		}
-		*/
-		return Token.OPEN_PAREN;
+            is '(': return TOKEN.OPEN_PAREN;
 
-            is ')':
-		/*
-		paren_level = paren_level - 1;
-		if( generic_state == IN_ARGUMENTS && paren_level == 0 ) {
-		    generic_state = IN_OTHER;
-		}
-		*/
-		return Token.CLOSE_PAREN;
+            is ')': return TOKEN.CLOSE_PAREN;
 
             is '[':
-		c = skipWhiteSpace();
-		if end_of_file then
-		    return Token.OPEN_SQUARE;
-		elif c == ']' then
-		    return Token.ARRAY_DEF;
-		else
-		    prevChar(c);
-		    return Token.OPEN_SQUARE;
-		fi
+                c = skip_white_space();
+                if end_of_file then
+                    return TOKEN.OPEN_SQUARE;
+                elif c == ']' then
+                    return TOKEN.ARRAY_DEF;
+                else
+                    prev_char(c);
+                    return TOKEN.OPEN_SQUARE;
+                fi
 
-            is ']': return Token.CLOSE_SQUARE;
+            is ']': return TOKEN.CLOSE_SQUARE;
 
-            is '+': return Token.ADD;
-            is '-': return Token.SUB;
-            is '*': return Token.MUL;
+            is '+': return TOKEN.ADD;
+            is '-': return TOKEN.SUB;
+            is '*': return TOKEN.MUL;
             is '/':
-                c = nextChar();
+                c = next_char();
                 if c == '/' then
-		    buffer = new StringBuffer("//");
+                    buffer = new StringBuffer("//");
                     do
-                        c = nextChar();
-			if c != '\n' then
-			    buffer.append( c );
-			fi
-			if !( !end_of_file && c != '\n' ) then break; fi;
+                        c = next_char();
+                        if c != '\n' then
+                            buffer.append( c );
+                        fi
+                        if !( !end_of_file && c != '\n' ) then break; fi;
                     od
 
-		    if buffer.startsWith("///") then
-			buffer.append( "\n" );
-			if for_comment then
-			    // IO.Std.err.println( "from: " + new System.Backtrace() );
-			    // IO.Std.err.println( "appending comment: " + buffer );
-			    ParseTree.appendLastComment(buffer);
-			else
-			    ParseTree.LastComment = buffer;
-			fi
-			return readToken2(true);
-		    else
-			return readToken2(false);
-		    fi
+                    if buffer.startsWith("///") then
+                        buffer.append( "\n" );
+                        /*
+                        if for_comment then
+                            // IO.Std.err.println( "from: " + new System.Backtrace() );
+                            // IO.Std.err.println( "appending comment: " + buffer );
+                            ParseTree.appendLastComment(buffer);
+                        else
+                            ParseTree.LastComment = buffer;
+                        fi
+                        */
+                        return read_token_2(true);
+                    else
+                        return read_token_2(false);
+                    fi
                 elif c == '*' then
                     buffer = new StringBuffer("/*");
-		    do
-			c = nextChar();
+                    do
+                        c = next_char();
 
-			if c == '*' then
-			    c = nextChar();
-			    if c == '/' then
-				break;
-			    fi
-			    buffer.append( '*' );
-			fi
-			buffer.append( c );
-			if end_of_file then break; fi
-		    od
+                        if c == '*' then
+                            c = next_char();
+                            if c == '/' then
+                                break;
+                            fi
+                            buffer.append( '*' );
+                        fi
+                        buffer.append( c );
+                        if end_of_file then break; fi
+                    od
 
-		    if buffer.startsWith( "/**" ) then
-			buffer.append( "*/" );
-			if for_comment then
-			    IO.Std.err.println( "from: " + new System.Backtrace() );
-			    IO.Std.err.println( "appending comment: " + buffer );
-			    ParseTree.appendLastComment(buffer);
-			else
-			    ParseTree.LastComment = buffer;
-			fi
-			return readToken2(true);		    
-		    else
-			return readToken2(false);
-		    fi
-		else
-                    prevChar(c);
-                    return Token.DIV;
+                    if buffer.startsWith( "/**" ) then
+                        buffer.append( "*/" );
+                        /*
+                        if for_comment then
+                            IO.Std.err.println( "from: " + new System.Backtrace() );
+                            IO.Std.err.println( "appending comment: " + buffer );
+                            ParseTree.appendLastComment(buffer);
+                        else
+                            ParseTree.LastComment = buffer;
+                        fi
+                        */
+                        return read_token_2(true);            
+                    else
+                        return read_token_2(false);
+                    fi
+                else
+                    prev_char(c);
+                    return TOKEN.DIV;
                 fi
-	    is '%': return Token.MOD;	    
+            is '%': return TOKEN.MOD;       
 
             is '.': 
-		c = nextChar();
-		if c == '.' then
-		    return Token.RANGE;
-		else
-		    prevChar(c);
-		    return Token.DOT;
-		fi
+                c = next_char();
+                if c == '.' then
+                    return TOKEN.RANGE;
+                else
+                    prev_char(c);
+                    return TOKEN.DOT;
+                fi
 
-            is ',': return Token.COMMA;
-            is ':': return Token.COLON;
-            is ';': 
-		/*
-		if( generic_state == IN_FOR ) {
-		    generic_state = IN_OTHER;
-		} else if( paren_level == 0 ) {
-		    generic_state = MAYBE_IN_TYPE;
-		}
-		*/
-		return Token.END_STATEMENT;
+            is ',': return TOKEN.COMMA;
+            is ':': return TOKEN.COLON;
+            is ';': return TOKEN.SEMICOLON;
 
-	    is '@':
-		return Token.PRAGMA;
+            is '@':
+                return TOKEN.PRAGMA;
 
-	    is '#':
-		buffer = new StringBuffer();
-		do
-		    c = nextChar();
-		    if c < '0' || c > '9' then 
-			prevChar(c);
-			break;
-		    fi
-		    buffer.append(c);
-		od
+            is '#':
+                buffer = new StringBuffer();
+                do
+                    c = next_char();
+                    if c < '0' || c > '9' then 
+                        prev_char(c);
+                        break;
+                    fi
+                    buffer.append(c);
+                od
 
-		current_line = buffer.parseInt();
+                _current_line = buffer.parseInt();
 
-		return readToken2(false);
+                return read_token_2(false);
             esac
             
             // IO.Std.out.println( "unknown: '" + c + "'" );
-            return Token.UNKNOWN;
-	si        
+            return TOKEN.UNKNOWN;
+        si        
     si
 si
