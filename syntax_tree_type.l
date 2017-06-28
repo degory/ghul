@@ -90,7 +90,10 @@ namespace Syntax is
       class NAMED isa TYPE is
         public IDENTIFIER name;
 
-        void init(IDENTIFIER name) is this.name = name; si
+        void init(IDENTIFIER name) is
+            super.init();
+            this.name = name;
+        si
 
         public get int size is return 8; si
       si
@@ -99,6 +102,7 @@ namespace Syntax is
         public List<TYPE> arguments;
 
         void init(IDENTIFIER name, List<TYPE> arguments) is
+          super.init(name);
           this.arguments = arguments;
         si
       si

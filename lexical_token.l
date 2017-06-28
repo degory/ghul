@@ -1,4 +1,8 @@
 namespace Lexical is
+  class _dummy is
+    private System.Enum<TOKEN>[] _dummy;
+  si
+
   enum TOKEN is
     FIRST = 0,
     ARRAY_DEF = 1,

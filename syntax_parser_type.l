@@ -2,7 +2,7 @@ import glist;
 import gvector;
 
 namespace Syntax is
-    namespace Parse is
+    namespace Parser is
         use System;
         use Generic;
 
@@ -78,7 +78,7 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        var identifier = context.identifier_parser.parse(context);
+                        var identifier = context.parse_identifier();
 
                         if context.current_token == Lexical.TOKEN.LT then
                             context.next_token();

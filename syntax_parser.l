@@ -1,34 +1,11 @@
-import tokenizer;
 import gmap;
 import glist;
 import gvector;
 
-import tokenizer;
-import ast;
-import parser_type;
-import parser_identifier;
-
 namespace Syntax is
-    namespace Parse is
+    namespace Parser is
         use System;
         use Generic;
-
-        class CONTEXT is
-            public Lexical.TOKENIZER tokenizer;
-
-            // FIXME: without generic methods and/or reflection, it's tricky to do this in a nice open/closed way:
-            public TYPE type_parser;
-            public IDENTIFIER identifier_parser;
-            public TUPLE tuple_parser;          
-
-            bool next_token() is
-                return tokenizer.next_token();
-            si                    
-
-            get Lexical.TOKEN current_token is
-                return tokenizer.current_token;
-            si
-        si
 
         interface Parser<T> is
             T parse(CONTEXT context);
@@ -36,6 +13,7 @@ namespace Syntax is
 
         class PARSER<T> do Parser<T> is
             Generic.Map<Lexical.TOKEN,T proc(CONTEXT)> parsers;
+            String expected_tokens;
 
             void init() is
                 parsers = new Generic.Map<Lexical.TOKEN, T proc(CONTEXT)>();
@@ -57,8 +35,29 @@ namespace Syntax is
                 if p != null then
                     return p(context);
                 else
-                    IO.Std.err.println("unexpected token: " + context.current_token);
+                    return unexpected_token(context);
                 fi
+
+            si
+
+            T unexpected_token(CONTEXT context) is
+                if expected_tokens == null then
+                    populate_expected_tokens();
+                fi                    
+
+                context.error(context.location, "syntax error: expected % but found %" % { expected_tokens, context.current_token });
+            si
+
+            private void populate_expected_tokens() is
+                var buffer = new StringBuffer();
+
+                foreach var k; parsers.keys() do
+                    buffer
+                        .append(k.box)
+                        .append(' ');
+                od
+
+                expected_tokens = buffer;
             si
         si
     si

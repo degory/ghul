@@ -1,10 +1,6 @@
 // copyright 2004-2017 degs <junk@giantblob.com> all rights reserved
 
 import stream;
-import vector;
-import map;
-
-import token;
 
 namespace Lexical is
     use System.Object;
@@ -234,7 +230,7 @@ namespace Lexical is
             _prev_char = c;
         si
 
-        get String token_string is
+        get String current_string is
             return _token_string;
         si
 
