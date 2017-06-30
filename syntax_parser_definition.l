@@ -1,46 +1,19 @@
 namespace Syntax is
     namespace Parser is
-        class DEFINITION_LIST isa PARSER<Tree.DEFINITION_LIST> is
+        use Generic;
+
+        class DEFINITION_LIST isa PARSER<Tree.Definition.DEFINITION_LIST> is
             void init() is
                 super.init();
             si
 
-            Tree.DEFINITION parse(CONTEXT context) is
+            Tree.Definition.DEFINITION_LIST parse(CONTEXT context) is
                 var start = context.location;
 
-                var definitions = new List<DEFINITION>();
+                var definitions = new Vector<Tree.DEFINITION>();
 
                 do
-                    var defintion = maybe_parse_definition(context);
-                    
-                    if definition != null then
-                        definitions.add(definition);
-
-                od
-
-                return new DEFINITION_LIST(start..context.location, definitions);
-            si
-        si
-
-        class DEFINITION isa PARSER<Tree.DEFINITION> is
-            void init() is
-                super.init();
-
-                add_parser(
-                    this.parse_definition,
-                    {
-                        Lexical.TOKEN.VAR, Lexical.TOKEN.LET
-                    }
-                );
-            si
-
-            DEFINITION_LIST parse_definition(CONTEXT context) is
-                var start = context.location;
-
-                var definitions = new List<DEFINITION>();
-
-                do
-                    var defintion = parse(context);
+                    var definition = context.parse_definition();
                     
                     if definition != null then
                         definitions.add(definition);
@@ -49,7 +22,51 @@ namespace Syntax is
                     fi
                 od
 
-                return new DEFINITION_LIST(start..context.location, definitions);
+                return new Tree.Definition.DEFINITION_LIST(start..context.location, definitions);
+            si
+        si
+
+        class DEFINITION isa PARSER<Tree.DEFINITION> is
+            void init() is
+                super.init();
+
+                add_parser(
+                    Tree.DEFINITION proc(CONTEXT context) is
+                        var start = context.location;
+
+                        context.next_token();
+
+                        var identifier = context.parse_identifier();
+                        
+                        var type = Tree.Type.INFER;
+                        var initializer = Tree.Expression.NONE;
+
+                        if context.current_token == Lexical.TOKEN.COLON then
+                    
+
+                            context.next_token();
+                            
+                            type = context.parse_type();
+                        fi
+
+                        if context.current_token == Lexical.TOKEN.ASSIGN then
+                            context.next_token();
+
+                            initializer = context.parse_expression();
+                        fi
+
+                        return new Tree.Definition.LET(
+                            start..context.location,
+                            identifier,
+                            type,
+                            initializer);    
+                    si,
+                    Lexical.TOKEN.LET
+                );
+            si
+
+            DEFINITION parse_var_or_let() is
+                
             si
 
             DEFINITION unexpected_token(CONTEXT context) is
@@ -57,7 +74,7 @@ namespace Syntax is
             si
         si
 
-        class LET isa Parser<Tree.LET> is
+        class LET isa PARSER<Tree.Definition.LET> is
             LET parse(CONTEXT context) is
                 if context.expect_token(Lexical.TOKEN.LET) then
                     context.next_token();
@@ -71,8 +88,6 @@ namespace Syntax is
                         
                         type = context.parse_type();
                     fi
-
-                    if 
                 fi
             si
         si

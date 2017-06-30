@@ -27,6 +27,10 @@ namespace Syntax is
         void init() is super.init(); si
       si
 
+      class NONE isa BUILT_IN is
+        void init() is super.init(); si
+      si
+
       class BOOL isa BUILT_IN is
         void init() is super.init(); si
 

@@ -23,7 +23,7 @@ namespace Syntax is
                 parsers[token] = p;
             si
            
-            void add_parser(T proc(CONTEXT) p, List<Lexical.TOKEN> tokens) is
+            void add_parser(T proc(CONTEXT) p, Iterable<Lexical.TOKEN> tokens) is
                 foreach var t; tokens do
                     add_parser(p, t);
                 od

@@ -13,6 +13,7 @@ namespace Syntax is
             static TYPE type_parser = new TYPE();
             static IDENTIFIER identifier_parser = new IDENTIFIER();
             static DEFINITION definition_parser = new DEFINITION();
+            static EXPRESSION expression_parser = new EXPRESSION();
 
             public Lexical.TOKENIZER tokenizer;
 
@@ -43,7 +44,16 @@ namespace Syntax is
 
             public bool expect_token(Lexical.TOKEN token) is
                 if current_token != token then
-                    error(location, "syntax error: expected % but found %" % Object{token, current_token});
+                    error(
+                        location,
+                        "syntax error: expected % but found %"
+                            % Object{token, current_token});
+                fi
+            si
+
+            public bool next_token(Lexical.TOKEN token) is
+                if expect_token(token) then
+                    next_token();
                 fi
             si
 
@@ -61,6 +71,10 @@ namespace Syntax is
 
             public Tree.DEFINITION parse_definition() is
                 return definition_parser.parse(this);
+            si
+
+            public Tree.EXPRESSION parse_expression() is
+                return expression_parser.parse(this);
             si
         si
     si

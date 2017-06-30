@@ -17,10 +17,12 @@ import syntax_parser_type;
 import syntax_parser_definition;
 import syntax_parser_identifier;
 import syntax_parser_definition;
+import syntax_parser_expression;
 
 import syntax_tree;
 import syntax_tree_type;
 import syntax_tree_definition;
+import syntax_tree_expression;
 
 import syntax_tree_visitor;
 import syntax_tree_transformer;
