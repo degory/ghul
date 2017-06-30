@@ -38,12 +38,10 @@ namespace Syntax is
 
                         var identifier = context.parse_identifier();
                         
-                        var type = Tree.Type.INFER;
-                        var initializer = Tree.Expression.NONE;
+                        Tree.TYPE type = Tree.Type.BUILT_IN.INFER;
+                        Tree.EXPRESSION initializer = new Tree.Expression.NONE(context.location);
 
                         if context.current_token == Lexical.TOKEN.COLON then
-                    
-
                             context.next_token();
                             
                             type = context.parse_type();
@@ -65,11 +63,11 @@ namespace Syntax is
                 );
             si
 
-            DEFINITION parse_var_or_let() is
+            Tree.DEFINITION parse_var_or_let() is
                 
             si
 
-            DEFINITION unexpected_token(CONTEXT context) is
+            Tree.DEFINITION unexpected_token(CONTEXT context) is
                 return null;
             si
         si
@@ -81,7 +79,7 @@ namespace Syntax is
 
                     var identifier = context.parse_identifier();
                     
-                    var type = Tree.Type.INFER;
+                    TYPE type = new Tree.Type.INFER(context.location);
 
                     if context.current_token == Lexical.TOKEN.COLON then
                         context.next_token();

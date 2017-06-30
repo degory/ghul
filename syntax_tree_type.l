@@ -7,6 +7,8 @@ namespace Syntax is
       use Generic;
 
       class BUILT_IN isa TYPE is
+        public static NONE NONE = new NONE();
+        public static INFER INFER = new INFER();
         public static VOID VOID = new VOID();
         public static BOOL BOOL = new BOOL();
         public static BYTE BYTE = new BYTE();
@@ -30,6 +32,10 @@ namespace Syntax is
       class NONE isa BUILT_IN is
         void init() is super.init(); si
       si
+
+      class INFER isa TYPE is
+        void init() is super.init(); si
+      si      
 
       class BOOL isa BUILT_IN is
         void init() is super.init(); si

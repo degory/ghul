@@ -65,7 +65,7 @@ namespace Syntax is
                         context.next_token();
                         return new Tree.Type.POINTER(this.parse(context));
                     si,
-                    Lexical.TOKEN.POINTER
+                    Lexical.TOKEN.PTR
                 );
 
                 add_parser(
@@ -73,7 +73,7 @@ namespace Syntax is
                         context.next_token();
                         return new Tree.Type.REFERENCE(this.parse(context));
                     si,
-                    Lexical.TOKEN.REFERENCE
+                    Lexical.TOKEN.REF
                 );
 
                 add_parser(

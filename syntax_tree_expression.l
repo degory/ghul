@@ -1,6 +1,9 @@
 namespace Syntax is
     namespace Tree is
         namespace Expression is
+            use System;
+            use Generic;
+
             enum OPERATION is
                 ADD,
                 SUBTRACT,
