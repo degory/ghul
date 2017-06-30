@@ -31,16 +31,28 @@ namespace Syntax is
                     precedence[Lexical.TOKEN.PERCENT] = PRIORITY.MULTIPLICATION;
 
                     precedence[Lexical.TOKEN.PLUS] = PRIORITY.ADDITION;
-                    precedence[Lexical.TOKEN.MINUS] = PRIORITY.SUBTRACT;
+                    precedence[Lexical.TOKEN.MINUS] = PRIORITY.ADDITION;
 
                     precedence[Lexical.TOKEN_AND_BITWISE] = PRIORITY.BITWISE;
                     precedence[Lexical.TOKEN_OR_BITWISE] = PRIORITY.BITWISE;
+
 
                     operation = new Map<Lexical.TOKEN, Tree.Expression.OPERATION>();
 
                     operation[Lexical.TOKEN.DOT] = Tree.Expression.OPERATION.MEMBER;
                     operation[Lexical.TOKEN.SQUARE_OPEN] = Tree.Expression.OPERATION.MEMBER;
-                    operation[Lexical.TOKEN.PAREN_OPEN] = Tree.Expression.OPERATION_MEMBER;
+                    operation[Lexical.TOKEN.PAREN_OPEN] = Tree.Expression.OPERATION.MEMBER;
+
+                    operation[Lexical.TOKEN.SLASH] = Tree.Expression.OPERATION.DIVIDE;
+                    operation[Lexical.TOKEN.STAR] = Tree.Expression.OPERATION.MULTIPLICATION;
+                    operation[Lexical.TOKEN.PERCENT] = Tree.EXPRESSION.OPERATION.MODULUS;
+
+                    operation[Lexical.TOKEN.PLUS] = Tree.Expression.OPERATION.ADDITION;
+                    operation[Lexical.TOKEN.MINUS = Tree.Expression.OPERATION.SUBTRACTION]
+
+                    operation[Lexical.TOKEN.AND] = Tree.Expression.OPERATION.AND_BITWISE;
+                    operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR_BITWISE;
+                    
                 si
 
                 EXPRESSION parse(CONTEXT context) is
@@ -49,7 +61,7 @@ namespace Syntax is
 
                 EXPRESSION parse(
                     CONTEXT context,
-                     EXPRESSION left,
+                    EXPRESSION left,
                     PRIORITY min_precedence
                 )
                 is
@@ -93,7 +105,7 @@ namespace Syntax is
                         PRIMARY proc(CONTEXT context) is
                             return new Expression.UNARY(
                                 context.location,
-                                OPERATION.SUBTRACT,
+                                OPERATION.SUBTRACTION,
                                 this.parse(context)
                             );
                         si,
