@@ -149,10 +149,7 @@ namespace Syntax is
 
                     add_parser(
                         Tree.Expression.PRIMARY proc(CONTEXT context) is
-                            return new Tree.Expression.LITERAL(
-                                context.location,
-                                context.parse_expression_literal()
-                            );
+                            return context.parse_expression_literal();
                         si,
                         {
                             Lexical.TOKEN.INT_LITERAL,
@@ -188,6 +185,19 @@ namespace Syntax is
                         return new Tree.Expression.TUPLE(start..context.location, expressions);
                     fi                    
                 si
+            si
+
+            class LITERAL isa PARSER<Tree.Expression.LITERAL> is
+                void init() is
+                    super.init();
+
+                    add_parser(
+                        Tree.Expression.LITERAL proc(CONTEXT context) is
+                            return new Tree.Expression.NONE(context.location);
+                        si,
+                        Lexical.TOKEN.NONE
+                    );
+                si          
             si
         si
     si

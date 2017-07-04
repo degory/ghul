@@ -15,6 +15,7 @@ namespace Syntax is
             static IDENTIFIER identifier_parser = new IDENTIFIER();
             static DEFINITION definition_parser = new DEFINITION();
             static EXPRESSION expression_parser = new EXPRESSION();
+            static Expression.LITERAL expression_literal_parser = new Expression.LITERAL();
             static Expression.PRIMARY expression_primary_parser = new Expression.PRIMARY();
             static Expression.TUPLE expression_tuple_parser = new Expression.TUPLE();
 
@@ -99,6 +100,10 @@ namespace Syntax is
 
             public Tree.EXPRESSION parse_expression() is
                 return expression_parser.parse(this);
+            si
+
+            public Tree.Expression.LITERAL parse_expression_literal() is
+                return expression_literal_parser.parse(this);
             si
 
             public Tree.Expression.PRIMARY parse_expression_primary() is
