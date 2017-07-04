@@ -8,17 +8,20 @@ namespace Syntax is
             si
 
             Tree.IDENTIFIER parse(CONTEXT context) is
-                if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
-                    var name = context.token_string;
-                    context.next_token();
+                var start = context.location;
 
-                    var result = new Tree.IDENTIFER(name);
+                if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
+                    var name = context.current_string;
+                    var result = new Tree.IDENTIFIER(context.location, name);
+
+                    context.next_token();                    
 
                     while context.current_token == Lexical.TOKEN.DOT do
                         context.next_token();
 
                         result =
                             new Tree.QUALIFIED_IDENTIFIER(
+                                start..context.location,
                                 result,
                                 context.current_string);
                     od

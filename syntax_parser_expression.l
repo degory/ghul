@@ -108,7 +108,7 @@ namespace Syntax is
                     super.init();
 
                     add_parser(
-                        PRIMARY proc(CONTEXT context) is
+                        Tree.Expression.PRIMARY proc(CONTEXT context) is
                             return new Tree.Expression.UNARY(
                                 context.location,
                                 Tree.Expression.OPERATION.SUBTRACT,
@@ -119,7 +119,7 @@ namespace Syntax is
                     );
 
                     add_parser(
-                        PRIMARY proc(CONTEXT context) is
+                        Tree.Expression.PRIMARY proc(CONTEXT context) is
                             var identifier = new Tree.Expression.IDENTIFIER(
                                 context.location,
                                 context.parse_identifier()
@@ -129,7 +129,7 @@ namespace Syntax is
                                 context.next_token();
 
                                 return new Tree.Expression.TYPED(
-                                    context.LOCATION,
+                                    context.location,
                                     identifier,
                                     context.parse_type()
                                 );
@@ -141,17 +141,17 @@ namespace Syntax is
                     );
 
                     add_parser(
-                        PRIMARY proc(CONTEXT context) is
-                            return context.parse_tuple();
+                        Tree.Expression.PRIMARY proc(CONTEXT context) is
+                            return context.parse_expression_tuple();
                         si,
                         Lexical.TOKEN.PAREN_OPEN
                     );              
 
                     add_parser(
-                        PRIMARY proc(CONTEXT context) is
+                        Tree.Expression.PRIMARY proc(CONTEXT context) is
                             return new Tree.Expression.LITERAL(
                                 context.location,
-                                context.parse_literal()
+                                context.parse_expression_literal()
                             );
                         si,
                         {
@@ -168,12 +168,10 @@ namespace Syntax is
                     super.init();
                 si
 
-                TUPLE parse(CONTEXT context) is                    
-                    if context.expect_token(Lexical.TOKEN.PAREN_OPEN) then
+                Tree.Expression.TUPLE parse(CONTEXT context) is                    
+                    var start = context.location;
+                    if context.next_token(Lexical.TOKEN.PAREN_OPEN) then
                         var expressions = new Vector<Tree.EXPRESSION>();
-                        var start = context.location;
-
-                        context.next_token();
 
                         while context.current_token != Lexical.TOKEN.PAREN_CLOSE do
                             expressions.add(context.parse_expression());
@@ -186,7 +184,9 @@ namespace Syntax is
                         od
 
                         context.next_token(Lexical.TOKEN.PAREN_CLOSE);
-                    fi
+
+                        return new Tree.Expression.TUPLE(start..context.location, expressions);
+                    fi                    
                 si
             si
         si

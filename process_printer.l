@@ -29,15 +29,17 @@ namespace Syntax is
                 void visit(VARIABLE variable) is
                     variable.identifier.accept(this);
                     result.append(' ');
+                    /*
                     if variable.type != Type.INFER then
                         result.append(": ");
                         variable.type.accept(this);
                     fi
+                    */
                 si
 
                 void visit(VARIABLE_LIST variables) is
                     var first = true;
-
+/*
                     foreach var v; variables do
                         if !first then result.append(", "); fi
 
@@ -45,6 +47,7 @@ namespace Syntax is
 
                         first = false;
                     od
+*/
                 si
 
                 void visit(LET l) is

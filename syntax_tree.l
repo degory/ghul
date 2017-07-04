@@ -49,6 +49,8 @@ namespace Syntax is
 
       void init(LOCATION location, IDENTIFIER parent, String name) is
         super.init(location, name);
+        
+        this.parent = parent;
       si
 
       void accept(Visitor visitor) is

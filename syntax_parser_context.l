@@ -16,6 +16,7 @@ namespace Syntax is
             static DEFINITION definition_parser = new DEFINITION();
             static EXPRESSION expression_parser = new EXPRESSION();
             static Expression.PRIMARY expression_primary_parser = new Expression.PRIMARY();
+            static Expression.TUPLE expression_tuple_parser = new Expression.TUPLE();
 
             public Lexical.TOKENIZER tokenizer;
 
@@ -102,6 +103,10 @@ namespace Syntax is
 
             public Tree.Expression.PRIMARY parse_expression_primary() is
                 return expression_primary_parser.parse(this);
+            si
+
+            public Tree.Expression.TUPLE parse_expression_tuple() is
+                return expression_tuple_parser.parse(this);
             si
         si
     si

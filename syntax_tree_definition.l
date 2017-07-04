@@ -48,24 +48,12 @@ namespace Syntax is
           this.variables.add(variables);
         si
 
-        Iterator<VARIABLE> elements() is
-          return variables.elements();
+        get Iterator<VARIABLE> Iterator is
+          return variables.Iterator;
         si
 
         void accept(Visitor visitor) is
           visitor.visit(this);
-        si
-
-        DEFINITION accept(Transformer transformer) is
-          var new_definitions = new Vector<DEFINITION>(definitions.Length);
-
-          foreach var d; definitions do
-            new_definitions.add(d.accept(transformer));
-          od
-
-          defintions = new_definitions;
-
-          return Coalesce<DEFINITION>.c(transformer.visit(this), this);
         si
       si
 
@@ -102,8 +90,8 @@ namespace Syntax is
           this.variables = variables;
         si     
 
-        public Iterator<VARIABLE> elements() is
-          return variables.elements();
+        public get Iterator<VARIABLE> Iterator is
+          return variables.Iterator;
         si
 
         void accept(Visitor visitor) is
@@ -123,8 +111,8 @@ namespace Syntax is
           this.definitions.add(definitions);
         si
 
-        Iterator<DEFINITION> elements() is
-          return defintions.elements();
+        get Iterator<DEFINITION> Iterator is
+          return definitions.Iterator;
         si
 
         void accept(Visitor visitor) is
@@ -138,7 +126,7 @@ namespace Syntax is
             new_definitions.add(d.accept(transformer));
           od
 
-          defintions = new_definitions;
+          definitions = new_definitions;
 
           return Coalesce<DEFINITION>.c(transformer.visit(this), this);
         si

@@ -1,5 +1,7 @@
 namespace Syntax is
     namespace Tree is
+        use System;
+        
         class Transformer is
             NODE visit(NODE node) is
                 throw new NotImplementedException();

@@ -36,7 +36,6 @@ namespace Syntax is
             si
 
             class BINARY isa EXPRESSION is
-                public LOCATION location;
                 public OPERATION operation;
                 public EXPRESSION left;
                 public EXPRESSION right;
@@ -55,8 +54,30 @@ namespace Syntax is
                 si
             si
 
+            class PRIMARY isa EXPRESSION is
+                void init(LOCATION location) is
+                    super.init(location);
+                si
+            si
+
+            class TYPED isa PRIMARY is
+                public IDENTIFIER identifier;
+                public TYPE type;
+
+                void init(
+                    LOCATION location,
+                    IDENTIFIER identifier,
+                    TYPE type
+                )
+                is
+                    super.init(location);
+
+                    this.identifier = identifier; 
+                    this.type = type;
+                si
+            si            
+
             class UNARY isa PRIMARY is
-                public LOCATION location;
                 public OPERATION operation;
                 public EXPRESSION right;
                 
@@ -69,12 +90,6 @@ namespace Syntax is
                     this.location = location; 
                     this.operation = operation;
                     this.right = right;
-                si
-            si
-
-            class PRIMARY isa EXPRESSION is
-                void init(LOCATION location) is
-                    super.init(location);
                 si
             si
 
