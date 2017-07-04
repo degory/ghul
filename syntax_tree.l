@@ -64,7 +64,7 @@ namespace Syntax is
 
     class EXPRESSION isa NODE is
       void init(LOCATION location) is
-        super.init(location, name);
+        super.init(location);
       si
 
       void accept(Visitor visitor) is
@@ -78,11 +78,11 @@ namespace Syntax is
 
     class DEFINITION isa NODE is
       void init(LOCATION location) is
-        super.init(location, name);
+        super.init(location);
       si
 
       void accept(Visitor visitor) is
-        visitor.visitor(this);
+        visitor.visit(this);
       si
 
       DEFINITION accept(Transformer transformer) is

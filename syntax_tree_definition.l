@@ -81,8 +81,8 @@ namespace Syntax is
           this.variables = variables;
         si 
 
-        public Iterator<VARIABLE> elements() is
-          return variables.elements();
+        public get Iterator<VARIABLE> Iterator is
+          return variables.Iterator;
         si
 
         void accept(Visitor visitor) is

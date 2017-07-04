@@ -6,7 +6,7 @@ namespace Lexical is
   enum TOKEN is
     FIRST = 0,
     PLUS,
-    AND_BITWISE,
+    AND,
     AND_THEN,
     ARRAY_DEF,
     ARROW,
@@ -74,7 +74,7 @@ namespace Lexical is
     NULL,
     OD,
     OPERATOR,
-    OR_BITWISE,
+    OR,
     OR_ELSE,
     PAREN_CLOSE,
     PAREN_OPEN,

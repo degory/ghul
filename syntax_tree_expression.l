@@ -30,6 +30,8 @@ namespace Syntax is
                 AND_THEN,
                 OR_ELSE,
 
+                MEMBER,
+                INDEX,
                 CALL
             si
 
@@ -53,7 +55,7 @@ namespace Syntax is
                 si
             si
 
-            class UNARY isa EXPRESSION is
+            class UNARY isa PRIMARY is
                 public LOCATION location;
                 public OPERATION operation;
                 public EXPRESSION right;
@@ -64,7 +66,7 @@ namespace Syntax is
                     EXPRESSION right
                 )
                 is
-                    this.location = location;
+                    this.location = location; 
                     this.operation = operation;
                     this.right = right;
                 si
@@ -73,6 +75,16 @@ namespace Syntax is
             class PRIMARY isa EXPRESSION is
                 void init(LOCATION location) is
                     super.init(location);
+                si
+            si
+
+            class IDENTIFIER isa PRIMARY is
+                Tree.IDENTIFIER identifier;
+
+                void init(LOCATION location, Tree.IDENTIFIER identifier) is
+                    super.init(location);
+
+                    this.identifier = identifier;
                 si
             si
 

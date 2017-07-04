@@ -135,8 +135,8 @@ namespace Lexical is
                 symbol_tokens["default"] = TOKEN.DEFAULT;
                 symbol_tokens["break"] = TOKEN.BREAK;
                 symbol_tokens["continue"] = TOKEN.CONTINUE;
-                symbol_tokens["ref"] = TOKEN.REFERENCE;
-                symbol_tokens["ptr"] = TOKEN.POINTER;
+                symbol_tokens["ref"] = TOKEN.REF;
+                symbol_tokens["ptr"] = TOKEN.PTR;
                 symbol_tokens["int"] = TOKEN.INT;
                 symbol_tokens["long"] = TOKEN.LONG;
                 symbol_tokens["word"] = TOKEN.WORD;
@@ -154,9 +154,9 @@ namespace Lexical is
                 symbol_tokens["finally"] = TOKEN.FINALLY;
                 symbol_tokens["this"] = TOKEN.THIS;
                 symbol_tokens["super"] = TOKEN.SUPER;
-                symbol_tokens["null"] = TOKEN.CONST_NULL;
-                symbol_tokens["true"] = TOKEN.CONST_TRUE;
-                symbol_tokens["false"] = TOKEN.CONST_FALSE;
+                symbol_tokens["null"] = TOKEN.NULL;
+                symbol_tokens["true"] = TOKEN.TRUE;
+                symbol_tokens["false"] = TOKEN.FALSE;
                 symbol_tokens["use"] = TOKEN.USE;
                 symbol_tokens["native"] = TOKEN.NATIVE;
                 symbol_tokens["pragma"] = TOKEN.PRAGMA;
@@ -300,19 +300,16 @@ namespace Lexical is
         TOKEN read_operator_method_token() is
             TOKEN r = read_token_2(false);
             case r 
-            is TOKEN.ADD:
-                _token_string = "operator+";
-
-            is TOKEN.SUB:
+            is TOKEN.PLUS:
                 _token_string = "operator-";
 
-            is TOKEN.MUL:
+            is TOKEN.STAR:
                 _token_string = "operator*";
 
-            is TOKEN.DIV:
+            is TOKEN.SLASH:
                 _token_string = "operator/";
 
-            is TOKEN.MOD:
+            is TOKEN.PERCENT:
                 _token_string = "operator%";
 
             is TOKEN.SHIFT_LEFT:
@@ -330,7 +327,7 @@ namespace Lexical is
             is TOKEN.XOR:
                 _token_string = "operator^";
 
-            is TOKEN.OBJ_EQ:
+            is TOKEN.EQ_OBJ:
                 _token_string = "operator=~";
 
             is TOKEN.GT:
@@ -403,7 +400,7 @@ namespace Lexical is
                 _token_string = buffer.Freeze;
                 prev_char(c);
                 // IO.Std.err.println( "read const int: '" + _token_string + "'" );
-                return TOKEN.CONST_INT;
+                return TOKEN.INT_LITERAL;
             elif (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' then
                 // IO.Std.out.println( "letter: '" + c + "'" );
                 buffer = new StringBuffer();
@@ -442,7 +439,7 @@ namespace Lexical is
                     fi
                 od
                 _token_string = buffer.Freeze;
-                return TOKEN.CONST_STRING;
+                return TOKEN.STRING_LITERAL;
 
             is cast char(39): // single quote
                 buffer = new StringBuffer();
@@ -467,7 +464,7 @@ namespace Lexical is
 
                 _token_string = buffer.Freeze;
                 // IO.Std.err.println( "const char: '" + _token_string + "'" );
-                return TOKEN.CONST_CHAR;
+                return TOKEN.CHAR_LITERAL;
 
             is '`':
                 buffer = new StringBuffer();
@@ -489,14 +486,14 @@ namespace Lexical is
                 od
         
                 _token_string = buffer.Freeze;
-                return TOKEN.CONST_CSTRING;
+                return TOKEN.CSTRING_LITERAL;
                     
             is '=':
                 c = next_char();
                 if c == '=' then
                     return TOKEN.EQ;
                 elif c == '~' then
-                    return TOKEN.OBJ_EQ;
+                    return TOKEN.EQ_OBJ;
                 else
                     prev_char(c);
                     return TOKEN.ASSIGN;
@@ -529,16 +526,16 @@ namespace Lexical is
                 if c == '=' then
                     return TOKEN.NE;
                 elif c == '~' then
-                    return TOKEN.OBJ_NE;
+                    return TOKEN.NE_OBJ;
                 else
                     prev_char(c);
-                    return TOKEN.BOOL_NOT;
+                    return TOKEN.NOT;
                 fi
 
             is '&':
                 c = next_char();
                 if c == '&' then
-                    return TOKEN.BOOL_AND;
+                    return TOKEN.AND_THEN;
                 else
                     prev_char(c);
                     return TOKEN.AND;
@@ -547,7 +544,7 @@ namespace Lexical is
             is '|':
                 c = next_char();
                 if c == '|' then
-                    return TOKEN.BOOL_OR;
+                    return TOKEN.OR_ELSE;
                 else
                     prev_char(c);
                     return TOKEN.OR;
@@ -555,33 +552,31 @@ namespace Lexical is
 
             is '~': return TOKEN.NOT;
             is '^': return TOKEN.XOR;
+/*
+            is '{': return TOKEN.BRACE_OPEN;
 
-            is '{':
-                // generic_state = MAYBE_IN_TYPE;
-                return TOKEN.START_BLOCK;
+            is '}': return TOKEN.BRACE_CLOSE;
+*/
+            is '(': return TOKEN.PAREN_OPEN;
 
-            is '}': return TOKEN.END_BLOCK;
-
-            is '(': return TOKEN.OPEN_PAREN;
-
-            is ')': return TOKEN.CLOSE_PAREN;
+            is ')': return TOKEN.PAREN_CLOSE;
 
             is '[':
                 c = skip_white_space();
                 if end_of_file then
-                    return TOKEN.OPEN_SQUARE;
+                    return TOKEN.SQUARE_OPEN;
                 elif c == ']' then
                     return TOKEN.ARRAY_DEF;
                 else
                     prev_char(c);
-                    return TOKEN.OPEN_SQUARE;
+                    return TOKEN.SQUARE_OPEN;
                 fi
 
-            is ']': return TOKEN.CLOSE_SQUARE;
+            is ']': return TOKEN.SQUARE_CLOSE;
 
-            is '+': return TOKEN.ADD;
-            is '-': return TOKEN.SUB;
-            is '*': return TOKEN.MUL;
+            is '+': return TOKEN.PLUS;
+            is '-': return TOKEN.MINUS;
+            is '*': return TOKEN.STAR;
             is '/':
                 c = next_char();
                 if c == '/' then
@@ -642,9 +637,9 @@ namespace Lexical is
                     fi
                 else
                     prev_char(c);
-                    return TOKEN.DIV;
+                    return TOKEN.SLASH;
                 fi
-            is '%': return TOKEN.MOD;       
+            is '%': return TOKEN.PERCENT;       
 
             is '.': 
                 c = next_char();

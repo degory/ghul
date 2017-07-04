@@ -9,8 +9,8 @@ namespace Syntax is
 
             Tree.IDENTIFIER parse(CONTEXT context) is
                 if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
-                    var name = state.token_string;
-                    state.next_token();
+                    var name = context.token_string;
+                    context.next_token();
 
                     var result = new Tree.IDENTIFER(name);
 

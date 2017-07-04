@@ -32,7 +32,7 @@ import process_printer;
 namespace Main is
     use System;
     use Logging;
-
+    
     class Main is
         void init() is
             var args = Arguments.ProgramArguments;

@@ -1,6 +1,7 @@
 namespace Syntax is
     namespace Parser is
         use System;
+        use Generic;
         use Logging;
 
         class CONTEXT is
@@ -14,6 +15,7 @@ namespace Syntax is
             static IDENTIFIER identifier_parser = new IDENTIFIER();
             static DEFINITION definition_parser = new DEFINITION();
             static EXPRESSION expression_parser = new EXPRESSION();
+            static Expression.PRIMARY expression_primary_parser = new Expression.PRIMARY();
 
             public Lexical.TOKENIZER tokenizer;
 
@@ -48,11 +50,32 @@ namespace Syntax is
                         location,
                         "syntax error: expected % but found %"
                             % Object{token, current_token});
+                    return false;
+                else
+                    return true;
                 fi
             si
 
+            public bool expect_token(List<Lexical.TOKEN> tokens) is
+                if !tokens.contains(current_token) then
+                    error(
+                        location,
+                        "syntax error: expected % but found %"
+                            % Object{tokens, current_token});
+                    return false;
+                else
+                    return true;
+                fi
+            si            
+
             public bool next_token(Lexical.TOKEN token) is
                 if expect_token(token) then
+                    next_token();
+                fi
+            si
+
+            public bool next_token(List<Lexical.TOKEN> tokens) is
+                if expect_token(tokens) then
                     next_token();
                 fi
             si
@@ -75,6 +98,10 @@ namespace Syntax is
 
             public Tree.EXPRESSION parse_expression() is
                 return expression_parser.parse(this);
+            si
+
+            public Tree.Expression.PRIMARY parse_expression_primary() is
+                return expression_primary_parser.parse(this);
             si
         si
     si
