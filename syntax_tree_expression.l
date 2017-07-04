@@ -47,7 +47,8 @@ namespace Syntax is
                     EXPRESSION right
                 )
                 is
-                    this.location = location;
+                    super.init(location);
+
                     this.operation = operation;
                     this.left = left;
                     this.right = right;
@@ -87,7 +88,8 @@ namespace Syntax is
                     EXPRESSION right
                 )
                 is
-                    this.location = location; 
+                    super.init(location);
+                    
                     this.operation = operation;
                     this.right = right;
                 si

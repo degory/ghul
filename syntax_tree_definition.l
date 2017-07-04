@@ -44,6 +44,8 @@ namespace Syntax is
           Iterable<VARIABLE> variables
         )
         is
+          super.init(location);
+
           this.variables = new Vector<VARIABLE>();
           this.variables.add(variables);
         si
@@ -107,6 +109,8 @@ namespace Syntax is
           Iterable<DEFINITION> definitions
         )
         is
+          super.init(location);
+          
           this.definitions = new Vector<DEFINITION>();
           this.definitions.add(definitions);
         si

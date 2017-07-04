@@ -8,6 +8,8 @@ namespace Syntax is
             void init(Lexical.TOKENIZER tokenizer, LOGGER logger) is
                 this.tokenizer = tokenizer;
                 this.logger = logger;
+
+                this.tokenizer.next_token();
             si
 
             // FIXME: without generic methods and/or reflection, it's tricky to do this in a nice open/closed way:
@@ -31,10 +33,10 @@ namespace Syntax is
                 return new LOCATION(
                     tokenizer.current_file,
 
+                    tokenizer.start_line,
+                    tokenizer.start_column,
                     tokenizer.current_line,
-                    0,
-                    tokenizer.current_line,
-                    0
+                    tokenizer.current_column
                 );                    
             si
 
@@ -51,7 +53,7 @@ namespace Syntax is
                     error(
                         location,
                         "syntax error: expected % but found %"
-                            % Object{token, current_token});
+                            % Object{Lexical.TOKEN_NAMES[token], Lexical.TOKEN_NAMES[current_token]});
                     return false;
                 else
                     return true;
@@ -63,7 +65,7 @@ namespace Syntax is
                     error(
                         location,
                         "syntax error: expected % but found %"
-                            % Object{tokens, current_token});
+                            % Object{Lexical.TOKEN_NAMES[tokens], Lexical.TOKEN_NAMES[current_token]});
                     return false;
                 else
                     return true;

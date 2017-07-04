@@ -27,7 +27,7 @@ namespace Syntax is
                 start_line <= 0 || start_column <= 0 ||
                 end_line < 0 || end_column < 0
             then
-                throw new BoundsException("invalid location");
+                throw new BoundsException("invalid location %,%..%,%" % Object{ start_line, start_column, end_line, end_column });
             fi
 
             start = start_line << SHIFT + start_column;

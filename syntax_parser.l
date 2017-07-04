@@ -13,7 +13,7 @@ namespace Syntax is
 
         class PARSER<T> do Parser<T> is
             Generic.Map<Lexical.TOKEN,T proc(CONTEXT)> parsers;
-            String expected_tokens;
+            Iterable<Lexical.TOKEN> expected_tokens;
 
             void init() is
                 parsers = new Generic.Map<Lexical.TOKEN, T proc(CONTEXT)>();
@@ -45,19 +45,20 @@ namespace Syntax is
                     populate_expected_tokens();
                 fi                    
 
-                context.error(context.location, "syntax error: expected % but found %" % { expected_tokens, context.current_token });
+                context.error(context.location, "syntax error: expected % but found %" 
+                    % Object{
+                        Lexical.TOKEN_NAMES[expected_tokens],
+                        Lexical.TOKEN_NAMES[context.current_token]});
             si
 
             private void populate_expected_tokens() is
-                var buffer = new StringBuffer();
+                var et = new Vector<Lexical.TOKEN>();
 
                 foreach var k; parsers.keys() do
-                    buffer
-                        .append(k.box)
-                        .append(' ');
+                    et.add(k);                        
                 od
 
-                expected_tokens = buffer;
+                expected_tokens = et;
             si
         si
     si

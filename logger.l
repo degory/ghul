@@ -11,14 +11,19 @@ namespace Logging is
         si
 
         void write(Syntax.LOCATION location, String severity, String message) is
-            writer.write(location.file_name);
-            writer.write(": ");
-            writer.write(location.start_line);
-            writer.write(": ");
-            writer.write(severity);
-            writer.write(": ");
-            writer.write(message);
-            writer.write('\n');
+            writer.write(
+                "%: %,%..%,%: %: %\n" % Object{
+                    location.file_name,
+
+                    location.start_line,
+                    location.start_column,
+                    location.end_line,
+                    location.end_column,
+
+                    severity,
+                    message
+                }
+            );
         si
 
         void error(

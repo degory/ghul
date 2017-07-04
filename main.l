@@ -5,6 +5,7 @@ import system_coalesce;
 import logger;
 
 import lexical_token;
+import lexical_token_names;
 import lexical_tokenizer;
 
 import syntax_location;

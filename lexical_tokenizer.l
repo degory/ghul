@@ -108,7 +108,14 @@ namespace Lexical is
         char _prev_char;
 
         String _current_file;
+        int _prev_line;
+        int _prev_column;
+
         int _current_line;
+        int _current_column;
+
+        int _start_line;
+        int _start_column;
 
         String[] _token_name;
 
@@ -187,7 +194,10 @@ namespace Lexical is
             end_of_file = false;
             input = i;
             _current_file = current_file;
+            _start_line = 1;
+            _start_column = 1;
             _current_line = 1;
+            _current_column = 1;
 
             init_symbol_tokens();
         si
@@ -204,11 +214,18 @@ namespace Lexical is
             char c;
             if _prev_char != cast char(0) then
                 c = _prev_char;
+                _current_line = _prev_line;
+                _current_column = _prev_column;
                 _prev_char = cast char(0);
                 // IO.Std.err.print(""+c);
                 // IO.Std.out.println( "next char: returning buffered: '" + c + "'" );
                 return c;     
             fi
+
+            _prev_line = _current_line;
+            _prev_column = _current_column;
+
+            _current_column = _current_column + 1;
 
             int c0 = input.read();
 
@@ -221,6 +238,7 @@ namespace Lexical is
             c = cast char(c0);
             if c == '\n' then
                 _current_line = _current_line + 1;
+                _current_column = 1;
             fi
 
             return c;
@@ -238,9 +256,21 @@ namespace Lexical is
             return _token_name[cast int(t)];
         si
 
+        get int start_line is
+            return _start_line;
+        si
+
+        get int start_column is
+            return _start_column;
+        si        
+
         get int current_line is
             return _current_line;
         si
+
+        get int current_column is
+            return _current_column;
+        si        
 
         get String current_file is
             return _current_file;
@@ -281,6 +311,9 @@ namespace Lexical is
         si
 
         bool next_token() is
+            _start_line = _current_line;            
+            _start_column = _current_column;
+
             token = read_token();
 
             return token != TOKEN.END_OF_INPUT;
