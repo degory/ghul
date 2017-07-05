@@ -1,4 +1,4 @@
-namespace Syntax is
+namespace Source is
     use System;
 
     class LOCATION is
@@ -21,12 +21,10 @@ namespace Syntax is
             int end_column
         )
         is
-            // IO.Std.err.println("new location % %,%..%,%" % Object{ file_name, start_line, start_column, end_line, end_column });
-
             this.file_name = file_name;
 
             if
-                start_line <= 0 || start_column <= 0 ||
+                start_line <= 0 || start_column < 0 ||
                 end_line < 0 || end_column < 0
             then
                 throw new BoundsException("invalid location %,%..%,%" % Object{ start_line, start_column, end_line, end_column });
@@ -42,8 +40,6 @@ namespace Syntax is
                 end = start;
                 start = t;
             fi
-
-            IO.Std.err.println("location normalised to %" % Object{ this });
         si
 
         private void init(
@@ -78,8 +74,6 @@ namespace Syntax is
         si
 
         LOCATION operator..(LOCATION with) is
-            IO.Std.err.println("extend location % - %" % Object{this, with});
-
             int new_start, new_end;
 
             if start < with.start then
@@ -96,5 +90,75 @@ namespace Syntax is
 
             return new LOCATION(file_name, new_start, new_end);
         si                
+    si
+
+    class LOCATION_CURSOR is
+        String _file_name;
+
+        int _previous_line;
+        int _previous_column;
+
+        int _start_line;
+        int _start_column;
+
+        int _current_line;
+        int _current_column;
+
+        void init(String file_name) is
+            _file_name = file_name;
+            
+            _previous_line = 1;
+            _previous_column = 0;
+
+            _start_line = 1;
+            _start_column = 0;
+
+            _current_line = 1;
+            _current_column = 0;
+        si
+
+        void jump(int line, int column) is
+            _start_line = line;
+            _start_column = column;
+
+            _current_line = line;
+            _current_column = column;
+        si
+
+        void save() is
+            _previous_line = _current_line;
+            _previous_column = _current_column;
+        si
+
+        void restore() is
+            _current_line = _previous_line;
+            _current_column = _previous_column;
+        si
+
+        void start() is
+            _start_line = _current_line;
+            _start_column = _current_column;
+        si
+
+        void next_column() is
+            _current_column = _current_column + 1;
+        si
+
+        void next_line() is
+            _current_column = 0;
+            _current_line = _current_line + 1;
+        si
+
+        public get LOCATION location is
+            return new LOCATION(
+                _file_name,
+
+                _start_line,
+                _start_column,
+
+                _current_line,
+                _current_column
+            );
+        si
     si
 si

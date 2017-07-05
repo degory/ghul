@@ -1,5 +1,7 @@
 namespace Syntax is
     namespace Parser is
+        use Source;
+
         // a.b.c.d -> d.c.b.a
 
         class IDENTIFIER do Parser<Tree.IDENTIFIER> is
@@ -19,11 +21,15 @@ namespace Syntax is
                     while context.current_token == Lexical.TOKEN.DOT do
                         context.next_token();
 
-                        result =
-                            new Tree.QUALIFIED_IDENTIFIER(
-                                start..context.location,
-                                result,
-                                context.current_string);
+                        if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
+                            result =
+                                new Tree.QUALIFIED_IDENTIFIER(
+                                    start..context.location,
+                                    result,
+                                    context.current_string);
+                            
+                            context.next_token();
+                        fi                        
                     od
 
                     return result;

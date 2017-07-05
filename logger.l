@@ -1,6 +1,8 @@
 namespace Logging is
     use System;
 
+    use Source;
+
     class LOGGER is
         IO.Writer writer;
 
@@ -10,7 +12,7 @@ namespace Logging is
             this.writer = IO.Std.err;
         si
 
-        void write(Syntax.LOCATION location, String severity, String message) is
+        void write(LOCATION location, String severity, String message) is
             writer.write(
                 "%: %,%..%,%: %: %\n" % Object{
                     location.file_name,
@@ -27,7 +29,7 @@ namespace Logging is
         si
 
         void error(
-            Syntax.LOCATION location,
+            LOCATION location,
             String message
         )
         is
@@ -35,7 +37,7 @@ namespace Logging is
         si
 
         void warn(
-            Syntax.LOCATION location,
+            LOCATION location,
             String message
         )
         is

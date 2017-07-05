@@ -2,7 +2,9 @@ namespace Syntax is
     namespace Parser is
         use System;
         use Generic;
+
         use Logging;
+        use Source;
 
         class CONTEXT is
             void init(Lexical.TOKENIZER tokenizer, LOGGER logger) is
@@ -27,7 +29,16 @@ namespace Syntax is
 
             bool next_token() is
                 return tokenizer.next();
-            si     
+            si
+
+            LOCATION location_and_next() is
+                // CQS eat me
+                var result = location;
+
+                next_token();
+
+                return result;
+            si
 
             get LOCATION location is
                 return tokenizer.current.location;

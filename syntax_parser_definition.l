@@ -2,6 +2,8 @@ namespace Syntax is
     namespace Parser is
         use Generic;
 
+        use Source;
+
         class DEFINITION isa PARSER<Tree.DEFINITION> is
             void init() is
                 super.init();

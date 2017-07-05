@@ -9,6 +9,8 @@ namespace Syntax is
                 StringBuffer result;
 
                 void init() is
+                    super.init();
+                    
                     result = new StringBuffer();
                 si
 

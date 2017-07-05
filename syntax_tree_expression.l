@@ -4,6 +4,8 @@ namespace Syntax is
             use System;
             use Generic;
 
+            use Source;
+
             enum OPERATION is
                 ADD,
                 SUBTRACT,

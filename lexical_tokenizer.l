@@ -8,6 +8,8 @@ namespace Lexical is
     use System.StringBuffer;
     use System.Exception;
 
+    use Source;
+
     class TOKEN_BUFFER is
         const int MAX = 32;  // maximum lookahead before we assume we're not in a generic type
 
@@ -24,7 +26,6 @@ namespace Lexical is
         si
 
         void reset() is
-            // IO.Std.err.println( "clear buffer..." );
             read_pos = 0;
             write_pos = 0;
         si
@@ -38,7 +39,6 @@ namespace Lexical is
         si
 
         void write( TOKEN_PAIR t ) is
-            // IO.Std.err.println( "buffer token: " + cast int(t.token) + ", string: " + t.string );
             values[write_pos] = t;
             write_pos = write_pos + 1;
         si
@@ -46,7 +46,6 @@ namespace Lexical is
         TOKEN_PAIR read() is
             TOKEN_PAIR result = values[read_pos];
             read_pos = read_pos + 1;
-            // IO.Std.err.println( "read buffered token: " + cast int(result.token) + ", string: " + result.string );
             return result;
         si
     si
@@ -81,10 +80,10 @@ namespace Lexical is
 
     class TOKEN_PAIR is
         TOKEN _token;
-        Syntax.LOCATION _location;
+        LOCATION _location;
         String _string;
 
-        void init( TOKEN token, Syntax.LOCATION location, String string ) is
+        void init( TOKEN token, LOCATION location, String string ) is
             super.init();
             _token = token;
             _location = location;
@@ -95,7 +94,7 @@ namespace Lexical is
             return _token;
         si        
 
-        get Syntax.LOCATION location is
+        get LOCATION location is
             return _location;
         si
 
@@ -109,6 +108,8 @@ namespace Lexical is
     si
 
     class TOKENIZER is
+        Logging.LOGGER logger;
+
         TOKEN_PAIR _token_pair;
         static TOKEN_MAP symbol_tokens;
         TOKEN_BUFFER buffer;
@@ -117,15 +118,7 @@ namespace Lexical is
         bool end_of_file;
         char _prev_char;
 
-        String _current_file;
-        int _prev_line;
-        int _prev_column;
-
-        int _current_line;
-        int _current_column;
-
-        int _start_line;
-        int _start_column;
+        LOCATION_CURSOR cursor;
 
         String[] _token_name;
 
@@ -196,62 +189,52 @@ namespace Lexical is
            fi
         si
 
-        void init( String current_file, IO.Reader i ) is
+        void init( String file_name, IO.Reader i ) is
             super.init();
 
             buffer = new TOKEN_BUFFER();
 
             end_of_file = false;
             input = i;
-            _current_file = current_file;
-            _start_line = 1;
-            _start_column = 1;
-            _current_line = 1;
-            _current_column = 1;
 
             init_symbol_tokens();
 
-            _token_pair = new TOKEN_PAIR(TOKEN.UNKNOWN, location, null);
-        si
+            cursor = new LOCATION_CURSOR(file_name);
 
-        void error( String msg ) is
-            IO.Std.err.println( _current_file + ": " + _current_line + ": error: " + msg );
+            _token_pair = new TOKEN_PAIR(TOKEN.UNKNOWN, location, null);
         si
 
         bool is_end_of_file() is
             return end_of_file;
         si
 
-        get Syntax.LOCATION location is
-            var result = new Syntax.LOCATION(
-                _current_file, _start_line, _start_column, _current_line, _current_column
-            );
-
-            IO.Std.err.println("get location: " + result);
+        get LOCATION location is
+            var result = cursor.location;
 
             return result;
+        si
+
+        void advance_cursor(char c) is
+            cursor.next_column();
+
+            if c == '\n' then
+                cursor.next_line();
+            fi
         si
 
         char next_char() is
             char c;
             if _prev_char != cast char(0) then
-                c = _prev_char;
-                _current_line = _prev_line;
-                _current_column = _prev_column;
+                c = _prev_char;                
+
+                advance_cursor(c);
+
                 _prev_char = cast char(0);
 
-                IO.Std.err.println("next char: " + location + ": " + c);
                 // IO.Std.err.print(""+c);
                 return c;     
             fi
-
-            _prev_line = _current_line;
-            _prev_column = _current_column;
-
-            _current_column = _current_column + 1;
-
-            IO.Std.err.println("next char: " + location + ": " + c);
-
+            
             int c0 = input.read();
 
             if c0 == -1 then
@@ -260,15 +243,17 @@ namespace Lexical is
             fi
 
             c = cast char(c0);
-            if c == '\n' then
-                _current_line = _current_line + 1;
-                _current_column = 1;
-            fi
+
+            cursor.save();
+
+            advance_cursor(c);
 
             return c;
         si
 
         void prev_char( char c ) is
+            cursor.restore();
+
             _prev_char = c;
         si
 
@@ -280,43 +265,19 @@ namespace Lexical is
             return _token_name[cast int(t)];
         si
 
-        get int start_line is
-            return _start_line;
-        si
-
-        get int start_column is
-            return _start_column;
-        si        
-
-        get int current_line is
-            return _current_line;
-        si
-
-        get int current_column is
-            return _current_column;
-        si        
-
-        get String current_file is
-            return _current_file;
-        si
-
         char read_escape() is
             char c = next_char();
 
             int result = 0;
             if c == 't' then
-                // IO.Std.err.println( "escape tab" );
                 return cast char(9);
             elif c == 'n' then
-                // IO.Std.err.println( "escape newline" );
                 return '\n';
             elif c == 'r' then
                 return cast char(13);
             elif c == '\\' then
-                // IO.Std.err.println( "escape backslash" );
                 return '\\';
             elif c >= '0' && c <= '7' then
-                // IO.Std.err.println( "escape octal" );
                 while c >= '0' && c <= '7' do
                     result = 8 * result + cast int(c);
                     c = next_char();
@@ -324,41 +285,27 @@ namespace Lexical is
                 prev_char(c);
                 return cast char(result);
             else
-                // IO.Std.err.println( "escape literal: '" + c + "'" );
                 return c;
             fi
         si
 
         get TOKEN_PAIR current is
-            IO.Std.err.println("tokenizer current: " + _token_pair);
             return _token_pair;
         si
 
         bool next() is
             _token_pair = read_token();
 
-            IO.Std.err.println("next token: " + TOKEN_NAMES[current.token]);
-
             return current.token != TOKEN.END_OF_INPUT;
         si
 
         char skip_white_space() is
-            IO.Std.err.println("skip white space: " + location + "...");
-
             char c;
             do
                 c = next_char();
-
-                if c == '\n' then
-                    _current_line = _current_line + 1;
-                    _current_column = 1;
-                fi
                 
-                // IO.Str.err.println( "white space: '" + c + "'?" );
                 if ! (!end_of_file && (c == ' ' || c == cast char(9) || c == '\n')) then break; fi
             od
-
-            IO.Std.err.println("skip white space: " + location + ": " + c);            
     
             return c;
         si
@@ -419,7 +366,6 @@ namespace Lexical is
 
         TOKEN_PAIR read_token() is
             if buffer.avail then
-                // IO.Std.err.println( "token in buffer..." );
                 return buffer.read();        
             fi
 
@@ -427,23 +373,18 @@ namespace Lexical is
         si
     
         TOKEN_PAIR read_token_2(bool for_comment) is
-            IO.Std.err.println("read token: " + location + "...");
-
-            TOKEN r;
-
-            _start_line = _current_line;            
-            _start_column = _current_column;            
+            TOKEN r;            
 
             var c = skip_white_space();
             if end_of_file then
                 return new TOKEN_PAIR(TOKEN.END_OF_INPUT,location,null);
             fi
 
+            cursor.start();
+
             StringBuffer buffer = null;
 
-            // IO.Std.err.println( "number/letter: '" + c + "'?" );
             if c >= '0' && c <= '9' then
-                // IO.Std.err.println( "number: '" + c + "'" );
                 buffer = new StringBuffer();
                 buffer.append( c );
                 c = next_char();
@@ -458,7 +399,6 @@ namespace Lexical is
                         buffer.append(c);
                         c = next_char();
                     od
-                    // IO.Std.err.println( "read hex const: '" + buffer + "'" );
                 else
                     while (c >= '0' && c <= '9') || c == 'x' || c == 'w' || c == 'W' || c == 'l' || c == 'L' || c == 'c' || c == 'C' do
                         buffer.append(c);
@@ -467,7 +407,7 @@ namespace Lexical is
                 fi
 
                 prev_char(c);
-                // IO.Std.err.println( "read const int: '" + _token_string + "'" );
+
                 return new TOKEN_PAIR(
                     TOKEN.INT_LITERAL,
                     location,
@@ -475,14 +415,11 @@ namespace Lexical is
                 );
 
             elif (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' then
-                // IO.Std.err.println( "letter: '" + c + "'" );
                 buffer = new StringBuffer();
                 while (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' do
                     buffer.append(c);
                     c = next_char();
                 od
-
-                IO.Std.err.println("maybe identifier: " + buffer);
 
                 prev_char(c);
                 r = symbol_tokens[buffer];
@@ -513,7 +450,7 @@ namespace Lexical is
                     fi
 
                     if end_of_file then
-                        error( "end of file in string literal at line " + _start_line );
+                        logger.error(location, "end of file in string literal");
                         break;
                     fi
                 od
@@ -538,18 +475,17 @@ namespace Lexical is
                         c = next_char();
                     fi
                     if end_of_file then
-                        error( "end of file in character literal at line " + _start_line );
+                        logger.error(location, "end of file in character literal");
                         break;
                     fi
                 od
 
                 if buffer.Length < 1 then
-                    error( "zero length character literal" );
+                    logger.error(location, "zero length character literal" );
                 elif buffer.Length > 1 then
-                    error( "character literal is too long");
+                    logger.error(location, "character literal is too long");
                 fi
 
-                // IO.Std.err.println( "const char: '" + _token_string + "'" );
                 return 
                     new TOKEN_PAIR(
                         TOKEN.CHAR_LITERAL,
@@ -571,7 +507,7 @@ namespace Lexical is
                     fi
 
                     if end_of_file then
-                        error( "end of file in char ptr literal at line " + _start_line );
+                        logger.error(location, "end of file in char ptr literal");
                         break;
                     fi
                 od
@@ -688,8 +624,6 @@ namespace Lexical is
                         buffer.append( "\n" );
                         /*
                         if for_comment then
-                            // IO.Std.err.println( "from: " + new System.Backtrace() );
-                            // IO.Std.err.println( "appending comment: " + buffer );
                             ParseTree.appendLastComment(buffer);
                         else
                             ParseTree.LastComment = buffer;
@@ -719,8 +653,6 @@ namespace Lexical is
                         buffer.append( "*/" );
                         /*
                         if for_comment then
-                            IO.Std.err.println( "from: " + new System.Backtrace() );
-                            IO.Std.err.println( "appending comment: " + buffer );
                             ParseTree.appendLastComment(buffer);
                         else
                             ParseTree.LastComment = buffer;
@@ -763,13 +695,11 @@ namespace Lexical is
                     buffer.append(c);
                 od
 
-                _current_line = buffer.parseInt();
-                _current_column = 1;
+                cursor.jump(buffer.parseInt(), 1);
 
                 return read_token_2(false);
             esac
             
-            // IO.Std.err.println( "unknown: '" + c + "'" );
             return new TOKEN_PAIR(TOKEN.UNKNOWN, location, "" + c);
         si        
     si

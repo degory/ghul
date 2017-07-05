@@ -4,6 +4,8 @@ namespace Syntax is
   use System;
   use Generic;
 
+  use Source;
+
   namespace Tree is
     class NODE is
       public LOCATION location;
@@ -23,6 +25,10 @@ namespace Syntax is
         else
           return this;
         fi
+      si
+
+      public String toString() is
+        return super.toString() + "@" + location;
       si
     si
 

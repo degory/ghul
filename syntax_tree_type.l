@@ -6,6 +6,8 @@ namespace Syntax is
       use System;
       use Generic;
 
+      use Source;
+
       class BUILT_IN isa TYPE is
         void init(LOCATION location) is
           super.init(location);

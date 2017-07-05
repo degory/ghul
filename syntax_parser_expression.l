@@ -2,6 +2,8 @@ namespace Syntax is
     namespace Parser is
         use Generic;
 
+        use Source;
+
         class EXPRESSION isa PARSER<Tree.EXPRESSION> is
 
             Dict<Lexical.TOKEN, Expression.PRECEDENCE> precedence;

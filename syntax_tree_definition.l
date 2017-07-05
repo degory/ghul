@@ -3,6 +3,8 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use Source;
+
     namespace Definition is
       class VARIABLE isa DEFINITION is
         public IDENTIFIER identifier;

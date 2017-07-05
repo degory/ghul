@@ -10,7 +10,7 @@ import lexical_token;
 import lexical_token_names;
 import lexical_tokenizer;
 
-import syntax_location;
+import source_location;
 
 import syntax_parser_context;
 

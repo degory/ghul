@@ -6,55 +6,51 @@ namespace Syntax is
         use System;
         use Generic;
 
+        use Source;
+
         class TYPE isa PARSER<Tree.TYPE> is
             void init() is 
                 super.init();
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
-                        return new Tree.Type.VOID(context.location);
+                        return new Tree.Type.VOID(context.location_and_next());
                     si,
                     Lexical.TOKEN.VOID);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
-                        return new Tree.Type.BOOL(context.location);
+                        return new Tree.Type.BOOL(context.location_and_next());
                     si,
                     Lexical.TOKEN.BOOL);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
-                        return new Tree.Type.BYTE(context.location);
+                        return new Tree.Type.BYTE(context.location_and_next());
                     si, 
                     Lexical.TOKEN.BYTE);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
-                        return new Tree.Type.CHAR(context.location);
+                        return new Tree.Type.CHAR(context.location_and_next());
                     si,
                     Lexical.TOKEN.CHAR);
  
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
-                        return new Tree.Type.INT(context.location);
+                        return new Tree.Type.INT(context.location_and_next());
                     si,
                     Lexical.TOKEN.INT); 
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return new Tree.Type.WORD(context.location);
+                        return new Tree.Type.WORD(context.location_and_next());
                     si,
                     Lexical.TOKEN.WORD); 
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        IO.Std.err.println("parse array...");                        
                         var start = context.location;
                         context.next_token();
                         var element = this.parse(context);
@@ -65,7 +61,6 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        IO.Std.err.println("parse ptr...");
                         var start = context.location;
                         context.next_token();
                         var element = this.parse(context);
@@ -76,9 +71,7 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        IO.Std.err.println("parse ref...");
                         var start = context.location;
-                        IO.Std.err.println("parse ref from: " + start);                        
                         context.next_token();
                         var element = this.parse(context);
                         return new Tree.Type.REFERENCE(start..element.location, element);
@@ -87,10 +80,11 @@ namespace Syntax is
                 );
 
                 add_parser(
-                    Tree.TYPE proc(CONTEXT context) is                        
-                        IO.Std.err.println("parse generic...");
+                    Tree.TYPE proc(CONTEXT context) is
                         var start = context.location;
-                        IO.Std.err.println("parse generic from: " + start);
+
+                        IO.Std.err.flush();
+
                         var identifier = context.parse_identifier();
 
                         if context.current_token == Lexical.TOKEN.LT then
@@ -110,11 +104,12 @@ namespace Syntax is
                 );
             si
 
-            List<Tree.TYPE> parse_type_list(CONTEXT context) is
+            List<Tree.TYPE> parse_type_list(CONTEXT context) is                
                 var result = new Vector<Tree.TYPE>();
 
                 do
-                    result.add(parse(context));
+                    var element = parse(context);
+                    result.add(element);
 
                     if context.current_token != Lexical.TOKEN.COMMA then break; fi
 
