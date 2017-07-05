@@ -1,3 +1,3 @@
 #!/bin/bash
 cd /build/source/rewrite
-lc main.l
+lc test_definitions.l

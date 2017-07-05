@@ -79,12 +79,16 @@ namespace Syntax is
             public bool next_token(Lexical.TOKEN token) is
                 if expect_token(token) then
                     next_token();
+
+                    return true;
                 fi
             si
 
             public bool next_token(List<Lexical.TOKEN> tokens) is
                 if expect_token(tokens) then
                     next_token();
+
+                    return true;
                 fi
             si
 
