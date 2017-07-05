@@ -38,23 +38,37 @@ namespace Main is
     
     class Main is
         void init() is
-            var args = Arguments.ProgramArguments;
+            try 
+                var args = Arguments.ProgramArguments.Iterator;
 
-            foreach var s; args do
-                var tokenizer = new Lexical.TOKENIZER(
-                    s,
-                    IO.File.openRead(s)
-                );
+                args.nextElement();
 
-                var logger = new LOGGER();                    
+                foreach var s; args do
+                    var tokenizer = new Lexical.TOKENIZER(
+                        s,
+                        IO.File.openRead(s)
+                    );
 
-                var context = new Syntax.Parser.CONTEXT(
-                    tokenizer,
-                    logger
-                );
+                    var logger = new LOGGER();                    
 
-                IO.Std.out.println(context.parse_type());
-            od
+                    var context = new Syntax.Parser.CONTEXT(
+                        tokenizer,
+                        logger
+                    );
+
+                    for var done = false; !done; do
+                        var type = context.parse_type();
+
+                        if type != null then
+                            IO.Std.out.println(type);
+                        else
+                            done = true;
+                        fi
+                    od
+                od
+            catch Exception e
+                IO.Std.err.println(e);                
+            yrt
         si
     si
 si

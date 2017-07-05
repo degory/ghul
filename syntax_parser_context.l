@@ -9,7 +9,7 @@ namespace Syntax is
                 this.tokenizer = tokenizer;
                 this.logger = logger;
 
-                this.tokenizer.next_token();
+                this.tokenizer.next_token();                
             si
 
             // FIXME: without generic methods and/or reflection, it's tricky to do this in a nice open/closed way:

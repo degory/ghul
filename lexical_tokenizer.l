@@ -218,7 +218,6 @@ namespace Lexical is
                 _current_column = _prev_column;
                 _prev_char = cast char(0);
                 // IO.Std.err.print(""+c);
-                // IO.Std.out.println( "next char: returning buffered: '" + c + "'" );
                 return c;     
             fi
 
@@ -230,7 +229,6 @@ namespace Lexical is
             int c0 = input.read();
 
             if c0 == -1 then
-                // IO.Std.out.println( "next char: returning eof from: " + new System.Backtrace() );
                 end_of_file = true;
                 return ' ';
             fi
@@ -315,6 +313,8 @@ namespace Lexical is
             _start_column = _current_column;
 
             token = read_token();
+
+            IO.Std.out.println("next token: " + TOKEN_NAMES[token]);
 
             return token != TOKEN.END_OF_INPUT;
         si
