@@ -54,6 +54,7 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        IO.Std.err.println("parse array...");                        
                         var start = context.location;
                         context.next_token();
                         var element = this.parse(context);
@@ -64,6 +65,7 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        IO.Std.err.println("parse ptr...");
                         var start = context.location;
                         context.next_token();
                         var element = this.parse(context);
@@ -74,7 +76,9 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        IO.Std.err.println("parse ref...");
                         var start = context.location;
+                        IO.Std.err.println("parse ref from: " + start);                        
                         context.next_token();
                         var element = this.parse(context);
                         return new Tree.Type.REFERENCE(start..element.location, element);
@@ -83,8 +87,10 @@ namespace Syntax is
                 );
 
                 add_parser(
-                    Tree.TYPE proc(CONTEXT context) is
+                    Tree.TYPE proc(CONTEXT context) is                        
+                        IO.Std.err.println("parse generic...");
                         var start = context.location;
+                        IO.Std.err.println("parse generic from: " + start);
                         var identifier = context.parse_identifier();
 
                         if context.current_token == Lexical.TOKEN.LT then

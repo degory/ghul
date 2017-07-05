@@ -9,7 +9,7 @@ namespace Syntax is
                 this.tokenizer = tokenizer;
                 this.logger = logger;
 
-                this.tokenizer.next_token();                
+                this.tokenizer.next();                
             si
 
             // FIXME: without generic methods and/or reflection, it's tricky to do this in a nice open/closed way:
@@ -26,26 +26,19 @@ namespace Syntax is
             public LOGGER logger;
 
             bool next_token() is
-                return tokenizer.next_token();
+                return tokenizer.next();
             si     
 
             get LOCATION location is
-                return new LOCATION(
-                    tokenizer.current_file,
-
-                    tokenizer.start_line,
-                    tokenizer.start_column,
-                    tokenizer.current_line,
-                    tokenizer.current_column
-                );                    
+                return tokenizer.current.location;
             si
 
             get Lexical.TOKEN current_token is
-                return tokenizer.current_token;
+                return tokenizer.current.token;
             si
 
             get String current_string is
-                return tokenizer.current_string;
+                return tokenizer.current.string;
             si
 
             public bool expect_token(Lexical.TOKEN token) is

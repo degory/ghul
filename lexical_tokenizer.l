@@ -80,29 +80,39 @@ namespace Lexical is
     si
 
     class TOKEN_PAIR is
-        public String _string;
-        public TOKEN _token;
+        TOKEN _token;
+        Syntax.LOCATION _location;
+        String _string;
 
-        void init( TOKEN token, String string ) is
+        void init( TOKEN token, Syntax.LOCATION location, String string ) is
             super.init();
             _token = token;
+            _location = location;
             _string = string;
+        si
+
+        get TOKEN token is
+            return _token;
+        si        
+
+        get Syntax.LOCATION location is
+            return _location;
         si
 
         get String string is
             return _string;
         si
 
-        get TOKEN token is
-            return _token;
+        public String toString() is
+            return "" + _location + ": " + TOKEN_NAMES[_token] + ": " + _string;
         si
     si
 
     class TOKENIZER is
-        TOKEN token;
+        TOKEN_PAIR _token_pair;
         static TOKEN_MAP symbol_tokens;
         TOKEN_BUFFER buffer;
-        String _token_string;
+
         IO.Reader input;
         bool end_of_file;
         char _prev_char;
@@ -200,6 +210,8 @@ namespace Lexical is
             _current_column = 1;
 
             init_symbol_tokens();
+
+            _token_pair = new TOKEN_PAIR(TOKEN.UNKNOWN, location, null);
         si
 
         void error( String msg ) is
@@ -210,6 +222,16 @@ namespace Lexical is
             return end_of_file;
         si
 
+        get Syntax.LOCATION location is
+            var result = new Syntax.LOCATION(
+                _current_file, _start_line, _start_column, _current_line, _current_column
+            );
+
+            IO.Std.err.println("get location: " + result);
+
+            return result;
+        si
+
         char next_char() is
             char c;
             if _prev_char != cast char(0) then
@@ -217,6 +239,8 @@ namespace Lexical is
                 _current_line = _prev_line;
                 _current_column = _prev_column;
                 _prev_char = cast char(0);
+
+                IO.Std.err.println("next char: " + location + ": " + c);
                 // IO.Std.err.print(""+c);
                 return c;     
             fi
@@ -225,6 +249,8 @@ namespace Lexical is
             _prev_column = _current_column;
 
             _current_column = _current_column + 1;
+
+            IO.Std.err.println("next char: " + location + ": " + c);
 
             int c0 = input.read();
 
@@ -247,7 +273,7 @@ namespace Lexical is
         si
 
         get String current_string is
-            return _token_string;
+            return _token_pair.string;
         si
 
         get String token_name[TOKEN t] is
@@ -303,107 +329,117 @@ namespace Lexical is
             fi
         si
 
-        get TOKEN current_token is
-            // IO.Std.err.println( "got: " + YyNameClass.yyName[cast int(token)] );
-            return token;
+        get TOKEN_PAIR current is
+            IO.Std.err.println("tokenizer current: " + _token_pair);
+            return _token_pair;
         si
 
-        bool next_token() is
-            _start_line = _current_line;            
-            _start_column = _current_column;
+        bool next() is
+            _token_pair = read_token();
 
-            token = read_token();
+            IO.Std.err.println("next token: " + TOKEN_NAMES[current.token]);
 
-            IO.Std.err.println("next token: " + TOKEN_NAMES[token]);
-
-            return token != TOKEN.END_OF_INPUT;
+            return current.token != TOKEN.END_OF_INPUT;
         si
 
         char skip_white_space() is
+            IO.Std.err.println("skip white space: " + location + "...");
+
             char c;
             do
                 c = next_char();
+
+                if c == '\n' then
+                    _current_line = _current_line + 1;
+                    _current_column = 1;
+                fi
+                
                 // IO.Str.err.println( "white space: '" + c + "'?" );
                 if ! (!end_of_file && (c == ' ' || c == cast char(9) || c == '\n')) then break; fi
             od
+
+            IO.Std.err.println("skip white space: " + location + ": " + c);            
     
             return c;
         si
 
-        TOKEN read_operator_method_token() is
-            TOKEN r = read_token_2(false);
-            case r 
+        TOKEN_PAIR read_operator_method_token() is
+            var start = location;
+            var o = read_token_2(false);
+            var string = "";
+
+            case o.token 
             is TOKEN.PLUS:
-                _token_string = "operator-";
+                string = "operator-";
 
             is TOKEN.STAR:
-                _token_string = "operator*";
+                string = "operator*";
 
             is TOKEN.SLASH:
-                _token_string = "operator/";
+                string = "operator/";
 
             is TOKEN.PERCENT:
-                _token_string = "operator%";
+                string = "operator%";
 
             is TOKEN.SHIFT_LEFT:
-                _token_string = "operator<<";
+                string = "operator<<";
 
             is TOKEN.SHIFT_RIGHT:
-                _token_string = "operator>>";
+                string = "operator>>";
 
             is TOKEN.AND:
-                 _token_string = "operator&";
+                string = "operator&";
 
             is TOKEN.OR:
-                _token_string = "operator|";
+                string = "operator|";
 
             is TOKEN.XOR:
-                _token_string = "operator^";
+                string = "operator^";
 
             is TOKEN.EQ_OBJ:
-                _token_string = "operator=~";
+                string = "operator=~";
 
             is TOKEN.GT:
-                _token_string = "operator>";
+                string = "operator>";
 
             is TOKEN.RANGE:
-                _token_string = "operator..";
+                string = "operator..";
 
             default:
                 // syntax error:
-                return r;
+                return o;
             esac
 
-            return TOKEN.IDENTIFIER;
+            return new TOKEN_PAIR(
+                TOKEN.IDENTIFIER,
+                start..location,
+                string
+            );
         si
 
-        TOKEN read_token() is
-            TOKEN r;
-
+        TOKEN_PAIR read_token() is
             if buffer.avail then
                 // IO.Std.err.println( "token in buffer..." );
-                TOKEN_PAIR p = buffer.read();        
-                _token_string = p.string;
-
-                // IO.Std.err.println( "returning buffered: " + cast int(p.token) );
-                return p.token;
+                return buffer.read();        
             fi
 
             return read_token_2(false);
         si
     
-        TOKEN read_token_2(bool for_comment) is
+        TOKEN_PAIR read_token_2(bool for_comment) is
+            IO.Std.err.println("read token: " + location + "...");
+
             TOKEN r;
+
+            _start_line = _current_line;            
+            _start_column = _current_column;            
 
             var c = skip_white_space();
             if end_of_file then
-                return TOKEN.END_OF_INPUT;
+                return new TOKEN_PAIR(TOKEN.END_OF_INPUT,location,null);
             fi
 
-            var open_line = _current_line;
-
             StringBuffer buffer = null;
-            _token_string = null; // new StringBuffer("");
 
             // IO.Std.err.println( "number/letter: '" + c + "'?" );
             if c >= '0' && c <= '9' then
@@ -430,10 +466,14 @@ namespace Lexical is
                     od
                 fi
 
-                _token_string = buffer.Freeze;
                 prev_char(c);
                 // IO.Std.err.println( "read const int: '" + _token_string + "'" );
-                return TOKEN.INT_LITERAL;
+                return new TOKEN_PAIR(
+                    TOKEN.INT_LITERAL,
+                    location,
+                    buffer
+                );
+
             elif (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' then
                 // IO.Std.err.println( "letter: '" + c + "'" );
                 buffer = new StringBuffer();
@@ -441,15 +481,21 @@ namespace Lexical is
                     buffer.append(c);
                     c = next_char();
                 od
-                _token_string = buffer.Freeze;
+
+                IO.Std.err.println("maybe identifier: " + buffer);
+
                 prev_char(c);
-                r = symbol_tokens[_token_string];
+                r = symbol_tokens[buffer];
 
                 if r == TOKEN.OPERATOR then
                     return read_operator_method_token();
                 fi
 
-                return r;
+                return new TOKEN_PAIR(
+                    r,
+                    location,
+                    buffer
+                );
             fi
 
             case c
@@ -467,12 +513,17 @@ namespace Lexical is
                     fi
 
                     if end_of_file then
-                        error( "end of file in string literal at line " + open_line );
+                        error( "end of file in string literal at line " + _start_line );
                         break;
                     fi
                 od
-                _token_string = buffer.Freeze;
-                return TOKEN.STRING_LITERAL;
+
+                return
+                    new TOKEN_PAIR(
+                        TOKEN.STRING_LITERAL,
+                        location,
+                        buffer
+                    );
 
             is cast char(39): // single quote
                 buffer = new StringBuffer();
@@ -487,17 +538,24 @@ namespace Lexical is
                         c = next_char();
                     fi
                     if end_of_file then
-                        error( "end of file in character literal at line " + open_line );
+                        error( "end of file in character literal at line " + _start_line );
                         break;
                     fi
                 od
+
                 if buffer.Length < 1 then
                     error( "zero length character literal" );
+                elif buffer.Length > 1 then
+                    error( "character literal is too long");
                 fi
 
-                _token_string = buffer.Freeze;
                 // IO.Std.err.println( "const char: '" + _token_string + "'" );
-                return TOKEN.CHAR_LITERAL;
+                return 
+                    new TOKEN_PAIR(
+                        TOKEN.CHAR_LITERAL,
+                        location,
+                        buffer
+                    );
 
             is '`':
                 buffer = new StringBuffer();
@@ -513,103 +571,107 @@ namespace Lexical is
                     fi
 
                     if end_of_file then
-                        error( "end of file in char ptr literal at line " + open_line );
+                        error( "end of file in char ptr literal at line " + _start_line );
                         break;
                     fi
                 od
         
-                _token_string = buffer.Freeze;
-                return TOKEN.CSTRING_LITERAL;
+                return
+                    new TOKEN_PAIR( 
+                        TOKEN.CSTRING_LITERAL,
+                        location,
+                        buffer
+                    );
                     
             is '=':
                 c = next_char();
                 if c == '=' then
-                    return TOKEN.EQ;
+                    return new TOKEN_PAIR(TOKEN.EQ, location, null);
                 elif c == '~' then
-                    return TOKEN.EQ_OBJ;
+                    return new TOKEN_PAIR(TOKEN.EQ_OBJ, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.ASSIGN;
+                    return new TOKEN_PAIR(TOKEN.ASSIGN, location, null);
                 fi
 
             is '>':
                 c = next_char();
                 if c == '=' then
-                    return TOKEN.GE;
+                    return new TOKEN_PAIR(TOKEN.GE,location,null);
                 elif c == '>' then
-                    return TOKEN.SHIFT_RIGHT;
+                    return new TOKEN_PAIR(TOKEN.SHIFT_RIGHT, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.GT;
+                    return new TOKEN_PAIR(TOKEN.GT, location, null);
                 fi
 
             is '<':
                 c = next_char();
                 if c == '=' then
-                    return TOKEN.LE;
+                    return new TOKEN_PAIR(TOKEN.LE, location, null);
                 elif c == '<' then
-                    return TOKEN.SHIFT_LEFT;
+                    return new TOKEN_PAIR(TOKEN.SHIFT_LEFT, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.LT;
+                    return new TOKEN_PAIR(TOKEN.LT, location, null);
                 fi
 
             is '!':
                 c = next_char();
                 if c == '=' then
-                    return TOKEN.NE;
+                    return new TOKEN_PAIR(TOKEN.NE, location, null);
                 elif c == '~' then
-                    return TOKEN.NE_OBJ;
+                    return new TOKEN_PAIR(TOKEN.NE_OBJ, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.NOT;
+                    return new TOKEN_PAIR(TOKEN.NOT, location, null);
                 fi
 
             is '&':
                 c = next_char();
                 if c == '&' then
-                    return TOKEN.AND_THEN;
+                    return new TOKEN_PAIR(TOKEN.AND_THEN, location,null);
                 else
                     prev_char(c);
-                    return TOKEN.AND;
+                    return new TOKEN_PAIR(TOKEN.AND, location, null);
                 fi
                 
             is '|':
                 c = next_char();
                 if c == '|' then
-                    return TOKEN.OR_ELSE;
+                    return new TOKEN_PAIR(TOKEN.OR_ELSE, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.OR;
+                    return new TOKEN_PAIR(TOKEN.OR, location, null);
                 fi
 
-            is '~': return TOKEN.NOT;
-            is '^': return TOKEN.XOR;
+            is '~': return new TOKEN_PAIR(TOKEN.NOT, location, null);
+            is '^': return new TOKEN_PAIR(TOKEN.XOR, location, null);
 /*
-            is '{': return TOKEN.BRACE_OPEN;
+            is '{': return new TOKEN_PAIR(TOKEN.BRACE_OPEN, location, null);
 
-            is '}': return TOKEN.BRACE_CLOSE;
+            is '}': return new TOKEN_PAIR(TOKEN.BRACE_CLOSE, location, null);
 */
-            is '(': return TOKEN.PAREN_OPEN;
+            is '(': return new TOKEN_PAIR(TOKEN.PAREN_OPEN, location, null);
 
-            is ')': return TOKEN.PAREN_CLOSE;
+            is ')': return new TOKEN_PAIR(TOKEN.PAREN_CLOSE, location, null);
 
             is '[':
                 c = skip_white_space();
                 if end_of_file then
-                    return TOKEN.SQUARE_OPEN;
+                    return new TOKEN_PAIR(TOKEN.SQUARE_OPEN, location, null);   
                 elif c == ']' then
-                    return TOKEN.ARRAY_DEF;
+                    return new TOKEN_PAIR(TOKEN.ARRAY_DEF, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.SQUARE_OPEN;
+                    return new TOKEN_PAIR(TOKEN.SQUARE_OPEN, location, null);
                 fi
 
-            is ']': return TOKEN.SQUARE_CLOSE;
+            is ']': return new TOKEN_PAIR(TOKEN.SQUARE_CLOSE, location, null);
 
-            is '+': return TOKEN.PLUS;
-            is '-': return TOKEN.MINUS;
-            is '*': return TOKEN.STAR;
+            is '+': return new TOKEN_PAIR(TOKEN.PLUS, location, null);
+            is '-': return new TOKEN_PAIR(TOKEN.MINUS, location, null);
+            is '*': return new TOKEN_PAIR(TOKEN.STAR, location, null);
             is '/':
                 c = next_char();
                 if c == '/' then
@@ -670,25 +732,25 @@ namespace Lexical is
                     fi
                 else
                     prev_char(c);
-                    return TOKEN.SLASH;
+                    return new TOKEN_PAIR(TOKEN.SLASH, location, null);
                 fi
-            is '%': return TOKEN.PERCENT;       
+            is '%': return new TOKEN_PAIR(TOKEN.PERCENT, location, null);
 
             is '.': 
                 c = next_char();
                 if c == '.' then
-                    return TOKEN.RANGE;
+                    return new TOKEN_PAIR(TOKEN.RANGE, location, null);
                 else
                     prev_char(c);
-                    return TOKEN.DOT;
+                    return new TOKEN_PAIR(TOKEN.DOT, location, null);
                 fi
 
-            is ',': return TOKEN.COMMA;
-            is ':': return TOKEN.COLON;
-            is ';': return TOKEN.SEMICOLON;
+            is ',': return new TOKEN_PAIR(TOKEN.COMMA, location, null);
+            is ':': return new TOKEN_PAIR(TOKEN.COLON, location, null);
+            is ';': return new TOKEN_PAIR(TOKEN.SEMICOLON, location, null);
 
             is '@':
-                return TOKEN.PRAGMA;
+                return new TOKEN_PAIR(TOKEN.PRAGMA, location, null);
 
             is '#':
                 buffer = new StringBuffer();
@@ -702,12 +764,13 @@ namespace Lexical is
                 od
 
                 _current_line = buffer.parseInt();
+                _current_column = 1;
 
                 return read_token_2(false);
             esac
             
             // IO.Std.err.println( "unknown: '" + c + "'" );
-            return TOKEN.UNKNOWN;
+            return new TOKEN_PAIR(TOKEN.UNKNOWN, location, "" + c);
         si        
     si
 si

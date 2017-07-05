@@ -21,7 +21,7 @@ namespace Syntax is
             int end_column
         )
         is
-            IO.Std.err.println("new location % %,%..%,%" % Object{ file_name, start_line, start_column, end_line, end_column });
+            // IO.Std.err.println("new location % %,%..%,%" % Object{ file_name, start_line, start_column, end_line, end_column });
 
             this.file_name = file_name;
 

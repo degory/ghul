@@ -39,6 +39,8 @@ namespace Main is
     class Main is
         void init() is
             try 
+                IO.Std.err.FlushOnPrintln = true;
+
                 var args = Arguments.ProgramArguments.Iterator;
 
                 args.nextElement();
