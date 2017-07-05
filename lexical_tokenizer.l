@@ -279,18 +279,18 @@ namespace Lexical is
 
             int result = 0;
             if c == 't' then
-                // IO.Std.out.println( "escape tab" );
+                // IO.Std.err.println( "escape tab" );
                 return cast char(9);
             elif c == 'n' then
-                // IO.Std.out.println( "escape newline" );
+                // IO.Std.err.println( "escape newline" );
                 return '\n';
             elif c == 'r' then
                 return cast char(13);
             elif c == '\\' then
-                // IO.Std.out.println( "escape backslash" );
+                // IO.Std.err.println( "escape backslash" );
                 return '\\';
             elif c >= '0' && c <= '7' then
-                // IO.Std.out.println( "escape octal" );
+                // IO.Std.err.println( "escape octal" );
                 while c >= '0' && c <= '7' do
                     result = 8 * result + cast int(c);
                     c = next_char();
@@ -298,7 +298,7 @@ namespace Lexical is
                 prev_char(c);
                 return cast char(result);
             else
-                // IO.Std.out.println( "escape literal: '" + c + "'" );
+                // IO.Std.err.println( "escape literal: '" + c + "'" );
                 return c;
             fi
         si
@@ -314,7 +314,7 @@ namespace Lexical is
 
             token = read_token();
 
-            IO.Std.out.println("next token: " + TOKEN_NAMES[token]);
+            IO.Std.err.println("next token: " + TOKEN_NAMES[token]);
 
             return token != TOKEN.END_OF_INPUT;
         si
@@ -323,7 +323,7 @@ namespace Lexical is
             char c;
             do
                 c = next_char();
-                // IO.Std.out.println( "white space: '" + c + "'?" );
+                // IO.Str.err.println( "white space: '" + c + "'?" );
                 if ! (!end_of_file && (c == ' ' || c == cast char(9) || c == '\n')) then break; fi
             od
     
@@ -405,9 +405,9 @@ namespace Lexical is
             StringBuffer buffer = null;
             _token_string = null; // new StringBuffer("");
 
-            // IO.Std.out.println( "number/letter: '" + c + "'?" );
+            // IO.Std.err.println( "number/letter: '" + c + "'?" );
             if c >= '0' && c <= '9' then
-                // IO.Std.out.println( "number: '" + c + "'" );
+                // IO.Std.err.println( "number: '" + c + "'" );
                 buffer = new StringBuffer();
                 buffer.append( c );
                 c = next_char();
@@ -435,7 +435,7 @@ namespace Lexical is
                 // IO.Std.err.println( "read const int: '" + _token_string + "'" );
                 return TOKEN.INT_LITERAL;
             elif (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' then
-                // IO.Std.out.println( "letter: '" + c + "'" );
+                // IO.Std.err.println( "letter: '" + c + "'" );
                 buffer = new StringBuffer();
                 while (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' do
                     buffer.append(c);
@@ -706,7 +706,7 @@ namespace Lexical is
                 return read_token_2(false);
             esac
             
-            // IO.Std.out.println( "unknown: '" + c + "'" );
+            // IO.Std.err.println( "unknown: '" + c + "'" );
             return TOKEN.UNKNOWN;
         si        
     si

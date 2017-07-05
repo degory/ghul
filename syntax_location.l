@@ -21,6 +21,8 @@ namespace Syntax is
             int end_column
         )
         is
+            IO.Std.err.println("new location % %,%..%,%" % Object{ file_name, start_line, start_column, end_line, end_column });
+
             this.file_name = file_name;
 
             if
@@ -30,8 +32,8 @@ namespace Syntax is
                 throw new BoundsException("invalid location %,%..%,%" % Object{ start_line, start_column, end_line, end_column });
             fi
 
-            start = start_line << SHIFT + start_column;
-            end = end_line << SHIFT + end_column;
+            start = (start_line << SHIFT) | start_column;
+            end = (end_line << SHIFT) | end_column;
 
             if end == 0 then
                 end = start;
@@ -40,6 +42,8 @@ namespace Syntax is
                 end = start;
                 start = t;
             fi
+
+            IO.Std.err.println("location normalised to %" % Object{ this });
         si
 
         private void init(
@@ -69,7 +73,13 @@ namespace Syntax is
             return end & MASK;
         si
 
+        String toString() is
+            return "% %,%..%,%" % Object{file_name, start_line, start_column, end_line, end_column};
+        si
+
         LOCATION operator..(LOCATION with) is
+            IO.Std.err.println("extend location % - %" % Object{this, with});
+
             int new_start, new_end;
 
             if start < with.start then

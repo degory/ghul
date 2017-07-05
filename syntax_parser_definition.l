@@ -62,7 +62,7 @@ namespace Syntax is
                 if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
                     var identifier = context.parse_identifier();
                     
-                    Tree.TYPE type = Tree.Type.BUILT_IN.INFER;
+                    Tree.TYPE type = new Tree.Type.INFER(start..context.location);
                     Tree.EXPRESSION initializer = new Tree.Expression.NONE(context.location);
 
                     if context.current_token == Lexical.TOKEN.COLON then

@@ -60,7 +60,7 @@ namespace Main is
                         var type = context.parse_type();
 
                         if type != null then
-                            IO.Std.out.println(type);
+                            IO.Std.err.println("%: %" % Object{type.location, type});
                         else
                             done = true;
                         fi

@@ -13,82 +13,91 @@ namespace Syntax is
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.VOID;
+                        return new Tree.Type.VOID(context.location);
                     si,
                     Lexical.TOKEN.VOID);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.BOOL;
+                        return new Tree.Type.BOOL(context.location);
                     si,
                     Lexical.TOKEN.BOOL);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.BYTE;
+                        return new Tree.Type.BYTE(context.location);
                     si, 
                     Lexical.TOKEN.BYTE);
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.CHAR;
+                        return new Tree.Type.CHAR(context.location);
                     si,
                     Lexical.TOKEN.CHAR);
  
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.INT;
+                        return new Tree.Type.INT(context.location);
                     si,
                     Lexical.TOKEN.INT); 
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         context.next_token();
-                        return Tree.Type.BUILT_IN.WORD;
+                        return new Tree.Type.WORD(context.location);
                     si,
                     Lexical.TOKEN.WORD); 
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        var start = context.location;
                         context.next_token();
-                        return new Tree.Type.ARRAY(this.parse(context));
+                        var element = this.parse(context);
+                        return new Tree.Type.ARRAY(start..element.location, element);
                     si,
                     Lexical.TOKEN.ARRAY_DEF
                 );
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        var start = context.location;
                         context.next_token();
-                        return new Tree.Type.POINTER(this.parse(context));
+                        var element = this.parse(context);
+                        return new Tree.Type.POINTER(start..element.location, element);
                     si,
                     Lexical.TOKEN.PTR
                 );
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        var start = context.location;
                         context.next_token();
-                        return new Tree.Type.REFERENCE(this.parse(context));
+                        var element = this.parse(context);
+                        return new Tree.Type.REFERENCE(start..element.location, element);
                     si,
                     Lexical.TOKEN.REF
                 );
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        var start = context.location;
                         var identifier = context.parse_identifier();
 
                         if context.current_token == Lexical.TOKEN.LT then
                             context.next_token();
 
-                            var result = new Tree.Type.GENERIC(identifier, parse_type_list(context));
-                            context.expect_token(Lexical.TOKEN.GT);
+                            var types = parse_type_list(context);
+
+                            var result = new Tree.Type.GENERIC(start..context.location, identifier, types);
+                            context.next_token(Lexical.TOKEN.GT);
 
                             return result;
                         else
-                            return new Tree.Type.NAMED(identifier);
+                            return new Tree.Type.NAMED(identifier.location, identifier);
                         fi
                     si,
                     Lexical.TOKEN.IDENTIFIER
