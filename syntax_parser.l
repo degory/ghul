@@ -49,6 +49,10 @@ namespace Syntax is
                     % Object{
                         Lexical.TOKEN_NAMES[expected_tokens],
                         Lexical.TOKEN_NAMES[context.current_token]});
+
+                IO.Std.err.flush();
+
+                throw new Exception("unexpected token");
             si
 
             private void populate_expected_tokens() is

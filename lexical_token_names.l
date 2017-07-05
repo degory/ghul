@@ -9,8 +9,6 @@ namespace Lexical is
         private static TOKEN_NAMES _instance;  
 
         void init() is
-            IO.Std.err.println("initializing token names...");
-
             names = new Map<TOKEN, String>();
 
             names[TOKEN.PLUS] = "+";
@@ -124,8 +122,6 @@ namespace Lexical is
             names[TOKEN.WORD] = "word";
             names[TOKEN.XOR] = "xor";
             names[TOKEN.YRT] = "ytr";
-
-            IO.Std.err.println("names is:\n" + names);
         si
 
         private static get TOKEN_NAMES instance is
@@ -147,17 +143,36 @@ namespace Lexical is
         si
 
         public static get String[Iterable<Lexical.TOKEN> tokens] is
+            var sorted_tokens = new Vector<Lexical.TOKEN>();
+            sorted_tokens.add(tokens);
+            Sort<Lexical.TOKEN>.sort(sorted_tokens);
+
             var result = new StringBuffer();
 
             var seen_any = false;
 
-            foreach var t; tokens do
+            foreach var t; sorted_tokens do
                 if seen_any then
-                    result.append(',');
+                    result.append(", ");
                 fi
 
                 result.append(TOKEN_NAMES[t]);
+
+                seen_any = true;
             od
+
+            var i = result.lastIndexOf(',');
+
+            if i >= 0 then
+                var left = result.substring(0, i);
+                var right = result.substring(i + 2);
+
+                result = 
+                    new StringBuffer()
+                        .append(left)
+                        .append(" or ")
+                        .append(right);
+            fi
 
             return result;
         si
