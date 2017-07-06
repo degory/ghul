@@ -47,12 +47,9 @@ namespace Syntax is
         )
         is
           super.init(location);
-          IO.Std.err.println("" + this + " add " + variables); 
 
           this.variables = new Vector<VARIABLE>();
           this.variables.add(variables);
-
-          IO.Std.err.println("" + this + " has " + this.variables); 
         si
 
         get Iterator<VARIABLE> Iterator is
