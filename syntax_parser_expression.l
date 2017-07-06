@@ -194,8 +194,8 @@ namespace Syntax is
                     super.init();
 
                     add_parser(
-                        Tree.Expression.LITERAL proc(CONTEXT context) is
-                            return new Tree.Expression.NONE(context.location);
+                        Tree.Expression.LITERAL proc(CONTEXT context) is                            
+                            return new Tree.Expression.NONE(context.location_and_next());
                         si,
                         Lexical.TOKEN.NONE
                     );

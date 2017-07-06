@@ -13,6 +13,8 @@ var x, y;
 
 var x: int, y: bool;
 
+qvar l: bool = none;
+
 var n = none;
 
 var m = none, p, q:int, z: int = none;

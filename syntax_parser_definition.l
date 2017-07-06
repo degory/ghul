@@ -49,6 +49,8 @@ namespace Syntax is
                         var variable = parse_variable(context);
                         end = variable.location;
 
+                        variables.add(variable);
+
                         if context.current_token != Lexical.TOKEN.COMMA then
                             break;
                         else
@@ -65,7 +67,7 @@ namespace Syntax is
 
                 if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
                     var identifier = context.parse_identifier();
-                    var location = identifier.location;
+                    var end = identifier.location;
                     
                     Tree.TYPE type = new Tree.Type.INFER(start..context.location);
                     Tree.EXPRESSION initializer = new Tree.Expression.NONE(context.location);
@@ -74,18 +76,18 @@ namespace Syntax is
                         context.next_token();
                         
                         type = context.parse_type();
-                        location = type.location;
+                        end = type.location;
                     fi
 
                     if context.current_token == Lexical.TOKEN.ASSIGN then
                         context.next_token();
 
                         initializer = context.parse_expression();
-                        location = initializer.location;
+                        end = initializer.location;
                     fi
 
                     return new Tree.Definition.VARIABLE(
-                        start..location,
+                        start..end,
                         identifier,
                         type,
                         initializer);    

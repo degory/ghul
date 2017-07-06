@@ -33,6 +33,12 @@ namespace Test is
 
                         if definition != null then
                             IO.Std.err.println("%: %" % Object{definition.location, definition});
+
+                            var printer = new Syntax.Process.PRINTER();
+
+                            definition.accept(printer);
+
+                            IO.Std.err.println(printer.result);
                         else
                             done = true;
                         fi
