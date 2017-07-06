@@ -91,5 +91,21 @@ namespace Syntax is
         void visit(EXPRESSION expression) is
             throw new NotImplementedException("Visitor % does not define a visit method for expression %" % Object{this, expression});
         si
+
+        void visit(Expression.IDENTIFIER identifier) is
+            throw new NotImplementedException("Visitor % does not define a visit method for identifier %" % Object{this, identifier});
+        si
+        
+        void visit(Expression.NONE none) is
+            throw new NotImplementedException("Visitor % does not define a visit method for none %" % Object{this, none});
+        si
+
+        void visit(Expression.UNARY unary) is
+            throw new NotImplementedException("Visitor % does not define a visit method for unary %" % Object{this, unary});
+        si
+
+        void visit(Expression.BINARY binary) is
+            throw new NotImplementedException("Visitor % does not define a visit method for binary %" % Object{this, binary});
+        si
     si
 si

@@ -38,12 +38,16 @@ namespace Syntax is
 
             void visit(VARIABLE variable) is
                 variable.identifier.accept(this);
-                _result.append(' ');
 
                 // FIXME: not OOP
                 if !isa Type.INFER(variable.type) then
                     _result.append(": ");
                     variable.type.accept(this);
+                fi
+
+                if variable.initializer != null then
+                    _result.append(" = ");
+                    variable.initializer.accept(this);
                 fi
             si
 
@@ -105,7 +109,7 @@ namespace Syntax is
 
             void visit(GENERIC generic) is
                 generic.name.accept(this);
-                _result.append('<');
+                _result.append('[');
 
                 var seen_any = false;
                 foreach var a; generic.arguments do
@@ -118,8 +122,32 @@ namespace Syntax is
                     seen_any = true;
                 od
 
-                _result.append('>');
+                _result.append(']');
             si
+
+            // expression 
+
+            void visit(Expression.NONE none) is
+                _result.append("none");
+            si
+
+            void visit(Expression.IDENTIFIER identifier) is
+                identifier.identifier.accept(this);
+            si
+
+            void visit(Expression.UNARY unary) is
+                _result.append(Expression.OPERATION_NAMES[unary.operation]);
+
+                unary.right.accept(this);
+            si
+
+            void visit(Expression.BINARY binary) is
+                binary.left.accept(this);
+
+                _result.append(Expression.OPERATION_NAMES[binary.operation]);
+                
+                binary.right.accept(this);
+            si            
         si
     si
 si

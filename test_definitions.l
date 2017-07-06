@@ -32,13 +32,7 @@ namespace Test is
                         context.next_token(Lexical.TOKEN.SEMICOLON);    
 
                         if definition != null then
-                            IO.Std.err.println("%: %" % Object{definition.location, definition});
-
-                            var printer = new Syntax.Process.PRINTER();
-
-                            definition.accept(printer);
-
-                            IO.Std.err.println(printer.result);
+                            IO.Std.err.println(definition);
                         else
                             done = true;
                         fi

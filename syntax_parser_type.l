@@ -52,48 +52,16 @@ namespace Syntax is
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
                         var start = context.location;
-                        context.next_token();
-                        var element = this.parse(context);
-                        return new Tree.Type.ARRAY(start..element.location, element);
-                    si,
-                    Lexical.TOKEN.ARRAY_DEF
-                );
-
-                add_parser(
-                    Tree.TYPE proc(CONTEXT context) is
-                        var start = context.location;
-                        context.next_token();
-                        var element = this.parse(context);
-                        return new Tree.Type.POINTER(start..element.location, element);
-                    si,
-                    Lexical.TOKEN.PTR
-                );
-
-                add_parser(
-                    Tree.TYPE proc(CONTEXT context) is
-                        var start = context.location;
-                        context.next_token();
-                        var element = this.parse(context);
-                        return new Tree.Type.REFERENCE(start..element.location, element);
-                    si,
-                    Lexical.TOKEN.REF
-                );
-
-                add_parser(
-                    Tree.TYPE proc(CONTEXT context) is
-                        var start = context.location;
-
-                        IO.Std.err.flush();
 
                         var identifier = context.parse_identifier();
 
-                        if context.current_token == Lexical.TOKEN.LT then
+                        if context.current_token == Lexical.TOKEN.SQUARE_OPEN then
                             context.next_token();
 
                             var types = parse_type_list(context);
 
                             var result = new Tree.Type.GENERIC(start..context.location, identifier, types);
-                            context.next_token(Lexical.TOKEN.GT);
+                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
 
                             return result;
                         else
@@ -102,6 +70,35 @@ namespace Syntax is
                     si,
                     Lexical.TOKEN.IDENTIFIER
                 );
+            si
+
+            Tree.TYPE parse(CONTEXT context) is
+                var result = super.parse(context);
+
+                return parse_structured(context, result);
+            si
+
+            Tree.TYPE parse_structured(CONTEXT context, Tree.TYPE element) is
+                var result = element;
+
+                do
+                    case context.current_token
+                    is Lexical.TOKEN.ARRAY_DEF:
+                        result = new Tree.Type.ARRAY(result.location..context.location, result);
+                        context.next_token();
+                    
+                    is Lexical.TOKEN.REF:
+                        result = new Tree.Type.REFERENCE(result.location..context.location, result);
+                        context.next_token();
+
+                    is Lexical.TOKEN.PTR:
+                        result = new Tree.Type.POINTER(result.location..context.location, result);
+                        context.next_token();
+
+                    default:
+                        return result;
+                    esac
+                od
             si
 
             List<Tree.TYPE> parse_type_list(CONTEXT context) is                

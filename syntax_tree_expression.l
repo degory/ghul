@@ -37,6 +37,53 @@ namespace Syntax is
                 CALL
             si
 
+            class OPERATION_NAMES is
+                static Map<OPERATION, String> names;
+
+                static get String[OPERATION op] is
+                    if names == null then
+                        names = new Map<OPERATION, String>();
+
+                        names[OPERATION.ADD] = "+";
+                        names[OPERATION.SUBTRACT] = "-";
+
+                        names[OPERATION.MULTIPLY] = "*";
+                        names[OPERATION.DIVIDE] = "/";
+                        names[OPERATION.MODULUS] = "%";
+
+                        names[OPERATION.AND] = "&";
+                        names[OPERATION.OR] = "|";
+
+                        names[OPERATION.SHIFT_LEFT] = "<<";
+                        names[OPERATION.SHIFT_RIGHT] = ">>";
+
+                        names[OPERATION.LESS] = "<";
+                        names[OPERATION.LESS_OR_EQUAL] = ">";
+                        names[OPERATION.EQUAL] = "==";
+                        names[OPERATION.EQUAL_OBJ] = "=~";
+                        names[OPERATION.NOT_EQUAL] = "!=";
+                        names[OPERATION.NOT_EQUAL_OBJ] = "!~";
+                        names[OPERATION.GREATER] = ">";
+                        names[OPERATION.GREATER_OR_EQUAL] = ">=";
+
+                        names[OPERATION.AND_THEN] = "&&";
+                        names[OPERATION.OR_ELSE] = "||";
+
+                        names[OPERATION.MEMBER] = ".";
+                        names[OPERATION.INDEX] = "[]";
+                        names[OPERATION.CALL] = "()";                        
+                    fi
+
+                    var result = names[op];
+
+                    if result != null then
+                        return result;
+                    else
+                        return "unknown";
+                    fi
+                si
+            si
+
             class BINARY isa EXPRESSION is
                 public OPERATION operation;
                 public EXPRESSION left;
@@ -55,11 +102,19 @@ namespace Syntax is
                     this.left = left;
                     this.right = right;
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
             si
 
             class PRIMARY isa EXPRESSION is
                 void init(LOCATION location) is
                     super.init(location);
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
                 si
             si
 
@@ -78,6 +133,10 @@ namespace Syntax is
                     this.identifier = identifier; 
                     this.type = type;
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
             si            
 
             class UNARY isa PRIMARY is
@@ -95,15 +154,23 @@ namespace Syntax is
                     this.operation = operation;
                     this.right = right;
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
             si
 
             class IDENTIFIER isa PRIMARY is
-                Tree.IDENTIFIER identifier;
+                public Tree.IDENTIFIER identifier;
 
                 void init(LOCATION location, Tree.IDENTIFIER identifier) is
                     super.init(location);
 
                     this.identifier = identifier;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
                 si
             si
 
@@ -120,6 +187,10 @@ namespace Syntax is
                     this.expressions = new Vector<EXPRESSION>();
                     this.expressions.add(expressions);
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
             si
 
             class LITERAL isa PRIMARY is
@@ -134,12 +205,20 @@ namespace Syntax is
 
                     this.value = value;
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si                
             si
 
             class NONE isa LITERAL is
                 void init(LOCATION location) is
                     super.init(location);
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si                                
             si
 
             class MEMBER isa PRIMARY is 
@@ -152,6 +231,10 @@ namespace Syntax is
                     this.left = left;
                     this.right = right;
                 si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si                
             si
         si
     si

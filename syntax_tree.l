@@ -28,7 +28,11 @@ namespace Syntax is
       si
 
       public String toString() is
-        return super.toString() + "@" + location;
+        var printer = new Process.PRINTER();
+
+        accept(printer);
+
+        return "%: %" % Object{location, printer.result};
       si
     si
 

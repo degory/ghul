@@ -1,5 +1,6 @@
 namespace Syntax is
     namespace Parser is
+        use System;
         use Generic;
 
         use Source;
@@ -50,7 +51,7 @@ namespace Syntax is
                 return parse(
                     context,
                     context.parse_expression_primary(),
-                    Expression.PRECEDENCE.NONE
+                    Expression.PRECEDENCE.MIN
                 );
             si
 
@@ -95,6 +96,7 @@ namespace Syntax is
         namespace Expression is
             enum PRECEDENCE is
                 NONE,
+                MIN,
                 BOOLEAN,
                 RELATIONAL,
                 SHIFT,
@@ -122,6 +124,7 @@ namespace Syntax is
 
                     add_parser(
                         Tree.Expression.PRIMARY proc(CONTEXT context) is
+                            
                             var identifier = new Tree.Expression.IDENTIFIER(
                                 context.location,
                                 context.parse_identifier()

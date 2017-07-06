@@ -4,19 +4,24 @@ let a;
 let b;
 
 var x: int;
-var y: ref ptr[]word; // FIXME: semi colon not recognized here
+var y: word[] ref ptr; // FIXME: semi colon not recognized here
 
-var y: ARRAY<ref int>;
-var m: MAP<TOKEN,ptr char>;
+var y: ARRAY[int ref];
+var m: MAP[TOKEN,char ptr];
 
 var x, y;
 
 var x: int, y: bool;
 
-qvar l: bool = none;
+var q = none, p = none, r = none; var n = none;
 
-var n = none;
+var l: bool = none;
 
 var m = none, p, q:int, z: int = none;
+
+var add = x + y;
+var mul = a * b;
+var div = c / d;
+
 
 
