@@ -7,6 +7,7 @@ namespace Syntax is
             use Source;
 
             enum OPERATION is
+                NONE,
                 ADD,
                 SUBTRACT,
 

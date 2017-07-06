@@ -30,8 +30,10 @@ namespace Syntax is
 
             void visit(QUALIFIED_IDENTIFIER identifier) is
                 identifier.parent.accept(this);
-                _result.append('.');
-                identifier.accept(this);
+                
+                _result
+                    .append('.')
+                    .append(identifier.name);
             si
 
             // definitions
@@ -89,18 +91,18 @@ namespace Syntax is
             si
 
             void visit(ARRAY array) is
-                _result.append("[]");
                 array.element.accept(this);
+                _result.append("[]");
             si
 
             void visit(POINTER pointer) is
-                _result.append("ptr ");
                 pointer.element.accept(this);
+                _result.append(" ptr");
             si
 
             void visit(REFERENCE reference) is
-                _result.append("ref ");
                 reference.element.accept(this);
+                _result.append(" ref");
             si
 
             void visit(NAMED named) is

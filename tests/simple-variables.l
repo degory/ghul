@@ -19,8 +19,8 @@ var l: bool = none;
 
 var m = none, p, q:int, z: int = none;
 
-var add = x + y;
-var mul = a * b;
+var add = thing.x + thing.y;
+var mul = bloop.a * gloop.b;
 var div = c / d;
 
 

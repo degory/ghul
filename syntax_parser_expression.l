@@ -67,6 +67,7 @@ namespace Syntax is
                     if left_precedence < min_precedence then break; fi
 
                     var op = operation[context.current_token];
+
                     context.next_token();
 
                     Tree.EXPRESSION right = context.parse_expression_primary();
