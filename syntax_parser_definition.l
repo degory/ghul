@@ -66,11 +66,11 @@ namespace Syntax is
                 var start = context.location;
 
                 if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
-                    var identifier = context.parse_identifier();
+                    var identifier = context.parse_unqualified_identifier();
                     var end = identifier.location;
                     
                     Tree.TYPE type = new Tree.Type.INFER(start..context.location);
-                    Tree.EXPRESSION initializer = new Tree.Expression.NONE(context.location);
+                    Tree.EXPRESSION initializer; // = new Tree.Expression.NONE(context.location);
 
                     if context.current_token == Lexical.TOKEN.COLON then
                         context.next_token();
@@ -96,8 +96,7 @@ namespace Syntax is
 
             Tree.DEFINITION unexpected_token(CONTEXT context) is
                 return null; 
-            si
-            
+            si            
         si
     si
 si

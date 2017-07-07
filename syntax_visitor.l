@@ -114,6 +114,22 @@ namespace Syntax is
             throwNotImplemented("none", none);
         si
 
+        void visit(Expression.TUPLE tuple) is
+            throwNotImplemented("tuple", tuple);
+        si
+
+        void visit(Expression.CALL call) is
+            throwNotImplemented("call", call);
+        si
+
+        void visit(Expression.MEMBER member) is
+            throwNotImplemented("member", member);
+        si
+
+        void visit(Expression.INDEX index) is
+            throwNotImplemented("index", index);
+        si        
+
         void visit(Expression.UNARY unary) is
             throwNotImplemented("unary", unary);
         si

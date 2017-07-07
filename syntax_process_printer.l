@@ -141,7 +141,7 @@ namespace Syntax is
 
             void visit(TYPE_LIST types) is
                 var seen_any = false;
-                foreach var t; types.elements do
+                foreach var t; types.Iterator do
                     if seen_any then
                         _result.append(',');
                     fi
@@ -162,6 +162,42 @@ namespace Syntax is
                 identifier.identifier.accept(this);
             si
 
+            void visit(Expression.TUPLE tuple) is
+                _result.append('(');
+
+                tuple.elements.accept(this);
+
+                _result.append(')');
+            si
+
+            void visit(Expression.CALL call) is
+                call.function.accept(this);
+
+                _result.append('(');
+
+                call.arguments.accept(this);
+
+                _result.append(')');
+            si            
+
+            void visit(Expression.MEMBER member) is
+                member.left.accept(this);
+
+                _result.append('.');
+
+                member.identifier.accept(this);
+            si
+
+            void visit(Expression.INDEX index) is
+                index.left.accept(this);
+
+                _result.append('[');
+
+                index.index.accept(this);
+
+                _result.append(']');
+            si
+
             void visit(Expression.UNARY unary) is
                 _result.append(Expression.OPERATION_NAMES[unary.operation]);
 
@@ -174,7 +210,20 @@ namespace Syntax is
                 _result.append(Expression.OPERATION_NAMES[binary.operation]);
                 
                 binary.right.accept(this);
-            si            
+            si
+
+            void visit(Expression.EXPRESSION_LIST expressions) is
+                var seen_any = false;
+                foreach var e; expressions do
+                    if seen_any then
+                        _result.append(',');
+                    fi
+
+                    e.accept(this);
+
+                    seen_any = true;
+                od
+            si             
         si
     si
 si

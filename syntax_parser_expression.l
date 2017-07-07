@@ -50,7 +50,7 @@ namespace Syntax is
             Tree.EXPRESSION parse(CONTEXT context) is
                 return parse(
                     context,
-                    context.parse_expression_primary(),
+                    context.parse_expression_secondary(),
                     Expression.PRECEDENCE.MIN
                 );
             si
@@ -70,7 +70,7 @@ namespace Syntax is
 
                     context.next_token();
 
-                    Tree.EXPRESSION right = context.parse_expression_primary();
+                    Tree.EXPRESSION right = context.parse_expression_secondary();
                     
                     do
                         var right_precedence = precedence[context.current_token];
@@ -92,6 +92,23 @@ namespace Syntax is
 
                 return left;
             si
+
+            Tree.Expression.EXPRESSION_LIST parse_expression_list(CONTEXT context) is
+                var start = context.location;
+
+                var expressions = new Vector<Tree.EXPRESSION>();
+
+                do
+                    var expression = context.parse_expression();
+                    expressions.add(expression);
+
+                    if context.current_token != Lexical.TOKEN.COMMA then
+                        return new Tree.Expression.EXPRESSION_LIST(start..expression.location, expressions);
+                    fi
+
+                    context.next_token();
+                od
+            si          
         si
 
         namespace Expression is
@@ -126,11 +143,9 @@ namespace Syntax is
                     add_parser(
                         Tree.Expression.PRIMARY proc(CONTEXT context) is
                             
-                            var identifier = new Tree.Expression.IDENTIFIER(
-                                context.location,
-                                context.parse_identifier()
-                            );                            
-                            
+                            var identifier = parse_identifier(context);
+
+                            // maybe we're in the arguments list of a function literal?                          
                             if context.current_token == Lexical.TOKEN.COLON then
                                 context.next_token();
 
@@ -164,6 +179,58 @@ namespace Syntax is
                         }
                     );                    
                 si
+
+                Tree.Expression.IDENTIFIER parse_identifier(CONTEXT context) is
+                    return new Tree.Expression.IDENTIFIER(
+                        context.location,
+                        context.parse_unqualified_identifier()
+                    );                            
+                si
+            si
+
+            class SECONDARY isa PARSER<Tree.EXPRESSION> is
+                void init() is  
+                    super.init();
+                si
+
+                Tree.EXPRESSION parse(CONTEXT context) is
+                    var start = context.location;
+                    Tree.EXPRESSION result = context.parse_expression_primary();
+
+                    do
+                        case context.current_token
+                        is Lexical.TOKEN.PAREN_OPEN:
+                            context.next_token();
+                            Tree.Expression.EXPRESSION_LIST arguments;
+
+                            if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
+                                arguments = context.parse_expression_list();
+                            else
+                                arguments = new Tree.Expression.EXPRESSION_LIST(context.location, new Vector<Tree.EXPRESSION>());
+                            fi
+
+                            result = new Tree.Expression.CALL(start..context.location, result, arguments);
+                            context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+
+                        is Lexical.TOKEN.SQUARE_OPEN:
+                            context.next_token();
+                            var index = context.parse_expression();
+
+                            result = new Tree.Expression.INDEX(start..context.location, result, index);
+                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
+
+                        is Lexical.TOKEN.DOT:
+                            context.next_token();
+
+                            var member = context.parse_expression_identifier();
+                            result = new Tree.Expression.MEMBER(start..member.location, result, member);
+
+                        default:
+                            break;
+
+                        esac
+                    od
+                si
             si
 
             class TUPLE isa PARSER<Tree.Expression.TUPLE> is
@@ -174,18 +241,16 @@ namespace Syntax is
                 Tree.Expression.TUPLE parse(CONTEXT context) is                    
                     var start = context.location;
                     if context.next_token(Lexical.TOKEN.PAREN_OPEN) then
-                        var expressions = new Vector<Tree.EXPRESSION>();
+                        context.next_token();
 
-                        while context.current_token != Lexical.TOKEN.PAREN_CLOSE do
-                            expressions.add(context.parse_expression());
+                        Tree.Expression.EXPRESSION_LIST expressions;
 
-                            if context.current_token == Lexical.TOKEN.COMMA then
-                                context.next_token();
-                            else
-                                break;
-                            fi
-                        od
-
+                        if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
+                            expressions = context.parse_expression_list();
+                        else
+                            expressions = new Tree.Expression.EXPRESSION_LIST(context.location, new Vector<Tree.EXPRESSION>());
+                        fi
+                        
                         context.next_token(Lexical.TOKEN.PAREN_CLOSE);
 
                         return new Tree.Expression.TUPLE(start..context.location, expressions);

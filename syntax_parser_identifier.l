@@ -35,6 +35,17 @@ namespace Syntax is
                     return result;
                 fi
             si
+
+            Tree.IDENTIFIER parse_unqualified_identifier(CONTEXT context) is
+                if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
+                    var name = context.current_string;
+                    var result = new Tree.IDENTIFIER(context.location, name);
+
+                    context.next_token();                    
+
+                    return result;
+                fi
+            si
         si
     si
 si

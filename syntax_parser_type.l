@@ -52,7 +52,7 @@ namespace Syntax is
                     Tree.TYPE proc(CONTEXT context) is
                         var start = context.location;
 
-                        var identifier = context.parse_identifier();
+                        var identifier = context.parse_qualified_identifier();
 
                         if context.current_token == Lexical.TOKEN.SQUARE_OPEN then
                             context.next_token();

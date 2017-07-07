@@ -21,6 +21,7 @@ namespace Syntax is
             static EXPRESSION expression_parser = new EXPRESSION();
             static Expression.LITERAL expression_literal_parser = new Expression.LITERAL();
             static Expression.PRIMARY expression_primary_parser = new Expression.PRIMARY();
+            static Expression.SECONDARY expression_secondary_parser = new Expression.SECONDARY();
             static Expression.TUPLE expression_tuple_parser = new Expression.TUPLE();
 
             public Lexical.TOKENIZER tokenizer;
@@ -128,9 +129,13 @@ namespace Syntax is
                 return type_parser.parse(this);
             si
 
-            public Tree.IDENTIFIER parse_identifier() is
+            public Tree.IDENTIFIER parse_qualified_identifier() is
                 return identifier_parser.parse(this);
             si
+
+            public Tree.IDENTIFIER parse_unqualified_identifier() is
+                return identifier_parser.parse_unqualified_identifier(this);
+            si            
 
             public Tree.DEFINITION parse_definition() is
                 return definition_parser.parse(this);
@@ -144,8 +149,20 @@ namespace Syntax is
                 return expression_literal_parser.parse(this);
             si
 
+            public Tree.Expression.IDENTIFIER parse_expression_identifier() is
+                return expression_primary_parser.parse_identifier(this);
+            si
+
+            public Tree.Expression.EXPRESSION_LIST parse_expression_list() is
+                return expression_parser.parse_expression_list(this);
+            si
+
             public Tree.Expression.PRIMARY parse_expression_primary() is
                 return expression_primary_parser.parse(this);
+            si
+
+            public Tree.EXPRESSION parse_expression_secondary() is
+                return expression_secondary_parser.parse(this);
             si
 
             public Tree.Expression.TUPLE parse_expression_tuple() is

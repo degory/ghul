@@ -175,18 +175,34 @@ namespace Syntax is
                 si
             si
 
+            class EXPRESSION_LIST isa NODE do Iterable<EXPRESSION> is
+                public Iterable<EXPRESSION> expressions;
+
+                void init(LOCATION location, Iterable<EXPRESSION> expressions) is
+                    super.init(location);                    
+                    this.expressions = new Vector<EXPRESSION>(expressions);
+                si
+
+                get Iterator<EXPRESSION> Iterator is
+                    return expressions.Iterator;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
+            si
+
             class TUPLE isa PRIMARY is
-                public List<EXPRESSION> expressions;
+                public EXPRESSION_LIST elements;
 
                 void init(
                     LOCATION location,
-                    Iterable<EXPRESSION> expressions
+                    EXPRESSION_LIST elements
                 )
                 is
                     super.init(location);
 
-                    this.expressions = new Vector<EXPRESSION>();
-                    this.expressions.add(expressions);
+                    this.elements = elements;
                 si
 
                 void accept(Visitor visitor) is
@@ -222,21 +238,53 @@ namespace Syntax is
                 si                                
             si
 
+            class CALL isa PRIMARY is
+                public EXPRESSION function;
+                public EXPRESSION_LIST arguments;
+
+                void init(LOCATION location, EXPRESSION function, EXPRESSION_LIST arguments) is
+                    super.init(location);
+
+                    this.function = function;
+                    this.arguments = arguments;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
+            si
+
             class MEMBER isa PRIMARY is 
                 public EXPRESSION left;
-                public IDENTIFIER right;
+                public IDENTIFIER identifier;
 
-                void init(LOCATION location, EXPRESSION left, IDENTIFIER right) is
+                void init(LOCATION location, EXPRESSION left, IDENTIFIER identifier) is
                     super.init(location);
 
                     this.left = left;
-                    this.right = right;
+                    this.identifier = identifier;
                 si
 
                 void accept(Visitor visitor) is
                     visitor.visit(this);
                 si                
             si
+
+            class INDEX isa PRIMARY is 
+                public EXPRESSION left;
+                public EXPRESSION index;
+
+                void init(LOCATION location, EXPRESSION left, EXPRESSION index) is
+                    super.init(location);
+
+                    this.left = left;
+                    this.index = index;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si                
+            si            
         si
     si
 si
