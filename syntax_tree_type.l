@@ -132,6 +132,22 @@ namespace Syntax is
         si
       si
 
+      class FUNCTION isa TYPE is
+        public TYPE result;
+        public TYPE_LIST arguments;
+
+        void init(LOCATION location, TYPE_LIST arguments, TYPE result) is
+          super.init(location);
+
+          this.result = result;
+          this.arguments = arguments;
+        si
+
+        void accept(Visitor visitor) is
+          visitor.visit(this);
+        si
+      si
+
       class NAMED isa TYPE is
         public IDENTIFIER name;
 
@@ -148,9 +164,9 @@ namespace Syntax is
       si
 
       class GENERIC isa NAMED is
-        public List<TYPE> arguments;
+        public TYPE_LIST arguments;
 
-        void init(LOCATION location, IDENTIFIER name, List<TYPE> arguments) is
+        void init(LOCATION location, IDENTIFIER name, TYPE_LIST arguments) is
           super.init(location, name);
           this.arguments = arguments;
         si
@@ -158,6 +174,23 @@ namespace Syntax is
         void accept(Visitor visitor) is
           visitor.visit(this);
         si        
+      si
+
+      class TYPE_LIST isa NODE do Iterable<TYPE> is
+        public Iterable<TYPE> elements;
+
+        void init(LOCATION location, Iterable<TYPE> elements) is
+          super.init(location);
+          this.elements = new Vector<TYPE>(elements);
+        si
+
+        void accept(Visitor visitor) is
+          visitor.visit(this);
+        si
+
+        get Iterator<TYPE> Iterator is
+          return elements.Iterator;
+        si
       si
     si
   si

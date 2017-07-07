@@ -525,6 +525,8 @@ namespace Lexical is
                     return new TOKEN_PAIR(TOKEN.EQ, location, null);
                 elif c == '~' then
                     return new TOKEN_PAIR(TOKEN.EQ_OBJ, location, null);
+                elif c == '>' then
+                    return new TOKEN_PAIR(TOKEN.ARROW_FAT, location, null);
                 else
                     prev_char(c);
                     return new TOKEN_PAIR(TOKEN.ASSIGN, location, null);
@@ -606,7 +608,15 @@ namespace Lexical is
             is ']': return new TOKEN_PAIR(TOKEN.SQUARE_CLOSE, location, null);
 
             is '+': return new TOKEN_PAIR(TOKEN.PLUS, location, null);
-            is '-': return new TOKEN_PAIR(TOKEN.MINUS, location, null);
+            is '-':
+                c = next_char();
+                if c == '>' then
+                    return new TOKEN_PAIR(TOKEN.ARROW_THIN, location, null);
+                else
+                    prev_char(c);
+                    return new TOKEN_PAIR(TOKEN.MINUS, location, null);
+                fi
+
             is '*': return new TOKEN_PAIR(TOKEN.STAR, location, null);
             is '/':
                 c = next_char();

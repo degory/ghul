@@ -43,7 +43,7 @@ namespace Syntax is
 
                 // FIXME: not OOP
                 if !isa Type.INFER(variable.type) then
-                    _result.append(": ");
+                    _result.append(": ");                    
                     variable.type.accept(this);
                 fi
 
@@ -113,18 +113,35 @@ namespace Syntax is
                 generic.name.accept(this);
                 _result.append('[');
 
+                generic.arguments.accept(this);
+
+                _result.append(']');
+            si
+
+            void visit(FUNCTION function) is
+                _result.append("(");
+
+                function.arguments.accept(this);
+
+                _result.append(")");
+
+                if !isa INFER(function.result) then
+                    _result.append(" -> ");
+                    function.result.accept(this);
+                fi
+            si
+
+            void visit(TYPE_LIST types) is
                 var seen_any = false;
-                foreach var a; generic.arguments do
+                foreach var t; types.elements do
                     if seen_any then
                         _result.append(',');
                     fi
 
-                    a.accept(this);
+                    t.accept(this);
 
                     seen_any = true;
                 od
-
-                _result.append(']');
             si
 
             // expression 

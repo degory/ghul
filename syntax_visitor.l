@@ -2,110 +2,120 @@ namespace Syntax is
     use System;
 
     use Tree;
-    use Tree.Definition;
-    use Tree.Type;
 
     class Visitor is
         void init() is
             super.init();
         si
 
+        private void throwNotImplemented(String name, NODE node) is
+            throw new NotImplementedException("Visitor % does not define a visit method for % %" % Object{this, name, Object.dump(node)});
+        si
+
         // node
 
         void visit(NODE node) is
-            throw new NotImplementedException("Visitor % does not define a visit method for node %" % Object{this, node});
+            throwNotImplemented("node", node);
         si
 
         // identifiers
 
         void visit(IDENTIFIER identifier) is
-            throw new NotImplementedException("Visitor % does not define a visit method for identifier %" % Object{this, identifier});
+            throwNotImplemented("identifier", identifier);
         si
 
         void visit(QUALIFIED_IDENTIFIER identifier) is
-            throw new NotImplementedException("Visitor % does not define a visit method for identifier %" % Object{this, identifier});
+            throwNotImplemented("qualified identifier", identifier);
         si
 
         // definitions
 
-        void visit(VARIABLE variable) is
-            throw new NotImplementedException("Visitor % does not define a visit method for variable %" % Object{this, variable});
-        si
-
-        void visit(VARIABLE_LIST variables) is
-            throw new NotImplementedException("Visitor % does not define a visit method for % variable list %" % Object{this, variables});
-        si
-
-        void visit(LET l) is
-            throw new NotImplementedException("Visitor % does not define a visit method for let %" % Object{this, l});
-        si
-
-        void visit(VAR v) is
-            throw new NotImplementedException("Visitor % does not define a visit method for var %" % Object{this, v});
-        si
-
         void visit(DEFINITION definition) is
-            throw new NotImplementedException("Visitor % does not define a visit method for definition %" % Object{this, definition});
+            throwNotImplemented("definition", definition);
         si
 
-        void visit(DEFINITION_LIST definitions) is
-            throw new NotImplementedException("Visitor % does not define a visit method for definition list %" % Object{this, definitions});
+        void visit(Definition.VARIABLE variable) is
+            throwNotImplemented("variable", variable);
+        si
+
+        void visit(Definition.VARIABLE_LIST variables) is
+            throwNotImplemented("variable list", variables);
+        si
+
+        void visit(Definition.LET l) is
+            throwNotImplemented("let", l);
+        si
+
+        void visit(Definition.VAR v) is
+            throwNotImplemented("var", v);
+        si
+
+        void visit(Definition.DEFINITION_LIST definitions) is
+            throwNotImplemented("definition list", definitions);
         si
 
         // types
 
         void visit(TYPE type) is
-            throw new NotImplementedException("Visitor % does not define a visit method for type %" % Object{this, type});
+            throwNotImplemented("type", type);
         si
 
-        void visit(BUILT_IN built_in) is
-            throw new NotImplementedException("Visitor % does not define a visit method for built in %" % Object{this, built_in});
+        void visit(Type.BUILT_IN built_in) is
+            throwNotImplemented("built id", built_in);
         si        
 
-        void visit(STRUCTURED structured) is
-            throw new NotImplementedException("Visitor % does not define a visit method for structured %" % Object{this, structured});
+        void visit(Type.STRUCTURED structured) is
+            throwNotImplemented("structured", structured);
         si
 
-        void visit(ARRAY array) is
-            throw new NotImplementedException("Visitor % does not define a visit method for array %" % Object{this, array});
+        void visit(Type.ARRAY array) is
+            throwNotImplemented("array", array);
         si
 
-        void visit(POINTER pointer) is
-            throw new NotImplementedException("Visitor % does not define a visit method for pointer %" % Object{this, pointer});
+        void visit(Type.POINTER pointer) is
+            throwNotImplemented("pointer", pointer);
         si
 
-        void visit(REFERENCE reference) is
-            throw new NotImplementedException("Visitor % does not define a visit method for reference %" % Object{this, reference});
+        void visit(Type.REFERENCE reference) is
+            throwNotImplemented("reference", reference);            
         si
 
-        void visit(NAMED named) is
-            throw new NotImplementedException("Visitor % does not define a visit method for named %" % Object{this, named});
+        void visit(Type.NAMED named) is
+            throwNotImplemented("named", named);
         si
 
-        void visit(GENERIC generic) is
-            throw new NotImplementedException("Visitor % does not define a visit method for generic %" % Object{this, generic});
-        si        
+        void visit(Type.TYPE_LIST types) is
+            throwNotImplemented("type list", types);
+        si
+
+        void visit(Type.GENERIC generic) is
+            throwNotImplemented("generic", generic);
+        si
+
+        void visit(Type.FUNCTION function) is
+            throwNotImplemented("function", function);
+        si
         
         // expressions
 
         void visit(EXPRESSION expression) is
-            throw new NotImplementedException("Visitor % does not define a visit method for expression %" % Object{this, expression});
+            throwNotImplemented("expression", expression);
         si
 
         void visit(Expression.IDENTIFIER identifier) is
-            throw new NotImplementedException("Visitor % does not define a visit method for identifier %" % Object{this, identifier});
+            throwNotImplemented("identifier", identifier);
         si
         
         void visit(Expression.NONE none) is
-            throw new NotImplementedException("Visitor % does not define a visit method for none %" % Object{this, none});
+            throwNotImplemented("none", none);
         si
 
         void visit(Expression.UNARY unary) is
-            throw new NotImplementedException("Visitor % does not define a visit method for unary %" % Object{this, unary});
+            throwNotImplemented("unary", unary);
         si
 
         void visit(Expression.BINARY binary) is
-            throw new NotImplementedException("Visitor % does not define a visit method for binary %" % Object{this, binary});
+            throwNotImplemented("binary", binary);
         si
     si
 si

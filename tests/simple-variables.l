@@ -11,6 +11,8 @@ var m: MAP[TOKEN,char ptr];
 
 var x, y;
 
+var f: (int, int) -> int;
+
 var x: int, y: bool;
 
 var q = none, p = none, r = none; var n = none;

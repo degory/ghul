@@ -70,6 +70,43 @@ namespace Syntax is
                     si,
                     Lexical.TOKEN.IDENTIFIER
                 );
+
+                add_parser(
+                    Tree.TYPE proc(CONTEXT context) is
+                        var start = context.location;
+
+                        context.next_token();
+
+                        Tree.Type.TYPE_LIST arguments;
+                        Tree.TYPE result;
+
+                        if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
+                            arguments = parse_type_list(context);
+                        else
+                            arguments = new Tree.Type.TYPE_LIST(start, new Tree.TYPE[0]);
+                        fi
+
+                        var end = context.location;
+
+                        context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+                        
+                        if context.current_token == Lexical.TOKEN.ARROW_THIN then
+                            context.next_token();
+
+                            result = parse(context);
+                            end = result.location;
+                        else 
+                            result = new Tree.Type.INFER(start..end);
+                        fi
+
+                        return new Tree.Type.FUNCTION(
+                            start..end,                            
+                            arguments,
+                            result
+                        ); 
+                    si,
+                    Lexical.TOKEN.PAREN_OPEN
+                );
             si
 
             Tree.TYPE parse(CONTEXT context) is
@@ -101,19 +138,24 @@ namespace Syntax is
                 od
             si
 
-            List<Tree.TYPE> parse_type_list(CONTEXT context) is                
-                var result = new Vector<Tree.TYPE>();
+            Tree.Type.TYPE_LIST parse_type_list(CONTEXT context) is                
+                var elements = new Vector<Tree.TYPE>();
+
+                var start = context.location;
+                LOCATION end = null;
 
                 do
                     var element = parse(context);
-                    result.add(element);
+                    elements.add(element);
+
+                    end = element.location;
 
                     if context.current_token != Lexical.TOKEN.COMMA then break; fi
 
                     context.next_token();
                 od
 
-                return result;
+                return new Tree.Type.TYPE_LIST(start..end, elements);
             si
         si
     si

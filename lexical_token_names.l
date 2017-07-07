@@ -15,8 +15,8 @@ namespace Lexical is
             names[TOKEN.AND] = "&";
             names[TOKEN.AND_THEN] = "&&";
             names[TOKEN.ARRAY_DEF] = "[]";
-            names[TOKEN.ARROW] = "->";
             names[TOKEN.ARROW_FAT] = "=>";
+            names[TOKEN.ARROW_THIN] = "->";
             names[TOKEN.ASSERT] = "";
             names[TOKEN.ASSIGN] = "=";
             names[TOKEN.AT] = "@";

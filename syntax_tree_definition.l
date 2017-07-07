@@ -38,7 +38,7 @@ namespace Syntax is
         si
       si
 
-      class VARIABLE_LIST isa DEFINITION do Iterable<VARIABLE> is
+      class VARIABLE_LIST isa NODE do Iterable<VARIABLE> is
         public List<VARIABLE> variables;
 
         void init(
