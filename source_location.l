@@ -149,7 +149,7 @@ namespace Source is
             _current_line = _current_line + 1;
         si
 
-        public get LOCATION location is
+        get LOCATION location is
             return new LOCATION(
                 _file_name,
 

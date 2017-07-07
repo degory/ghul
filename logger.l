@@ -20,7 +20,8 @@ namespace Logging is
                     location.start_line,
                     location.start_column,
                     location.end_line,
-                    location.end_column,
+                    // FIXME: VS code seems to expect +1 here - are we needlessly adjusting in prev_char?
+                    location.end_column + 1, 
 
                     severity,
                     message
@@ -43,5 +44,13 @@ namespace Logging is
         is
             write(location, "warn", message);
         si
+
+        void info(
+            LOCATION location,
+            String message
+        )
+        is
+            write(location, "info", message);
+        si        
     si
 si

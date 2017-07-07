@@ -32,7 +32,7 @@ namespace Syntax is
 
         accept(printer);
 
-        return "%: %" % Object{location, printer.result};
+        return printer.result;
       si
     si
 

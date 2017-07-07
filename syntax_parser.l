@@ -37,7 +37,6 @@ namespace Syntax is
                 else
                     return unexpected_token(context);
                 fi
-
             si
 
             T unexpected_token(CONTEXT context) is

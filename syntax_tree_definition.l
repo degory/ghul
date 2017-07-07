@@ -73,7 +73,7 @@ namespace Syntax is
           this.variables = variables;
         si 
 
-        public get Iterator<VARIABLE> Iterator is
+        get Iterator<VARIABLE> Iterator is
           return variables.Iterator;
         si
 
@@ -94,7 +94,7 @@ namespace Syntax is
           this.variables = variables;
         si     
 
-        public get Iterator<VARIABLE> Iterator is
+        get Iterator<VARIABLE> Iterator is
           return variables.Iterator;
         si
 

@@ -13,7 +13,7 @@ namespace Syntax is
           super.init(location);
         si
 
-        public get String name is
+        get String name is
           throw new NotImplementedException("% does not implement name" % Object{this});
         si
 
@@ -31,19 +31,25 @@ namespace Syntax is
       class VOID isa BUILT_IN is
         void init(LOCATION location) is super.init(location); si
 
-        public get String name is return "void"; si
+        get String name is return "void"; si
+      si
+
+      class UNDEFINED isa BUILT_IN is
+        void init(LOCATION location) is super.init(location); si
+
+        get String name is return "undefined"; si
       si
 
       class NONE isa BUILT_IN is
         void init(LOCATION location) is super.init(location); si
 
-        public get String name is return "none"; si
+        get String name is return "none"; si
       si
 
       class INFER isa TYPE is
         void init(LOCATION location) is super.init(location); si
 
-        public get String name is return "infer"; si
+        get String name is return "infer"; si
       si      
 
       class BOOL isa BUILT_IN is
@@ -51,7 +57,7 @@ namespace Syntax is
 
         get int size is return 1; si
 
-        public get String name is return "bool"; si
+        get String name is return "bool"; si
       si
 
       class BYTE isa INTEGER is
@@ -59,7 +65,7 @@ namespace Syntax is
 
         get int size is return 1; si
 
-        public get String name is return "byte"; si        
+        get String name is return "byte"; si        
       si
       
       class CHAR isa INTEGER is
@@ -67,7 +73,7 @@ namespace Syntax is
 
         get int size is return 1; si
 
-        public get String name is return "char"; si
+        get String name is return "char"; si
       si
 
       class INT isa INTEGER is
@@ -75,7 +81,7 @@ namespace Syntax is
 
         get int size is return 4; si
 
-        public get String name is return "int"; si      
+        get String name is return "int"; si      
       si
 
       class WORD isa INTEGER is
@@ -83,7 +89,7 @@ namespace Syntax is
 
         get int size is return 8; si
 
-        public get String name is return "word"; si        
+        get String name is return "word"; si        
       si
 
       class LONG isa INTEGER is
@@ -91,7 +97,7 @@ namespace Syntax is
 
         get int size is return 8; si
 
-        public get String name is return "long"; si                
+        get String name is return "long"; si                
       si
 
       class STRUCTURED isa TYPE is
@@ -103,7 +109,7 @@ namespace Syntax is
           this.element = element;
         si
 
-        public get int size is return 8; si
+        get int size is return 8; si
 
         void accept(Visitor visitor) is visitor.visit(this); si        
       si
@@ -169,7 +175,7 @@ namespace Syntax is
             this.name = name;
         si
 
-        public get int size is return 8; si
+        get int size is return 8; si
 
         void accept(Visitor visitor) is
           visitor.visit(this);

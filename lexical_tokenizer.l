@@ -204,7 +204,7 @@ namespace Lexical is
             _token_pair = new TOKEN_PAIR(TOKEN.UNKNOWN, location, null);
         si
 
-        bool is_end_of_file() is
+        get bool is_end_of_file is
             return end_of_file;
         si
 

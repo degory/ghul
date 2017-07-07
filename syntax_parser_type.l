@@ -44,7 +44,6 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
-                        context.next_token();
                         return new Tree.Type.WORD(context.location_and_next());
                     si,
                     Lexical.TOKEN.WORD); 
@@ -106,6 +105,7 @@ namespace Syntax is
                         else 
                             if !types.Iterator.hasMoreElements() then
                                 context.error(start..end, "tuple has no elements");
+                                return new Tree.Type.UNDEFINED(start..end);
                             else
                                 return new Tree.Type.TUPLE(
                                     start..end,
@@ -150,8 +150,8 @@ namespace Syntax is
             Tree.Type.TYPE_LIST parse_type_list(CONTEXT context) is                
                 var elements = new Vector<Tree.TYPE>();
 
-                var start = context.location;
-                LOCATION end = null;
+                var start = context.location;                
+                var end = context.location;
 
                 do
                     var element = parse(context);
@@ -166,6 +166,12 @@ namespace Syntax is
 
                 return new Tree.Type.TYPE_LIST(start..end, elements);
             si
+
+            Tree.TYPE unexpected_token(CONTEXT context) is
+                super.unexpected_token(context);
+
+                return new Tree.Type.UNDEFINED(context.location);
+            si            
         si
     si
 si

@@ -40,6 +40,30 @@ namespace Syntax is
                 return result;
             si
 
+            void skip_token(List<Lexical.TOKEN> tokens) is
+                var start = location;
+
+                do
+                    if is_end_of_file then
+                        error(start..location, "unexpected input at end of file " % Object{Lexical.TOKEN_NAMES[current_token]});
+                        return;
+                    elif tokens.contains(current_token) then
+                        error(start..location, "ignored unexpected input" % Object{Lexical.TOKEN_NAMES[current_token]});
+                        
+                        next_token();
+                        return;
+                    else
+                        next_token();
+                    fi
+                od
+            si
+
+            void skip_token(Lexical.TOKEN token) is
+                var t = new Vector<Lexical.TOKEN>();
+                t.add(token);                
+                skip_token(t);
+            si
+
             get LOCATION location is
                 return tokenizer.current.location;
             si
@@ -50,6 +74,10 @@ namespace Syntax is
 
             get String current_string is
                 return tokenizer.current.string;
+            si
+
+            get bool is_end_of_file is
+                return tokenizer.is_end_of_file;
             si
 
             public bool expect_token(Lexical.TOKEN token) is

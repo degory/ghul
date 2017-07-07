@@ -26,20 +26,25 @@ namespace Test is
                         logger
                     );
 
-                    for var done = false; !done; do
+                    var i = 0;
+
+                    while !context.is_end_of_file do
+                        // IO.Std.err.printlcn("not end of file, next token is: " + Lexical.TOKEN_NAMES[context.current_token]);
+
                         var definition = context.parse_definition();
 
-                        context.next_token(Lexical.TOKEN.SEMICOLON);    
-
                         if definition != null then
-                            IO.Std.err.println(definition);
+                            logger.info(definition.location, "read definition %" % Object{definition});
+                            context.next_token(Lexical.TOKEN.SEMICOLON);
                         else
-                            done = true;
+                            context.skip_token(Lexical.TOKEN.SEMICOLON);
                         fi
+
+                        i = i + 1;
                     od
                 od
             catch Exception e
-                IO.Std.err.println(e);                
+                IO.Std.err.println(e);            
             yrt
         si
     si
