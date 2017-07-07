@@ -73,17 +73,18 @@ namespace Syntax is
 
                 add_parser(
                     Tree.TYPE proc(CONTEXT context) is
+                        // could be function or tuple
+
                         var start = context.location;
 
                         context.next_token();
 
-                        Tree.Type.TYPE_LIST arguments;
-                        Tree.TYPE result;
+                        Tree.Type.TYPE_LIST types;
 
                         if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
-                            arguments = parse_type_list(context);
+                            types = parse_type_list(context);
                         else
-                            arguments = new Tree.Type.TYPE_LIST(start, new Tree.TYPE[0]);
+                            types = new Tree.Type.TYPE_LIST(start, new Tree.TYPE[0]);
                         fi
 
                         var end = context.location;
@@ -93,17 +94,25 @@ namespace Syntax is
                         if context.current_token == Lexical.TOKEN.ARROW_THIN then
                             context.next_token();
 
-                            result = parse(context);
+                            var result = parse(context);
                             end = result.location;
-                        else 
-                            result = new Tree.Type.INFER(start..end);
-                        fi
 
-                        return new Tree.Type.FUNCTION(
-                            start..end,                            
-                            arguments,
-                            result
-                        ); 
+                            return new Tree.Type.FUNCTION(
+                                start..end,                            
+                                types,
+                                result
+                            ); 
+                            
+                        else 
+                            if !types.Iterator.hasMoreElements() then
+                                context.error(start..end, "tuple has no elements");
+                            else
+                                return new Tree.Type.TUPLE(
+                                    start..end,
+                                    types
+                                );
+                            fi
+                        fi
                     si,
                     Lexical.TOKEN.PAREN_OPEN
                 );

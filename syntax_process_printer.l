@@ -131,6 +131,14 @@ namespace Syntax is
                 fi
             si
 
+            void visit(TUPLE tuple) is
+                _result.append("(");
+
+                tuple.elements.accept(this);
+
+                _result.append(")");
+            si            
+
             void visit(TYPE_LIST types) is
                 var seen_any = false;
                 foreach var t; types.elements do

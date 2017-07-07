@@ -148,6 +148,19 @@ namespace Syntax is
         si
       si
 
+      class TUPLE isa TYPE is
+        public TYPE_LIST elements;
+
+        void init(LOCATION location, TYPE_LIST elements) is
+          super.init(location);
+          this.elements = elements; 
+        si
+
+        void accept(Visitor visitor) is
+          visitor.visit(this);
+        si
+      si
+
       class NAMED isa TYPE is
         public IDENTIFIER name;
 

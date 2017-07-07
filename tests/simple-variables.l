@@ -11,7 +11,25 @@ var m: MAP[TOKEN,char ptr];
 
 var x, y;
 
-var f: (int, int) -> int;
+var function1: (int, int) -> int;
+
+var function2: () -> word;
+
+var return_tuple: (word, word) -> (word, word);
+
+var return_function_return_tuplie: 
+    (String, LIST[String]) ->
+        (String[], MAP[TOKEN, int]) ->
+            (int, THING[int], word[]);
+
+var some_tuple: (int, int);
+
+var should_error: ();
+
+var should_error[];
+
+var should_error: MAP[];
+
 
 var x: int, y: bool;
 

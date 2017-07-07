@@ -96,6 +96,10 @@ namespace Syntax is
             throwNotImplemented("function", function);
         si
         
+        void visit(Type.TUPLE tuple) is
+            throwNotImplemented("tuple", tuple);
+        si
+
         // expressions
 
         void visit(EXPRESSION expression) is
