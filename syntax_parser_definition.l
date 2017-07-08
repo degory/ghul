@@ -1,5 +1,6 @@
 namespace Syntax is
     namespace Parser is
+        use System;
         use Generic;
 
         use Source;
@@ -9,19 +10,23 @@ namespace Syntax is
                 super.init();
             si
 
+            get String description is
+                return "definition";
+            si
+
             Tree.DEFINITION parse(CONTEXT context) is
                 case context.current_token
                 is Lexical.TOKEN.LET: return parse_let(context);
                 is Lexical.TOKEN.VAR: return parse_var(context);
                 esac
 
-                context.expect_token({Lexical.TOKEN.LET, Lexical.TOKEN.VAR});                
+                context.expect_token({Lexical.TOKEN.LET, Lexical.TOKEN.VAR}, syntax_error_message);                
             si
 
             Tree.Definition.LET parse_let(CONTEXT context) is
                 var start = context.location;
 
-                if context.next_token(Lexical.TOKEN.LET) then
+                if context.next_token(Lexical.TOKEN.LET, syntax_error_message) then
                     var variable_list = parse_variable_list(context, false);
 
                     return new Tree.Definition.LET(start..variable_list.location, variable_list);
@@ -31,7 +36,7 @@ namespace Syntax is
             Tree.Definition.VAR parse_var(CONTEXT context) is
                 var start = context.location;
 
-                if context.next_token(Lexical.TOKEN.VAR) then
+                if context.next_token(Lexical.TOKEN.VAR, syntax_error_message) then
                     var variable_list = parse_variable_list(context, false);
 
                     return new Tree.Definition.VAR(start..variable_list.location, variable_list);
@@ -65,7 +70,7 @@ namespace Syntax is
             Tree.Definition.VARIABLE parse_variable(CONTEXT context) is
                 var start = context.location;
 
-                if context.expect_token(Lexical.TOKEN.IDENTIFIER) then
+                if context.expect_token(Lexical.TOKEN.IDENTIFIER, syntax_error_message) then
                     var identifier = context.parse_unqualified_identifier();
                     var end = identifier.location;
                     

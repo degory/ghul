@@ -48,3 +48,18 @@ var blah: int = thing.field + other.thing.field;
 
 var tuple = (a, b, c);
 
+let fresult = function(x, y, y);
+
+let paren = (a + b) * (c + d);
+
+let foftuple = function((a, b, c));
+
+let index_tuple = (a, b)[c];
+
+let member_tuple = (a, b).b;
+
+let typed = (a: int, b:int);
+
+
+
+

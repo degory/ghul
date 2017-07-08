@@ -10,13 +10,27 @@ namespace Syntax is
         interface Parser<T> is
             T parse(CONTEXT context);
         si
-
+        
         class PARSER<T> do Parser<T> is
             Generic.Map<Lexical.TOKEN,T proc(CONTEXT)> parsers;
             Iterable<Lexical.TOKEN> expected_tokens;
 
             void init() is
                 parsers = new Generic.Map<Lexical.TOKEN, T proc(CONTEXT)>();
+            si
+
+            get String description is
+                return null;
+            si
+
+            get String syntax_error_message is
+                var d = description;
+
+                if d != null then
+                    return "in " + d;
+                else
+                    return "syntax error";
+                fi
             si
 
             void add_parser(T proc(CONTEXT) p, Lexical.TOKEN token) is
@@ -44,8 +58,9 @@ namespace Syntax is
                     populate_expected_tokens();
                 fi                    
 
-                context.error(context.location, "syntax error: expected % but found %" 
+                context.error(context.location, "%: expected % but found %" 
                     % Object{
+                        syntax_error_message,
                         Lexical.TOKEN_NAMES[expected_tokens],
                         Lexical.TOKEN_NAMES[context.current_token]});
             si

@@ -60,7 +60,7 @@ namespace Syntax is
                             var types = parse_type_list(context);
 
                             var result = new Tree.Type.GENERIC(start..context.location, identifier, types);
-                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
+                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE, syntax_error_message);
 
                             return result;
                         else
@@ -88,7 +88,7 @@ namespace Syntax is
 
                         var end = context.location;
 
-                        context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+                        context.next_token(Lexical.TOKEN.PAREN_CLOSE, syntax_error_message);
                         
                         if context.current_token == Lexical.TOKEN.ARROW_THIN then
                             context.next_token();
@@ -117,6 +117,10 @@ namespace Syntax is
                     Lexical.TOKEN.PAREN_OPEN
                 );
             si
+
+            get String description is
+                return "type";
+            si                        
 
             Tree.TYPE parse(CONTEXT context) is
                 var result = super.parse(context);

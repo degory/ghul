@@ -34,14 +34,16 @@ namespace Test is
                         var definition = context.parse_definition();
 
                         if definition != null then
-                            logger.info(definition.location, "read definition %" % Object{definition});
-                            context.next_token(Lexical.TOKEN.SEMICOLON);
+                            logger.info(definition.location, "read definition \"%\"" % Object{definition});
+                            context.next_token(Lexical.TOKEN.SEMICOLON, "in definition statement");
                         else
-                            context.skip_token(Lexical.TOKEN.SEMICOLON);
+                            context.skip_token(Lexical.TOKEN.SEMICOLON, "in definition statement");
                         fi
 
                         i = i + 1;
                     od
+
+                    logger.info(context.location, "finished");
                 od
             catch Exception e
                 IO.Std.err.println(e);            

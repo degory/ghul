@@ -162,6 +162,14 @@ namespace Syntax is
                 identifier.identifier.accept(this);
             si
 
+            void visit(Expression.TYPED typed) is
+                typed.identifier.accept(this);
+
+                _result.append(": ");
+
+                typed.type.accept(this);
+            si
+
             void visit(Expression.TUPLE tuple) is
                 _result.append('(');
 

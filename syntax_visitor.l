@@ -110,6 +110,10 @@ namespace Syntax is
             throwNotImplemented("identifier", identifier);
         si
         
+        void visit(Expression.TYPED typed) is
+            throwNotImplemented("typed", typed);
+        si
+
         void visit(Expression.NONE none) is
             throwNotImplemented("none", none);
         si
@@ -137,5 +141,9 @@ namespace Syntax is
         void visit(Expression.BINARY binary) is
             throwNotImplemented("binary", binary);
         si
+
+        void visit(Expression.EXPRESSION_LIST expressions) is
+            throwNotImplemented("expression list", expressions);
+        si        
     si
 si

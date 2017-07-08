@@ -47,6 +47,10 @@ namespace Syntax is
                 operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR;                
             si
 
+            get String description is
+                return "expression";
+            si
+
             Tree.EXPRESSION parse(CONTEXT context) is
                 return parse(
                     context,
@@ -100,6 +104,7 @@ namespace Syntax is
 
                 do
                     var expression = context.parse_expression();
+
                     expressions.add(expression);
 
                     if context.current_token != Lexical.TOKEN.COMMA then
@@ -186,6 +191,10 @@ namespace Syntax is
                         context.parse_unqualified_identifier()
                     );                            
                 si
+
+                get String description is
+                    return "definition";
+                si                
             si
 
             class SECONDARY isa PARSER<Tree.EXPRESSION> is
@@ -193,6 +202,10 @@ namespace Syntax is
                     super.init();
                 si
 
+                get String description is
+                    return "secondary expression";
+                si
+                
                 Tree.EXPRESSION parse(CONTEXT context) is
                     var start = context.location;
                     Tree.EXPRESSION result = context.parse_expression_primary();
@@ -205,28 +218,30 @@ namespace Syntax is
 
                             if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
                                 arguments = context.parse_expression_list();
-                            else
+                           else
                                 arguments = new Tree.Expression.EXPRESSION_LIST(context.location, new Vector<Tree.EXPRESSION>());
                             fi
 
                             result = new Tree.Expression.CALL(start..context.location, result, arguments);
-                            context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+                            
+                            context.next_token(Lexical.TOKEN.PAREN_CLOSE, syntax_error_message);
 
                         is Lexical.TOKEN.SQUARE_OPEN:
                             context.next_token();
                             var index = context.parse_expression();
 
                             result = new Tree.Expression.INDEX(start..context.location, result, index);
-                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
+                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE, syntax_error_message);
 
                         is Lexical.TOKEN.DOT:
                             context.next_token();
 
                             var member = context.parse_expression_identifier();
+                            
                             result = new Tree.Expression.MEMBER(start..member.location, result, member);
 
                         default:
-                            break;
+                            return result;
 
                         esac
                     od
@@ -238,11 +253,13 @@ namespace Syntax is
                     super.init();
                 si
 
+                get String description is
+                    return "tuple";
+                si                
+
                 Tree.Expression.TUPLE parse(CONTEXT context) is                    
                     var start = context.location;
-                    if context.next_token(Lexical.TOKEN.PAREN_OPEN) then
-                        context.next_token();
-
+                    if context.next_token(Lexical.TOKEN.PAREN_OPEN, syntax_error_message) then
                         Tree.Expression.EXPRESSION_LIST expressions;
 
                         if context.current_token != Lexical.TOKEN.PAREN_CLOSE then
@@ -251,7 +268,7 @@ namespace Syntax is
                             expressions = new Tree.Expression.EXPRESSION_LIST(context.location, new Vector<Tree.EXPRESSION>());
                         fi
                         
-                        context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+                        context.next_token(Lexical.TOKEN.PAREN_CLOSE, syntax_error_message);
 
                         return new Tree.Expression.TUPLE(start..context.location, expressions);
                     fi                    
@@ -268,7 +285,12 @@ namespace Syntax is
                         si,
                         Lexical.TOKEN.NONE
                     );
-                si          
+                si    
+
+                get String description is
+                    return "literal";
+                si
+                          
             si
         si
     si

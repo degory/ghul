@@ -41,15 +41,15 @@ namespace Syntax is
                 return result;
             si
 
-            void skip_token(List<Lexical.TOKEN> tokens) is
+            void skip_token(List<Lexical.TOKEN> tokens, String message) is
                 var start = location;
 
                 do
                     if is_end_of_file then
-                        error(start..location, "unexpected input at end of file " % Object{Lexical.TOKEN_NAMES[current_token]});
+                        error(start..location, "%: expected %" % Object{message, Lexical.TOKEN_NAMES[current_token]});
                         return;
                     elif tokens.contains(current_token) then
-                        error(start..location, "ignored unexpected input" % Object{Lexical.TOKEN_NAMES[current_token]});
+                        error(start..location, "%: expected %" % Object{message, Lexical.TOKEN_NAMES[current_token]});
                         
                         next_token();
                         return;
@@ -59,10 +59,10 @@ namespace Syntax is
                 od
             si
 
-            void skip_token(Lexical.TOKEN token) is
+            void skip_token(Lexical.TOKEN token, String message) is
                 var t = new Vector<Lexical.TOKEN>();
                 t.add(token);                
-                skip_token(t);
+                skip_token(t, message);
             si
 
             get LOCATION location is
@@ -81,12 +81,28 @@ namespace Syntax is
                 return tokenizer.is_end_of_file;
             si
 
-            public bool expect_token(Lexical.TOKEN token) is
+            public bool expect_token(Lexical.TOKEN token, String message) is
                 if current_token != token then
                     error(
                         location,
-                        "syntax error: expected % but found %"
-                            % Object{Lexical.TOKEN_NAMES[token], Lexical.TOKEN_NAMES[current_token]});
+                        "%: expected % but found %"
+                            % Object{message, Lexical.TOKEN_NAMES[token], Lexical.TOKEN_NAMES[current_token]});
+                    return false;
+                else
+                    return true;
+                fi
+            si
+
+            public bool expect_token(Lexical.TOKEN token) is
+                return expect_token(token, "syntax error");
+            si
+
+            public bool expect_token(List<Lexical.TOKEN> tokens, String message) is
+                if !tokens.contains(current_token) then
+                    error(
+                        location,
+                        "%: expected % but found %"
+                            % Object{message, Lexical.TOKEN_NAMES[tokens], Lexical.TOKEN_NAMES[current_token]});
                     return false;
                 else
                     return true;
@@ -94,32 +110,32 @@ namespace Syntax is
             si
 
             public bool expect_token(List<Lexical.TOKEN> tokens) is
-                if !tokens.contains(current_token) then
-                    error(
-                        location,
-                        "syntax error: expected % but found %"
-                            % Object{Lexical.TOKEN_NAMES[tokens], Lexical.TOKEN_NAMES[current_token]});
-                    return false;
-                else
-                    return true;
-                fi
-            si            
+                return expect_token(tokens, "syntax error");
+            si
 
-            public bool next_token(Lexical.TOKEN token) is
-                if expect_token(token) then
+            public bool next_token(Lexical.TOKEN token, String message) is
+                if expect_token(token, message) then
                     next_token();
 
                     return true;
                 fi
+            si
+
+            public bool next_token(List<Lexical.TOKEN> tokens, String message) is
+                if expect_token(tokens, message) then
+                    next_token();
+
+                    return true;
+                fi
+            si
+
+            public bool next_token(Lexical.TOKEN token) is
+                return next_token(token, "syntax error");
             si
 
             public bool next_token(List<Lexical.TOKEN> tokens) is
-                if expect_token(tokens) then
-                    next_token();
-
-                    return true;
-                fi
-            si
+                return next_token(tokens, "syntax error");
+            si            
 
             public void error(LOCATION location, String message) is
                 logger.error(location, message);
