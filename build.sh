@@ -1,3 +1,3 @@
 #!/bin/bash
 cd /build/source/rewrite
-lc test_definitions.l
+find main logging source lexical syntax -name '*.l' | xargs lc
