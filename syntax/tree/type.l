@@ -195,6 +195,22 @@ namespace Syntax is
         si        
       si
 
+      class NAMED_TUPLE_ELEMENT isa TYPE is
+        public IDENTIFIER name;
+        public TYPE type;
+
+        void init(LOCATION location, IDENTIFIER name, TYPE type) is
+          super.init(location);
+
+          this.name = name;
+          this.type = type;
+        si
+
+        void accept(Visitor visitor) is
+          visitor.visit(this);
+        si
+      si
+
       class TYPE_LIST isa NODE do Iterable<TYPE> is
         public Iterable<TYPE> elements;
 

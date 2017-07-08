@@ -100,6 +100,10 @@ namespace Syntax is
             throwNotImplemented("tuple", tuple);
         si
 
+        void visit(Type.NAMED_TUPLE_ELEMENT element) is
+            throwNotImplemented("name tuple element", element);
+        si
+
         // expressions
 
         void visit(EXPRESSION expression) is
@@ -110,8 +114,8 @@ namespace Syntax is
             throwNotImplemented("identifier", identifier);
         si
         
-        void visit(Expression.TYPED typed) is
-            throwNotImplemented("typed", typed);
+        void visit(Expression.VARIABLE variable) is
+            throwNotImplemented("variable", variable);
         si
 
         void visit(Expression.NONE none) is

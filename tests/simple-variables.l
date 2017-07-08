@@ -60,6 +60,18 @@ let member_tuple = (a, b).b;
 
 let typed = (a: int, b:int);
 
+var tuple_named_elements: (a: int, b:int);
+
+var tuple_anon_elements: (int, int);
+
+var function_named_args: (a: int, b: int) -> int;
+
+var func_return_tuple_named_elements: (int, int) -> (a: int, b: int);
+
+var func_return_tuple_named_elements: (x: int, y: int) -> (a: int, b: int); // = (x: int, y: int) => (a: int = none, b: int = none);
+
+var tuple_named_values: (a: int, b: int) = (a = c = c = none, b = none);
+
 
 
 

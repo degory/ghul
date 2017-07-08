@@ -2,8 +2,6 @@ namespace Syntax is
     namespace Process is
         use System;
         use Tree;
-        use Tree.Definition;
-        use Tree.Type;
 
         class PRINTER isa Visitor is
             StringBuffer _result;
@@ -38,7 +36,7 @@ namespace Syntax is
 
             // definitions
 
-            void visit(VARIABLE variable) is
+            void visit(Definition.VARIABLE variable) is
                 variable.identifier.accept(this);
 
                 // FIXME: not OOP
@@ -53,7 +51,7 @@ namespace Syntax is
                 fi
             si
 
-            void visit(VARIABLE_LIST variables) is
+            void visit(Definition.VARIABLE_LIST variables) is
                 var first = true;
 
                 foreach var v; variables do
@@ -65,19 +63,19 @@ namespace Syntax is
                 od
             si
 
-            void visit(LET l) is
+            void visit(Definition.LET l) is
                 _result.append("let ");
                 l.variables.accept(this);
                 _result.append(";");
             si
 
-            void visit(VAR v) is
+            void visit(Definition.VAR v) is
                 _result.append("var ");
                 v.variables.accept(this);
                 _result.append(";");
             si
 
-            void visit(DEFINITION_LIST definitions) is
+            void visit(Definition.DEFINITION_LIST definitions) is
                 foreach var d; definitions do
                     d.accept(this);
                     _result.append('\n');
@@ -86,30 +84,30 @@ namespace Syntax is
 
             // types
 
-            void visit(BUILT_IN type) is
+            void visit(Type.BUILT_IN type) is
                 _result.append(type.name);
             si
 
-            void visit(ARRAY array) is
+            void visit(Type.ARRAY array) is
                 array.element.accept(this);
                 _result.append("[]");
             si
 
-            void visit(POINTER pointer) is
+            void visit(Type.POINTER pointer) is
                 pointer.element.accept(this);
                 _result.append(" ptr");
             si
 
-            void visit(REFERENCE reference) is
+            void visit(Type.REFERENCE reference) is
                 reference.element.accept(this);
                 _result.append(" ref");
             si
 
-            void visit(NAMED named) is
+            void visit(Type.NAMED named) is
                 named.name.accept(this);
             si
 
-            void visit(GENERIC generic) is
+            void visit(Type.GENERIC generic) is
                 generic.name.accept(this);
                 _result.append('[');
 
@@ -118,28 +116,34 @@ namespace Syntax is
                 _result.append(']');
             si
 
-            void visit(FUNCTION function) is
+            void visit(Type.FUNCTION function) is
                 _result.append("(");
 
                 function.arguments.accept(this);
 
                 _result.append(")");
 
-                if !isa INFER(function.result) then
+                if !isa Type.INFER(function.result) then
                     _result.append(" -> ");
                     function.result.accept(this);
                 fi
             si
 
-            void visit(TUPLE tuple) is
+            void visit(Type.TUPLE tuple) is
                 _result.append("(");
 
                 tuple.elements.accept(this);
 
                 _result.append(")");
-            si            
+            si
 
-            void visit(TYPE_LIST types) is
+            void visit(Type.NAMED_TUPLE_ELEMENT element) is
+                element.name.accept(this);
+                _result.append(": ");
+                element.type.accept(this);
+            si      
+
+            void visit(Type.TYPE_LIST types) is
                 var seen_any = false;
                 foreach var t; types.Iterator do
                     if seen_any then
@@ -162,12 +166,20 @@ namespace Syntax is
                 identifier.identifier.accept(this);
             si
 
-            void visit(Expression.TYPED typed) is
-                typed.identifier.accept(this);
+            void visit(Expression.VARIABLE variable) is
+                variable.identifier.accept(this);
 
-                _result.append(": ");
+                if !isa Type.INFER(variable.type) then
+                    _result.append(": ");
 
-                typed.type.accept(this);
+                    variable.type.accept(this);
+                fi
+
+                if variable.initializer != null then
+                    _result.append( " = ");
+
+                    variable.initializer.accept(this);
+                fi
             si
 
             void visit(Expression.TUPLE tuple) is

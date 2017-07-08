@@ -103,7 +103,9 @@ namespace Syntax is
                 var expressions = new Vector<Tree.EXPRESSION>();
 
                 do
+                    context.allow_tuple_element = true;
                     var expression = context.parse_expression();
+                    context.allow_tuple_element = false;
 
                     expressions.add(expression);
 
@@ -147,21 +149,50 @@ namespace Syntax is
 
                     add_parser(
                         Tree.Expression.PRIMARY proc(CONTEXT context) is
-                            
+                            var start = context.location;
+
                             var identifier = parse_identifier(context);
 
-                            // maybe we're in the arguments list of a function literal?                          
-                            if context.current_token == Lexical.TOKEN.COLON then
-                                context.next_token();
+                            // FIXME:
+                            if context.allow_tuple_element && !isa Tree.QUALIFIED_IDENTIFIER(identifier.identifier) then
+                                context.allow_tuple_element = false;
+                                
+                                var end = identifier.location;
+                                
+                                Tree.TYPE type;
+                                Tree.EXPRESSION initializer;
 
-                                return new Tree.Expression.TYPED(
-                                    context.location,
-                                    identifier,
-                                    context.parse_type()
-                                );
-                            else
-                                return identifier;
+                                if context.current_token == Lexical.TOKEN.COLON then
+                                    context.next_token();
+
+                                    type = context.parse_type();
+                                    end = type.location;
+                                fi
+
+                                if context.current_token == Lexical.TOKEN.ASSIGN then
+                                    context.next_token();
+
+                                    initializer = context.parse_expression();
+                                    end = initializer.location;
+                                fi
+
+                                if initializer != null then
+                                    if type == null then
+                                        type = new Tree.Type.INFER(context.location);
+                                    fi
+                                fi
+
+                                if type != null then
+                                    return new Tree.Expression.VARIABLE(
+                                        start..end,
+                                        identifier.identifier,
+                                        type,
+                                        initializer
+                                    );
+                                fi
                             fi
+
+                            return identifier;
                         si,
                         Lexical.TOKEN.IDENTIFIER
                     );

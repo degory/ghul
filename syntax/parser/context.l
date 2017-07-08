@@ -24,10 +24,12 @@ namespace Syntax is
             static Expression.SECONDARY expression_secondary_parser = new Expression.SECONDARY();
             static Expression.TUPLE expression_tuple_parser = new Expression.TUPLE();
 
+            public bool allow_tuple_element;
+
             public Lexical.TOKENIZER tokenizer;
 
             public LOGGER logger;
-
+            
             bool next_token() is
                 return tokenizer.next();
             si

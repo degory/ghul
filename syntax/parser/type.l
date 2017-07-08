@@ -54,6 +54,14 @@ namespace Syntax is
 
                         var identifier = context.parse_qualified_identifier();
 
+                        if !isa Tree.QUALIFIED_IDENTIFIER(identifier) && context.current_token == Lexical.TOKEN.COLON then
+                            context.next_token();
+
+                            var type = parse(context);
+
+                            return new Tree.Type.NAMED_TUPLE_ELEMENT(start..type.location, identifier, type);
+                        fi
+
                         if context.current_token == Lexical.TOKEN.SQUARE_OPEN then
                             context.next_token();
 

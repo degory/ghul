@@ -119,20 +119,25 @@ namespace Syntax is
                 si
             si
 
-            class TYPED isa PRIMARY is
-                public IDENTIFIER identifier;
+            // FIXME: not really sure how this relates to a variable definition
+            // is it exactly the same thing?
+            class VARIABLE isa PRIMARY is
+                public Tree.IDENTIFIER identifier;
                 public TYPE type;
+                public EXPRESSION initializer;
 
                 void init(
                     LOCATION location,
-                    IDENTIFIER identifier,
-                    TYPE type
+                    Tree.IDENTIFIER identifier,
+                    TYPE type,
+                    EXPRESSION initializer
                 )
                 is
                     super.init(location);
 
                     this.identifier = identifier; 
                     this.type = type;
+                    this.initializer = initializer;
                 si
 
                 void accept(Visitor visitor) is
