@@ -48,6 +48,8 @@ var blah: int = thing.field + other.thing.field;
 
 var tuple = (a, b, c);
 
+let generic_of_tuple: Iterable[(key: K, value: V)] = [(a, b), (b, c)];
+
 let fresult = function(x, y, y);
 
 let paren = (a + b) * (c + d);

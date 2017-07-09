@@ -215,6 +215,24 @@ namespace Syntax is
                 si
             si
 
+            class LIST isa PRIMARY is
+                public EXPRESSION_LIST elements;
+
+                void init(
+                    LOCATION location,
+                    EXPRESSION_LIST elements
+                )
+                is
+                    super.init(location);
+
+                    this.elements = elements;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si
+            si
+
             class LITERAL isa PRIMARY is
                 public String value;
 

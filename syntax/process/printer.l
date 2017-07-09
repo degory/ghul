@@ -204,6 +204,14 @@ namespace Syntax is
                 _result.append(')');
             si
 
+            void visit(Expression.LIST list) is
+                _result.append('[');
+
+                list.elements.accept(this);
+
+                _result.append(']');
+            si            
+
             void visit(Expression.CALL call) is
                 call.function.accept(this);
 

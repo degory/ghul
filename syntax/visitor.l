@@ -130,6 +130,10 @@ namespace Syntax is
             throwNotImplemented("tuple", tuple);
         si
 
+        void visit(Expression.LIST list) is
+            throwNotImplemented("list", list);
+        si        
+
         void visit(Expression.CALL call) is
             throwNotImplemented("call", call);
         si

@@ -199,6 +199,25 @@ namespace Syntax is
 
                     add_parser(
                         Tree.Expression.PRIMARY proc(CONTEXT context) is
+                            var start = context.location;
+
+                            context.next_token();
+
+                            var elements = context.parse_expression_list();
+                            var end = context.location;
+
+                            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
+
+                            return new Tree.Expression.LIST(
+                                start..end,
+                                elements
+                            );
+                        si,
+                        Lexical.TOKEN.SQUARE_OPEN
+                    );
+                    
+                    add_parser(
+                        Tree.Expression.PRIMARY proc(CONTEXT context) is
                             return context.parse_expression_tuple();
                         si,
                         Lexical.TOKEN.PAREN_OPEN
