@@ -271,6 +271,52 @@ namespace Syntax is
                             
                             result = new Tree.Expression.MEMBER(start..member.location, result, member);
 
+                        is Lexical.TOKEN.ARROW_THIN, Lexical.TOKEN.ARROW_FAT:
+                            if
+                                isa Tree.Expression.TUPLE(result) || 
+                                isa Tree.Expression.IDENTIFIER(result)
+                            then
+                                Tree.TYPE type;
+                                Tree.Expression.TUPLE arguments;
+
+                                if context.current_token == Lexical.TOKEN.ARROW_THIN then
+                                    context.next_token();
+                                    type = context.parse_type();
+                                else
+                                    type = new Tree.Type.INFER(start..result.location);
+                                fi
+
+                                if context.next_token(Lexical.TOKEN.ARROW_FAT) then
+                                    if isa Tree.Expression.TUPLE(result) then
+                                        arguments = cast Tree.Expression.TUPLE(result);
+                                    else
+                                        var elements = new Vector<Tree.EXPRESSION>();
+                                        elements.add(result);
+                                        arguments = new Tree.Expression.TUPLE(
+                                            start..result.location,
+                                            new Tree.Expression.EXPRESSION_LIST(
+                                                start..result.location,
+                                                elements
+                                            )
+                                        );
+                                    fi
+
+                                    var body = context.parse_expression();
+
+                                    return new Tree.Expression.FUNCTION(
+                                        start..body.location,
+                                        arguments,
+                                        type,
+                                        body
+                                    );
+                                fi
+                            fi
+
+                            unexpected_token(context);
+                            return new Tree.Expression.NONE(
+                                start..context.location
+                            );
+
                         default:
                             return result;
 

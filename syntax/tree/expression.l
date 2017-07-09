@@ -243,6 +243,29 @@ namespace Syntax is
                 si                                
             si
 
+            class FUNCTION isa PRIMARY is
+                public TUPLE arguments;
+                public TYPE type;
+                public EXPRESSION body;
+
+                void init(
+                    LOCATION location,
+                    TUPLE arguments,
+                    TYPE type,                    
+                    EXPRESSION body)
+                is
+                    super.init(location);
+
+                    this.arguments = arguments;
+                    this.type = type;
+                    this.body = body;
+                si
+
+                void accept(Visitor visitor) is
+                    visitor.visit(this);
+                si                
+            si
+
             class CALL isa PRIMARY is
                 public EXPRESSION function;
                 public EXPRESSION_LIST arguments;

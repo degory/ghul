@@ -182,6 +182,20 @@ namespace Syntax is
                 fi
             si
 
+            void visit(Syntax.Tree.Expression.FUNCTION function) is
+                function.arguments.accept(this);
+
+                if !isa Type.INFER(function.type) then
+                    _result.append(" -> ");
+
+                    function.type.accept(this);
+                fi
+
+                _result.append(" => ");
+
+                function.body.accept(this);
+            si
+
             void visit(Expression.TUPLE tuple) is
                 _result.append('(');
 

@@ -9,7 +9,7 @@ namespace Syntax is
         si
 
         private void throwNotImplemented(String name, NODE node) is
-            throw new NotImplementedException("Visitor % does not define a visit method for % %" % Object{this, name, Object.dump(node)});
+            throw new NotImplementedException("Visitor % does not define a visit method for % % and/or this node does not accept this visitor" % Object{this, name, Object.dump(node)});
         si
 
         // node
@@ -121,6 +121,10 @@ namespace Syntax is
         void visit(Expression.NONE none) is
             throwNotImplemented("none", none);
         si
+
+        void visit(Syntax.Tree.Expression.FUNCTION function) is
+            throwNotImplemented("function", function);
+        si        
 
         void visit(Expression.TUPLE tuple) is
             throwNotImplemented("tuple", tuple);
