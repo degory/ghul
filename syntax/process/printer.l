@@ -140,6 +140,7 @@ namespace Syntax is
                 fi
 
                 if property.getter_body != null then
+                    _result.append(' ');
                     property.getter_body.accept(this);
 
                     if property.setter_body != null then
@@ -150,6 +151,7 @@ namespace Syntax is
                 if property.setter_body != null then
                     _result.append(" = ");
                     property.setter_argument.accept(this);
+                    _result.append(' ');
 
                     property.setter_body.accept(this);
                 fi
@@ -360,7 +362,7 @@ namespace Syntax is
             si
 
             void visit(Statement.EXPRESSION expression) is
-                expression.accept(this);
+                expression.expression.accept(this);
                 _result.append(";");
             si
 
@@ -373,6 +375,17 @@ namespace Syntax is
             void visit(Statement.VAR v) is
                 _result.append("var ");
                 v.variables.accept(this);
+                _result.append(";");
+            si
+
+            void visit(Statement.RETURN r) is
+                _result.append("return");
+
+                if r.expression != null then
+                    _result.append(' ');
+                    r.expression.accept(this);
+                fi
+
                 _result.append(";");
             si
 

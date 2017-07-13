@@ -40,6 +40,8 @@ namespace Syntax is namespace Parser is namespace Definition is
             Tree.Body.NODE setter_body;
             Tree.Identifier.NODE setter_argument_name;
 
+            var expect_semicolon = true;
+
             do
                 if context.current.token == Lexical.TOKEN.ASSIGN then
                     if setter_argument_name != null then
@@ -50,6 +52,9 @@ namespace Syntax is namespace Parser is namespace Definition is
 
                     setter_argument_name = identifier_parser.parse(context);
 
+                    // FIXME: should we allow expression body here anyway?
+                    expect_semicolon = context.current.token == Lexical.TOKEN.ARROW_FAT;
+
                     setter_body = body_parser.parse(context);
 
                     if context.current.token == Lexical.TOKEN.COMMA then
@@ -58,6 +63,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                         break;
                     fi
                 elif {Lexical.TOKEN.IS, Lexical.TOKEN.ARROW_FAT}.contains(context.current.token) then
+                    expect_semicolon = context.current.token == Lexical.TOKEN.ARROW_FAT;
 
                     if getter_body != null then
                         context.error(context.location, "replacing read");
@@ -70,8 +76,6 @@ namespace Syntax is namespace Parser is namespace Definition is
                     else
                         break;
                     fi                    
-
-                    break;
                 fi
 
             od
@@ -85,7 +89,9 @@ namespace Syntax is namespace Parser is namespace Definition is
                 setter_body
             );
 
-            context.next_token(Lexical.TOKEN.SEMICOLON);
+            if expect_semicolon then
+                context.next_token(Lexical.TOKEN.SEMICOLON);
+            fi
 
             return result;
         si

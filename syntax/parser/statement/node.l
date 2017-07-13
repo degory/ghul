@@ -52,6 +52,28 @@ namespace Syntax is namespace Parser is namespace Statement is
                 si,
                 Lexical.TOKEN.VAR
             );
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+                    var end = context.location;
+
+                    if context.next_token(Lexical.TOKEN.RETURN, syntax_error_message) then
+                        Tree.Expression.NODE expression;
+
+                        if context.current.token != Lexical.TOKEN.SEMICOLON then
+                            expression = expression_parser.parse(context);
+                            end = expression.location;
+                        fi
+
+                        context.next_token(Lexical.TOKEN.SEMICOLON);
+                        
+                        return new Tree.Statement.RETURN(start..end, expression);
+                    fi
+                si,
+                Lexical.TOKEN.RETURN
+            );
+            
         si
 
         Tree.Statement.NODE other_token(CONTEXT context) is

@@ -198,6 +198,10 @@ namespace Syntax is
             throwNotImplemented("expression", expression);
         si
 
+        void visit(Statement.RETURN return_) is
+            throwNotImplemented("return", return_);
+        si
+
         // function body
 
         void visit(Body.NODE body) is
