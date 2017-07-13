@@ -47,6 +47,10 @@ namespace Syntax is namespace Parser is namespace Definition is
                 type = new Tree.Type.INFER(context.location);
             fi
 
+            // FIXME: body parser can't handle this as it may be called from an expression,
+            // where we never want a semi-colon after a function body
+            var expect_semicolon = context.current.token != Lexical.TOKEN.IS;
+
             var body = body_parser.parse(context);
 
             var result = new Tree.Definition.FUNCTION(
@@ -56,6 +60,10 @@ namespace Syntax is namespace Parser is namespace Definition is
                 type,
                 body
             );
+
+            if expect_semicolon then
+                context.next_token(Lexical.TOKEN.SEMICOLON);
+            fi
 
             return result;
         si

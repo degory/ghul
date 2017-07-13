@@ -69,6 +69,14 @@ namespace Source is
             return end & MASK;
         si
 
+        bool operator=~(LOCATION other) is
+            if this == other then
+                return true;
+            else
+                return this.start == other.start && this.end == other.end && this.file_name =~ other.file_name;
+            fi
+        si
+
         String toString() is
             return "% %,%..%,%" % Object{file_name, start_line, start_column, end_line, end_column};
         si

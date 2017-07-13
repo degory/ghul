@@ -7,6 +7,9 @@ namespace Syntax is
         use Source;
 
         class CONTEXT is
+            LOCATION last_error_location;
+            String last_error_message;
+
             public bool allow_tuple_element;
 
             public Lexical.TOKENIZER tokenizer;
@@ -17,7 +20,10 @@ namespace Syntax is
                 this.tokenizer = tokenizer;
                 this.logger = logger;
 
-                this.tokenizer.next();                
+                this.tokenizer.next();
+
+                last_error_location = this.location;
+                last_error_message = "";
             si
 
             bool next_token() is
@@ -154,7 +160,17 @@ namespace Syntax is
             si            
 
             public void error(LOCATION location, String message) is
-                logger.error(location, message);
+                if location !~ last_error_location || message !~ last_error_message then
+                    last_error_location = location;
+                    last_error_message = message;
+
+                    logger.error(location, message);
+                elif !is_end_of_file then
+                    // FIXME: better error recovery
+                    next_token();
+                else
+                    throw new Exception("give up");
+                fi
             si
         si
     si

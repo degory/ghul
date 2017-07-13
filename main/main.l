@@ -36,9 +36,6 @@ namespace Test is
                         if definition != null then
                             logger.info(definition.location, "read definition " + Object.dump(definition));
                             logger.info(definition.location, "read definition \"%\"" % Object{definition});
-                            context.next_token(Lexical.TOKEN.SEMICOLON, "in definition statement");
-                        else
-                            context.skip_token(Lexical.TOKEN.SEMICOLON, "in definition statement");
                         fi
 
                         i = i + 1;

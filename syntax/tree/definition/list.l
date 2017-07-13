@@ -25,15 +25,5 @@ namespace Syntax is namespace Tree is namespace Definition is
         void accept(Visitor visitor) is
             visitor.visit(this);
         si
-
-        String argl() is
-            var result = new StringBuffer();
-
-            foreach var d; definitions do
-                result.append(Object.dump(d));
-            od
-
-            return result;
-        si
     si
 si si si 
