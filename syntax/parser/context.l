@@ -7,6 +7,12 @@ namespace Syntax is
         use Source;
 
         class CONTEXT is
+            public bool allow_tuple_element;
+
+            public Lexical.TOKENIZER tokenizer;
+
+            public LOGGER logger;
+            
             void init(Lexical.TOKENIZER tokenizer, LOGGER logger) is
                 this.tokenizer = tokenizer;
                 this.logger = logger;
@@ -14,24 +20,32 @@ namespace Syntax is
                 this.tokenizer.next();                
             si
 
-            // FIXME: without generic methods and/or reflection, it's tricky to do this in a nice open/closed way:
-            static TYPE type_parser = new TYPE();
-            static IDENTIFIER identifier_parser = new IDENTIFIER();
-            static DEFINITION definition_parser = new DEFINITION();
-            static EXPRESSION expression_parser = new EXPRESSION();
-            static Expression.LITERAL expression_literal_parser = new Expression.LITERAL();
-            static Expression.PRIMARY expression_primary_parser = new Expression.PRIMARY();
-            static Expression.SECONDARY expression_secondary_parser = new Expression.SECONDARY();
-            static Expression.TUPLE expression_tuple_parser = new Expression.TUPLE();
-
-            public bool allow_tuple_element;
-
-            public Lexical.TOKENIZER tokenizer;
-
-            public LOGGER logger;
-            
             bool next_token() is
-                return tokenizer.next();
+                var result = tokenizer.next();
+
+/*
+                if current.token == Lexical.TOKEN.IDENTIFIER then
+                    IO.Std.err.println(" " + current.string);
+                else 
+                    IO.Std.err.println(" " + Lexical.TOKEN_NAMES[current.token]);
+                fi
+*/
+
+                return result;
+            si
+
+            get Lexical.TOKEN_PAIR current is
+                return tokenizer.current;
+            si
+
+            void write_token(Lexical.TOKEN_PAIR token) is
+                tokenizer.write_token(token);
+                next_token();
+            si
+
+            void write_tokens(Iterable<Lexical.TOKEN_PAIR> tokens) is
+                tokenizer.write_tokens(tokens);
+                next_token();
             si
 
             LOCATION location_and_next() is
@@ -141,50 +155,6 @@ namespace Syntax is
 
             public void error(LOCATION location, String message) is
                 logger.error(location, message);
-            si
-
-            public Tree.TYPE parse_type() is
-                return type_parser.parse(this);
-            si
-
-            public Tree.IDENTIFIER parse_qualified_identifier() is
-                return identifier_parser.parse(this);
-            si
-
-            public Tree.IDENTIFIER parse_unqualified_identifier() is
-                return identifier_parser.parse_unqualified_identifier(this);
-            si            
-
-            public Tree.DEFINITION parse_definition() is
-                return definition_parser.parse(this);
-            si
-
-            public Tree.EXPRESSION parse_expression() is
-                return expression_parser.parse(this);
-            si
-
-            public Tree.Expression.LITERAL parse_expression_literal() is
-                return expression_literal_parser.parse(this);
-            si
-
-            public Tree.Expression.IDENTIFIER parse_expression_identifier() is
-                return expression_primary_parser.parse_identifier(this);
-            si
-
-            public Tree.Expression.EXPRESSION_LIST parse_expression_list() is
-                return expression_parser.parse_expression_list(this);
-            si
-
-            public Tree.Expression.PRIMARY parse_expression_primary() is
-                return expression_primary_parser.parse(this);
-            si
-
-            public Tree.EXPRESSION parse_expression_secondary() is
-                return expression_secondary_parser.parse(this);
-            si
-
-            public Tree.Expression.TUPLE parse_expression_tuple() is
-                return expression_tuple_parser.parse(this);
             si
         si
     si

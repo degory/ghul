@@ -22,11 +22,11 @@ namespace Syntax is
 
             // Identifiers
 
-            void visit(IDENTIFIER identifier) is
+            void visit(Identifier.NODE identifier) is
                 _result.append(identifier.name);
             si
 
-            void visit(QUALIFIED_IDENTIFIER identifier) is
+            void visit(Identifier.QUALIFIED identifier) is
                 identifier.parent.accept(this);
                 
                 _result
@@ -36,7 +36,7 @@ namespace Syntax is
 
             // definitions
 
-            void visit(Definition.VARIABLE variable) is
+            void visit(Variable.NODE variable) is
                 variable.identifier.accept(this);
 
                 // FIXME: not OOP
@@ -51,7 +51,7 @@ namespace Syntax is
                 fi
             si
 
-            void visit(Definition.VARIABLE_LIST variables) is
+            void visit(Variable.LIST variables) is
                 var first = true;
 
                 foreach var v; variables do
@@ -63,24 +63,98 @@ namespace Syntax is
                 od
             si
 
-            void visit(Definition.LET l) is
-                _result.append("let ");
-                l.variables.accept(this);
-                _result.append(";");
-            si
-
-            void visit(Definition.VAR v) is
-                _result.append("var ");
-                v.variables.accept(this);
-                _result.append(";");
-            si
-
-            void visit(Definition.DEFINITION_LIST definitions) is
+            void visit(Definition.LIST definitions) is
                 foreach var d; definitions do
                     d.accept(this);
                     _result.append('\n');
                 od
             si
+
+            void visit(Definition.CLASS class_) is
+                _result.append("class ");
+
+                class_.name.accept(this);
+
+                if class_.arguments != null then 
+                    _result.append('[');
+                    class_.arguments.accept(this);
+                    _result.append(']');
+                fi
+
+                if class_.ancestors != null then                    
+                    _result.append(": ");
+
+                    class_.ancestors.accept(this);
+                fi
+
+                _result.append(" is\n");
+                class_.body.accept(this);
+                _result.append("si\n");
+            si
+    
+            void visit(Definition.INTERFACE interface_) is
+                _result.append("class ");
+                interface_.name.accept(this);
+
+                if interface_.arguments != null then 
+                    _result.append('[');
+                    interface_.arguments.accept(this);
+                    _result.append(']');
+                fi
+
+                if interface_.ancestors != null then
+                    _result.append(": ");
+
+                    interface_.ancestors.accept(this);
+                fi
+
+                _result.append(" is\n");
+                interface_.body.accept(this);
+                _result.append("si\n");
+            si        
+
+            void visit(Definition.FUNCTION function) is
+                function.name.accept(this);
+                _result.append('(');
+                function.arguments.accept(this);
+                _result.append(')');
+
+                if !isa Type.INFER(function.type) then
+                    _result.append(" -> ");
+                    function.type.accept(this);
+                fi
+
+                _result.append(' ');
+
+                if function.body != null then
+                    function.body.accept(this);
+                fi
+            si
+
+            void visit(Definition.PROPERTY property) is
+                property.name.accept(this);
+
+                if !isa Type.INFER(property.type) then
+                    _result.append(": ");
+                    property.type.accept(this);
+                fi
+
+                if property.getter_body != null then
+                    property.getter_body.accept(this);
+
+                    if property.setter_body != null then
+                        _result.append(",");
+                    fi
+                fi
+
+                if property.setter_body != null then
+                    _result.append(" = ");
+                    property.setter_argument.accept(this);
+
+                    property.setter_body.accept(this);
+                fi
+            si
+            
 
             // types
 
@@ -143,7 +217,7 @@ namespace Syntax is
                 element.type.accept(this);
             si      
 
-            void visit(Type.TYPE_LIST types) is
+            void visit(Type.LIST types) is
                 var seen_any = false;
                 foreach var t; types.Iterator do
                     if seen_any then
@@ -191,8 +265,6 @@ namespace Syntax is
                     function.type.accept(this);
                 fi
 
-                _result.append(" => ");
-
                 function.body.accept(this);
             si
 
@@ -204,7 +276,11 @@ namespace Syntax is
                 _result.append(')');
             si
 
-            void visit(Expression.LIST list) is
+            void visit(Expression.LITERAL literal) is
+                _result.append(literal.value);
+            si                        
+
+            void visit(Expression.LIST_LITERAL list) is
                 _result.append('[');
 
                 list.elements.accept(this);
@@ -254,7 +330,7 @@ namespace Syntax is
                 binary.right.accept(this);
             si
 
-            void visit(Expression.EXPRESSION_LIST expressions) is
+            void visit(Expression.LIST expressions) is
                 var seen_any = false;
                 foreach var e; expressions do
                     if seen_any then
@@ -265,7 +341,53 @@ namespace Syntax is
 
                     seen_any = true;
                 od
-            si             
+            si
+
+            // Statements
+
+            void visit(Statement.LIST list) is
+                foreach var s; list.Iterator do
+                    s.accept(this);
+                    _result.append("\n");
+                od
+            si
+
+            void visit(Statement.ASSIGNMENT assign) is
+                assign.left.accept(this);
+                _result.append(" = ");
+                assign.right.accept(this);
+                _result.append(";");
+            si
+
+            void visit(Statement.EXPRESSION expression) is
+                expression.accept(this);
+                _result.append(";");
+            si
+
+            void visit(Statement.LET l) is
+                _result.append("let ");
+                l.variables.accept(this);
+                _result.append(";");
+            si
+
+            void visit(Statement.VAR v) is
+                _result.append("var ");
+                v.variables.accept(this);
+                _result.append(";");
+            si
+
+            // function body
+
+            void visit(Body.EXPRESSION expression) is
+                _result.append(" => ");
+                expression.expression.accept(this);
+            si
+
+            void visit(Body.BLOCK block) is
+                _result.append("is\n");
+                block.statements.accept(this);
+                _result.append("si\n");
+            si            
         si
     si
 si

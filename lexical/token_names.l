@@ -121,7 +121,7 @@ namespace Lexical is
             names[TOKEN.WHILE] = "while";
             names[TOKEN.WORD] = "word";
             names[TOKEN.XOR] = "xor";
-            names[TOKEN.YRT] = "ytr";
+            names[TOKEN.YRT] = "yrt";
         si
 
         private static get TOKEN_NAMES instance is

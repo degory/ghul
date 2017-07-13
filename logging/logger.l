@@ -4,6 +4,8 @@ namespace Logging is
     use Source;
 
     class LOGGER is
+        int error_count;
+
         IO.Writer writer;
 
         void init() is
@@ -35,6 +37,12 @@ namespace Logging is
         )
         is
             write(location, "error", message);
+
+            error_count = error_count + 1;
+
+            if error_count >= 100 then
+                throw new Exception("too many errors");
+            fi
         si
 
         void warn(

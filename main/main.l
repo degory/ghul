@@ -7,6 +7,8 @@ namespace Test is
     class Main is
         void init() is
             try 
+                var container = new IoC.CONTAINER();
+
                 IO.Std.err.FlushOnPrintln = true;
 
                 var args = Arguments.ProgramArguments.Iterator;
@@ -29,11 +31,10 @@ namespace Test is
                     var i = 0;
 
                     while !context.is_end_of_file do
-                        // IO.Std.err.printlcn("not end of file, next token is: " + Lexical.TOKEN_NAMES[context.current_token]);
-
-                        var definition = context.parse_definition();
+                        var definition = container.definition_parser.parse(context);
 
                         if definition != null then
+                            logger.info(definition.location, "read definition " + Object.dump(definition));
                             logger.info(definition.location, "read definition \"%\"" % Object{definition});
                             context.next_token(Lexical.TOKEN.SEMICOLON, "in definition statement");
                         else

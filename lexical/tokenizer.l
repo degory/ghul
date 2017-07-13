@@ -3,50 +3,40 @@
 import stream;
 
 namespace Lexical is
-    use System.Object;
-    use System.String;
-    use System.StringBuffer;
-    use System.Exception;
+    use System;
+    use System;
+    use System;
+    use System;
+
+    use Generic;
 
     use Source;
 
     class TOKEN_BUFFER is
-        const int MAX = 32;  // maximum lookahead before we assume we're not in a generic type
-
-        int read_pos;
-        int write_pos;
-
-        TOKEN_PAIR[] values, temp;
+        Vector<TOKEN_PAIR> values;
 
         void init() is
-            values = new TOKEN_PAIR[MAX*2];   // additional space to accomodate turning single '>>'
-            temp = new TOKEN_PAIR[MAX*2];     // tokens into two token sequence close-generic close-generic
-            read_pos = 0;
-            write_pos = 0;
+            values = new Vector<TOKEN_PAIR>(10);   
         si
 
         void reset() is
-            read_pos = 0;
-            write_pos = 0;
+            init();
         si
 
         get bool avail is
-            return read_pos < write_pos;
+            return values.Length > 0;
         si
        
-        get bool is_full is
-            return write_pos >= MAX;
+        void write(TOKEN_PAIR t) is
+            values.add(t);
         si
 
-        void write( TOKEN_PAIR t ) is
-            values[write_pos] = t;
-            write_pos = write_pos + 1;
+        void write(Iterable<TOKEN_PAIR> t) is
+            values.add(t);
         si
 
         TOKEN_PAIR read() is
-            TOKEN_PAIR result = values[read_pos];
-            read_pos = read_pos + 1;
-            return result;
+            return values.pull();
         si
     si
 
@@ -230,8 +220,6 @@ namespace Lexical is
                 advance_cursor(c);
 
                 _prev_char = cast char(0);
-
-                // IO.Std.err.print(""+c);
                 return c;     
             fi
             
@@ -362,6 +350,14 @@ namespace Lexical is
                 start..location,
                 string
             );
+        si
+
+        void write_token(TOKEN_PAIR token) is 
+            buffer.write(token);
+        si
+
+        void write_tokens(Iterable<TOKEN_PAIR> tokens) is
+            buffer.write(tokens);
         si
 
         TOKEN_PAIR read_token() is

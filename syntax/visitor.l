@@ -15,48 +15,58 @@ namespace Syntax is
         // node
 
         void visit(NODE node) is
-            throwNotImplemented("node", node);
+            throw new NotImplementedException("Visitor itself is missing a matching method for %" % Object{node});
         si
 
         // identifiers
 
-        void visit(IDENTIFIER identifier) is
+        void visit(Identifier.NODE identifier) is
             throwNotImplemented("identifier", identifier);
         si
 
-        void visit(QUALIFIED_IDENTIFIER identifier) is
+        void visit(Identifier.QUALIFIED identifier) is
             throwNotImplemented("qualified identifier", identifier);
         si
 
         // definitions
 
-        void visit(DEFINITION definition) is
+        void visit(Definition.NODE definition) is
             throwNotImplemented("definition", definition);
         si
 
-        void visit(Definition.VARIABLE variable) is
+        void visit(Definition.LIST definitions) is
+            throwNotImplemented("definition list", definitions);
+        si
+
+        void visit(Definition.CLASS class_) is
+            throwNotImplemented("class", class_);
+        si
+
+        void visit(Definition.INTERFACE interface_) is
+            throwNotImplemented("interface", interface_);
+        si        
+
+        void visit(Definition.FUNCTION function) is
+            throwNotImplemented("function", function);
+        si
+
+        void visit(Definition.PROPERTY property) is
+            throwNotImplemented("property", property);
+        si
+
+        // variables
+        
+        void visit(Variable.NODE variable) is
             throwNotImplemented("variable", variable);
         si
 
-        void visit(Definition.VARIABLE_LIST variables) is
+        void visit(Variable.LIST variables) is
             throwNotImplemented("variable list", variables);
-        si
-
-        void visit(Definition.LET l) is
-            throwNotImplemented("let", l);
-        si
-
-        void visit(Definition.VAR v) is
-            throwNotImplemented("var", v);
-        si
-
-        void visit(Definition.DEFINITION_LIST definitions) is
-            throwNotImplemented("definition list", definitions);
         si
 
         // types
 
-        void visit(TYPE type) is
+        void visit(Type.NODE type) is
             throwNotImplemented("type", type);
         si
 
@@ -84,7 +94,7 @@ namespace Syntax is
             throwNotImplemented("named", named);
         si
 
-        void visit(Type.TYPE_LIST types) is
+        void visit(Type.LIST types) is
             throwNotImplemented("type list", types);
         si
 
@@ -106,14 +116,22 @@ namespace Syntax is
 
         // expressions
 
-        void visit(EXPRESSION expression) is
+        void visit(Expression.NODE expression) is
             throwNotImplemented("expression", expression);
         si
 
         void visit(Expression.IDENTIFIER identifier) is
             throwNotImplemented("identifier", identifier);
         si
-        
+
+        void visit(Expression.LITERAL literal) is
+            throwNotImplemented("literal", literal);
+        si                        
+
+        void visit(Expression.LIST_LITERAL list) is
+            throwNotImplemented("list literal", list);
+        si                                
+                
         void visit(Expression.VARIABLE variable) is
             throwNotImplemented("variable", variable);
         si
@@ -154,8 +172,44 @@ namespace Syntax is
             throwNotImplemented("binary", binary);
         si
 
-        void visit(Expression.EXPRESSION_LIST expressions) is
-            throwNotImplemented("expression list", expressions);
-        si        
+        // statements
+
+        void visit(Statement.NODE statement) is
+            throwNotImplemented("statement", statement);
+        si
+
+        void visit(Statement.LIST statements) is
+            throwNotImplemented("statement list", statements);
+        si
+
+        void visit(Statement.LET l) is
+            throwNotImplemented("let", l);
+        si
+
+        void visit(Statement.VAR v) is
+            throwNotImplemented("var", v);
+        si
+               
+        void visit(Statement.ASSIGNMENT assign) is
+            throwNotImplemented("assignment", assign);
+        si
+        
+        void visit(Statement.EXPRESSION expression) is
+            throwNotImplemented("expression", expression);
+        si
+
+        // function body
+
+        void visit(Body.NODE body) is
+            throwNotImplemented("body", body);
+        si
+
+        void visit(Body.EXPRESSION expression) is
+            throwNotImplemented("expression body", expression);
+        si
+
+        void visit(Body.BLOCK block) is
+            throwNotImplemented("block body", block);
+        si
     si
 si
