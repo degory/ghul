@@ -6,16 +6,23 @@ namespace Syntax is namespace Parser is namespace Statement is
         Parser<Tree.Expression.NODE> expression_parser;
         Parser<Tree.Variable.LIST> variable_list_parser;
 
+        Parser<Tree.Statement.LIST> statement_list_parser;
+
+        Tree.Statement.NODE proc(CONTEXT) if_parser;
+
         get String description is return "statement"; si
 
         void init(
             Parser<Tree.Expression.NODE> expression_parser,
-            Parser<Tree.Variable.LIST> variable_list_parser
-            ) is
+            Parser<Tree.Variable.LIST> variable_list_parser,
+            Parser<Tree.Statement.LIST> statement_list_parser
+        )
+        is
             super.init();
 
             this.expression_parser = expression_parser;
             this.variable_list_parser = variable_list_parser;
+            this.statement_list_parser = statement_list_parser;
             
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
@@ -73,7 +80,46 @@ namespace Syntax is namespace Parser is namespace Statement is
                 si,
                 Lexical.TOKEN.RETURN
             );
-            
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var result = parse_if(context);
+
+                    context.next_token(Lexical.TOKEN.FI);
+
+                    return result;
+                si,
+                Lexical.TOKEN.IF
+            );            
+        si
+
+        Tree.Statement.IF parse_if(CONTEXT context) is
+            var start = context.location;
+
+            context.next_token();
+
+            var condition = expression_parser.parse(context);
+
+            context.next_token(Lexical.TOKEN.THEN);
+
+            var then_branch = statement_list_parser.parse(context);
+            Tree.Statement.LIST else_branch;
+            Tree.Statement.IF elif_branch;
+
+            if context.current.token == Lexical.TOKEN.ELSE then
+                context.next_token();
+                else_branch = statement_list_parser.parse(context);
+            elif context.current.token == Lexical.TOKEN.ELIF then
+                elif_branch = parse_if(context);
+            fi
+
+            return new Tree.Statement.IF(
+                start..context.location,
+                condition,
+                then_branch,
+                else_branch,
+                elif_branch
+            );
         si
 
         Tree.Statement.NODE other_token(CONTEXT context) is

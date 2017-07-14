@@ -389,6 +389,29 @@ namespace Syntax is
                 _result.append(";");
             si
 
+            void visit(Statement.IF i) is
+                _result.append("if ");
+
+                i.condition.accept(this);
+
+                _result.append(" then\n");
+
+                i.then_branch.accept(this);
+
+                if i.else_branch != null then
+                    _result.append("else\n");
+
+                    i.else_branch.accept(this);
+                elif i.elif_branch != null then
+                    // FIXME: this is a bodge!
+                    _result.append("el");
+
+                    i.elif_branch.accept(this);
+                fi
+
+                _result.append("fi\n");                
+            si
+
             // function body
 
             void visit(Body.EXPRESSION expression) is

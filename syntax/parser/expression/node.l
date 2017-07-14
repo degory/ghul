@@ -9,6 +9,7 @@ namespace Syntax is namespace Parser is namespace Expression is
         MIN,
         BOOLEAN,
         RELATIONAL,
+        RANGE,
         SHIFT,
         BITWISE,
         ADDITION,
@@ -56,6 +57,7 @@ namespace Syntax is namespace Parser is namespace Expression is
             precedence[Lexical.TOKEN.AND] = PRECEDENCE.BITWISE;
             precedence[Lexical.TOKEN.OR] = PRECEDENCE.BITWISE;
 
+            precedence[Lexical.TOKEN.RANGE] = PRECEDENCE.RANGE;
 
             operation = new Map<Lexical.TOKEN, Tree.Expression.OPERATION>();
 
@@ -72,6 +74,8 @@ namespace Syntax is namespace Parser is namespace Expression is
 
             operation[Lexical.TOKEN.AND] = Tree.Expression.OPERATION.AND;
             operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR;                
+
+            operation[Lexical.TOKEN.RANGE] = Tree.Expression.OPERATION.RANGE;
         si
 
         get String description is

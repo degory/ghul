@@ -202,6 +202,10 @@ namespace Syntax is
             throwNotImplemented("return", return_);
         si
 
+        void visit(Statement.IF if_) is
+            throwNotImplemented("if", if_);
+        si
+
         // function body
 
         void visit(Body.NODE body) is

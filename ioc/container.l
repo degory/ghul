@@ -224,7 +224,8 @@ namespace IoC is
                 Parser.Parser<Tree.Statement.NODE> proc() is
                     return new Parser.Statement.NODE(
                         expression_parser,
-                        variable_list_parser
+                        variable_list_parser,
+                        statement_list_parser
                     );
                 si;
 
