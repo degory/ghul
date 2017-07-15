@@ -92,6 +92,10 @@ namespace Lexical is
             return _string;
         si
 
+        get String name is
+            return TOKEN_NAMES[_token];
+        si
+
         public String toString() is
             return "" + _location + ": " + TOKEN_NAMES[_token] + ": " + _string;
         si

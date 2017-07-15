@@ -28,26 +28,24 @@ namespace Syntax is namespace Parser is namespace Definition is
             // need two token lookahead here to determine if this is a
             // property or a function. Read the identifier first:
 
-            var ident = context.current;
-
+            context.mark();
             context.next_token();
             
             if property_tokens.contains(context.current.token) then
-                var punctuation = context.current;
-
-                // push the identifier and punctuation back, so we can read them again:
-                context.write_tokens({ident, punctuation});
+                // backtrack to the identifier and parse as a property:
+                context.backtrack();
 
                 return property_parser.parse(context);
 
             elif context.current.token == Lexical.TOKEN.PAREN_OPEN then
-                var paren = context.current;
-
-                // push the identifier and parenthesis back, so we can read them again:
-                context.write_tokens({ident, paren});
-
+                // backtrack  to the identifier and parse as a function:
+                context.backtrack();
                 return function_parser.parse(context); 
             fi
+            
+            context.commit();
+
+            other_token(context);
         si
     si
 si si si
