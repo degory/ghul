@@ -19,6 +19,8 @@ namespace Syntax is namespace Tree is namespace Expression is
         SHIFT_LEFT,
         SHIFT_RIGHT,
 
+        RANGE,
+
         LESS,
         LESS_OR_EQUAL,
         EQUAL,

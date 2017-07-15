@@ -140,6 +140,7 @@ namespace Syntax is
                 fi
 
                 if property.getter_body != null then
+                    _result.append(' ');
                     property.getter_body.accept(this);
 
                     if property.setter_body != null then
@@ -150,6 +151,7 @@ namespace Syntax is
                 if property.setter_body != null then
                     _result.append(" = ");
                     property.setter_argument.accept(this);
+                    _result.append(' ');
 
                     property.setter_body.accept(this);
                 fi
@@ -360,7 +362,7 @@ namespace Syntax is
             si
 
             void visit(Statement.EXPRESSION expression) is
-                expression.accept(this);
+                expression.expression.accept(this);
                 _result.append(";");
             si
 
@@ -375,6 +377,62 @@ namespace Syntax is
                 v.variables.accept(this);
                 _result.append(";");
             si
+
+            void visit(Statement.RETURN r) is
+                _result.append("return");
+
+                if r.expression != null then
+                    _result.append(' ');
+                    r.expression.accept(this);
+                fi
+
+                _result.append(";");
+            si
+
+            void visit(Statement.IF i) is
+                _result.append("if ");
+
+                i.condition.accept(this);
+
+                _result.append(" then\n");
+
+                i.then_branch.accept(this);
+
+                if i.else_branch != null then
+                    _result.append("else\n");
+
+                    i.else_branch.accept(this);
+                elif i.elif_branch != null then
+                    // FIXME: this is a bodge!
+                    _result.append("el");
+
+                    i.elif_branch.accept(this);
+                fi
+
+                _result.append("fi\n");                
+            si
+
+            void visit(Statement.DO do_) is
+                if do_.condition != null then
+                    _result.append("while ");
+                    do_.condition.accept(this);
+                    _result.append(" ");
+                fi    
+
+                _result.append("do\n");
+
+                do_.body.accept(this);
+
+                _result.append("od\n"); 
+            si
+
+            void visit(Statement.LABELLED labelled) is
+                labelled.label.accept(this);
+
+                _result.append(": ");
+
+                labelled.statement.accept(this);
+            si            
 
             // function body
 

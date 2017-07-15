@@ -58,7 +58,7 @@ namespace Syntax is namespace Parser is
                 % Object{
                     syntax_error_message,
                     Lexical.TOKEN_NAMES[expected_tokens],
-                    Lexical.TOKEN_NAMES[context.current.token]});
+                    context.current.name});
         si
 
         private void populate_expected_tokens() is
