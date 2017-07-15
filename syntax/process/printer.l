@@ -412,6 +412,28 @@ namespace Syntax is
                 _result.append("fi\n");                
             si
 
+            void visit(Statement.DO do_) is
+                if do_.condition != null then
+                    _result.append("while ");
+                    do_.condition.accept(this);
+                    _result.append(" ");
+                fi    
+
+                _result.append("do\n");
+
+                do_.body.accept(this);
+
+                _result.append("od\n"); 
+            si
+
+            void visit(Statement.LABELLED labelled) is
+                labelled.label.accept(this);
+
+                _result.append(": ");
+
+                labelled.statement.accept(this);
+            si            
+
             // function body
 
             void visit(Body.EXPRESSION expression) is

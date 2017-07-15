@@ -10,6 +10,8 @@ namespace Syntax is
             LOCATION last_error_location;
             String last_error_message;
 
+            Vector<Lexical.TOKEN_PAIR> speculative_parse_tokens;
+
             public bool allow_tuple_element;
 
             public Lexical.TOKENIZER tokenizer;
@@ -29,13 +31,9 @@ namespace Syntax is
             bool next_token() is
                 var result = tokenizer.next();
 
-/*
-                if current.token == Lexical.TOKEN.IDENTIFIER then
-                    IO.Std.err.println(" " + current.string);
-                else 
-                    IO.Std.err.println(" " + Lexical.TOKEN_NAMES[current.token]);
+                if speculative_parse_tokens != null then
+                    speculative_parse_tokens.add(current);
                 fi
-*/
 
                 return result;
             si
@@ -52,6 +50,28 @@ namespace Syntax is
             void write_tokens(Iterable<Lexical.TOKEN_PAIR> tokens) is
                 tokenizer.write_tokens(tokens);
                 next_token();
+            si
+
+            void mark() is
+                assert(speculative_parse_tokens == null, "cannot start nested speculative parse");
+
+                speculative_parse_tokens = new Vector<Lexical.TOKEN_PAIR>();
+
+                speculative_parse_tokens.add(current);
+            si
+
+            void commit() is
+                assert(speculative_parse_tokens != null, "cannot commit: not in speculative parse");
+
+                speculative_parse_tokens = null;
+            si
+
+            void backtrack() is
+                assert(speculative_parse_tokens != null, "cannot backtrack: not in speculative parse");
+
+                write_tokens(speculative_parse_tokens);
+
+                speculative_parse_tokens = null;
             si
 
             LOCATION location_and_next() is

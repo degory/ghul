@@ -2,7 +2,12 @@ namespace Syntax is namespace Parser is namespace Statement is
     use System;
     use Generic;
 
+    // TODO: break this up into smaller classes
     class NODE isa BASE<Tree.Statement.NODE> is
+        List<Lexical.TOKEN> labellable_statement_tokens;
+
+        Parser<Tree.Identifier.NODE> identifier_parser;
+
         Parser<Tree.Expression.NODE> expression_parser;
         Parser<Tree.Variable.LIST> variable_list_parser;
 
@@ -13,6 +18,8 @@ namespace Syntax is namespace Parser is namespace Statement is
         get String description is return "statement"; si
 
         void init(
+            List<Lexical.TOKEN> labellable_statement_tokens,
+            Parser<Tree.Identifier.NODE> identifier_parser,
             Parser<Tree.Expression.NODE> expression_parser,
             Parser<Tree.Variable.LIST> variable_list_parser,
             Parser<Tree.Statement.LIST> statement_list_parser
@@ -20,6 +27,8 @@ namespace Syntax is namespace Parser is namespace Statement is
         is
             super.init();
 
+            this.labellable_statement_tokens = labellable_statement_tokens;
+            this.identifier_parser = identifier_parser;
             this.expression_parser = expression_parser;
             this.variable_list_parser = variable_list_parser;
             this.statement_list_parser = statement_list_parser;
@@ -83,6 +92,37 @@ namespace Syntax is namespace Parser is namespace Statement is
 
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    Tree.Expression.NODE condition;
+
+                    if context.current.token == Lexical.TOKEN.WHILE then
+                        context.next_token();
+
+                        condition = expression_parser.parse(context);
+                    fi
+
+                    Tree.Statement.LIST body;
+
+                    context.next_token(Lexical.TOKEN.DO, syntax_error_message);
+                    
+                    body = statement_list_parser.parse(context);
+
+                    var result = new Tree.Statement.DO(
+                        start..context.location,
+                        condition,
+                        body
+                    );
+
+                    context.next_token(Lexical.TOKEN.OD);
+
+                    return result;
+                si,
+                {Lexical.TOKEN.WHILE, Lexical.TOKEN.DO}
+            );
+            
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
                     var result = parse_if(context);
 
                     context.next_token(Lexical.TOKEN.FI);
@@ -123,6 +163,32 @@ namespace Syntax is namespace Parser is namespace Statement is
         si
 
         Tree.Statement.NODE other_token(CONTEXT context) is
+
+            if context.current.token == Lexical.TOKEN.IDENTIFIER then
+                context.mark();
+
+                var label = identifier_parser.parse(context);
+
+                if context.current.token == Lexical.TOKEN.COLON then
+                    context.next_token();
+
+                    if labellable_statement_tokens.contains(context.current.token) then
+                        context.commit();
+
+                        var statement = this.parse(context);
+
+                        return new Tree.Statement.LABELLED(
+                            label.location..statement.location,
+                            label,
+                            statement
+                        );
+                    fi
+                fi
+
+                // was not a statement label, so backtrack
+                context.backtrack();
+            fi
+
             var left = expression_parser.parse(context);
 
             if context.current.token == Lexical.TOKEN.ASSIGN then

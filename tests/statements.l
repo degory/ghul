@@ -1,5 +1,5 @@
 class STATEMENTS is
-    f() is
+    if_statements() is
         if condition then
             let a = b + c;
         else
@@ -25,5 +25,27 @@ class STATEMENTS is
         else
             c = (a = none, b = none, c = none).a;
         fi
+    si
+
+    do_statements() is
+        while condition do
+            a = b + c;
+
+            d = e + f;
+        od
+
+        do
+            forever();
+            and();
+            ever();
+        od
+
+        label: while condition do
+            i = i + 1;
+        od
+
+        label: do
+            j = j - 1;
+        od
     si
 si

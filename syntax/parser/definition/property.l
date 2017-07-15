@@ -77,7 +77,6 @@ namespace Syntax is namespace Parser is namespace Definition is
                         break;
                     fi                    
                 fi
-
             od
 
             var result = new Tree.Definition.PROPERTY(

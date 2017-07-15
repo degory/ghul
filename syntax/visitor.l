@@ -206,6 +206,14 @@ namespace Syntax is
             throwNotImplemented("if", if_);
         si
 
+        void visit(Statement.DO do_) is
+            throwNotImplemented("do", do_);
+        si
+
+        void visit(Statement.LABELLED labelled) is
+            throwNotImplemented("labelled", labelled);
+        si
+
         // function body
 
         void visit(Body.NODE body) is
