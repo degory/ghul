@@ -214,6 +214,14 @@ namespace Syntax is
             throwNotImplemented("labelled", labelled);
         si
 
+        void visit(Statement.BREAK break_) is
+            throwNotImplemented("break", break_);
+        si
+
+        void visit(Statement.CONTINUE continue_) is
+            throwNotImplemented("continue", continue_);
+        si
+
         // function body
 
         void visit(Body.NODE body) is

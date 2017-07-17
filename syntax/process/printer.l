@@ -432,6 +432,22 @@ namespace Syntax is
                 _result.append(": ");
 
                 labelled.statement.accept(this);
+            si
+
+            void visit(Statement.BREAK break_) is
+                _result.append("break");
+                if break_.label != null then
+                    _result.append(' ');
+                    break_.label.accept(this);
+                fi
+            si
+
+            void visit(Statement.CONTINUE continue_) is
+                _result.append("continue");
+                if continue_.label != null then
+                    _result.append(' ');
+                    continue_.label.accept(this);
+                fi
             si            
 
             // function body

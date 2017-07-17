@@ -130,7 +130,49 @@ namespace Syntax is namespace Parser is namespace Statement is
                     return result;
                 si,
                 Lexical.TOKEN.IF
+            );
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+                    var end = context.location;
+
+                    context.next_token();
+
+                    Tree.Identifier.NODE label;
+
+                    if context.current.token == Lexical.TOKEN.IDENTIFIER then
+                        label = identifier_parser.parse(context);
+                        end = label.location;
+                    fi
+
+                    var result = new Tree.Statement.BREAK(start..end, label);
+                    context.next_token(Lexical.TOKEN.SEMICOLON);
+                    return result;
+                si,
+                Lexical.TOKEN.BREAK
             );            
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+                    var end = context.location;
+
+                    context.next_token();
+
+                    Tree.Identifier.NODE label;
+
+                    if context.current.token == Lexical.TOKEN.IDENTIFIER then
+                        label = identifier_parser.parse(context);
+                        end = label.location;
+                    fi
+
+                    var result = new Tree.Statement.CONTINUE(start..end, label);
+                    context.next_token(Lexical.TOKEN.SEMICOLON);
+                    return result;
+                si,
+                Lexical.TOKEN.CONTINUE
+            );                        
         si
 
         Tree.Statement.IF parse_if(CONTEXT context) is

@@ -47,5 +47,19 @@ class STATEMENTS is
         label: do
             j = j - 1;
         od
+
+        label: while condition do
+            i = i + 1;
+            if world.is_ended then break label; fi
+
+            continue;
+        od
+
+        label: do
+            j = j - 1;
+            if not_apocalypse then continue label; fi
+
+            break;
+        od        
     si
 si
