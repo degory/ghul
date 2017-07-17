@@ -34,7 +34,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                 Tree.Definition.NODE proc(CONTEXT context) is
                     return definition_namespace_parser.parse(context);
                 si,
-                Lexical.TOKEN.CLASS
+                Lexical.TOKEN.NAMESPACE
             );
 
             add_parser(

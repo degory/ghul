@@ -8,7 +8,7 @@ namespace Syntax is namespace Parser is namespace Definition is
         Parser<Tree.Definition.LIST> definition_list_parser;
 
         void init(
-            Parser<Tree.Identifier.NODE> identifier_parser,
+            Parser<Tree.Identifier.NODE> identifier_qualified_parser,
             Parser<Tree.Definition.LIST> definition_list_parser
         ) is
             super.init();

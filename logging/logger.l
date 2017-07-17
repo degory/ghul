@@ -8,6 +8,10 @@ namespace Logging is
 
         IO.Writer writer;
 
+        get bool any_errors is
+            return error_count > 0;
+        si
+
         void init() is
             super.init();
 

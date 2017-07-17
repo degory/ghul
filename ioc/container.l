@@ -61,7 +61,7 @@ namespace IoC is
             definition_parser = new LAZY_PARSER<Tree.Definition.NODE>();
             definition_list_parser = new LAZY_PARSER<Tree.Definition.LIST>();
 
-            definition_namespace_parser = new LAZY_PARSER<Tree.Definition.CLASS>();
+            definition_namespace_parser = new LAZY_PARSER<Tree.Definition.NAMESPACE>();
             definition_class_parser = new LAZY_PARSER<Tree.Definition.CLASS>();
             definition_interface_parser = new LAZY_PARSER<Tree.Definition.INTERFACE>();
             definition_member_parser = new LAZY_PARSER<Tree.Definition.NODE>();
@@ -114,6 +114,7 @@ namespace IoC is
             definition_parser.create = 
                 Parser.Parser<Tree.Definition.NODE> proc() is
                     return new Parser.Definition.NODE(
+                        definition_namespace_parser,
                         definition_class_parser,
                         definition_interface_parser,
                         definition_member_parser
@@ -127,20 +128,20 @@ namespace IoC is
                     );
                 si;
 
+            definition_namespace_parser.create =
+                Parser.Parser<Tree.Definition.NAMESPACE> proc() is
+                    return new Parser.Definition.NAMESPACE(
+                        identifier_qualified_parser,
+                        definition_list_parser
+                    );
+                si;
+
             definition_class_parser.create =
                 Parser.Parser<Tree.Definition.CLASS> proc() is
                     return new Parser.Definition.CLASS(
                         identifier_parser,
                         type_parser,
                         type_list_parser,
-                        definition_list_parser
-                    );
-                si;
-
-            definition_namespace_parser.create =
-                Parser.Parser<Tree.Definition.NAMESPACE> proc() is
-                    return new Parser.Definition.NAMESPACE(
-                        identifier_qualified_parser,
                         definition_list_parser
                     );
                 si;

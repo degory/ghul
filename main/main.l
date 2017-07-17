@@ -6,6 +6,8 @@ namespace Test is
     
     class Main is
         void init() is
+            var any_errors = false;
+
             try 
                 var container = new IoC.CONTAINER();
 
@@ -42,9 +44,14 @@ namespace Test is
                     od
 
                     logger.info(context.location, "finished");
+
+                    any_errors = any_errors || logger.any_errors;
                 od
+
+                native.exit(cast int(any_errors));
             catch Exception e
-                IO.Std.err.println(e);            
+                IO.Std.err.println(e);
+                native.exit(1);
             yrt
         si
     si
