@@ -38,6 +38,10 @@ namespace Syntax is
             throwNotImplemented("definition list", definitions);
         si
 
+        void visit(Definition.NAMESPACE namespace_) is
+            throwNotImplemented("namespace", namespace_);
+        si        
+
         void visit(Definition.CLASS class_) is
             throwNotImplemented("class", class_);
         si

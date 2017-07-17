@@ -70,6 +70,16 @@ namespace Syntax is
                 od
             si
 
+            void visit(Definition.NAMESPACE namespace_) is
+                _result.append("namespace ");
+
+                namespace_.name.accept(this);
+
+                _result.append(" is\n");
+                namespace_.body.accept(this);
+                _result.append("si\n");
+            si            
+
             void visit(Definition.CLASS class_) is
                 _result.append("class ");
 
@@ -157,7 +167,6 @@ namespace Syntax is
                 fi
             si
             
-
             // types
 
             void visit(Type.BUILT_IN type) is
