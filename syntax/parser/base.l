@@ -30,6 +30,10 @@ namespace Syntax is namespace Parser is
         si
 
         void add_parser(T proc(CONTEXT) p, Lexical.TOKEN token) is
+            if parsers[token] != null then
+                throw new Exception("% alread has a parser (%)" % Object{token, p});
+            fi
+
             parsers[token] = p;
         si
         

@@ -9,6 +9,7 @@ namespace Syntax is namespace Parser is namespace Statement is
         Parser<Tree.Identifier.NODE> identifier_parser;
 
         Parser<Tree.Expression.NODE> expression_parser;
+        Parser<Tree.Variable.NODE> variable_parser;
         Parser<Tree.Variable.LIST> variable_list_parser;
 
         Parser<Tree.Statement.LIST> statement_list_parser;
@@ -21,6 +22,7 @@ namespace Syntax is namespace Parser is namespace Statement is
             List<Lexical.TOKEN> labellable_statement_tokens,
             Parser<Tree.Identifier.NODE> identifier_parser,
             Parser<Tree.Expression.NODE> expression_parser,
+            Parser<Tree.Variable.NODE> variable_parser,
             Parser<Tree.Variable.LIST> variable_list_parser,
             Parser<Tree.Statement.LIST> statement_list_parser
         )
@@ -30,6 +32,7 @@ namespace Syntax is namespace Parser is namespace Statement is
             this.labellable_statement_tokens = labellable_statement_tokens;
             this.identifier_parser = identifier_parser;
             this.expression_parser = expression_parser;
+            this.variable_parser = variable_parser;
             this.variable_list_parser = variable_list_parser;
             this.statement_list_parser = statement_list_parser;
             
@@ -92,6 +95,17 @@ namespace Syntax is namespace Parser is namespace Statement is
 
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
+                    var result = parse_if(context);
+
+                    context.next_token(Lexical.TOKEN.FI);
+
+                    return result;
+                si,
+                Lexical.TOKEN.IF
+            );            
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
                     var start = context.location;
 
                     Tree.Expression.NODE condition;
@@ -120,18 +134,37 @@ namespace Syntax is namespace Parser is namespace Statement is
                 si,
                 {Lexical.TOKEN.WHILE, Lexical.TOKEN.DO}
             );
-            
+
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
-                    var result = parse_if(context);
+                    var start = context.location;
 
-                    context.next_token(Lexical.TOKEN.FI);
+                    context.next_token(Lexical.TOKEN.FOR);
+
+                    var variable = variable_parser.parse(context);
+
+                    context.next_token(Lexical.TOKEN.IN);
+
+                    var expression = expression_parser.parse(context);
+
+                    context.next_token(Lexical.TOKEN.DO, syntax_error_message);
+                    
+                    var body = statement_list_parser.parse(context);
+
+                    var result = new Tree.Statement.FOR(
+                        start..context.location,
+                        variable,
+                        expression,
+                        body
+                    );
+
+                    context.next_token(Lexical.TOKEN.OD);
 
                     return result;
                 si,
-                Lexical.TOKEN.IF
-            );
-
+                {Lexical.TOKEN.FOR}
+            );            
+            
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
                     var start = context.location;
@@ -172,7 +205,7 @@ namespace Syntax is namespace Parser is namespace Statement is
                     return result;
                 si,
                 Lexical.TOKEN.CONTINUE
-            );                        
+            );
         si
 
         Tree.Statement.IF parse_if(CONTEXT context) is

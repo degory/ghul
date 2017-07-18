@@ -435,6 +435,22 @@ namespace Syntax is
                 _result.append("od\n"); 
             si
 
+            void visit(Statement.FOR for_) is
+                _result.append("for ");
+
+                for_.variable.accept(this);
+
+                _result.append(" in ");
+
+                for_.expression.accept(this);
+
+                _result.append(" do\n");
+
+                for_.body.accept(this);
+
+                _result.append("od\n"); 
+            si
+
             void visit(Statement.LABELLED labelled) is
                 labelled.label.accept(this);
 

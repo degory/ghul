@@ -237,6 +237,7 @@ namespace IoC is
                         { Lexical.TOKEN.FOR, Lexical.TOKEN.WHILE, Lexical.TOKEN.DO },
                         identifier_parser,
                         expression_parser,
+                        variable_parser,
                         variable_list_parser,
                         statement_list_parser
                     );

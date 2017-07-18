@@ -53,6 +53,7 @@ namespace Lexical is
     IDENTIFIER,
     IF,
     IMPORT,
+    IN,
     INT,
     INTERFACE,
     INT_LITERAL,

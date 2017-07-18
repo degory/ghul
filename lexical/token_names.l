@@ -59,6 +59,7 @@ namespace Lexical is
             names[TOKEN.IDENTIFIER] = "identifier";
             names[TOKEN.IF] = "if";
             names[TOKEN.IMPORT] = "import";
+            names[TOKEN.IN] = "in";
             names[TOKEN.INT] = "int";
             names[TOKEN.INTERFACE] = "interface";
             names[TOKEN.INT_LITERAL] = "int literal";
@@ -143,20 +144,24 @@ namespace Lexical is
         si
 
         public static get String[Iterable<Lexical.TOKEN> tokens] is
-            var sorted_tokens = new Vector<Lexical.TOKEN>();
-            sorted_tokens.add(tokens);
-            Sort<Lexical.TOKEN>.sort(sorted_tokens);
+            var sorted_tokens = new Vector<String>();
+
+            foreach var t; tokens do
+                sorted_tokens.add(TOKEN_NAMES[t]);
+            od
+
+            Sort<String>.sort(sorted_tokens);
 
             var result = new StringBuffer();
 
             var seen_any = false;
 
-            foreach var t; sorted_tokens do
+            foreach var s; sorted_tokens do
                 if seen_any then
                     result.append(", ");
                 fi
 
-                result.append(TOKEN_NAMES[t]);
+                result.append(s);
 
                 seen_any = true;
             od

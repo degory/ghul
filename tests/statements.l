@@ -63,5 +63,19 @@ namespace Test.Statements is
                 break;
             od        
         si
+
+        for_statements() is
+            for i in 0..9 do
+                IO.Std.err.println("Hello range %" % i);
+            od
+
+            for j in [a, b, c, d, e] do
+                IO.Std.err.println("Hello list %" % j);
+            od
+
+            for k in (x, y, z) do
+                IO.Std.err.println("Does this make sense %?" % k);
+            od
+        si
     si
 si

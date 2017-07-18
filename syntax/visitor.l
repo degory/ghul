@@ -214,6 +214,10 @@ namespace Syntax is
             throwNotImplemented("do", do_);
         si
 
+        void visit(Statement.FOR for_) is
+            throwNotImplemented("for", for_);
+        si
+
         void visit(Statement.LABELLED labelled) is
             throwNotImplemented("labelled", labelled);
         si

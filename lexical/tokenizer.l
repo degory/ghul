@@ -134,7 +134,7 @@ namespace Lexical is
                 symbol_tokens["while"] = TOKEN.WHILE;
                 symbol_tokens["do"] = TOKEN.DO;
                 symbol_tokens["for"] = TOKEN.FOR;
-                symbol_tokens["foreach"] = TOKEN.FOREACH;
+                symbol_tokens["in"] = TOKEN.IN;
                 symbol_tokens["case"] = TOKEN.CASE;
                 symbol_tokens["default"] = TOKEN.DEFAULT;
                 symbol_tokens["break"] = TOKEN.BREAK;
