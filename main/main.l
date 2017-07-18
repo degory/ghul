@@ -18,6 +18,8 @@ namespace Test is
                 args.nextElement();
 
                 foreach var s; args do
+                    IO.Std.err.println("will parse: " + s + "...");
+
                     var tokenizer = new Lexical.TOKENIZER(
                         s,
                         IO.File.openRead(s)
@@ -47,6 +49,9 @@ namespace Test is
 
                     any_errors = any_errors || logger.any_errors;
                 od
+
+                IO.Std.err.println("exiting");
+                IO.Std.err.flush();
 
                 native.exit(cast int(any_errors));
             catch Exception e
