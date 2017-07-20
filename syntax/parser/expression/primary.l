@@ -103,13 +103,31 @@ namespace Syntax is namespace Parser is namespace Expression is
                     context.next_token();
 
                     var elements = expression_list_parser.parse(context);
+
+                    Tree.Type.NODE type;
+
                     var end = context.location;
 
                     context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
 
+                    // legacy language cannot always correctly infer correct
+                    // type for list literals, and in the short term we need
+                    // to translate new to legacy syntax, so support specifying
+                    // explict element type here:
+                    if context.current.token == Lexical.TOKEN.COLON then
+                        context.next_token();
+
+                        type = type_parser.parse(context);
+
+                        end = type.location;
+                    else
+                        type = new Tree.Type.INFER(start..end);
+                    fi
+
                     return new Tree.Expression.LIST_LITERAL(
                         start..end,
-                        elements
+                        elements,
+                        type
                     );
                 si,
                 Lexical.TOKEN.SQUARE_OPEN

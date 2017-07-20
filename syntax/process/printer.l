@@ -297,6 +297,11 @@ namespace Syntax is
                 list.elements.accept(this);
 
                 _result.append(']');
+
+                if !isa Tree.Type.INFER(list.type) then
+                    _result.append(": ");
+                    list.type.accept(this);
+                fi
             si            
 
             void visit(Expression.CALL call) is
