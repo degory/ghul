@@ -20,7 +20,7 @@ namespace Lexical is
             names[TOKEN.ASSERT] = "";
             names[TOKEN.ASSIGN] = "=";
             names[TOKEN.AT] = "@";
-            names[TOKEN.BITAND] = "";
+            names[TOKEN.BANG] = "!";
             names[TOKEN.BOOL] = "bool";
             names[TOKEN.BREAK] = "break";
             names[TOKEN.BYTE] = "byte";
@@ -56,6 +56,7 @@ namespace Lexical is
             names[TOKEN.GE] = ">=";
             names[TOKEN.GET] = "get";
             names[TOKEN.GT] = ">";
+            names[TOKEN.HAT] = "^";
             names[TOKEN.IDENTIFIER] = "identifier";
             names[TOKEN.IF] = "if";
             names[TOKEN.IMPORT] = "import";
@@ -77,7 +78,6 @@ namespace Lexical is
             names[TOKEN.NE_OBJ] = "!~";
             names[TOKEN.NEW] = "new";
             names[TOKEN.NONE] = "none";
-            names[TOKEN.NOT] = "not";
             names[TOKEN.NULL] = "null";
             names[TOKEN.OD] = "od";
             names[TOKEN.OPERATOR] = "operator";
@@ -121,7 +121,6 @@ namespace Lexical is
             names[TOKEN.VOID] = "void";
             names[TOKEN.WHILE] = "while";
             names[TOKEN.WORD] = "word";
-            names[TOKEN.XOR] = "xor";
             names[TOKEN.YRT] = "yrt";
         si
 

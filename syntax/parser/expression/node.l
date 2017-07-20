@@ -56,8 +56,24 @@ namespace Syntax is namespace Parser is namespace Expression is
 
             precedence[Lexical.TOKEN.AND] = PRECEDENCE.BITWISE;
             precedence[Lexical.TOKEN.OR] = PRECEDENCE.BITWISE;
+            precedence[Lexical.TOKEN.HAT] = PRECEDENCE.BITWISE;
 
             precedence[Lexical.TOKEN.RANGE] = PRECEDENCE.RANGE;
+
+            precedence[Lexical.TOKEN.SHIFT_LEFT] = PRECEDENCE.SHIFT;
+            precedence[Lexical.TOKEN.SHIFT_RIGHT] = PRECEDENCE.SHIFT;
+
+            precedence[Lexical.TOKEN.EQ] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.NE] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.EQ_OBJ] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.NE_OBJ] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.LT] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.LE] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.GT] = PRECEDENCE.RELATIONAL;
+            precedence[Lexical.TOKEN.GE] = PRECEDENCE.RELATIONAL;
+
+            precedence[Lexical.TOKEN.AND_THEN] = PRECEDENCE.BOOLEAN;
+            precedence[Lexical.TOKEN.OR_ELSE] = PRECEDENCE.BOOLEAN;            
 
             operation = new Map<Lexical.TOKEN, Tree.Expression.OPERATION>();
 
@@ -73,9 +89,25 @@ namespace Syntax is namespace Parser is namespace Expression is
             operation[Lexical.TOKEN.MINUS] = Tree.Expression.OPERATION.SUBTRACT;
 
             operation[Lexical.TOKEN.AND] = Tree.Expression.OPERATION.AND;
-            operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR;                
+            operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR;  
+            operation[Lexical.TOKEN.HAT] = Tree.Expression.OPERATION.XOR;              
 
             operation[Lexical.TOKEN.RANGE] = Tree.Expression.OPERATION.RANGE;
+
+            operation[Lexical.TOKEN.SHIFT_LEFT] = Tree.Expression.OPERATION.SHIFT_LEFT;
+            operation[Lexical.TOKEN.SHIFT_RIGHT] = Tree.Expression.OPERATION.SHIFT_RIGHT;
+
+            operation[Lexical.TOKEN.EQ] = Tree.Expression.OPERATION.EQUAL;
+            operation[Lexical.TOKEN.NE] = Tree.Expression.OPERATION.NOT_EQUAL;
+            operation[Lexical.TOKEN.EQ_OBJ] = Tree.Expression.OPERATION.EQUAL_OBJ;
+            operation[Lexical.TOKEN.NE_OBJ] = Tree.Expression.OPERATION.NOT_EQUAL_OBJ;
+            operation[Lexical.TOKEN.LT] = Tree.Expression.OPERATION.LESS;
+            operation[Lexical.TOKEN.LE] = Tree.Expression.OPERATION.LESS_OR_EQUAL;
+            operation[Lexical.TOKEN.GT] = Tree.Expression.OPERATION.GREATER;
+            operation[Lexical.TOKEN.GE] = Tree.Expression.OPERATION.GREATER_OR_EQUAL;
+
+            operation[Lexical.TOKEN.AND_THEN] = Tree.Expression.OPERATION.AND_THEN;
+            operation[Lexical.TOKEN.OR_ELSE] = Tree.Expression.OPERATION.OR_ELSE;
         si
 
         get String description is

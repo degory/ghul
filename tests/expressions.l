@@ -1,0 +1,19 @@
+namespace Test.Expressions is
+    class SOME_CLASS is
+        some_function() is
+            let a = x + y;
+
+            let b = x * z + w * z;
+
+            let c = x > y || w < z;
+
+            let d = x >= y && x <= z;
+
+            let e = x ^ y & z ^ z;
+
+            let f = x | y & z;
+
+            let h = x << y | z >> y;
+        si
+    si
+si

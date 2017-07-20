@@ -1,0 +1,24 @@
+namespace Syntax is namespace Tree is namespace Expression is
+    use Source;
+
+    class UNARY isa NODE is
+        public OPERATION operation;
+        public NODE right;
+        
+        void init(
+            LOCATION location,
+            OPERATION operation,
+            NODE right
+        )
+        is
+            super.init(location);
+            
+            this.operation = operation;
+            this.right = right;
+        si
+
+        void accept(Visitor visitor) is
+            visitor.visit(this);
+        si
+    si
+si si si

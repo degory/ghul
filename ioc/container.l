@@ -35,7 +35,7 @@ namespace IoC is
 
         LAZY_PARSER<Tree.Expression.NODE> expression_parser;
         LAZY_PARSER<Tree.Expression.LIST> expression_list_parser;
-        LAZY_PARSER<Tree.Expression.PRIMARY> expression_primary_parser;
+        LAZY_PARSER<Tree.Expression.NODE> expression_primary_parser;
         LAZY_PARSER<Tree.Expression.NODE> expression_secondary_parser;
         LAZY_PARSER<Tree.Expression.TUPLE> expression_tuple_parser;
         LAZY_PARSER<Tree.Expression.LITERAL> expression_literal_parser;
@@ -70,7 +70,7 @@ namespace IoC is
 
             expression_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_list_parser = new LAZY_PARSER<Tree.Expression.LIST>();            
-            expression_primary_parser = new LAZY_PARSER<Tree.Expression.PRIMARY>();
+            expression_primary_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_secondary_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_tuple_parser = new LAZY_PARSER<Tree.Expression.TUPLE>();
             expression_literal_parser = new LAZY_PARSER<Tree.Expression.LITERAL>();
@@ -202,7 +202,7 @@ namespace IoC is
                 si;
             
             expression_primary_parser.create = 
-                Parser.Parser<Tree.Expression.PRIMARY> proc() is
+                Parser.Parser<Tree.Expression.NODE> proc() is
                     return new Parser.Expression.PRIMARY(
                         identifier_parser,
                         type_parser,

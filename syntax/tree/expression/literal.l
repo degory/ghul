@@ -3,7 +3,7 @@ namespace Syntax is namespace Tree is namespace Expression is
 
     use Source;
 
-    class LITERAL isa PRIMARY is
+    class LITERAL isa NODE is
         public String value;
 
         void init(
@@ -31,7 +31,7 @@ namespace Syntax is namespace Tree is namespace Expression is
         si                                
     si    
 
-    class LIST_LITERAL isa PRIMARY is
+    class LIST_LITERAL isa NODE is
         public LIST elements;
 
         void init(

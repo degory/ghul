@@ -332,7 +332,7 @@ namespace Lexical is
             is TOKEN.OR:
                 string = "operator|";
 
-            is TOKEN.XOR:
+            is TOKEN.HAT:
                 string = "operator^";
 
             is TOKEN.EQ_OBJ:
@@ -562,7 +562,7 @@ namespace Lexical is
                     return new TOKEN_PAIR(TOKEN.NE_OBJ, location, null);
                 else
                     prev_char(c);
-                    return new TOKEN_PAIR(TOKEN.NOT, location, null);
+                    return new TOKEN_PAIR(TOKEN.BANG, location, null);
                 fi
 
             is '&':
@@ -583,8 +583,8 @@ namespace Lexical is
                     return new TOKEN_PAIR(TOKEN.OR, location, null);
                 fi
 
-            is '~': return new TOKEN_PAIR(TOKEN.NOT, location, null);
-            is '^': return new TOKEN_PAIR(TOKEN.XOR, location, null);
+            is '~': return new TOKEN_PAIR(TOKEN.TILDE, location, null);
+            is '^': return new TOKEN_PAIR(TOKEN.HAT, location, null);
 /*
             is '{': return new TOKEN_PAIR(TOKEN.BRACE_OPEN, location, null);
 

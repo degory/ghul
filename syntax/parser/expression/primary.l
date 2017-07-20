@@ -3,7 +3,7 @@ namespace Syntax is namespace Parser is namespace Expression is
 
     use Source;
 
-    class PRIMARY isa BASE<Tree.Expression.PRIMARY> is
+    class PRIMARY isa BASE<Tree.Expression.NODE> is
         Parser<Tree.Identifier.NODE> identifier_parser;
 
         Parser<Tree.Type.NODE> type_parser;
@@ -33,7 +33,7 @@ namespace Syntax is namespace Parser is namespace Expression is
             this.expression_tuple_parser = expression_tuple_parser;
 
             add_parser(
-                Tree.Expression.PRIMARY proc(CONTEXT context) is
+                Tree.Expression.NODE proc(CONTEXT context) is
                     return new Tree.Expression.UNARY(
                         context.location,
                         Tree.Expression.OPERATION.SUBTRACT,
@@ -44,7 +44,7 @@ namespace Syntax is namespace Parser is namespace Expression is
             );
 
             add_parser(
-                Tree.Expression.PRIMARY proc(CONTEXT context) is
+                Tree.Expression.NODE proc(CONTEXT context) is
                     var start = context.location;
 
                     var identifier = identifier_parser.parse(context);
@@ -97,7 +97,7 @@ namespace Syntax is namespace Parser is namespace Expression is
             );
 
             add_parser(
-                Tree.Expression.PRIMARY proc(CONTEXT context) is
+                Tree.Expression.NODE proc(CONTEXT context) is
                     var start = context.location;
 
                     context.next_token();
@@ -116,14 +116,14 @@ namespace Syntax is namespace Parser is namespace Expression is
             );
             
             add_parser(
-                Tree.Expression.PRIMARY proc(CONTEXT context) is
+                Tree.Expression.NODE proc(CONTEXT context) is
                     return expression_tuple_parser.parse(context);
                 si,
                 Lexical.TOKEN.PAREN_OPEN
             );              
 
             add_parser(
-                Tree.Expression.PRIMARY proc(CONTEXT context) is
+                Tree.Expression.NODE proc(CONTEXT context) is
                     var location = context.location;
                     var string = context.current.string;
                     context.next_token();

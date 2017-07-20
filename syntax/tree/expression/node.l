@@ -6,15 +6,20 @@ namespace Syntax is namespace Tree is namespace Expression is
 
     enum OPERATION is
         NONE,
-        ADD,
-        SUBTRACT,
+
+        NOT,
+        NOT_BITWISE,
 
         MULTIPLY,
         DIVIDE,
         MODULUS,
 
+        ADD,
+        SUBTRACT,        
+
         AND,
         OR,
+        XOR,
 
         SHIFT_LEFT,
         SHIFT_RIGHT,
@@ -54,9 +59,12 @@ namespace Syntax is namespace Tree is namespace Expression is
 
                 names[OPERATION.AND] = "&";
                 names[OPERATION.OR] = "|";
+                names[OPERATION.XOR] = "^";
 
                 names[OPERATION.SHIFT_LEFT] = "<<";
                 names[OPERATION.SHIFT_RIGHT] = ">>";
+
+                names[OPERATION.RANGE] = "..";
 
                 names[OPERATION.LESS] = "<";
                 names[OPERATION.LESS_OR_EQUAL] = ">";

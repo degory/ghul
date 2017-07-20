@@ -14,7 +14,7 @@ namespace Lexical is
     ASSERT,
     ASSIGN,
     AT,
-    BITAND,
+    BANG,
     BOOL,
     BREAK,
     BYTE,
@@ -50,6 +50,7 @@ namespace Lexical is
     GE,
     GET,
     GT,
+    HAT,
     IDENTIFIER,
     IF,
     IMPORT,
@@ -71,7 +72,6 @@ namespace Lexical is
     NE_OBJ,
     NEW,
     NONE,
-    NOT,
     NULL,
     OD,
     OPERATOR,
@@ -105,6 +105,7 @@ namespace Lexical is
     THEN,
     THIS,
     THROW,
+    TILDE,
     TRUE,
     TRY,
     UNKNOWN,
@@ -115,7 +116,6 @@ namespace Lexical is
     VOID,
     WHILE,
     WORD,
-    XOR,
     YRT
   si
 si

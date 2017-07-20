@@ -1,6 +1,5 @@
 #!/bin/bash
 if [ -z "$JOB_NAME" ]; then
-    echo JOB_NAME not set
     export JOB_NAME=rewrite-ci
 fi
 

@@ -11,7 +11,7 @@ namespace Syntax is namespace Parser is namespace Expression is
         Parser<Tree.Type.NODE> type_parser;
 
         Parser<Tree.Expression.NODE> expression_parser;
-        Parser<Tree.Expression.PRIMARY> expression_primary_parser;
+        Parser<Tree.Expression.NODE> expression_primary_parser;
         Parser<Tree.Expression.LIST> expression_list_parser;
 
         Parser<Tree.Body.NODE> body_parser;
@@ -20,7 +20,7 @@ namespace Syntax is namespace Parser is namespace Expression is
             Parser<Tree.Identifier.NODE> identifier_parser,            
             Parser<Tree.Type.NODE> type_parser,
             Parser<Tree.Expression.NODE> expression_parser,
-            Parser<Tree.Expression.PRIMARY> expression_primary_parser,
+            Parser<Tree.Expression.NODE> expression_primary_parser,
             Parser<Tree.Expression.LIST> expression_list_parser,
             Parser<Tree.Body.NODE> body_parser
         )
