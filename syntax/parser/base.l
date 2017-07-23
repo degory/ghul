@@ -63,6 +63,8 @@ namespace Syntax is namespace Parser is
                     syntax_error_message,
                     Lexical.TOKEN_NAMES[expected_tokens],
                     context.current.name});
+
+            IO.Std.err.println("from here: " + new System.Backtrace());
         si
 
         private void populate_expected_tokens() is

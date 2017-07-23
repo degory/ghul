@@ -256,8 +256,8 @@ namespace IoC is
                             // try ... catch ... finally ... yrt
                             Lexical.TOKEN.CATCH, Lexical.TOKEN.FINALLY, Lexical.TOKEN.YRT,
 
-                            // case ... is ... is ... default ... esac, also is ... si
-                            Lexical.TOKEN.IS, Lexical.TOKEN.DEFAULT, Lexical.TOKEN.ESAC,
+                            // case ... when ... when ... default ... esac
+                            Lexical.TOKEN.WHEN, Lexical.TOKEN.DEFAULT, Lexical.TOKEN.ESAC,
 
                             // is ... si
                             Lexical.TOKEN.SI

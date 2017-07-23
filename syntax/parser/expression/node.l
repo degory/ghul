@@ -22,24 +22,14 @@ namespace Syntax is namespace Parser is namespace Expression is
         Dict<Lexical.TOKEN, PRECEDENCE> precedence;
         Dict<Lexical.TOKEN, Tree.Expression.OPERATION> operation;
 
-        // Parser<Tree.Expression.PRIMARY> expression_primary_parser;
         Parser<Tree.Expression.NODE> expression_secondary_parser;
-        // Parser<Tree.Expression.TUPLE> expression_tuple_parser;
-        // Parser<Tree.Expression.LITERAL> expression_literal_parser;
-        // Parser<Tree.Type.NODE> type_parser;
 
         void init(
-            // Parser<Tree.Expression.PRIMARY> expression_primary_parser,
             Parser<Tree.Expression.NODE> expression_secondary_parser
-            // Parser<Tree.Expression.TUPLE> expression_tuple_parser,
-            // Parser<Tree.Expression.LITERAL> expression_literal_parser
         ) is
             super.init();
 
-            // this.primary_parser = primary_parser;
             this.expression_secondary_parser = expression_secondary_parser;
-            // this.tuple_parser = tuple_parser;
-            // this.literal_parser = literal_parser;
 
             precedence = new Map<Lexical.TOKEN, PRECEDENCE>();
 

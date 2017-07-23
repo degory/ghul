@@ -210,6 +210,14 @@ namespace Syntax is
             throwNotImplemented("if", if_);
         si
 
+        void visit(Statement.CASE case_) is
+            throwNotImplemented("case", case_);
+        si
+
+        void visit(Statement.CASE_MATCH case_match) is
+            throwNotImplemented("case match", case_match);
+        si
+
         void visit(Statement.DO do_) is
             throwNotImplemented("do", do_);
         si

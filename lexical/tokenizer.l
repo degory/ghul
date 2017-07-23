@@ -136,6 +136,7 @@ namespace Lexical is
                 symbol_tokens["for"] = TOKEN.FOR;
                 symbol_tokens["in"] = TOKEN.IN;
                 symbol_tokens["case"] = TOKEN.CASE;
+                symbol_tokens["when"] = TOKEN.WHEN;
                 symbol_tokens["default"] = TOKEN.DEFAULT;
                 symbol_tokens["break"] = TOKEN.BREAK;
                 symbol_tokens["continue"] = TOKEN.CONTINUE;

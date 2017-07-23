@@ -119,6 +119,7 @@ namespace Lexical is
             names[TOKEN.VAR] = "var";
             names[TOKEN.VECTOR] = "vector";
             names[TOKEN.VOID] = "void";
+            names[TOKEN.WHEN] = "when";
             names[TOKEN.WHILE] = "while";
             names[TOKEN.WORD] = "word";
             names[TOKEN.YRT] = "yrt";

@@ -426,6 +426,34 @@ namespace Syntax is
                 _result.append("fi\n");                
             si
 
+            void visit(Statement.CASE case_) is
+                _result.append("case ");
+
+                case_.expression.accept(this);
+
+                _result.append("\n");
+
+                foreach var m; case_.matches do
+                    m.accept(this);
+                od
+
+                _result.append("esac\n");
+            si
+
+            void visit(Statement.CASE_MATCH match) is
+                if match.expression != null then
+                    _result.append("when ");
+
+                    match.expression.accept(this);
+
+                    _result.append(":\n");
+                else
+                    _result.append("default:\n");
+                fi
+
+                match.statements.accept(this);
+            si
+
             void visit(Statement.DO do_) is
                 if do_.condition != null then
                     _result.append("while ");
