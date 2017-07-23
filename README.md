@@ -1,2 +1,2 @@
-# ghul
+# ghūl
 ghūl programming language
