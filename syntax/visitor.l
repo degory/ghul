@@ -58,6 +58,10 @@ namespace Syntax is
             throwNotImplemented("property", property);
         si
 
+        void visit(Definition.INDEXER indexer) is
+            throwNotImplemented("indexer", indexer);
+        si        
+
         // variables
         
         void visit(Variable.NODE variable) is

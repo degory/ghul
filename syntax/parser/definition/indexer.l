@@ -1,36 +1,50 @@
 namespace Syntax is namespace Parser is namespace Definition is
     use System;
+    use Generic;
 
     use Source;
 
-    class PROPERTY isa BASE<Tree.Definition.PROPERTY> is
+    class INDEXER isa BASE<Tree.Definition.INDEXER> is
         Parser<Tree.Identifier.NODE> identifier_parser;
         Parser<Tree.Type.NODE> type_parser;
-        Parser<Tree.Definition.LIST> definition_list_parser;
+        Parser<Tree.Variable.NODE> variable_parser;
         Parser<Tree.Body.NODE> body_parser;
+        
+        get String description is return "indexer"; si
 
         void init(
             Parser<Tree.Identifier.NODE> identifier_parser,
             Parser<Tree.Type.NODE> type_parser,
-            Parser<Tree.Definition.LIST> definition_list_parser,
+            Parser<Tree.Variable.NODE> variable_parser,
             Parser<Tree.Body.NODE> body_parser
         ) is
             super.init();
+
             this.identifier_parser = identifier_parser;
             this.type_parser = type_parser;
-            this.definition_list_parser = definition_list_parser;
+            this.variable_parser = variable_parser;
             this.body_parser = body_parser;
         si
 
-        Tree.Definition.PROPERTY parse(CONTEXT context) is
+        Tree.Definition.INDEXER parse(CONTEXT context) is
+            Tree.Identifier.NODE name;
+
             var start = context.location;
-            var name = identifier_parser.parse(context);
+
+            if context.current.token == Lexical.TOKEN.IDENTIFIER then
+                name = identifier_parser.parse(context);
+            fi
+
+            context.next_token(Lexical.TOKEN.SQUARE_OPEN);
+
+            var index_argument = variable_parser.parse(context);
+
+            context.next_token(Lexical.TOKEN.SQUARE_CLOSE);
 
             Tree.Type.NODE type;
 
             if context.current.token == Lexical.TOKEN.COLON then
                 context.next_token();
-
                 type = type_parser.parse(context);
             else
                 type = new Tree.Type.INFER(context.location);
@@ -77,26 +91,26 @@ namespace Syntax is namespace Parser is namespace Definition is
                         break;
                     fi
                 else
-                    context.error(context.location, "unexpected input in property");
-                    break;                                    
+                    context.error(context.location, "unexpected input in indexer");
+                    break;
                 fi
             od
-
-            var result = new Tree.Definition.PROPERTY(
+            
+            var result = new Tree.Definition.INDEXER(
                 start..context.location,
-                type,
                 name,
+                index_argument,
+                type,
                 getter_body,
                 setter_argument_name,
                 setter_body
             );
-
+ 
             if expect_semicolon then
                 context.next_token(Lexical.TOKEN.SEMICOLON);
             fi
 
-            return result;
+            return result;           
         si
     si
 si si si
-            

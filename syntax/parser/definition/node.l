@@ -55,8 +55,8 @@ namespace Syntax is namespace Parser is namespace Definition is
                 Tree.Definition.NODE proc(CONTEXT context) is
                     return definition_member_parser.parse(context);
                 si,
-                Lexical.TOKEN.IDENTIFIER
-            );            
+                {Lexical.TOKEN.IDENTIFIER, Lexical.TOKEN.SQUARE_OPEN}
+            );
         si
     si
 si si si
