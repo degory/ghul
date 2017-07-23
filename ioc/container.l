@@ -32,6 +32,7 @@ namespace IoC is
         LAZY_PARSER<Tree.Definition.NODE> definition_member_parser;
         LAZY_PARSER<Tree.Definition.FUNCTION> definition_function_parser;
         LAZY_PARSER<Tree.Definition.PROPERTY> definition_property_parser;
+        LAZY_PARSER<Tree.Definition.INDEXER> definition_indexer_parser;
 
         LAZY_PARSER<Tree.Expression.NODE> expression_parser;
         LAZY_PARSER<Tree.Expression.LIST> expression_list_parser;
@@ -67,6 +68,7 @@ namespace IoC is
             definition_member_parser = new LAZY_PARSER<Tree.Definition.NODE>();
             definition_function_parser = new LAZY_PARSER<Tree.Definition.FUNCTION>();
             definition_property_parser = new LAZY_PARSER<Tree.Definition.PROPERTY>();
+            definition_indexer_parser = new LAZY_PARSER<Tree.Definition.INDEXER>();
 
             expression_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_list_parser = new LAZY_PARSER<Tree.Expression.LIST>();            
@@ -160,7 +162,8 @@ namespace IoC is
                 Parser.Parser<Tree.Definition.NODE> proc() is
                     return new Parser.Definition.MEMBER(
                         definition_function_parser,
-                        definition_property_parser
+                        definition_property_parser,
+                        definition_indexer_parser
                     );
                 si;
 
@@ -183,6 +186,16 @@ namespace IoC is
                         body_parser
                     );
                 si;
+
+            definition_indexer_parser.create = 
+                Parser.Parser<Tree.Definition.INDEXER> proc() is
+                    return new Parser.Definition.INDEXER(
+                        identifier_parser,
+                        type_parser,
+                        variable_parser,
+                        body_parser
+                    );
+                si;                
                 
             expression_parser.create =
                 Parser.Parser<Tree.Expression.NODE> proc() is

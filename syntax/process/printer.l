@@ -166,7 +166,40 @@ namespace Syntax is
                     property.setter_body.accept(this);
                 fi
             si
+
+            void visit(Definition.INDEXER indexer) is
+                if indexer.name != null then
+                    indexer.name.accept(this);
+                fi
+
+                _result.append("[");
+                indexer.index_argument.accept(this);
+                _result.append("]");
+
+                if !isa Type.INFER(indexer.type) then
+                    _result.append(": ");
+                    indexer.type.accept(this);
+                fi
+
+                if indexer.getter_body != null then
+                    _result.append(' ');
+                    indexer.getter_body.accept(this);
+
+                    if indexer.setter_body != null then
+                        _result.append(",");
+                    fi
+                fi
+
+                if indexer.setter_body != null then
+                    _result.append(" = ");
+                    indexer.setter_argument.accept(this);
+                    _result.append(' ');
+
+                    indexer.setter_body.accept(this);
+                fi
+            si
             
+                        
             // types
 
             void visit(Type.BUILT_IN type) is
