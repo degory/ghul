@@ -114,6 +114,7 @@ namespace Lexical is
     VAR,
     VECTOR,
     VOID,
+    WHEN,
     WHILE,
     WORD,
     YRT

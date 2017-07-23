@@ -102,8 +102,63 @@ namespace Syntax is namespace Parser is namespace Statement is
                     return result;
                 si,
                 Lexical.TOKEN.IF
-            );            
+            );      
 
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    context.next_token(Lexical.TOKEN.CASE);
+
+                    var expression = expression_parser.parse(context);
+
+                    var seen_default = false;
+
+                    var match_list = new Vector<Tree.Statement.CASE_MATCH>();
+
+                    while context.current.token != Lexical.TOKEN.ESAC do
+                        var match_start = context.location;
+                        Tree.Expression.NODE match_expression;
+
+                        if context.current.token != Lexical.TOKEN.DEFAULT then
+                            context.next_token(Lexical.TOKEN.WHEN);
+                            match_expression = expression_parser.parse(context);
+
+                            context.next_token(Lexical.TOKEN.COLON);
+                        else
+                            if seen_default then
+                                context.error(context.location, "more than one default in case statement");
+                            else
+                                seen_default = true;
+                            fi
+
+                            context.next_token(Lexical.TOKEN.DEFAULT);                            
+                        fi
+
+                        var match_statement = statement_list_parser.parse(context);
+
+                        match_list.add(
+                            new Tree.Statement.CASE_MATCH(
+                                match_start..match_statement.location,
+                                match_expression,
+                                match_statement
+                            )
+                        );
+                    od
+
+                    var result = new Tree.Statement.CASE(
+                        start..context.location,
+                        expression,
+                        match_list
+                    );
+
+                    context.next_token(Lexical.TOKEN.ESAC);
+
+                    return result;
+                si,
+                Lexical.TOKEN.CASE
+            );
+                  
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
                     var start = context.location;
@@ -162,7 +217,7 @@ namespace Syntax is namespace Parser is namespace Statement is
 
                     return result;
                 si,
-                {Lexical.TOKEN.FOR}
+                Lexical.TOKEN.FOR
             );            
             
             add_parser(
