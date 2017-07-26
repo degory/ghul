@@ -158,6 +158,56 @@ namespace Syntax is namespace Parser is namespace Statement is
                 si,
                 Lexical.TOKEN.CASE
             );
+
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    context.next_token(Lexical.TOKEN.TRY);
+
+                    var body = statement_list_parser.parse(context);
+
+                    var catches = new Vector<Tree.Statement.CATCH>();
+
+                    while context.current.token == Lexical.TOKEN.CATCH do
+                        var catch_start = context.location;
+
+                        context.next_token();
+
+                        var catch_variable = variable_parser.parse(context);
+
+                        var catch_body = statement_list_parser.parse(context);
+
+                        catches.add(
+                            new Tree.Statement.CATCH(
+                                catch_start..catch_body.location,
+                                catch_variable,
+                                catch_body
+                            )
+                        );
+                    od
+
+                    Tree.Statement.LIST finally_;
+
+                    if context.current.token == Lexical.TOKEN.FINALLY then
+                        context.next_token();
+
+                        finally_ = statement_list_parser.parse(context);
+                    fi
+
+                    var result = new Tree.Statement.TRY(
+                        start..context.location,
+                        body,
+                        catches,
+                        finally_
+                    );
+
+                    context.next_token(Lexical.TOKEN.YRT);
+
+                    return result;
+                si,
+                Lexical.TOKEN.TRY
+            );
                   
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
