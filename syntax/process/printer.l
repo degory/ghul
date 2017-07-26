@@ -101,7 +101,7 @@ namespace Syntax is
                 class_.body.accept(this);
                 _result.append("si\n");
             si
-    
+
             void visit(Definition.INTERFACE interface_) is
                 _result.append("class ");
                 interface_.name.accept(this);
@@ -121,8 +121,39 @@ namespace Syntax is
                 _result.append(" is\n");
                 interface_.body.accept(this);
                 _result.append("si\n");
-            si        
+            si           
 
+            void visit(Definition.ENUM enum_) is
+                _result.append("enum ");
+
+                enum_.name.accept(this);
+                _result.append(" is\n");
+
+                var seen_any = false;
+
+                foreach var member; enum_.members do
+                    if seen_any then
+                        _result.append(",\n");
+                    fi
+
+                    member.accept(this);
+
+                    seen_any = true;
+                od
+
+                _result.append("\nsi\n");
+            si
+
+            void visit(Definition.ENUM_MEMBER member) is
+                member.name.accept(this);
+
+                if member.initializer != null then
+                    _result.append(" = ");
+
+                    member.initializer.accept(this);
+                fi
+            si                        
+    
             void visit(Definition.FUNCTION function) is
                 function.name.accept(this);
                 _result.append('(');

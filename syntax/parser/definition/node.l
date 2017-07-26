@@ -10,6 +10,7 @@ namespace Syntax is namespace Parser is namespace Definition is
         Parser<Tree.Definition.NAMESPACE> definition_namespace_parser;
         Parser<Tree.Definition.CLASS> definition_class_parser;
         Parser<Tree.Definition.INTERFACE> definition_interface_parser;
+        Parser<Tree.Definition.ENUM> definition_enum_parser;
         Parser<Tree.Definition.NODE> definition_member_parser;
 
         get String description is
@@ -20,6 +21,7 @@ namespace Syntax is namespace Parser is namespace Definition is
             Parser<Tree.Definition.NAMESPACE> definition_namespace_parser,
             Parser<Tree.Definition.CLASS> definition_class_parser,
             Parser<Tree.Definition.INTERFACE> definition_interface_parser,
+            Parser<Tree.Definition.ENUM> definition_enum_parser,
             Parser<Tree.Definition.NODE> definition_member_parser
         )
         is
@@ -28,6 +30,7 @@ namespace Syntax is namespace Parser is namespace Definition is
             this.definition_namespace_parser = definition_namespace_parser;
             this.definition_class_parser = definition_class_parser;
             this.definition_interface_parser = definition_interface_parser;
+            this.definition_enum_parser = definition_enum_parser;
             this.definition_member_parser = definition_member_parser;
 
             add_parser(
@@ -50,6 +53,13 @@ namespace Syntax is namespace Parser is namespace Definition is
                 si,
                 Lexical.TOKEN.INTERFACE
             );
+
+            add_parser(
+                Tree.Definition.NODE proc(CONTEXT context) is
+                    return definition_enum_parser.parse(context);
+                si,
+                Lexical.TOKEN.ENUM
+            );            
 
             add_parser(
                 Tree.Definition.NODE proc(CONTEXT context) is

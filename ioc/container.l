@@ -29,6 +29,7 @@ namespace IoC is
         LAZY_PARSER<Tree.Definition.NAMESPACE> definition_namespace_parser;
         LAZY_PARSER<Tree.Definition.CLASS> definition_class_parser;
         LAZY_PARSER<Tree.Definition.INTERFACE> definition_interface_parser;
+        LAZY_PARSER<Tree.Definition.ENUM> definition_enum_parser;
         LAZY_PARSER<Tree.Definition.NODE> definition_member_parser;
         LAZY_PARSER<Tree.Definition.FUNCTION> definition_function_parser;
         LAZY_PARSER<Tree.Definition.PROPERTY> definition_property_parser;
@@ -65,6 +66,7 @@ namespace IoC is
             definition_namespace_parser = new LAZY_PARSER<Tree.Definition.NAMESPACE>();
             definition_class_parser = new LAZY_PARSER<Tree.Definition.CLASS>();
             definition_interface_parser = new LAZY_PARSER<Tree.Definition.INTERFACE>();
+            definition_enum_parser = new LAZY_PARSER<Tree.Definition.ENUM>();
             definition_member_parser = new LAZY_PARSER<Tree.Definition.NODE>();
             definition_function_parser = new LAZY_PARSER<Tree.Definition.FUNCTION>();
             definition_property_parser = new LAZY_PARSER<Tree.Definition.PROPERTY>();
@@ -119,6 +121,7 @@ namespace IoC is
                         definition_namespace_parser,
                         definition_class_parser,
                         definition_interface_parser,
+                        definition_enum_parser,
                         definition_member_parser
                     );
                 si;
@@ -155,6 +158,14 @@ namespace IoC is
                         type_parser,
                         type_list_parser,
                         definition_list_parser
+                    );
+                si;
+
+            definition_enum_parser.create =
+                Parser.Parser<Tree.Definition.ENUM> proc() is
+                    return new Parser.Definition.ENUM(
+                        identifier_parser,
+                        expression_parser
                     );
                 si;
 
