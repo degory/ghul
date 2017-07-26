@@ -222,6 +222,14 @@ namespace Syntax is
             throwNotImplemented("case match", case_match);
         si
 
+        void visit(Statement.TRY try_) is
+            throwNotImplemented("try", try_);
+        si
+
+        void visit(Statement.CATCH catch_) is
+            throwNotImplemented("catch", catch_);
+        si        
+
         void visit(Statement.DO do_) is
             throwNotImplemented("do", do_);
         si

@@ -487,6 +487,35 @@ namespace Syntax is
                 match.statements.accept(this);
             si
 
+            void visit(Statement.TRY try_) is
+                _result.append("try\n");
+
+                try_.body.accept(this);
+
+                _result.append("\n");
+
+                foreach var c; try_.catches do
+                    c.accept(this);
+                od
+
+                if try_.finally_ != null then
+                    _result.append("finally\n");
+                    try_.finally_.accept(this);
+                fi
+
+                _result.append("esac\n");
+            si
+
+            void visit(Statement.CATCH catch_) is
+                _result.append("catch ");
+
+                catch_.variable.accept(this);
+
+                _result.append("\n");
+
+                catch_.body.accept(this);
+            si            
+
             void visit(Statement.DO do_) is
                 if do_.condition != null then
                     _result.append("while ");
