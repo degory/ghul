@@ -50,6 +50,14 @@ namespace Syntax is
             throwNotImplemented("interface", interface_);
         si        
 
+        void visit(Definition.ENUM enum_) is
+            throwNotImplemented("enum", enum_);
+        si
+
+        void visit(Definition.ENUM_MEMBER enum_member) is
+            throwNotImplemented("enum member", enum_member);
+        si        
+
         void visit(Definition.FUNCTION function) is
             throwNotImplemented("function", function);
         si
