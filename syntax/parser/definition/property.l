@@ -77,7 +77,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                         break;
                     fi
                 else
-                    context.error(context.location, "unexpected input in property");
+                    // context.error(context.location, "unexpected input in property");
                     break;                                    
                 fi
             od

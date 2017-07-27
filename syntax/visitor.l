@@ -90,6 +90,10 @@ namespace Syntax is
             throwNotImplemented("type", type);
         si
 
+        void visit(Type.MODIFIER modifier) is
+            throwNotImplemented("modifier", modifier);
+        si
+
         void visit(Type.BUILT_IN built_in) is
             throwNotImplemented("built id", built_in);
         si        
