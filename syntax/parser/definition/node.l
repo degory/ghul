@@ -8,6 +8,7 @@ namespace Syntax is namespace Parser is namespace Definition is
 
     class NODE isa BASE<Tree.Definition.NODE> is
         Parser<Tree.Definition.NAMESPACE> definition_namespace_parser;
+        Parser<Tree.Definition.USE> definition_user_parser;
         Parser<Tree.Definition.CLASS> definition_class_parser;
         Parser<Tree.Definition.INTERFACE> definition_interface_parser;
         Parser<Tree.Definition.ENUM> definition_enum_parser;
@@ -19,6 +20,7 @@ namespace Syntax is namespace Parser is namespace Definition is
 
         void init(
             Parser<Tree.Definition.NAMESPACE> definition_namespace_parser,
+            Parser<Tree.Definition.USE> definition_user_parser,
             Parser<Tree.Definition.CLASS> definition_class_parser,
             Parser<Tree.Definition.INTERFACE> definition_interface_parser,
             Parser<Tree.Definition.ENUM> definition_enum_parser,
@@ -28,6 +30,7 @@ namespace Syntax is namespace Parser is namespace Definition is
             super.init();
 
             this.definition_namespace_parser = definition_namespace_parser;
+            this.definition_user_parser = definition_user_parser;
             this.definition_class_parser = definition_class_parser;
             this.definition_interface_parser = definition_interface_parser;
             this.definition_enum_parser = definition_enum_parser;
@@ -38,6 +41,13 @@ namespace Syntax is namespace Parser is namespace Definition is
                     return definition_namespace_parser.parse(context);
                 si,
                 Lexical.TOKEN.NAMESPACE
+            );
+
+            add_parser(
+                Tree.Definition.NODE proc(CONTEXT context) is
+                    return definition_user_parser.parse(context);
+                si,
+                Lexical.TOKEN.USE
             );
 
             add_parser(
@@ -59,7 +69,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                     return definition_enum_parser.parse(context);
                 si,
                 Lexical.TOKEN.ENUM
-            );            
+            );
 
             add_parser(
                 Tree.Definition.NODE proc(CONTEXT context) is
