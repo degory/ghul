@@ -695,6 +695,9 @@ namespace Lexical is
             is '@':
                 return new TOKEN_PAIR(TOKEN.PRAGMA, location, null);
 
+            is '?':
+                return new TOKEN_PAIR(TOKEN.QUESTION, location, null);
+
             is '#':
                 buffer = new StringBuffer();
                 do
