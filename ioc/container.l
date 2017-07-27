@@ -12,9 +12,9 @@ namespace IoC is
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_qualified_parser;
 
         // Parsers are mutually recursive, and so the corresponding classes are mutually
-        // inter dependent. This means we can't just inject dependencies into constructors
-        // instead, inject lazy wrapped dependencies. (Strictly they don't all need to be
-        // lazy but it's easier to just make them all lazy than figure out specific places
+        // inter dependent. This means we can't just inject dependencies into constructors,
+        // so instead, we inject lazy wrapped dependencies. (Strictly they don't all need to be
+        // lazy, but it's easier to just make them all lazy than figure out specific places
         // to break the cycles in the dependency graph)
         
         LAZY_PARSER<Tree.Type.NODE> type_parser;
@@ -28,6 +28,7 @@ namespace IoC is
 
         LAZY_PARSER<Tree.Definition.NAMESPACE> definition_namespace_parser;
         LAZY_PARSER<Tree.Definition.CLASS> definition_class_parser;
+        LAZY_PARSER<Tree.Definition.USE> definition_use_parser;
         LAZY_PARSER<Tree.Definition.INTERFACE> definition_interface_parser;
         LAZY_PARSER<Tree.Definition.ENUM> definition_enum_parser;
         LAZY_PARSER<Tree.Definition.NODE> definition_member_parser;
@@ -64,6 +65,7 @@ namespace IoC is
             definition_list_parser = new LAZY_PARSER<Tree.Definition.LIST>();
 
             definition_namespace_parser = new LAZY_PARSER<Tree.Definition.NAMESPACE>();
+            definition_use_parser = new LAZY_PARSER<Tree.Definition.USE>();
             definition_class_parser = new LAZY_PARSER<Tree.Definition.CLASS>();
             definition_interface_parser = new LAZY_PARSER<Tree.Definition.INTERFACE>();
             definition_enum_parser = new LAZY_PARSER<Tree.Definition.ENUM>();
@@ -119,6 +121,7 @@ namespace IoC is
                 Parser.Parser<Tree.Definition.NODE> proc() is
                     return new Parser.Definition.NODE(
                         definition_namespace_parser,
+                        definition_use_parser,
                         definition_class_parser,
                         definition_interface_parser,
                         definition_enum_parser,
@@ -138,6 +141,13 @@ namespace IoC is
                     return new Parser.Definition.NAMESPACE(
                         identifier_qualified_parser,
                         definition_list_parser
+                    );
+                si;
+
+            definition_use_parser.create =
+                Parser.Parser<Tree.Definition.USE> proc() is
+                    return new Parser.Definition.USE(
+                        identifier_qualified_parser
                     );
                 si;
 

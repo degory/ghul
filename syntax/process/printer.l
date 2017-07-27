@@ -80,6 +80,23 @@ namespace Syntax is
                 _result.append("si\n");
             si            
 
+            void visit(Definition.USE use_) is
+                _result.append("use ");
+
+                var seen_any = false;
+                foreach var u; use_.uses do
+                    if seen_any then
+                        _result.append(", ");
+                    fi
+
+                    _result.append(u);
+
+                    seen_any = true;
+                od
+
+                _result.append(";");
+            si            
+
             void visit(Definition.CLASS class_) is
                 _result.append("class ");
 

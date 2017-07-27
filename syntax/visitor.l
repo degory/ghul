@@ -42,6 +42,10 @@ namespace Syntax is
             throwNotImplemented("namespace", namespace_);
         si        
 
+        void visit(Definition.USE use_) is
+            throwNotImplemented("use", use_);
+        si
+
         void visit(Definition.CLASS class_) is
             throwNotImplemented("class", class_);
         si
