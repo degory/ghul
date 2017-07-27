@@ -332,6 +332,23 @@ namespace Syntax is
                 identifier.identifier.accept(this);
             si
 
+            void visit(Expression.NEW new_) is
+                _result.append("new ");
+
+                new_.type.accept(this);
+                new_.arguments.accept(this);
+            si
+
+            void visit(Expression.CAST cast_) is
+                _result.append("cast ");
+
+                cast_.type.accept(this);
+
+                _result.append('(');
+                cast_.right.accept(this);
+                _result.append(')');
+            si
+
             void visit(Expression.VARIABLE variable) is
                 variable.identifier.accept(this);
 
