@@ -160,6 +160,14 @@ namespace Syntax is
             throwNotImplemented("none", none);
         si
 
+        void visit(Expression.NEW new_) is
+            throwNotImplemented("new", new_);
+        si
+
+        void visit(Expression.CAST cast_) is
+            throwNotImplemented("cast", cast_);
+        si        
+
         void visit(Syntax.Tree.Expression.FUNCTION function) is
             throwNotImplemented("function", function);
         si        

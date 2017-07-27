@@ -138,7 +138,51 @@ namespace Syntax is namespace Parser is namespace Expression is
                     return expression_tuple_parser.parse(context);
                 si,
                 Lexical.TOKEN.PAREN_OPEN
-            );              
+            );
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    context.next_token(Lexical.TOKEN.NEW);
+
+                    var type = type_parser.parse(context);
+
+                    var arguments = expression_tuple_parser.parse(context);
+
+                    return new Tree.Expression.NEW(
+                        start..arguments.location,
+                        type,
+                        arguments
+                    );
+                si,
+                Lexical.TOKEN.NEW
+            );
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    context.next_token(Lexical.TOKEN.CAST);
+
+                    var type = type_parser.parse(context);
+
+                    context.next_token(Lexical.TOKEN.PAREN_OPEN);
+
+                    var value = expression_parser.parse(context);
+                    
+                    var result = new Tree.Expression.CAST(
+                        start..context.location,
+                        type,
+                        value
+                    );
+
+                    context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+
+                    return result;
+                si,
+                Lexical.TOKEN.CAST
+            );       
 
             add_parser(
                 Tree.Expression.NODE proc(CONTEXT context) is
