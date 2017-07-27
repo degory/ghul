@@ -184,6 +184,10 @@ namespace Syntax is
             throwNotImplemented("index", index);
         si        
 
+        void visit(Expression.HAS_VALUE has_value) is
+            throwNotImplemented("has value", has_value);
+        si
+
         void visit(Expression.UNARY unary) is
             throwNotImplemented("unary", unary);
         si

@@ -106,19 +106,27 @@ namespace Syntax is namespace Parser is namespace Expression is
 
                             var body = body_parser.parse(context);
 
-                            return new Tree.Expression.FUNCTION(
+                            result = new Tree.Expression.FUNCTION(
                                 start..body.location,
                                 arguments,
                                 type,
                                 body
                             );
+                        else
+                            return new Tree.Expression.NONE(start..context.location);
                         fi
+                    else
+                        context.error(result.location, "expected a function formal argument");
+                        return new Tree.Expression.NONE(start..context.location);
                     fi
 
-                    other_token(context);
-                    return new Tree.Expression.NONE(
-                        start..context.location
+                is Lexical.TOKEN.QUESTION:
+                    result = new Tree.Expression.HAS_VALUE(
+                        start..context.location,
+                        result
                     );
+
+                    context.next_token();
 
                 default:
                     return result;

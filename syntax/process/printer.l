@@ -413,6 +413,12 @@ namespace Syntax is
                 _result.append(']');
             si
 
+            void visit(Expression.HAS_VALUE has_value) is
+                has_value.left.accept(this);
+
+                _result.append('?');
+            si
+
             void visit(Expression.UNARY unary) is
                 _result.append(Expression.OPERATION_NAMES[unary.operation]);
 
