@@ -250,6 +250,15 @@ namespace Syntax is
                         
             // types
 
+            void visit(Type.MODIFIER modifier) is
+                if !isa Type.INFER(modifier.element) then
+                    modifier.element.accept(this);
+                    _result.append(' ');
+                fi
+                
+                _result.append(modifier.name);
+            si
+
             void visit(Type.BUILT_IN type) is
                 _result.append(type.name);
             si

@@ -55,7 +55,14 @@ namespace Syntax is namespace Parser is namespace Type is
                 Tree.Type.NODE proc(CONTEXT context) is
                     return new Tree.Type.WORD(context.location_and_next());
                 si,
-                Lexical.TOKEN.WORD); 
+                Lexical.TOKEN.WORD);
+
+            add_parser(
+                Tree.Type.NODE proc(CONTEXT context) is
+                    return parse_modified(context, new Tree.Type.INFER(context.location));
+                si,
+                {Lexical.TOKEN.PUBLIC, Lexical.TOKEN.PROTECTED, Lexical.TOKEN.PRIVATE, Lexical.TOKEN.STATIC}
+            );
 
             add_parser(
                 Tree.Type.NODE proc(CONTEXT context) is
@@ -138,7 +145,9 @@ namespace Syntax is namespace Parser is namespace Type is
         Tree.Type.NODE parse(CONTEXT context) is
             var result = super.parse(context);
 
-            return parse_structured(context, result);
+            result = parse_structured(context, result);
+
+            return parse_modified(context, result);
         si
 
         Tree.Type.NODE parse_structured(CONTEXT context, Tree.Type.NODE element) is
@@ -156,6 +165,34 @@ namespace Syntax is namespace Parser is namespace Type is
 
                 is Lexical.TOKEN.PTR:
                     result = new Tree.Type.POINTER(result.location..context.location, result);
+                    context.next_token();
+
+                default:
+                    return result;
+                esac
+            od
+        si
+
+        // FIXME: not legal in all contexts
+        Tree.Type.NODE parse_modified(CONTEXT context, Tree.Type.NODE element) is
+            var result = element;
+
+            do
+                case context.current.token
+                is Lexical.TOKEN.PUBLIC:
+                    result = new Tree.Type.PUBLIC(result.location..context.location, result);
+                    context.next_token();
+
+                is Lexical.TOKEN.PROTECTED:
+                    result = new Tree.Type.PROTECTED(result.location..context.location, result);
+                    context.next_token();
+
+                is Lexical.TOKEN.PRIVATE:
+                    result = new Tree.Type.PRIVATE(result.location..context.location, result);
+                    context.next_token();
+
+                is Lexical.TOKEN.STATIC:
+                    result = new Tree.Type.STATIC(result.location..context.location, result);
                     context.next_token();
 
                 default:
