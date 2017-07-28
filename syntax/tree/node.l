@@ -19,7 +19,7 @@ namespace Syntax is
       si
 
       public String toString() is
-        var printer = new Process.PRINTER();
+        var printer = new Process.Printer.GHUL();
 
         accept(printer);
 
