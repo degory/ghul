@@ -12,6 +12,9 @@ namespace Syntax is namespace Process is namespace Printer is
 
         void init() is
             super.init();
+
+            _depth = 0;
+            _indent = 2;
             
             _result = new StringBuffer();
         si
@@ -42,10 +45,8 @@ namespace Syntax is namespace Process is namespace Printer is
                 return;
             fi
 
-            foreach var i; 0.._depth do
-                foreach var j; 0.._indent do
-                    append(' ');
-                od
+            for var i = 0; i < _indent * _depth; i = i + 1 do
+                append(' ');
             od
         si
 
@@ -62,7 +63,7 @@ namespace Syntax is namespace Process is namespace Printer is
             return append(string);
         si
 
-        void apply(NODE node) is
+        void print(NODE node) is
             node.accept(this);
         si
 

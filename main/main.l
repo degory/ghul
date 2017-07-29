@@ -6,9 +6,12 @@ namespace Test is
     
     class Main is
         void init() is
+            var want_legacy = false;
             var any_errors = false;
 
             try 
+                var logger = new LOGGER();                    
+            
                 var container = new IoC.CONTAINER();
 
                 IO.Std.err.FlushOnPrintln = true;
@@ -18,36 +21,52 @@ namespace Test is
                 args.nextElement();
 
                 foreach var s; args do
-                    IO.Std.err.println("will parse: " + s + "...");
+                    if s =~ "-L" then
+                        want_legacy = true;
+                    elif s =~ "-G" then
+                        want_legacy = false;
+                    else
 
-                    var tokenizer = new Lexical.TOKENIZER(
-                        s,
-                        IO.File.openRead(s)
-                    );
+                        IO.Std.err.println("will parse: " + s + "...");
 
-                    var logger = new LOGGER();                    
+                        var tokenizer = new Lexical.TOKENIZER(
+                            s,
+                            IO.File.openRead(s)
+                        );
 
-                    var context = new Syntax.Parser.CONTEXT(
-                        tokenizer,
-                        logger
-                    );
+                        var context = new Syntax.Parser.CONTEXT(
+                            tokenizer,
+                            logger
+                        );
 
-                    var i = 0;
+                        var i = 0;
 
-                    while !context.is_end_of_file do
-                        var definition = container.definition_parser.parse(context);
+                        while !context.is_end_of_file do
+                            var definition = container.definition_parser.parse(context);
 
-                        if definition != null then
-                            logger.info(definition.location, "read definition " + Object.dump(definition));
-                            logger.info(definition.location, "read definition \"%\"" % Object{definition});
-                        fi
+                            if definition != null then
+                                logger.info(definition.location, "read definition " + Object.dump(definition));
 
-                        i = i + 1;
-                    od
+                                Syntax.Process.Printer.BASE printer;
 
-                    logger.info(context.location, "finished");
+                                if want_legacy then
+                                    printer = new Syntax.Process.Printer.LEGACY(logger);
+                                else
+                                    printer = new Syntax.Process.Printer.GHUL();
+                                fi
 
-                    any_errors = any_errors || logger.any_errors;
+                                printer.print(definition);
+
+                                IO.Std.err.println(printer.result);
+                            fi
+
+                            i = i + 1;
+                        od
+
+                        logger.info(context.location, "finished");
+
+                        any_errors = any_errors || logger.any_errors;
+                    fi
                 od
 
                 IO.Std.err.println("exiting");

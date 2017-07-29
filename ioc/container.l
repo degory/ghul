@@ -8,6 +8,16 @@ namespace IoC is
     use Parser.LAZY_PARSER;
 
     class CONTAINER is
+        static CONTAINER _instance;
+
+        get CONTAINER instance is
+            if _instance == null then
+                _instance = new CONTAINER();
+            fi
+
+            return _instance;
+        si
+
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_parser;
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_qualified_parser;
 
