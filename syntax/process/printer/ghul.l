@@ -102,8 +102,6 @@ namespace Syntax is namespace Process is namespace Printer is
                 function.type.accept(this);
             fi
 
-            append(' ');
-
             if function.body != null then
                 function.body.accept(this);
             fi
@@ -120,7 +118,6 @@ namespace Syntax is namespace Process is namespace Printer is
             fi
 
             if property.getter_body != null then
-                append(' ');
                 property.getter_body.accept(this);
 
                 if property.setter_body != null then
@@ -131,7 +128,6 @@ namespace Syntax is namespace Process is namespace Printer is
             if property.setter_body != null then
                 append(" = ");
                 property.setter_argument.accept(this);
-                append(' ');
 
                 property.setter_body.accept(this);
             fi
@@ -154,7 +150,6 @@ namespace Syntax is namespace Process is namespace Printer is
             fi
 
             if indexer.getter_body != null then
-                append(' ');
                 indexer.getter_body.accept(this);
 
                 if indexer.setter_body != null then
@@ -165,7 +160,6 @@ namespace Syntax is namespace Process is namespace Printer is
             if indexer.setter_body != null then
                 append(" = ");
                 indexer.setter_argument.accept(this);
-                append(' ');
 
                 indexer.setter_body.accept(this);
             fi
@@ -303,7 +297,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Body.BLOCK block) is
-            dent_append("is\n");
+            append(" is\n");
             in();
             block.statements.accept(this);
             out();

@@ -22,11 +22,11 @@ namespace Syntax is namespace Process is namespace Printer is
             node.accept(this);
         si
 
-        void append(Type.NODE type) is
+        void append(LOCATION location, Type.NODE type) is
             if !isa Type.INFER(type) then
                 type.accept(this);
             else
-                error(type.location, "legacy compiler cannot infer type here");
+                error(location, "legacy compiler cannot infer type here");
             fi
         si
 
@@ -62,10 +62,12 @@ namespace Syntax is namespace Process is namespace Printer is
 
                 append("namespace ");
                 append(ns);
-                append("is");
+                append(" is");
 
                 seen_any = true;
             od
+
+            nl();
 
             in();
             namespace_.body.accept(this);
@@ -82,6 +84,8 @@ namespace Syntax is namespace Process is namespace Printer is
 
                 seen_any = true;
             od            
+
+            nl();
         si            
 
         void visit(Definition.CLASS class_) is
@@ -147,7 +151,7 @@ namespace Syntax is namespace Process is namespace Printer is
         void visit(Definition.FUNCTION function) is
             dent();
 
-            append(function.type);
+            append(function.location, function.type);
 
             append(' ');
             
@@ -168,7 +172,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 if property.getter_body != null then
                     dent_append("get ");
 
-                    append(property.type);
+                    append(property.location, property.type);
 
                     append(' ');
 
@@ -182,7 +186,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 if property.setter_body != null then
                     dent_append("set ");
 
-                    append(property.type);
+                    append(property.location, property.type);
 
                     append(' ');
 
@@ -199,14 +203,14 @@ namespace Syntax is namespace Process is namespace Printer is
             else
                 // auto property:
                 dent();
-                append(property.type);
+                append(property.location, property.type);
                 append(" _");
                 property.name.accept(this);
                 append(";\n");
 
                 dent();
                 append("private set ");
-                append(property.type);
+                append(property.location, property.type);
                 append(" ");
                 property.name.accept(this);
                 append(" = ");
@@ -219,7 +223,7 @@ namespace Syntax is namespace Process is namespace Printer is
 
                 dent();
                 append("get ");
-                append(property.type);
+                append(property.location, property.type);
                 append(" ");
                 property.name.accept(this);
                 append("is return _");
@@ -233,7 +237,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 if indexer.getter_body != null then
                     dent_append("get ");
 
-                    append(indexer.type);
+                    append(indexer.location, indexer.type);
 
                     if indexer.name != null then
                         append(' ');
@@ -253,7 +257,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 if indexer.setter_body != null then
                     dent_append("set ");
 
-                    append(indexer.type);
+                    append(indexer.location, indexer.type);
 
                     if indexer.name != null then
                         append(' ');
@@ -320,7 +324,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Type.FUNCTION function) is
-            append(function.result);
+            append(function.location, function.result);
 
             append(" proc(");
 
@@ -357,11 +361,11 @@ namespace Syntax is namespace Process is namespace Printer is
         // expression 
 
         void visit(Expression.VARIABLE variable) is
-            error(variable.location, "legacy compiler does not support variables in expressions");
+            error(variable.location, "legacy compiler does not support tuples");
         si
 
         void visit(Syntax.Tree.Expression.FUNCTION function) is
-            append(function.type);
+            append(function.location, function.type);
 
             append(" proc");
 
@@ -393,9 +397,11 @@ namespace Syntax is namespace Process is namespace Printer is
         // Statements
 
         void visit(Statement.LET l) is
+            dent();
             append("var ");
             l.variables.accept(this);
             append(";");
+            nl();
         si
 
         void visit(Statement.CASE_MATCH match) is
