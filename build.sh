@@ -7,4 +7,4 @@ if [ ! -d /tmp/lcache-$JOB_NAME ]; then
     mkdir /tmp/lcache-$JOB_NAME
 fi
 
-find main ioc system logging source lexical syntax -name '*.l' | xargs lc -p $JOB_NAME
+find ghul ioc system logging source lexical syntax -name '*.l' | xargs lc -p $JOB_NAME

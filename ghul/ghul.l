@@ -1,6 +1,6 @@
 import imports;
 
-namespace Test is
+namespace Ghul is
     use System;
     use Generic;
 
