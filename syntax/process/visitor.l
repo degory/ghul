@@ -48,6 +48,10 @@ namespace Syntax is
             throwNotImplemented("definition list", definitions);
         si
 
+        void visit(Definition.IMPORT import_) is
+            throwNotImplemented("import", import_);
+        si        
+        
         void visit(Definition.NAMESPACE namespace_) is
             throwNotImplemented("namespace", namespace_);
         si        
@@ -154,19 +158,23 @@ namespace Syntax is
             throwNotImplemented("identifier", identifier);
         si
 
-        void visit(Expression.LITERAL literal) is
+        void visit(Expression.Literal.NODE literal) is
             throwNotImplemented("literal", literal);
         si                        
 
-        void visit(Expression.LIST_LITERAL list) is
-            throwNotImplemented("list literal", list);
-        si                                
+        void visit(Expression.Literal.STRING string) is
+            throwNotImplemented("string literal", string);
+        si
+
+        void visit(Expression.Literal.CHARACTER character) is
+            throwNotImplemented("character literal", character);            
+        si
                 
         void visit(Expression.VARIABLE variable) is
             throwNotImplemented("variable", variable);
         si
 
-        void visit(Expression.NONE none) is
+        void visit(Expression.Literal.NONE none) is
             throwNotImplemented("none", none);
         si
 
@@ -185,6 +193,10 @@ namespace Syntax is
         void visit(Expression.TUPLE tuple) is
             throwNotImplemented("tuple", tuple);
         si
+
+        void visit(Expression.SEQUENCE sequence) is
+            throwNotImplemented("sequence", sequence);
+        si                           
 
         void visit(Expression.LIST list) is
             throwNotImplemented("list", list);

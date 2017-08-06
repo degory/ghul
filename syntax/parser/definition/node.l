@@ -7,6 +7,7 @@ namespace Syntax is namespace Parser is namespace Definition is
     // definitions are the kind of things you get directly inside a class or an interface, including other definitions.
 
     class NODE isa BASE<Tree.Definition.NODE> is        
+        Parser<Tree.Definition.IMPORT> definition_import_parser;
         Parser<Tree.Definition.NAMESPACE> definition_namespace_parser;
         Parser<Tree.Definition.USE> definition_user_parser;
         Parser<Tree.Definition.CLASS> definition_class_parser;
@@ -19,7 +20,8 @@ namespace Syntax is namespace Parser is namespace Definition is
         si
 
         void init(
-            Parser<Tree.Definition.NAMESPACE> definition_namespace_parser,
+            Parser<Tree.Definition.IMPORT> definition_import_parser,
+            Parser<Tree.Definition.NAMESPACE> definition_namespace_parser,            
             Parser<Tree.Definition.USE> definition_user_parser,
             Parser<Tree.Definition.CLASS> definition_class_parser,
             Parser<Tree.Definition.INTERFACE> definition_interface_parser,
@@ -29,12 +31,20 @@ namespace Syntax is namespace Parser is namespace Definition is
         is
             super.init();
 
+            this.definition_import_parser = definition_import_parser;
             this.definition_namespace_parser = definition_namespace_parser;
             this.definition_user_parser = definition_user_parser;
             this.definition_class_parser = definition_class_parser;
             this.definition_interface_parser = definition_interface_parser;
             this.definition_enum_parser = definition_enum_parser;
             this.definition_member_parser = definition_member_parser;
+
+            add_parser(
+                Tree.Definition.NODE proc(CONTEXT context) is
+                    return definition_import_parser.parse(context);
+                si,
+                Lexical.TOKEN.IMPORT
+            );
 
             add_parser(
                 Tree.Definition.NODE proc(CONTEXT context) is

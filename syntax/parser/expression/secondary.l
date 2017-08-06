@@ -113,11 +113,11 @@ namespace Syntax is namespace Parser is namespace Expression is
                                 body
                             );
                         else
-                            return new Tree.Expression.NONE(start..context.location);
+                            return new Tree.Expression.Literal.NONE(start..context.location);
                         fi
                     else
                         context.error(result.location, "expected a function formal argument");
-                        return new Tree.Expression.NONE(start..context.location);
+                        return new Tree.Expression.Literal.NONE(start..context.location);
                     fi
 
                 is Lexical.TOKEN.QUESTION:

@@ -24,6 +24,27 @@ namespace Syntax is namespace Process is namespace Printer is
             fi
         si
 
+        void visit(Definition.IMPORT import_) is
+            dent();
+
+            append("import ");
+
+            var seen_any = false;
+            foreach var i; import_.imports do
+                if seen_any then
+                    append(", ");
+                fi
+
+                i.accept(this);
+
+                seen_any = true;
+            od
+
+            append(';');
+
+            nl();            
+        si        
+        
         void visit(Definition.NAMESPACE namespace_) is
             dent_append("namespace ");
 
@@ -37,6 +58,27 @@ namespace Syntax is namespace Process is namespace Printer is
 
             dent_append("si\n");
         si            
+
+        void visit(Definition.USE use_) is
+            dent();
+
+            append("use ");
+
+            var seen_any = false;
+            foreach var u; use_.uses do
+                if seen_any then
+                    append(", ");
+                fi
+
+                u.accept(this);
+
+                seen_any = true;
+            od
+
+            append(';');
+
+            nl();            
+        si        
 
         void visit(Definition.CLASS class_) is
             dent_append("class ");
@@ -301,18 +343,18 @@ namespace Syntax is namespace Process is namespace Printer is
             function.body.accept(this);
         si
 
-        void visit(Expression.LIST_LITERAL list) is
+        void visit(Expression.SEQUENCE sequence) is
             append('[');
 
-            list.elements.accept(this);
+            sequence.elements.accept(this);
 
             append(']');
 
-            if !isa Tree.Type.INFER(list.type) then
+            if !isa Tree.Type.INFER(sequence.type) then
                 append(": ");
-                list.type.accept(this);
+                sequence.type.accept(this);
             fi
-        si            
+        si
 
         void visit(Expression.HAS_VALUE has_value) is
             has_value.left.accept(this);
@@ -343,8 +385,7 @@ namespace Syntax is namespace Process is namespace Printer is
             for_.body.accept(this);
             out();
 
-            dent_append("od"); 
-            nl();
+            dent_append("od\n"); 
         si
 
         // function body

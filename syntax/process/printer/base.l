@@ -119,27 +119,6 @@ namespace Syntax is namespace Process is namespace Printer is
             od
         si
 
-        void visit(Definition.USE use_) is
-            dent();
-
-            append("use ");
-
-            var seen_any = false;
-            foreach var u; use_.uses do
-                if seen_any then
-                    append(", ");
-                fi
-
-                u.accept(this);
-
-                seen_any = true;
-            od
-
-            append(';');
-
-            nl();            
-        si            
-
         void visit(Definition.ENUM enum_) is
             dent();
 
@@ -236,7 +215,7 @@ namespace Syntax is namespace Process is namespace Printer is
 
         // expression 
 
-        void visit(Expression.NONE none) is
+        void visit(Expression.Literal.NONE none) is
             append("none");
         si
 
@@ -268,10 +247,6 @@ namespace Syntax is namespace Process is namespace Printer is
 
             append(')');
         si
-
-        void visit(Expression.LITERAL literal) is
-            append(literal.value);
-        si                        
 
         void visit(Expression.CALL call) is
             call.function.accept(this);
@@ -326,6 +301,52 @@ namespace Syntax is namespace Process is namespace Printer is
 
                 seen_any = true;
             od
+        si
+
+        void visit(Expression.Literal.NODE literal) is
+            append(literal.value);
+        si
+
+        void append_escape_char(char c) is
+            var ci = cast int(c);
+
+            if ci == 9 then
+                append("\t");
+            elif ci == 10 then
+                append("\n");
+            elif ci == 13 then
+                append("\r");
+            elif ci < 32 then
+                append("\\");
+
+                var b = new StringBuffer(5);
+                b.append(ci, 8);
+
+                append(b);
+            elif ci == 34 then
+                append("\\");
+                append(cast char(34));
+            elif ci == 39 then
+                append("\'");
+            else
+                append(c);
+            fi
+        si                
+
+        void visit(Expression.Literal.STRING string) is
+            // VS Code wigs out over L char escape sequences for some reason
+            append(cast char(34));
+            foreach var c; string.value do
+                append_escape_char(c);
+            od
+
+            append(cast char(34));
+        si
+
+        void visit(Expression.Literal.CHARACTER character) is
+            append("'");
+            append_escape_char(character.value[0]);
+            append("'");
         si
 
         // Statements

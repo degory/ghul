@@ -3,21 +3,22 @@ namespace Syntax is namespace Tree is namespace Definition is
 
     use Source;
 
-    class USE isa NODE is
-        public List<Identifier.NODE> uses;
+    class IMPORT isa NODE is
+        public List<Identifier.NODE> imports;
 
         void init(
             LOCATION location,
-            List<Identifier.NODE> uses
+            List<Identifier.NODE> imports
         )
         is
             super.init(location);
 
-            this.uses = uses;
+            this.imports = imports;
         si
 
         public void accept(Visitor visitor) is
             visitor.visit(this);
         si
-    si    
+    si
+    
 si si si

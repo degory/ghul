@@ -124,7 +124,7 @@ namespace Syntax is namespace Parser is namespace Expression is
                         type = new Tree.Type.INFER(start..end);
                     fi
 
-                    return new Tree.Expression.LIST_LITERAL(
+                    return new Tree.Expression.SEQUENCE(
                         start..end,
                         elements,
                         type
@@ -189,14 +189,39 @@ namespace Syntax is namespace Parser is namespace Expression is
                     var location = context.location;
                     var string = context.current.string;
                     context.next_token();
-                    return new Tree.Expression.LITERAL(location, string);
+                    return new Tree.Expression.Literal.INTEGER(location, string);
                 si,
-                {
-                    Lexical.TOKEN.INT_LITERAL,
-                    Lexical.TOKEN.STRING_LITERAL,
-                    Lexical.TOKEN.NONE
-                }
+                Lexical.TOKEN.INT_LITERAL
             );
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    var string = context.current.string;
+                    context.next_token();
+                    return new Tree.Expression.Literal.STRING(location, string);
+                si,
+                Lexical.TOKEN.STRING_LITERAL
+            );
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    var string = context.current.string;
+                    context.next_token();
+                    return new Tree.Expression.Literal.CHARACTER(location, string);
+                si,
+                Lexical.TOKEN.CHAR_LITERAL
+            );
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    context.next_token();
+                    return new Tree.Expression.Literal.NONE(location);
+                si,
+                Lexical.TOKEN.NONE
+            );            
         si
     si
 si si si

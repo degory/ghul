@@ -50,6 +50,20 @@ namespace Syntax is namespace Process is namespace Printer is
             fi
         si
 
+        void visit(Definition.IMPORT import_) is
+            foreach var i; import_.imports do
+                dent();
+
+                append("import ");
+
+                i.accept(this);
+
+                append(';');
+
+                nl();            
+            od
+        si        
+        
         void visit(Definition.NAMESPACE namespace_) is
             dent();
 
@@ -68,7 +82,6 @@ namespace Syntax is namespace Process is namespace Printer is
             od
 
             nl();
-
             in();
             namespace_.body.accept(this);
             out();
@@ -86,7 +99,21 @@ namespace Syntax is namespace Process is namespace Printer is
             od            
 
             nl();
-        si            
+        si
+
+        void visit(Definition.USE use_) is
+            foreach var u; use_.uses do
+                dent();
+
+                append("use ");
+
+                u.accept(this);
+
+                append(';');
+
+                nl();            
+            od
+        si        
 
         void visit(Definition.CLASS class_) is
             dent_append("class ");
@@ -170,7 +197,6 @@ namespace Syntax is namespace Process is namespace Printer is
             if function.body != null then
                 append(' ');
                 function.body.accept(this);
-                append("@");
                 nl();
             fi
         si
@@ -232,7 +258,6 @@ namespace Syntax is namespace Process is namespace Printer is
                     append(' ');
         
                     property.getter_body.accept(this);
-                    append("@");
                     nl();
                 fi
 
@@ -256,7 +281,6 @@ namespace Syntax is namespace Process is namespace Printer is
                     append(' ');
 
                     property.setter_body.accept(this);
-                    append("@");
                     nl();
                 fi
             elif !property.name.name.startsWith('_') && !property.modifiers.is_private then
@@ -331,7 +355,6 @@ namespace Syntax is namespace Process is namespace Printer is
                     append("]");
         
                     indexer.getter_body.accept(this);
-                    append("@");
                     nl();
                 fi
 
@@ -359,7 +382,6 @@ namespace Syntax is namespace Process is namespace Printer is
                     indexer.setter_argument.accept(this);
         
                     indexer.setter_body.accept(this);
-                    append("@");
                     nl();
                 fi
             else
@@ -454,14 +476,14 @@ namespace Syntax is namespace Process is namespace Printer is
             function.body.accept(this);
         si
 
-        void visit(Expression.LIST_LITERAL list) is
-            if !isa Tree.Type.INFER(list.type) then
-                list.type.accept(this);
+        void visit(Expression.SEQUENCE sequence) is
+            if !isa Tree.Type.INFER(sequence.type) then
+                sequence.type.accept(this);
             fi        
 
             append('{');
 
-            list.elements.accept(this);
+            sequence.elements.accept(this);
 
             append('}');
         si            
@@ -475,8 +497,7 @@ namespace Syntax is namespace Process is namespace Printer is
         // Statements
 
         void visit(Statement.LET l) is
-            dent();
-            append("var ");
+            dent_append("var ");
             l.variables.accept(this);
             append(";");
             nl();
@@ -501,8 +522,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.FOR for_) is
-            dent();
-            append("foreach ");
+            dent_append("foreach var ");
 
             for_.variable.accept(this);
 
@@ -516,7 +536,7 @@ namespace Syntax is namespace Process is namespace Printer is
             for_.body.accept(this);
             out();
 
-            append("od\n"); 
+            dent_append("od\n"); 
         si
 
         // function body
@@ -532,8 +552,7 @@ namespace Syntax is namespace Process is namespace Printer is
             in();
             block.statements.accept(this);
             out();
-            dent();
-            append("si");
+            dent_append("si");
         si            
     si
 si si si

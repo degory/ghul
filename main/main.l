@@ -58,6 +58,15 @@ namespace Test is
                                 printer.print(definition);
 
                                 IO.Std.err.println(printer.result);
+
+                                if want_legacy then
+                                    var out_file_name = s.substring(0, s.Length-5) + ".l";
+                                    var writer = IO.File.openWrite(out_file_name);
+
+                                    writer.print(printer.result);
+
+                                    writer.close();
+                                fi
                             fi
 
                             i = i + 1;

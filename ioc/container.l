@@ -39,6 +39,7 @@ namespace IoC is
         public LAZY_PARSER<Tree.Definition.NODE> definition_parser;
         LAZY_PARSER<Tree.Definition.LIST> definition_list_parser;
 
+        LAZY_PARSER<Tree.Definition.IMPORT> definition_import_parser;
         LAZY_PARSER<Tree.Definition.NAMESPACE> definition_namespace_parser;
         LAZY_PARSER<Tree.Definition.CLASS> definition_class_parser;
         LAZY_PARSER<Tree.Definition.USE> definition_use_parser;
@@ -54,7 +55,6 @@ namespace IoC is
         LAZY_PARSER<Tree.Expression.NODE> expression_primary_parser;
         LAZY_PARSER<Tree.Expression.NODE> expression_secondary_parser;
         LAZY_PARSER<Tree.Expression.TUPLE> expression_tuple_parser;
-        LAZY_PARSER<Tree.Expression.LITERAL> expression_literal_parser;
 
         LAZY_PARSER<Tree.Statement.NODE> statement_parser;
         LAZY_PARSER<Tree.Statement.LIST> statement_list_parser;
@@ -80,6 +80,7 @@ namespace IoC is
             definition_parser = new LAZY_PARSER<Tree.Definition.NODE>();
             definition_list_parser = new LAZY_PARSER<Tree.Definition.LIST>();
 
+            definition_import_parser = new LAZY_PARSER<Tree.Definition.IMPORT>();
             definition_namespace_parser = new LAZY_PARSER<Tree.Definition.NAMESPACE>();
             definition_use_parser = new LAZY_PARSER<Tree.Definition.USE>();
             definition_class_parser = new LAZY_PARSER<Tree.Definition.CLASS>();
@@ -95,7 +96,6 @@ namespace IoC is
             expression_primary_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_secondary_parser = new LAZY_PARSER<Tree.Expression.NODE>();
             expression_tuple_parser = new LAZY_PARSER<Tree.Expression.TUPLE>();
-            expression_literal_parser = new LAZY_PARSER<Tree.Expression.LITERAL>();
 
             statement_parser = new LAZY_PARSER<Tree.Statement.NODE>();
             statement_list_parser = new LAZY_PARSER<Tree.Statement.LIST>();
@@ -143,6 +143,7 @@ namespace IoC is
             definition_parser.create = 
                 Parser.Parser<Tree.Definition.NODE> proc() is
                     return new Parser.Definition.NODE(
+                        definition_import_parser,
                         definition_namespace_parser,
                         definition_use_parser,
                         definition_class_parser,
@@ -156,6 +157,13 @@ namespace IoC is
                 Parser.Parser<Tree.Definition.LIST> proc() is
                     return new Parser.Definition.LIST(
                         definition_parser
+                    );
+                si;
+
+            definition_import_parser.create =
+                Parser.Parser<Tree.Definition.IMPORT> proc() is
+                    return new Parser.Definition.IMPORT(
+                        identifier_parser
                     );
                 si;
 

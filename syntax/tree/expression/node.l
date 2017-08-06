@@ -67,7 +67,7 @@ namespace Syntax is namespace Tree is namespace Expression is
                 names[OPERATION.RANGE] = "..";
 
                 names[OPERATION.LESS] = "<";
-                names[OPERATION.LESS_OR_EQUAL] = ">";
+                names[OPERATION.LESS_OR_EQUAL] = "<=";
                 names[OPERATION.EQUAL] = "==";
                 names[OPERATION.EQUAL_OBJ] = "=~";
                 names[OPERATION.NOT_EQUAL] = "!=";
