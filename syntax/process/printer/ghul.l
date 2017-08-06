@@ -55,6 +55,8 @@ namespace Syntax is namespace Process is namespace Printer is
                 class_.ancestors.accept(this);
             fi
 
+            class_.modifiers.accept(this);
+
             append(" is\n");
 
             in();
@@ -80,6 +82,8 @@ namespace Syntax is namespace Process is namespace Printer is
                 interface_.ancestors.accept(this);
             fi
 
+            interface_.modifiers.accept(this);            
+
             append(" is\n");
 
             in();
@@ -87,12 +91,21 @@ namespace Syntax is namespace Process is namespace Printer is
             out();
 
             dent_append("si\n");
-        si           
+        si       
+
+        void after_body(Body.NODE node) is
+            if node == null || !node.is_block then
+                append(";\n");
+            else
+                append("\n");
+            fi
+        si
 
         void visit(Definition.FUNCTION function) is
             dent();
 
             function.name.accept(this);
+            
             append('(');
             function.arguments.accept(this);
             append(')');
@@ -100,11 +113,46 @@ namespace Syntax is namespace Process is namespace Printer is
             if !isa Type.INFER(function.type) then
                 append(" -> ");
                 function.type.accept(this);
+                
+                function.modifiers.accept(this);
+            elif !function.modifiers.is_empty then
+                function.modifiers.accept(this);
             fi
 
-            if function.body != null then
+            if function.body != null then                
+                append(' ');
                 function.body.accept(this);
             fi
+
+            after_body(function.body);
+        si
+
+        void append_member_type_and_modifiers(
+            Type.NODE type,
+            Modifier.LIST modifiers
+        ) is
+            if !isa Type.INFER(type) then
+                append(": ");
+                type.accept(this);
+                append(" ");
+                modifiers.accept(this);
+            elif !modifiers.is_empty then
+                modifiers.accept(this);
+            fi
+        si
+
+        bool indent_property(bool has_getter, bool has_setter) is
+            if has_getter && has_setter != null then
+                in();
+                nl();
+                dent();
+
+                return true;
+            elif has_getter || has_setter != null then
+                append(" ");
+            fi
+
+            return false;            
         si
 
         void visit(Definition.PROPERTY property) is
@@ -112,25 +160,34 @@ namespace Syntax is namespace Process is namespace Printer is
 
             property.name.accept(this);
 
-            if !isa Type.INFER(property.type) then
-                append(": ");
-                property.type.accept(this);
-            fi
+            append_member_type_and_modifiers(property.type, property.modifiers);
+
+            var out_again = indent_property(property.getter_body != null, property.setter_body != null);
 
             if property.getter_body != null then
                 property.getter_body.accept(this);
 
                 if property.setter_body != null then
-                    append(",");
-                fi
+                    append(",\n");
+                    dent();
+                else
+                    after_body(property.getter_body);                
+                fi           
+            else
+                append(' ');
             fi
 
             if property.setter_body != null then
-                append(" = ");
+                append("= ");
                 property.setter_argument.accept(this);
 
                 property.setter_body.accept(this);
+                after_body(property.setter_body);           
             fi
+
+            if out_again then
+                out();
+            fi            
         si
 
         void visit(Definition.INDEXER indexer) is
@@ -144,38 +201,39 @@ namespace Syntax is namespace Process is namespace Printer is
             indexer.index_argument.accept(this);
             append(']');
 
-            if !isa Type.INFER(indexer.type) then
-                append(": ");
-                indexer.type.accept(this);
-            fi
+            append_member_type_and_modifiers(indexer.type, indexer.modifiers);
+
+            var out_again = indent_property(indexer.getter_body != null, indexer.setter_body != null);
 
             if indexer.getter_body != null then
                 indexer.getter_body.accept(this);
 
                 if indexer.setter_body != null then
-                    append(",");
+                    append(",\n");
+                    dent();
+                else
+                    after_body(indexer.getter_body);                
                 fi
+            else
+                append(' ');
             fi
 
             if indexer.setter_body != null then
-                append(" = ");
+                append("= ");
                 indexer.setter_argument.accept(this);
+                append(' ');
 
                 indexer.setter_body.accept(this);
+                after_body(indexer.setter_body);
             fi
+
+            if out_again then
+                out();
+            fi                        
         si
         
                     
         // types
-
-        void visit(Type.MODIFIER modifier) is
-            if !isa Type.INFER(modifier.element) then
-                modifier.element.accept(this);
-                append(' ');
-            fi
-            
-            append(modifier.name);
-        si
 
         void visit(Type.GENERIC generic) is
             generic.name.accept(this);
@@ -292,12 +350,12 @@ namespace Syntax is namespace Process is namespace Printer is
         // function body
 
         void visit(Body.EXPRESSION expression) is
-            append(" => ");
+            append("=> ");
             expression.expression.accept(this);
         si
 
         void visit(Body.BLOCK block) is
-            append(" is\n");
+            append("is\n");
             in();
             block.statements.accept(this);
             out();

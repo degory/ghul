@@ -1,7 +1,7 @@
 namespace Syntax is namespace Tree is namespace Definition is
     use Source;
 
-    class INTERFACE isa NODE is
+    class INTERFACE isa MODIFIABLE is
         public Identifier.NODE name;
         public Type.LIST arguments;
         public Type.LIST ancestors;
@@ -12,10 +12,11 @@ namespace Syntax is namespace Tree is namespace Definition is
             Identifier.NODE name,
             Type.LIST arguments,
             Type.LIST ancestors,
+            Modifier.LIST modifiers,
             LIST body
         )
         is
-            super.init(location);
+            super.init(location, modifiers);
 
             this.name = name;
             this.arguments = arguments;

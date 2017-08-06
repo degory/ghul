@@ -13,8 +13,12 @@ namespace Syntax is namespace Tree is namespace Body is
             this.statements = statements;
         si
 
-        public void accept(Visitor visitor) is
+        void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        get bool is_block is
+            return true;
         si
     si
 si si si

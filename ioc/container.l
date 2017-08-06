@@ -20,6 +20,7 @@ namespace IoC is
 
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_parser;
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_qualified_parser;
+        Syntax.Parser.Parser<Tree.Modifier.NODE> modifier_parser;
 
         // Parsers are mutually recursive, and so the corresponding classes are mutually
         // inter dependent. This means we can't just inject dependencies into constructors,
@@ -32,6 +33,8 @@ namespace IoC is
 
         LAZY_PARSER<Tree.Variable.NODE> variable_parser;
         LAZY_PARSER<Tree.Variable.LIST> variable_list_parser;
+
+        LAZY_PARSER<Tree.Modifier.LIST> modifier_list_parser;
 
         public LAZY_PARSER<Tree.Definition.NODE> definition_parser;
         LAZY_PARSER<Tree.Definition.LIST> definition_list_parser;
@@ -62,6 +65,7 @@ namespace IoC is
             // non circular/leaf dependencies
             identifier_parser = new Parser.Identifier.NODE();
             identifier_qualified_parser = new Parser.Identifier.QUALIFIED();
+            modifier_parser = new Parser.Modifier.NODE();
 
             // circular dependencies
 
@@ -70,6 +74,8 @@ namespace IoC is
 
             variable_parser = new LAZY_PARSER<Tree.Variable.NODE>();
             variable_list_parser = new LAZY_PARSER<Tree.Variable.LIST>();
+
+            modifier_list_parser = new LAZY_PARSER<Tree.Modifier.LIST>();
 
             definition_parser = new LAZY_PARSER<Tree.Definition.NODE>();
             definition_list_parser = new LAZY_PARSER<Tree.Definition.LIST>();
@@ -127,6 +133,13 @@ namespace IoC is
                     );
                 si;
 
+            modifier_list_parser.create =
+                Parser.Parser<Tree.Modifier.LIST> proc() is
+                    return new Parser.Modifier.LIST(
+                        modifier_parser
+                    );
+                si;
+
             definition_parser.create = 
                 Parser.Parser<Tree.Definition.NODE> proc() is
                     return new Parser.Definition.NODE(
@@ -167,6 +180,7 @@ namespace IoC is
                         identifier_parser,
                         type_parser,
                         type_list_parser,
+                        modifier_list_parser,
                         definition_list_parser
                     );
                 si;
@@ -177,6 +191,7 @@ namespace IoC is
                         identifier_parser,
                         type_parser,
                         type_list_parser,
+                        modifier_list_parser,
                         definition_list_parser
                     );
                 si;
@@ -185,6 +200,7 @@ namespace IoC is
                 Parser.Parser<Tree.Definition.ENUM> proc() is
                     return new Parser.Definition.ENUM(
                         identifier_parser,
+                        modifier_list_parser,
                         expression_parser
                     );
                 si;
@@ -203,6 +219,7 @@ namespace IoC is
                     return new Parser.Definition.FUNCTION(
                         identifier_parser,
                         type_parser,
+                        modifier_list_parser,
                         body_parser,
                         variable_list_parser
                     );
@@ -213,6 +230,7 @@ namespace IoC is
                     return new Parser.Definition.PROPERTY(
                         identifier_parser,
                         type_parser,
+                        modifier_list_parser,
                         definition_list_parser,
                         body_parser
                     );
@@ -223,6 +241,7 @@ namespace IoC is
                     return new Parser.Definition.INDEXER(
                         identifier_parser,
                         type_parser,
+                        modifier_list_parser,
                         variable_parser,
                         body_parser
                     );

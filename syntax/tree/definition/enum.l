@@ -3,17 +3,18 @@ namespace Syntax is namespace Tree is namespace Definition is
 
     use Source;
 
-    class ENUM isa NODE is
+    class ENUM isa MODIFIABLE is
         public Identifier.NODE name;
         public List<ENUM_MEMBER> members;
 
         void init(
             LOCATION location,
             Identifier.NODE name,
+            Modifier.LIST modifiers,
             List<ENUM_MEMBER> members
         )
         is
-            super.init(location);
+            super.init(location, modifiers);
 
             this.name = name;
             this.members = members;

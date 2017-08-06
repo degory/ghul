@@ -1,7 +1,7 @@
 namespace Syntax is namespace Tree is namespace Definition is
     use Source;
 
-    class FUNCTION isa NODE is
+    class FUNCTION isa MODIFIABLE is
         public Identifier.NODE name;
         public Variable.LIST arguments;
         public Type.NODE type;
@@ -12,10 +12,11 @@ namespace Syntax is namespace Tree is namespace Definition is
             Identifier.NODE name,
             Variable.LIST arguments,
             Type.NODE type,
+            Modifier.LIST modifiers,
             Body.NODE body
         )
         is
-            super.init(location);
+            super.init(location, modifiers);
 
             this.name = name;
             this.arguments = arguments;

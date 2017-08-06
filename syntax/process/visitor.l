@@ -28,6 +28,16 @@ namespace Syntax is
             throwNotImplemented("qualified identifier", identifier);
         si
 
+        // modifiers
+
+        void visit(Modifier.NODE modifier) is
+            throwNotImplemented("modifier", modifier);
+        si
+
+        void visit(Modifier.LIST modifiers) is
+            throwNotImplemented("modifiers", modifiers);
+        si        
+
         // definitions
 
         void visit(Definition.NODE definition) is
@@ -88,10 +98,6 @@ namespace Syntax is
 
         void visit(Type.NODE type) is
             throwNotImplemented("type", type);
-        si
-
-        void visit(Type.MODIFIER modifier) is
-            throwNotImplemented("modifier", modifier);
         si
 
         void visit(Type.BUILT_IN built_in) is

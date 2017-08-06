@@ -6,18 +6,21 @@ namespace Syntax is namespace Parser is namespace Definition is
     class PROPERTY isa BASE<Tree.Definition.PROPERTY> is
         Parser<Tree.Identifier.NODE> identifier_parser;
         Parser<Tree.Type.NODE> type_parser;
+        Parser<Tree.Modifier.LIST> modifier_list_parser;     
         Parser<Tree.Definition.LIST> definition_list_parser;
         Parser<Tree.Body.NODE> body_parser;
 
         void init(
             Parser<Tree.Identifier.NODE> identifier_parser,
             Parser<Tree.Type.NODE> type_parser,
+            Parser<Tree.Modifier.LIST> modifier_list_parser,            
             Parser<Tree.Definition.LIST> definition_list_parser,
             Parser<Tree.Body.NODE> body_parser
         ) is
             super.init();
             this.identifier_parser = identifier_parser;
             this.type_parser = type_parser;
+            this.modifier_list_parser = modifier_list_parser;
             this.definition_list_parser = definition_list_parser;
             this.body_parser = body_parser;
         si
@@ -35,6 +38,8 @@ namespace Syntax is namespace Parser is namespace Definition is
             else
                 type = new Tree.Type.INFER(context.location);
             fi
+
+            var modifiers = modifier_list_parser.parse(context);
 
             Tree.Body.NODE getter_body;
             Tree.Body.NODE setter_body;
@@ -86,6 +91,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                 start..context.location,
                 type,
                 name,
+                modifiers,
                 getter_body,
                 setter_argument_name,
                 setter_body

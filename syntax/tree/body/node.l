@@ -1,5 +1,7 @@
 
 namespace Syntax is namespace Tree is namespace Body is
+    use System;
+
     use Source;
 
     class NODE isa Tree.NODE is
@@ -8,8 +10,12 @@ namespace Syntax is namespace Tree is namespace Body is
             super.init(location);
         si
 
-        public void accept(Visitor visitor) is
+        void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        get bool is_block is
+            return false;
         si
     si
 si si si

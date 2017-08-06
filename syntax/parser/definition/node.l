@@ -6,7 +6,7 @@ namespace Syntax is namespace Parser is namespace Definition is
 
     // definitions are the kind of things you get directly inside a class or an interface, including other definitions.
 
-    class NODE isa BASE<Tree.Definition.NODE> is
+    class NODE isa BASE<Tree.Definition.NODE> is        
         Parser<Tree.Definition.NAMESPACE> definition_namespace_parser;
         Parser<Tree.Definition.USE> definition_user_parser;
         Parser<Tree.Definition.CLASS> definition_class_parser;

@@ -6,15 +6,18 @@ namespace Syntax is namespace Parser is namespace Definition is
 
     class ENUM isa BASE<Tree.Definition.ENUM> is
         Parser<Tree.Identifier.NODE> identifier_parser;
+        Parser<Tree.Modifier.LIST> modifier_list_parser;
         Parser<Tree.Expression.NODE> expression_parser;
 
         void init(
             Parser<Tree.Identifier.NODE> identifier_parser,
+            Parser<Tree.Modifier.LIST> modifier_list_parser,            
             Parser<Tree.Expression.NODE> expression_parser
         ) is
             super.init();
             
             this.identifier_parser = identifier_parser;
+            this.modifier_list_parser = modifier_list_parser;
             this.expression_parser = expression_parser;
         si
 
@@ -23,6 +26,8 @@ namespace Syntax is namespace Parser is namespace Definition is
 
             var start = context.location;
             var name = identifier_parser.parse(context);
+
+            var modifiers = modifier_list_parser.parse(context);
 
             context.next_token(Lexical.TOKEN.IS);
 
@@ -57,6 +62,7 @@ namespace Syntax is namespace Parser is namespace Definition is
             var result = new Tree.Definition.ENUM(
                 start..context.location,
                 name,
+                modifiers,
                 members
             );
 

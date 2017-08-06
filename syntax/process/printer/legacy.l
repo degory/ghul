@@ -129,7 +129,7 @@ namespace Syntax is namespace Process is namespace Printer is
             dent_append("interface ");
             interface_.name.accept(this);
 
-            if interface_.arguments != null then 
+            if interface_.arguments != null then
                 append('<');
                 interface_.arguments.accept(this);
                 append('>');
@@ -146,7 +146,14 @@ namespace Syntax is namespace Process is namespace Printer is
             interface_.body.accept(this);
             out();
             dent_append("si\n");
-        si           
+        si
+
+        void append_newline_after_body(Body.NODE body) is
+            if !body.is_block then
+                // non-block body doesn't add a newline, but we always want one:
+                nl();
+            fi
+        si
 
         void visit(Definition.FUNCTION function) is
             dent();
@@ -163,14 +170,58 @@ namespace Syntax is namespace Process is namespace Printer is
             if function.body != null then
                 append(' ');
                 function.body.accept(this);
+                append("@");
+                nl();
+            fi
+        si
+
+        void append_getter_modifiers(Modifier.LIST modifiers, Identifier.NODE name) is
+            if modifiers.is_explicit_access then
+                modifiers.access_modifier.accept(this);
+                append(' ');
+            elif name != null && name.name.startsWith('_') then
+                append("private ");
+            fi
+
+            if modifiers.storage_class != null then
+                modifiers.storage_class.accept(this);
+                append(' ');
+            fi
+        si
+
+        void append_setter_modifiers(Modifier.LIST modifiers) is
+            if modifiers.is_explicit_access then
+                modifiers.access_modifier.accept(this);
+                append(' ');
+            else
+                append("private ");
+            fi
+
+            if modifiers.storage_class != null then
+                modifiers.storage_class.accept(this);
+                append(' ');
+            fi                    
+        si
+
+        void append_backing_field_modifiers(Modifier.LIST modifiers) is
+            append("private ");
+
+            if modifiers.storage_class != null then
+                modifiers.storage_class.accept(this);
+                append(' ');
             fi
         si
 
         void visit(Definition.PROPERTY property) is
             // FIXME: not sure how this would work for interfaces
             if property.getter_body != null || property.setter_body != null then
+
                 if property.getter_body != null then
-                    dent_append("get ");
+                    dent();
+
+                    append_getter_modifiers(property.modifiers, property.name);
+
+                    append("get ");
 
                     append(property.location, property.type);
 
@@ -181,10 +232,16 @@ namespace Syntax is namespace Process is namespace Printer is
                     append(' ');
         
                     property.getter_body.accept(this);
+                    append("@");
+                    nl();
                 fi
 
                 if property.setter_body != null then
-                    dent_append("set ");
+                    dent();
+
+                    append_setter_modifiers(property.modifiers);
+
+                    append("set ");
 
                     append(property.location, property.type);
 
@@ -199,43 +256,65 @@ namespace Syntax is namespace Process is namespace Printer is
                     append(' ');
 
                     property.setter_body.accept(this);
+                    append("@");
+                    nl();
                 fi
-            else
+            elif !property.name.name.startsWith('_') && !property.modifiers.is_private then
                 // auto property:
+
                 dent();
+
+                append_backing_field_modifiers(property.modifiers);
+                
                 append(property.location, property.type);
+                
                 append(" _");
                 property.name.accept(this);
                 append(";\n");
 
                 dent();
-                append("private set ");
-                append(property.location, property.type);
-                append(" ");
-                property.name.accept(this);
-                append(" = ");
-                property.setter_argument.accept(this);
-                append("is _");
-                property.name.accept(this);
-                append(" = ");
-                property.setter_argument.accept(this);
-                append("; si\n");
 
-                dent();
+                append_getter_modifiers(property.modifiers, property.name);
+
                 append("get ");
                 append(property.location, property.type);
                 append(" ");
                 property.name.accept(this);
-                append("is return _");
+                append(" is return _");
                 property.name.accept(this);
                 append("; si\n");
+
+                dent();
+
+                append_setter_modifiers(property.modifiers);
+                
+                append("set ");
+                append(property.location, property.type);
+                append(" ");
+                property.name.accept(this);
+                append(" = __value is _");
+                property.name.accept(this);
+                append(" = __value; si\n");                
+            else 
+                dent();
+
+                property.modifiers.accept(this);
+
+                append(property.location, property.type);
+                
+                append(" ");
+                property.name.accept(this);
+                append(";\n");
             fi
         si
 
         void visit(Definition.INDEXER indexer) is
             if indexer.getter_body != null || indexer.setter_body != null then
                 if indexer.getter_body != null then
-                    dent_append("get ");
+                    dent();
+                    append_getter_modifiers(indexer.modifiers, indexer.name);
+                    
+                    append("get ");
 
                     append(indexer.location, indexer.type);
 
@@ -249,13 +328,19 @@ namespace Syntax is namespace Process is namespace Printer is
 
                     indexer.index_argument.accept(this);
 
-                    append("] ");
+                    append("]");
         
                     indexer.getter_body.accept(this);
+                    append("@");
+                    nl();
                 fi
 
                 if indexer.setter_body != null then
-                    dent_append("set ");
+                    dent();
+
+                    append_setter_modifiers(indexer.modifiers);
+
+                    append("set ");
 
                     append(indexer.location, indexer.type);
 
@@ -269,11 +354,13 @@ namespace Syntax is namespace Process is namespace Printer is
 
                     indexer.index_argument.accept(this);
 
-                    append("] = ");
+                    append("] =");
 
                     indexer.setter_argument.accept(this);
         
                     indexer.setter_body.accept(this);
+                    append("@");
+                    nl();
                 fi
             else
                 error(indexer.location, "indexer must have at at least read or assign body");
@@ -281,15 +368,6 @@ namespace Syntax is namespace Process is namespace Printer is
         si
                             
         // types
-
-        void visit(Type.MODIFIER modifier) is
-            if !isa Type.INFER(modifier.element) then
-                modifier.element.accept(this);
-                append(' ');
-            fi
-            
-            append(modifier.name);
-        si
 
         void visit(Type.BUILT_IN type) is
             append(type.name);

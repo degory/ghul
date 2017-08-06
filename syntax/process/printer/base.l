@@ -81,6 +81,24 @@ namespace Syntax is namespace Process is namespace Printer is
                 .append(identifier.name);
         si
 
+        // modifiers
+
+        void visit(Modifier.NODE modifier) is
+            append(modifier.name);
+        si
+
+        void visit(Modifier.LIST modifiers) is
+            if modifiers.access_modifier != null then
+                modifiers.access_modifier.accept(this);
+                append(' ');
+            fi
+
+            if modifiers.storage_class != null then
+                modifiers.storage_class.accept(this);
+                append(' ');
+            fi
+        si
+
         // definitions
 
         void visit(Variable.LIST variables) is
@@ -98,7 +116,6 @@ namespace Syntax is namespace Process is namespace Printer is
         void visit(Definition.LIST definitions) is
             foreach var d; definitions do
                 d.accept(this);
-                append('\n');
             od
         si
 
@@ -144,6 +161,8 @@ namespace Syntax is namespace Process is namespace Printer is
 
                 seen_any = true;
             od
+
+            nl();
 
             out();
 

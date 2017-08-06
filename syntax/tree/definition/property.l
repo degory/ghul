@@ -1,7 +1,7 @@
 namespace Syntax is namespace Tree is namespace Definition is
     use Source;
 
-    class PROPERTY isa NODE is
+    class PROPERTY isa MODIFIABLE is
         public Type.NODE type;
         public Identifier.NODE name;
         public Body.NODE getter_body;
@@ -12,12 +12,13 @@ namespace Syntax is namespace Tree is namespace Definition is
             LOCATION location,
             Type.NODE type,
             Identifier.NODE name,
+            Modifier.LIST modifiers,            
             Body.NODE getter_body,
             Identifier.NODE setter_argument,
             Body.NODE setter_body
         )
         is
-            super.init(location);
+            super.init(location, modifiers);
 
             this.type = type;
             this.name = name;
