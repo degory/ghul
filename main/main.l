@@ -69,7 +69,12 @@ namespace Test is
                     fi
                 od
 
-                IO.Std.err.println("exiting");
+                if any_errors then
+                    IO.Std.err.println("FAILED");                    
+                else
+                    IO.Std.err.println("success");
+                fi
+
                 IO.Std.err.flush();
 
                 native.exit(cast int(any_errors));
