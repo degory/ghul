@@ -22,7 +22,7 @@ namespace Syntax is namespace Tree is namespace Expression is
         si
 
         void walk(Visitor visitor) is
-            if !visitor.pre(visitor) then
+            if !visitor.pre(this) then
                 right.walk(visitor);
             fi
 
