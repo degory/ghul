@@ -30,7 +30,9 @@ namespace Syntax is namespace Tree is namespace Expression is
             if !visitor.pre(this) then
                 identifier.walk(visitor);
                 type.walk(visitor);
-                initializer.walk(visitor);
+                if initializer != null then
+                    initializer.walk(visitor);
+                fi
             fi
 
             accept(visitor);        

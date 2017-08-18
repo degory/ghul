@@ -38,7 +38,9 @@ namespace Syntax is namespace Tree is namespace Definition is
 
                 if ancestors != null then
                     ancestors.walk(visitor);
-                fi 
+                fi
+
+                modifiers.walk(visitor);
                 
                 body.walk(visitor);
             fi

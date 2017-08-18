@@ -31,8 +31,17 @@ namespace Syntax is namespace Tree is namespace Definition is
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
                 name.walk(visitor);
-                arguments.walk(visitor);
-                ancestors.walk(visitor);
+
+                if arguments != null then
+                    arguments.walk(visitor);
+                fi
+
+                if ancestors != null then
+                   ancestors.walk(visitor);
+                fi
+
+                modifiers.walk(visitor);
+
                 body.walk(visitor);
             fi
 
