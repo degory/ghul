@@ -28,6 +28,10 @@ namespace Syntax is
                 this.location = location;
             si
 
+            int hash() is
+                return id;
+            si
+
             void invalidate(Iterable<Deletable<NODE>> from) is
                 foreach var d; from do
                     d.delete(this);

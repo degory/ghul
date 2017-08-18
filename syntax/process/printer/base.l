@@ -2,7 +2,7 @@ namespace Syntax is namespace Process is namespace Printer is
     use System;
     use Tree;
 
-    class BASE isa Visitor is
+    class BASE isa StrictVisitor is
         int _indent;
         int _depth;
 
