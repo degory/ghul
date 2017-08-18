@@ -33,7 +33,10 @@ namespace Syntax is namespace Tree is namespace Definition is
                 name.walk(visitor);
                 arguments.walk(visitor);
                 type.walk(visitor);
-                body.walk(visitor);
+
+                if body != null then
+                    body.walk(visitor);
+                fi
             fi
 
             accept(visitor);

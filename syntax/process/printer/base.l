@@ -163,6 +163,10 @@ namespace Syntax is namespace Process is namespace Printer is
         si
                     
         // types
+        void visit(Type.INFER type) is
+            append("infer");
+        si
+
         void visit(Type.BUILT_IN type) is
             append(type.name);
         si

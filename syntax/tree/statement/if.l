@@ -27,6 +27,23 @@ namespace Syntax is namespace Tree is namespace Statement is
 
         void accept(Visitor visitor) is
             visitor.visit(this);
-        si      
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                condition.walk(visitor);
+                then_branch.walk(visitor);
+
+                if else_branch != null then
+                    else_branch.walk(visitor);
+                fi 
+
+                if elif_branch != null then
+                    elif_branch.walk(visitor);
+                fi
+            fi
+
+            accept(visitor);
+        si
     si
 si si si

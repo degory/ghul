@@ -45,6 +45,10 @@ namespace Syntax is namespace Tree is namespace Type is
         void init(LOCATION location) is super.init(location); si
 
         get String name is return "infer"; si
+
+        void accept(Visitor visitor) is
+            visitor.visit(this);
+        si
     si      
 
     class BOOL isa BUILT_IN is

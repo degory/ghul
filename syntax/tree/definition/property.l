@@ -32,12 +32,26 @@ namespace Syntax is namespace Tree is namespace Definition is
         si
 
         void walk(Visitor visitor) is
-            if !visitor.pre(this) then
+            if !visitor.pre(this) then                
+                modifiers.walk(visitor);
+
                 type.walk(visitor);
-                name.walk(visitor);
-                getter_body.walk(visitor);
-                setter_argument.walk(visitor);
-                setter_body.walk(visitor);
+
+                if name != null then
+                    name.walk(visitor);
+                fi
+
+                if getter_body != null then                
+                    getter_body.walk(visitor);
+                fi
+
+                if setter_argument != null then
+                    setter_argument.walk(visitor);
+                fi
+
+                if setter_body != null then
+                    setter_body.walk(visitor);
+                fi
             fi
 
             accept(visitor);

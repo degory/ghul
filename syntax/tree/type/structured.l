@@ -12,7 +12,15 @@ namespace Syntax is namespace Tree is namespace Type is
             this.element = element;
         si
 
-        void accept(Visitor visitor) is visitor.visit(this); si        
+        void accept(Visitor visitor) is visitor.visit(this); si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                element.walk(visitor);
+            fi
+
+            accept(visitor);
+        si        
     si
 si si si
 

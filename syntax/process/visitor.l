@@ -184,6 +184,14 @@ namespace Syntax is
             throwNotImplemented("type", type);
         si
 
+        bool pre(Type.INFER infer) is
+            return false;
+        si
+
+        void visit(Type.INFER type) is
+            throwNotImplemented("infer", type);
+        si        
+
         bool pre(Type.BUILT_IN built_in) is
             return false;
         si

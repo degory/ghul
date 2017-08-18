@@ -115,6 +115,10 @@ namespace Syntax is
             log("type", type);
         si
 
+        void visit(Type.INFER type) is
+            log("infer", type);
+        si
+
         void visit(Type.BUILT_IN built_in) is
             log("built id", built_in);
         si        

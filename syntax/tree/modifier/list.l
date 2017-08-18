@@ -45,8 +45,13 @@ namespace Syntax is namespace Tree is namespace Modifier is
         
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                access_modifier.walk(visitor);
-                storage_class.walk(visitor);
+                if access_modifier != null then
+                    access_modifier.walk(visitor);
+                fi
+                
+                if storage_class != null then
+                    storage_class.walk(visitor);
+                fi
             fi
 
             accept(visitor);
