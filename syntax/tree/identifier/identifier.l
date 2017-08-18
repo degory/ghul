@@ -39,10 +39,6 @@ namespace Syntax is namespace Tree is namespace Identifier is
             return _parent;
         si
 
-        void accept(Visitor visitor) is
-            visitor.visit(this);
-        si
-
         get Iterator<String> Iterator is
             var result = new Vector<String>();
 
@@ -53,6 +49,20 @@ namespace Syntax is namespace Tree is namespace Identifier is
             od 
 
             return result.ReverseIterator;
+        si
+
+        void accept(Visitor visitor) is
+            visitor.visit(this);
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                if parent != null then
+                    parent.walk(visitor);
+                fi                
+            fi
+
+            accept(visitor);
         si
     si
 si si si

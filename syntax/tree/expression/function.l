@@ -21,6 +21,15 @@ namespace Syntax is namespace Tree is namespace Expression is
 
         void accept(Visitor visitor) is
             visitor.visit(this);
-        si                
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                type.walk(visitor);
+                body.walk(visitor);
+            fi
+
+            accept(visitor);
+        si        
     si
 si si si

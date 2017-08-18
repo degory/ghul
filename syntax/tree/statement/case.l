@@ -23,6 +23,18 @@ namespace Syntax is namespace Tree is namespace Statement is
         void accept(Visitor visitor) is
             visitor.visit(this);
         si      
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                expression.walk(visitor);
+
+                foreach var m; matches do
+                    m.walk(visitor);
+                od
+            fi
+
+            accept(visitor);
+        si
     si
 
     class CASE_MATCH isa NODE is
@@ -40,8 +52,18 @@ namespace Syntax is namespace Tree is namespace Statement is
             this.expression = expression;
             this.statements = statements;
         si
+
         void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                expression.walk(visitor);
+                statements.walk(visitor);
+            fi
+
+            accept(visitor);
         si
     si
 si si si

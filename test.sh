@@ -1,2 +1,2 @@
 #!/bin/bash
-main/main tests/*.ghul
+ghul/ghul tests/*.ghul

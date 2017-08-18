@@ -70,6 +70,12 @@ namespace Ghul is
                             if definition != null then
                                 logger.info(definition.location, "read definition " + Object.dump(definition));
 
+                                var all = new Syntax.All();
+
+                                definition.walk(all);
+
+                                IO.Std.err.println(all.result);
+
                                 Syntax.Process.Printer.BASE printer;
 
                                 if want_legacy then

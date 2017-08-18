@@ -19,10 +19,6 @@ namespace Syntax is namespace Tree is namespace Modifier is
             this.storage_class = storage_class;
         si
 
-        void accept(Visitor visitor) is
-            visitor.visit(this);
-        si
-        
         get bool is_empty is
             return access_modifier == null && storage_class == null;
         si
@@ -42,5 +38,18 @@ namespace Syntax is namespace Tree is namespace Modifier is
         get bool is_explicit_access is
             return access_modifier != null;
         si
+
+        void accept(Visitor visitor) is
+            visitor.visit(this);
+        si
+        
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                access_modifier.walk(visitor);
+                storage_class.walk(visitor);
+            fi
+
+            accept(visitor);
+        si        
     si
 si si si

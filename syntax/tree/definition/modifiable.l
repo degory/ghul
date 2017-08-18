@@ -15,8 +15,18 @@ namespace Syntax is namespace Tree is namespace Definition is
             this.modifiers = modifiers;
         si
 
-        public void accept(Visitor visitor) is
+        void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                foreach var m; modifiers do
+                    m.walk(visitor);
+                od
+            fi
+
+            accept(visitor);
         si
     si
 si si si

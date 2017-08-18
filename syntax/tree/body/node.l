@@ -5,17 +5,19 @@ namespace Syntax is namespace Tree is namespace Body is
     use Source;
 
     class NODE isa Tree.NODE is
+        get bool is_block is
+            return false;
+        si
+
         void init(LOCATION location)
         is
             super.init(location);
         si
 
         void accept(Visitor visitor) is
-            visitor.visit(this);
-        si
+            visitor.pre(this);
 
-        get bool is_block is
-            return false;
+            visitor.visit(this);
         si
     si
 si si si

@@ -16,8 +16,18 @@ namespace Syntax is namespace Tree is namespace Definition is
             this.uses = uses;
         si
 
-        public void accept(Visitor visitor) is
+        void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                foreach var u; uses do
+                    u.walk(visitor);
+                od
+            fi
+
+            accept(visitor);
         si
     si    
 si si si

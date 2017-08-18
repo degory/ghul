@@ -23,6 +23,13 @@ namespace Syntax is namespace Tree is namespace Definition is
         void accept(Visitor visitor) is
             visitor.visit(this);
         si
+
+        void walk(Visitor visitor) is
+            name.walk(visitor);
+            modifiers.walk(visitor);
+
+            accept(visitor);
+        si
     si
 
     class ENUM_MEMBER isa NODE is
@@ -43,6 +50,15 @@ namespace Syntax is namespace Tree is namespace Definition is
 
         void accept(Visitor visitor) is
             visitor.visit(this);
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                name.walk(visitor);
+                initializer.walk(visitor);
+            fi
+
+            accept(visitor);
         si
     si
 si si si

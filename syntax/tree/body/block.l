@@ -17,6 +17,14 @@ namespace Syntax is namespace Tree is namespace Body is
             visitor.visit(this);
         si
 
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                statements.walk(visitor);
+            fi
+            
+            accept(visitor);
+        si
+
         get bool is_block is
             return true;
         si
