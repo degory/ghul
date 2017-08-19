@@ -1,2 +1,3 @@
 #!/bin/bash
-docker run -v `pwd`:/home/dev/source/ -w /home/dev/source --user dev -t docker.giantblob.com/dev /bin/bash -c "./clean.sh && ./build.sh"
+mkdir -p /tmp/lcache-dev
+docker run -e JOB_NAME=dev -v /tmp/lcache-dev:/tmp/lcache-dev -v `pwd`:/home/dev/source/ -w /home/dev/source --user dev -t docker.giantblob.com/dev ./build.sh

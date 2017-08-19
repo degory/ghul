@@ -42,7 +42,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 append(' ');
             fi
 
-            variable.identifier.accept(this);
+            variable.name.accept(this);
 
             if variable.initializer != null then
                 append(" = ");

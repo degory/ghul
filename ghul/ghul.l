@@ -70,12 +70,13 @@ namespace Ghul is
                             if definition != null then
                                 logger.info(definition.location, "read definition " + Object.dump(definition));
 
-                                // var all = new Syntax.All();
-                                var test = new Syntax.Process.Test();
+                                var scopes = new Syntax.SCOPES();
 
-                                definition.walk(test);
+                                var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes);
 
-                                IO.Std.err.println(test.result);
+                                definition.walk(ds);
+
+                                IO.Std.err.println(ds);
 
                                 Syntax.Process.Printer.BASE printer;
 

@@ -10,7 +10,7 @@ namespace Syntax is namespace Process is namespace Printer is
         // definitions
 
         void visit(Variable.NODE variable) is
-            variable.identifier.accept(this);
+            variable.name.accept(this);
 
             // FIXME: not OOP
             if !isa Type.INFER(variable.type) then

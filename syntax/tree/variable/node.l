@@ -2,20 +2,20 @@ namespace Syntax is namespace Tree is namespace Variable is
     use Source;
     
     class NODE isa Tree.NODE is
-        public Identifier.NODE identifier;
+        public Identifier.NODE name;
         public Type.NODE type;
         public Expression.NODE initializer;
 
         void init(
             LOCATION location,
-            Identifier.NODE identifier,
+            Identifier.NODE name,
             Type.NODE type,
             Expression.NODE initializer
         )
         is
             super.init(location);
 
-            this.identifier = identifier;
+            this.name = name;
             this.type = type;
             this.initializer = initializer;
         si
@@ -26,9 +26,7 @@ namespace Syntax is namespace Tree is namespace Variable is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                IO.Std.err.println("identifier: " + identifier);
-                identifier.walk(visitor);
-                IO.Std.err.println("type: " + type);
+                name.walk(visitor);
                 
                 type.walk(visitor);
 
