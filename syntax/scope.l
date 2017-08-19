@@ -21,7 +21,9 @@ namespace Syntax is
         si
 
         void declare(String name, NODE node) is
-            assert(_symbols[name] == null);
+            if _symbols[name] != null then
+                IO.Std.err.println("redefining symbol: " + name + " as " + Object.dump(node));
+            fi
 
             _symbols[name] = node;
         si
