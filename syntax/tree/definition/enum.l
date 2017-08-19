@@ -25,12 +25,14 @@ namespace Syntax is namespace Tree is namespace Definition is
         si
 
         void walk(Visitor visitor) is
-            name.walk(visitor);
-            modifiers.walk(visitor);
+            if !visitor.pre(this) then
+                name.walk(visitor);
+                modifiers.walk(visitor);
 
-            foreach var m; members do
-                m.walk(visitor);
-            od
+                foreach var m; members do
+                    m.walk(visitor);
+                od
+            fi
             
             accept(visitor);
         si

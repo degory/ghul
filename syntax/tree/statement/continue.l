@@ -20,7 +20,9 @@ namespace Syntax is namespace Tree is namespace Statement is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                label.walk(visitor);
+                if label != null then
+                    label.walk(visitor);
+                fi
             fi
 
             accept(visitor);

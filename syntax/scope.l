@@ -6,7 +6,7 @@ namespace Syntax is
 
     class SCOPE is
         SCOPE _parent;
-        Map<String, NODE> _symbols;
+        Dict<String, NODE> _symbols;
 
         get NODE[String name] is
             var result = _symbols[name];
@@ -28,6 +28,7 @@ namespace Syntax is
 
         void init(SCOPE parent) is
             this._parent = parent;
+            _symbols = new SortedMap<String, NODE>();
         si
     si
 si

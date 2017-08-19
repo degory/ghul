@@ -10,8 +10,6 @@ namespace Syntax is
         Vector<SCOPE> _stack;
 
         get SCOPE top is
-            IO.Std.err.println("scopes top: " + _stack);
-            IO.Std.err.println("scopes top returning: " + _stack.Top);            
             return _stack.Top;
         si
 
@@ -46,14 +44,12 @@ namespace Syntax is
         si
 
         void push(String name, NODE node) is
-            IO.Std.err.println("scopes push: " + name + "," + node);
             declare(name, node);
 
             push(node);
         si
 
         void declare(String name, NODE node) is
-            IO.Std.err.println("scopes declare: " + name + "," + node);            
             top.declare(name, node);
         si
 

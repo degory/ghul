@@ -26,7 +26,23 @@ namespace Syntax is namespace Tree is namespace Statement is
 
         void accept(Visitor visitor) is
             visitor.visit(this);
-        si      
+        si
+
+        void walk(Visitor visitor) is
+            if !visitor.pre(this) then
+                body.walk(visitor);
+
+                foreach var c; catches do
+                    c.walk(visitor);
+                od
+
+                if finally_ != null then
+                    finally_.walk(visitor);
+                fi
+            fi
+
+            accept(visitor);
+        si
     si
 
     class CATCH isa NODE is
