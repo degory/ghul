@@ -1,9 +1,20 @@
+
 namespace Source is
     use System;
 
     class LOCATION is
         const int SHIFT = 12;
         const int MASK = 0xFFF;
+
+        static LOCATION _dummy;
+
+        static get LOCATION dummy is
+            if _dummy == null then
+                _dummy = new LOCATION("internal", 1, 1, 1, 1);
+            fi
+            
+            return _dummy;
+        si
 
         public String file_name;
 

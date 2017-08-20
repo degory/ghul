@@ -2,6 +2,7 @@ namespace Syntax is namespace Process is
     use System;
     use Generic;
 
+    use Source;
     use Tree;
 
     class DECLARE_SYMBOLS isa ScopeVisitorBase is
@@ -29,15 +30,96 @@ namespace Syntax is namespace Process is
         si        
 
         // definitions
-        
+
+        NODE get_or_create_aggregate_namespace(Identifier.NODE identifier, List<NODE> results) is
+            if identifier == null then
+               return null;
+            fi
+
+            var parent = get_or_create_aggregate_namespace(identifier.parent, results);
+
+            IO.Std.err.println("create aggregate ns:" + identifier);
+            IO.Std.err.println("parent aggregate is:" + parent);
+
+            var aggregate_namespace = this[identifier];
+
+            if aggregate_namespace != null then
+                IO.Std.err.println("existing aggregate is:" + aggregate_namespace);
+
+                return aggregate_namespace;
+            fi
+
+            aggregate_namespace =
+                new Definition.NAMESPACE(
+                    LOCATION.dummy,
+                    identifier,
+                    new Definition.LIST(
+                        LOCATION.dummy,
+                        new Definition.NODE[0]
+                    )
+                );
+
+            IO.Std.err.println("created aggregate ns:" + aggregate_namespace);
+
+            SCOPE parent_scope;
+
+            if parent != null then            
+                parent_scope = this[parent];
+
+                IO.Std.err.println("parent scope is: " + parent_scope);
+
+                assert(parent_scope != null, "expected namespace " + parent + " to have an associated scope");
+            fi
+
+            IO.Std.err.println("adding " + aggregate_namespace + " with parent scope " + parent_scope);
+
+            add(aggregate_namespace, parent_scope);
+             
+            results.add(aggregate_namespace);
+
+            return aggregate_namespace;
+        si
+
+        void declare_namespaces(Identifier.NODE identifier, Iterator<NODE> namespaces) is
+            var parent = identifier.parent;
+
+            if parent != null then
+                declare_namespaces(parent, namespaces);
+            fi
+
+            assert(namespaces.hasMoreElements());
+
+            var namespace_ = namespaces.nextElement();
+
+            IO.Std.err.println("declare aggregate namespace: " + identifier.name + " as " + namespace_);
+            declare(identifier.name, namespace_);
+        si
+
         bool pre(Definition.NAMESPACE namespace_) is
             IO.Std.err.println("pre namespace: " + namespace_);
-            push(namespace_.name.name, namespace_);
+
+            var aggregate_namespaces = new Vector<NODE>();
+
+            get_or_create_aggregate_namespace(
+                namespace_.name,
+                aggregate_namespaces
+            );
+
+            push(namespace_);
+
+            declare_namespaces(
+                namespace_.name,
+                aggregate_namespaces.Iterator
+            );
+
+            IO.Std.err.println("entering namespace, scope is: " + top);
+            
+            // push(namespace_.name.name, aggregate_namespace);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
             pop(namespace_);
-        si        
+        si   
 
         void visit(Definition.USE use_) is
             // TODO: insert into current scope:

@@ -29,6 +29,14 @@ namespace Syntax is
             _stack.add(new SCOPE(null));
         si
 
+        SCOPE add(NODE node, SCOPE parent) is
+            var scope = new SCOPE(parent);
+
+            _scopes[node] = scope;
+
+            return scope;
+        si
+
         void enter(NODE node) is
             var scope = _scopes[node];
             
@@ -40,9 +48,7 @@ namespace Syntax is
         void push(NODE node) is
             assert(_scopes[node] == null, "replacing existing scope for " + node + " " + _scopes[node]);
 
-            var scope = new SCOPE(top);
-        
-            _scopes[node] = scope;
+            var scope = add(node, top);
 
             _stack.add(scope);
         si

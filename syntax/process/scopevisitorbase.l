@@ -19,10 +19,42 @@ namespace Syntax is
             return _scopes[name];
         si
 
+        get NODE[Identifier.NODE identifier] is
+            return find_definition(identifier);
+        si
+
         void init(SCOPES scopes) is
             super.init();
 
             _scopes = scopes;
+        si
+
+        NODE find_definition(Identifier.NODE identifier) is
+            var parent = identifier.parent;
+            
+            if parent != null then
+                var parent_node = find_definition(parent);
+
+                if parent_node == null then
+                    IO.Std.err.println("scope not found: " + parent);
+                    return null;
+                fi
+
+                var parent_scope = this[parent_node];
+
+                if parent_scope == null then
+                   IO.Std.err.println("not a searchable scope: " + parent_node);
+                   return null;
+                fi
+                   
+                return parent_scope[identifier.name];
+            else
+                return this[identifier.name];
+            fi
+        si
+
+        void add(NODE node, SCOPE parent) is
+            _scopes.add(node, parent);
         si
 
         void push(NODE node) is

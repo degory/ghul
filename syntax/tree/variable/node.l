@@ -32,8 +32,10 @@ namespace Syntax is namespace Tree is namespace Variable is
 
                 if initializer != null then
                    initializer.walk(visitor);
-                fi                
+                fi
             fi
+
+            accept(visitor);
         si
     si
 si si si

@@ -12,29 +12,6 @@ namespace Syntax is namespace Process is
         private void log(String name, NODE node) is
             IO.Std.err.println("what to do with this?: % % %" % Object{this, name, Object.dump(node)});
         si
-        
-        NODE find_definition(Identifier.NODE node) is
-            var parent = node.parent;
-            
-            if parent != null then
-                var parent_node = find_definition(parent);
-
-                if parent_node == null then
-                    IO.Std.err.println("scope not found: " + parent);
-                    return null;
-                fi
-
-                var parent_scope = this[parent_node];
-
-                return parent_scope[node.name];
-            else
-                return this[node.name];
-            fi
-        si
-
-        get NODE[Identifier.NODE identifier] is
-            return find_definition(identifier);
-        si
 
         // node
         void visit(NODE node) is
