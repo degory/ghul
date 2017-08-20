@@ -78,6 +78,8 @@ namespace Ghul is
 
                                 IO.Std.err.println(ds);
 
+                                definition.walk(new Syntax.Process.SCOPE_TEST(scopes));
+
                                 Syntax.Process.Printer.BASE printer;
 
                                 if want_legacy then

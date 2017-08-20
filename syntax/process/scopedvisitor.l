@@ -4,13 +4,36 @@ namespace Syntax is namespace Process is
 
     use Tree;
 
-    class DECLARE_SYMBOLS isa ScopeVisitorBase is
+    class ScopedVisitor isa ScopeVisitorBase is
         void init(SCOPES scopes) is
             super.init(scopes);
         si
 
         private void log(String name, NODE node) is
             IO.Std.err.println("what to do with this?: % % %" % Object{this, name, Object.dump(node)});
+        si
+        
+        NODE find_definition(Identifier.NODE node) is
+            var parent = node.parent;
+            
+            if parent != null then
+                var parent_node = find_definition(parent);
+
+                if parent_node == null then
+                    IO.Std.err.println("scope not found: " + parent);
+                    return null;
+                fi
+
+                var parent_scope = this[parent_node];
+
+                return parent_scope[node.name];
+            else
+                return this[node.name];
+            fi
+        si
+
+        get NODE[Identifier.NODE identifier] is
+            return find_definition(identifier);
         si
 
         // node
@@ -28,11 +51,9 @@ namespace Syntax is namespace Process is
             log("modifiers", modifiers);
         si        
 
-        // definitions
-        
+        // definitions        
         bool pre(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("pre namespace: " + namespace_);
-            push(namespace_.name.name, namespace_);
+            enter(namespace_);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
@@ -44,7 +65,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.CLASS class_) is
-            push(class_.name.name, class_);
+            enter(class_);
         si
 
         void visit(Definition.CLASS class_) is
@@ -52,27 +73,27 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.INTERFACE interface_) is
-            push(interface_.name.name, interface_);
-        si        
+            enter(interface_);
+        si
 
         void visit(Definition.INTERFACE interface_) is
             pop(interface_);
         si        
 
         bool pre(Definition.ENUM enum_) is
-            push(enum_.name.name, enum_);
+            IO.Std.err.println("SV: pre-enum, before enter: " + Object.dump(enum_));
+            enter(enum_);
+            IO.Std.err.println("SV: pre-enum, after enter: " + Object.dump(enum_));
         si
 
         void visit(Definition.ENUM enum_) is
+            IO.Std.err.println("SV: visit-enum, before pop: " + Object.dump(enum_));
             pop(enum_);
-        si
-
-        bool pre(Definition.ENUM_MEMBER enum_member) is
-            declare(enum_member.name.name, enum_member);
+            IO.Std.err.println("SV: visit-enum, after pop: " + Object.dump(enum_));
         si
 
         bool pre(Definition.FUNCTION function) is
-            push(function.name.name, function);
+            enter(function);
         si
 
         void visit(Definition.FUNCTION function) is
@@ -80,7 +101,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.PROPERTY property) is
-            push(property.name.name, property);
+            enter(property);
         si
 
         void visit(Definition.PROPERTY property) is
@@ -88,37 +109,17 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.INDEXER indexer) is
-            if indexer.name != null then
-                push(indexer.name.name, indexer);
-            else
-                push(indexer);
-            fi
+            enter(indexer);
         si        
 
         void visit(Definition.INDEXER indexer) is
             pop(indexer);
         si        
 
-        // variables
-        
-        void visit(Variable.NODE variable) is
-            declare(variable.name.name, variable);
-        si
-
-        // expressions
-                
-        void visit(Expression.VARIABLE variable) is
-            // ???
-        si
-
-        void visit(Syntax.Tree.Expression.FUNCTION function) is
-            // ???
-        si        
-
         // statements
 
         bool pre (Statement.IF if_) is
-            push(if_);
+            enter(if_);
         si
 
         void visit(Statement.IF if_) is
@@ -126,7 +127,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.CASE case_) is
-            push(case_);
+            enter(case_);
         si
 
         void visit(Statement.CASE case_) is
@@ -134,7 +135,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.CASE_MATCH case_match) is
-            push(case_match);
+            enter(case_match);
         si
 
         void visit(Statement.CASE_MATCH case_match) is
@@ -142,7 +143,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.TRY try_) is
-            push(try_);
+            enter(try_);
         si
 
         void visit(Statement.TRY try_) is
@@ -150,7 +151,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.CATCH catch_) is
-            push(catch_);
+            enter(catch_);
         si
 
         void visit(Statement.CATCH catch_) is
@@ -158,7 +159,7 @@ namespace Syntax is namespace Process is
         si        
 
         bool pre(Statement.DO do_) is
-            push(do_);
+            enter(do_);
         si
 
         void visit(Statement.DO do_) is
@@ -166,7 +167,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.FOR for_) is
-            push(for_);
+            enter(for_);
         si
 
         void visit(Statement.FOR for_) is
@@ -174,7 +175,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.LABELLED labelled) is
-            push(labelled.label.name, labelled);
+            enter(labelled);
         si
         
         void visit(Statement.LABELLED labelled) is
@@ -184,7 +185,7 @@ namespace Syntax is namespace Process is
         // function body
 
         bool pre(Body.NODE body) is
-            push(body);
+            enter(body);
         si
 
         void visit(Body.NODE body) is
@@ -192,7 +193,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Body.EXPRESSION expression) is
-            push(expression);
+            enter(expression);
         si
 
         void visit(Body.EXPRESSION expression) is
@@ -200,7 +201,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Body.BLOCK block) is
-            push(block);
+            enter(block);
         si
 
         void visit(Body.BLOCK block) is

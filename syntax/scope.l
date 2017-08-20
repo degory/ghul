@@ -32,5 +32,9 @@ namespace Syntax is
             this._parent = parent;
             _symbols = new SortedMap<String, NODE>();
         si
+        
+        String toString() is
+            return Object.dump(this) + " " + _symbols;
+        si
     si
 si

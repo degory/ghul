@@ -13,6 +13,10 @@ namespace Syntax is
             return _stack.Top;
         si
 
+        get SCOPE[NODE node] is
+            return _scopes[node];
+        si
+
         get NODE[String name] is 
             return top[name];
         si
@@ -27,14 +31,14 @@ namespace Syntax is
 
         void enter(NODE node) is
             var scope = _scopes[node];
-
-            assert(scope != null);
+            
+            assert(scope != null, "enter: expected to find an existing scope for " + node);
 
             _stack.add(scope);
         si
 
         void push(NODE node) is
-            assert(_scopes[node] == null);
+            assert(_scopes[node] == null, "replacing existing scope for " + node + " " + _scopes[node]);
 
             var scope = new SCOPE(top);
         
@@ -57,8 +61,8 @@ namespace Syntax is
             var expected = _scopes[node];
 
             var result = _stack.pop();
-
-            assert(result == expected);
+            
+            assert(result == expected, "pop: expecting " + expected + " vs stack top " + result);
 
             return result;
         si

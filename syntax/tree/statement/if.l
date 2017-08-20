@@ -17,7 +17,7 @@ namespace Syntax is namespace Tree is namespace Statement is
         is
             super.init(location);
 
-            assert(else_branch == null || elif_branch == null);
+            assert(else_branch == null || elif_branch == null, "at least one of else or elif branch must be null");
             
             this.condition = condition;
             this.then_branch = then_branch;
