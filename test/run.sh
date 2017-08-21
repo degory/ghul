@@ -23,7 +23,7 @@ if [ "$GHUL" = "" ] ; then
     GHUL=ghul
 fi
 
-echo "${NAME}: compile ${CASE}/test.l as ${BINARY}..."
+echo "${NAME}: compile ..."
 $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 # mv test $CASE
 grep error: $TMP/err_out | sort >$TMP/err
@@ -50,12 +50,16 @@ else
 fi  
 
 if [ -f ./${BINARY} ] ; then
+    if [ -f $CASE/expectfail ] ; then
+        echo "${NAME}: expected compile failure but binary present ${BINARY}"
+        exit 1
+    fi
+
     ./${BINARY} 2>&1 | cat >$TMP/out
 elif [ -f $CASE/expectfail ] ; then
-    exit 1
+    exit $FAILED
 else
-    
-    echo "${NAME}: compile failed to produce binary ${BINARY}"
+    echo "${NAME}: expected compile success but no binary present ${BINARY}"
     exit 1
 fi
 
