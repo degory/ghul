@@ -10,14 +10,8 @@ if [ -f $CASE/ghulflags ] ; then
     GHULFLAGS="$GHULFLAGS `cat $CASE/ghulflags`"
 fi
 
-if [ "$PROCESS" != "" ] ; then
-    LCACHE="/tmp/lcache-test${PROCESS}"
-    LFLAGS="$LFLAGS -p test${PROCESS}"
-    BINARY="binary${PROCESS}"
-else 
-    LCACHE="/tmp/lcache"
-    BINARY="binary"
-fi
+LCACHE="/tmp/lcache"
+BINARY="binary"
 
 if ! [ -d $LCACHE ] ; then
     mkdir $LCACHE
