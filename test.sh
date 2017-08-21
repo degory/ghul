@@ -1,2 +1,5 @@
 #!/bin/bash
-ghul/ghul tests/*.ghul
+export GHULFLAGS="-E -L"
+export GHUL=../ghul/ghul
+pushd test
+./runall.sh

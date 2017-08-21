@@ -26,6 +26,7 @@ namespace Ghul is
         void init() is
             var want_legacy = false;
             var any_errors = false;
+            var ignore_errors = false;
 
             var to_build = new Vector<String>({"lc"});
 
@@ -48,6 +49,8 @@ namespace Ghul is
                         want_legacy = true;
                     elif s =~ "-G" then
                         want_legacy = false;
+                    elif s =~ "-E" then
+                        ignore_errors = true;
                     elif is_legacy(s) then
                         to_build.add(s);
                     elif is_ghul(s) then
@@ -123,8 +126,11 @@ namespace Ghul is
 
                 IO.Std.err.flush();
 
-                if !any_errors then
+                if ignore_errors || !any_errors then
                     if to_build.Length > 1 then
+                        to_build.add("-o");
+                        to_build.add("binary");
+
                         var process = new Util.Process();
 
                         var result = process.run("/usr/bin/lc", to_build.Array, Arguments.ProgramEnvironment, true);
