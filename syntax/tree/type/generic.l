@@ -15,7 +15,7 @@ namespace Syntax is namespace Tree is namespace Type is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                super.walk(visitor);
+                arguments.walk(visitor);
             fi
 
             accept(visitor);

@@ -2,9 +2,12 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use Logging;
+    use Source;
     use Tree;
 
     class SCOPE is
+        LOGGER _logger;
         SCOPE _parent;
         Dict<String, NODE> _symbols;
 
@@ -20,17 +23,27 @@ namespace Syntax is
             fi
         si
 
-        void declare(String name, NODE node) is
+        void init(LOGGER logger, SCOPE parent) is
+            this._logger = logger;
+            this._parent = parent;
+            _symbols = new SortedMap<String, NODE>();
+        si
+
+        void init(LOGGER logger) is
+            init(logger, null);
+        si
+        
+        void declare(LOCATION location, String name, NODE node) is
             if _symbols[name] != null then
-                IO.Std.err.println("redefining symbol: " + name + " as " + Object.dump(node));
+                _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
+                _logger.error(node.location, "symbol " + name + " is redefined at " + location);
             fi
 
             _symbols[name] = node;
         si
 
-        void init(SCOPE parent) is
-            this._parent = parent;
-            _symbols = new SortedMap<String, NODE>();
+        void declare(Identifier.NODE identifier, NODE node) is
+            declare(identifier.location, identifier.name, node);
         si
         
         String toString() is

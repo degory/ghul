@@ -2,9 +2,12 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use Logging;
+    use Source;
     use Tree;
 
     class SCOPES is
+        LOGGER _logger;
         Map<NODE, SCOPE> _scopes;
 
         Vector<SCOPE> _stack;
@@ -21,12 +24,12 @@ namespace Syntax is
             return top[name];
         si
 
-        void init() is
-            super.init();
+        void init(LOGGER logger) is
+            _logger = logger;
             _stack = new Vector<SCOPE>(50);
             _scopes = new Map<NODE, SCOPE>(65521);
 
-            _stack.add(new SCOPE(null));
+            _stack.add(new SCOPE(_logger));
         si
 
         bool is_defined_in_current_scope(String name) is
@@ -34,7 +37,7 @@ namespace Syntax is
         si
 
         SCOPE add(NODE node, SCOPE parent) is
-            var scope = new SCOPE(parent);
+            var scope = new SCOPE(_logger, parent);
 
             _scopes[node] = scope;
 
@@ -57,16 +60,26 @@ namespace Syntax is
             _stack.add(scope);
         si
 
-        void push(String name, NODE node) is
-            declare(name, node);
+        void push(LOCATION location, String name, NODE node) is
+            declare(location, name, node);
 
             push(node);
         si
 
-        void declare(String name, NODE node) is
-            top.declare(name, node);
+        void push(Identifier.NODE identifier, NODE node) is
+            declare(identifier, node);
+
+            push(node);
         si
 
+        void declare(LOCATION location, String name, NODE node) is
+            top.declare(location, name, node);
+        si
+
+        void declare(Identifier.NODE identifier, NODE node) is
+            top.declare(identifier, node);
+        si
+        
         SCOPE pop(NODE node) is
             var expected = _scopes[node];
 

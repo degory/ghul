@@ -30,7 +30,10 @@ namespace Ghul is
             var to_build = new Vector<String>({"lc"});
 
             try 
-                var logger = new LOGGER();                    
+                var logger = new LOGGER(); 
+
+                var scopes = new Syntax.SCOPES(logger);
+                var namespaces = new Syntax.NAMESPACES(logger, scopes);
             
                 var container = new IoC.CONTAINER();
 
@@ -72,16 +75,13 @@ namespace Ghul is
 
                                 definition.walk(new Syntax.Process.EXPAND_NAMESPACES());
 
-                                var scopes = new Syntax.SCOPES();
-                                var namespaces = new Syntax.NAMESPACES(scopes);
-
                                 var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);
 
                                 definition.walk(ds);
 
                                 IO.Std.err.println(ds);
 
-                                definition.walk(new Syntax.Process.SCOPE_TEST(scopes, namespaces));
+                                definition.walk(new Syntax.Process.SCOPE_TEST(logger, scopes, namespaces));
 
                                 Syntax.Process.Printer.BASE printer;
 

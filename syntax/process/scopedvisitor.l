@@ -35,13 +35,11 @@ namespace Syntax is namespace Process is
         si        
 
         bool pre(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("pre namespace: " + namespace_);
-
-            enter_namespace(namespace_.name.name);
+            enter_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            pop_namespace(namespace_.name.name);
+            pop_namespace(namespace_.name);
         si   
         
         void visit(Definition.USE use_) is

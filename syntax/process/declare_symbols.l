@@ -35,13 +35,11 @@ namespace Syntax is namespace Process is
         // definitions
 
         bool pre(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("pre namespace: " + namespace_); 
-
-            push_namespace(namespace_.name.name);
+            push_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            pop_namespace(namespace_.name.name);
+            pop_namespace(namespace_.name);
         si   
 
         void visit(Definition.USE use_) is
@@ -49,7 +47,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.CLASS class_) is
-            push(class_.name.name, class_);
+            push(class_.name, class_);
         si
 
         void visit(Definition.CLASS class_) is
@@ -57,7 +55,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.INTERFACE interface_) is
-            push(interface_.name.name, interface_);
+            push(interface_.name, interface_);
         si        
 
         void visit(Definition.INTERFACE interface_) is
@@ -65,7 +63,7 @@ namespace Syntax is namespace Process is
         si        
 
         bool pre(Definition.ENUM enum_) is
-            push(enum_.name.name, enum_);
+            push(enum_.name, enum_);
         si
 
         void visit(Definition.ENUM enum_) is
@@ -73,11 +71,11 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.ENUM_MEMBER enum_member) is
-            declare(enum_member.name.name, enum_member);
+            declare(enum_member.name, enum_member);
         si
 
         bool pre(Definition.FUNCTION function) is
-            push(function.name.name, function);
+            push(function.name, function);
         si
 
         void visit(Definition.FUNCTION function) is
@@ -85,7 +83,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.PROPERTY property) is
-            push(property.name.name, property);
+            push(property.name, property);
         si
 
         void visit(Definition.PROPERTY property) is
@@ -94,7 +92,7 @@ namespace Syntax is namespace Process is
 
         bool pre(Definition.INDEXER indexer) is
             if indexer.name != null then
-                push(indexer.name.name, indexer);
+                push(indexer.name, indexer);
             else
                 push(indexer);
             fi
@@ -107,7 +105,7 @@ namespace Syntax is namespace Process is
         // variables
         
         void visit(Variable.NODE variable) is
-            declare(variable.name.name, variable);
+            declare(variable.name, variable);
         si
 
         // expressions
@@ -179,7 +177,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Statement.LABELLED labelled) is
-            push(labelled.label.name, labelled);
+            push(labelled.label, labelled);
         si
         
         void visit(Statement.LABELLED labelled) is

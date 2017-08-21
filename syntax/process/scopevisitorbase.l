@@ -2,6 +2,7 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use Source;
     use Tree;
 
     class ScopeVisitorBase isa Visitor is
@@ -67,31 +68,53 @@ namespace Syntax is
             _scopes.push(node);
         si
 
-        void push(String name, NODE node) is
+        void push(LOCATION location, String name, NODE node) is
             IO.Std.err.println("" + Object.dump(this) + " push: " + name + ", " + Object.dump(node));
-            _scopes.push(name, node);
+            _scopes.push(location, name, node);
         si
 
+        void push(Identifier.NODE identifier, NODE node) is
+            IO.Std.err.println("" + Object.dump(this) + " push: " + identifier + ", " + Object.dump(node));
+            _scopes.push(identifier, node);
+        si
+        
         void enter(NODE node) is
              IO.Std.err.println("" + Object.dump(this) + " enter: " + Object.dump(node));
             _scopes.enter(node);
         si
 
-        void push_namespace(String name) is
-            _namespaces.push(name);
+        void push_namespace(LOCATION location, String name) is
+            _namespaces.push(location, name);
         si
 
-        void enter_namespace(String name) is
-            _namespaces.enter(name);
+        void push_namespace(Identifier.NODE identifier) is
+            _namespaces.push(identifier);
         si
 
-        void pop_namespace(String name) is
-            _namespaces.pop(name);
+        void enter_namespace(LOCATION location, String name) is
+            _namespaces.enter(location, name);
         si
 
-        void declare(String name, NODE node) is
+        void enter_namespace(Identifier.NODE identifier) is
+            _namespaces.enter(identifier);
+        si
+
+        void pop_namespace(LOCATION location, String name) is
+            _namespaces.pop(location, name);
+        si
+
+        void pop_namespace(Identifier.NODE identifier) is
+            _namespaces.pop(identifier);
+        si        
+
+        void declare(LOCATION location, String name, NODE node) is
             IO.Std.err.println("declare:" + name + " as " + Object.dump(node));
-            _scopes.declare(name, node);
+            _scopes.declare(location, name, node);
+        si        
+
+        void declare(Identifier.NODE identifier, NODE node) is
+            IO.Std.err.println("declare:" + identifier + " as " + Object.dump(node));
+            _scopes.declare(identifier, node);
         si
 
         SCOPE pop(NODE node) is

@@ -28,6 +28,8 @@ namespace Syntax is namespace Parser is namespace Definition is
 
         Tree.Definition.INTERFACE parse(CONTEXT context) is
             var start = context.location;
+            context.next_token(Lexical.TOKEN.INTERFACE);
+            
             var identifier = identifier_parser.parse(context);
 
             Tree.Type.LIST arguments;
