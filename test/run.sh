@@ -24,7 +24,6 @@ if [ "$GHUL" = "" ] ; then
 fi
 
 echo "${NAME}: compile ${CASE}/test.l as ${BINARY}..."
-echo $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 # mv test $CASE
 grep error: $TMP/err_out | sort >$TMP/err
