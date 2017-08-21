@@ -57,6 +57,15 @@ if [ -f ./${BINARY} ] ; then
 
     ./${BINARY} 2>&1 | cat >$TMP/out
 elif [ -f $CASE/expectfail ] ; then
+
+    if [ "$2" = "capture" ]; then
+        echo "${NAME}: captured errors:"
+        cat $CASE/err;
+
+        echo "${NAME}: captured warnings:"
+        cat $CASE/warn
+    fi
+    
     exit $FAILED
 else
     echo "${NAME}: expected compile success but no binary present ${BINARY}"
@@ -65,6 +74,15 @@ fi
 
 if [ "$2" = "capture" ]; then
     cp $TMP/out $CASE/out
+
+    echo "${NAME}: captured output:"
+    cat $CASE/out
+
+    echo "${NAME}: captured errors:"
+    cat $CASE/err;
+
+    echo "${NAME}: captured warnings:"
+    cat $CASE/warn
 else
     if ! diff $CASE/out $TMP/out >$TMP/out_diff ; then
        FAILED=1
