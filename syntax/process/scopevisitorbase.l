@@ -6,6 +6,7 @@ namespace Syntax is
 
     class ScopeVisitorBase isa Visitor is
         SCOPES _scopes;
+        NAMESPACES _namespaces;
         
         get SCOPE top is
             return _scopes.top;
@@ -23,10 +24,14 @@ namespace Syntax is
             return find_definition(identifier);
         si
 
-        void init(SCOPES scopes) is
+        void init(
+            SCOPES scopes,
+            NAMESPACES namespaces)
+        is
             super.init();
 
             _scopes = scopes;
+            _namespaces = namespaces;
         si
 
         NODE find_definition(Identifier.NODE identifier) is
@@ -70,6 +75,18 @@ namespace Syntax is
         void enter(NODE node) is
              IO.Std.err.println("" + Object.dump(this) + " enter: " + Object.dump(node));
             _scopes.enter(node);
+        si
+
+        void push_namespace(String name) is
+            _namespaces.push(name);
+        si
+
+        void enter_namespace(String name) is
+            _namespaces.enter(name);
+        si
+
+        void pop_namespace(String name) is
+            _namespaces.pop(name);
         si
 
         void declare(String name, NODE node) is

@@ -70,15 +70,18 @@ namespace Ghul is
                             if definition != null then
                                 logger.info(definition.location, "read definition " + Object.dump(definition));
 
-                                var scopes = new Syntax.SCOPES();
+                                definition.walk(new Syntax.Process.EXPAND_NAMESPACES());
 
-                                var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes);
+                                var scopes = new Syntax.SCOPES();
+                                var namespaces = new Syntax.NAMESPACES(scopes);
+
+                                var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);
 
                                 definition.walk(ds);
 
                                 IO.Std.err.println(ds);
 
-                                definition.walk(new Syntax.Process.SCOPE_TEST(scopes));
+                                definition.walk(new Syntax.Process.SCOPE_TEST(scopes, namespaces));
 
                                 Syntax.Process.Printer.BASE printer;
 

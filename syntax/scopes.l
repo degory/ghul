@@ -29,6 +29,10 @@ namespace Syntax is
             _stack.add(new SCOPE(null));
         si
 
+        bool is_defined_in_current_scope(String name) is
+            return top[name] != null;
+        si
+
         SCOPE add(NODE node, SCOPE parent) is
             var scope = new SCOPE(parent);
 

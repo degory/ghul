@@ -5,8 +5,8 @@ namespace Syntax is namespace Process is
     use Tree;
 
     class SCOPE_TEST isa ScopedVisitor is
-        void init(SCOPES scopes) is
-            super.init(scopes);
+        void init(SCOPES scopes, NAMESPACES namespaces) is
+            super.init(scopes, namespaces);
         si
 
         void visit(Identifier.QUALIFIED identifier) is

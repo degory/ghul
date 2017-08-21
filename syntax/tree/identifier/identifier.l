@@ -21,6 +21,14 @@ namespace Syntax is namespace Tree is namespace Identifier is
             return null;
         si
 
+        get List<String> parent_names is
+            return new String[0];
+        si
+
+        get List<String> names is
+            return String{name};
+        si        
+
         get Iterator<String> Iterator is
             return String{name}.Iterator;
         si
@@ -39,6 +47,28 @@ namespace Syntax is namespace Tree is namespace Identifier is
             return _parent;
         si
 
+        get List<String> parent_names is
+            var result = new Vector<String>();
+
+            for var p = parent; p != null; p = p.parent do
+                result.add(p.name);
+            od 
+
+            return result;
+        si
+
+        get List<String> names is
+            var result = new Vector<String>();
+
+            result.add(name);
+
+            for var p = parent; p != null; p = p.parent do
+                result.add(p.name);
+            od 
+
+            return result;
+        si
+
         get Iterator<String> Iterator is
             var result = new Vector<String>();
 
@@ -48,7 +78,7 @@ namespace Syntax is namespace Tree is namespace Identifier is
                 result.add(p.name);
             od 
 
-            return result.ReverseIterator;
+            return result.Iterator;
         si
 
         void accept(Visitor visitor) is

@@ -5,8 +5,14 @@ namespace Syntax is namespace Process is
     use Tree;
 
     class ScopedVisitor isa ScopeVisitorBase is
-        void init(SCOPES scopes) is
-            super.init(scopes);
+        void init(
+            SCOPES scopes,
+            NAMESPACES namespaces)
+        is
+            super.init(
+                scopes,
+                namespaces
+            );
         si
 
         private void log(String name, NODE node) is
@@ -28,15 +34,16 @@ namespace Syntax is namespace Process is
             log("modifiers", modifiers);
         si        
 
-        // definitions        
         bool pre(Definition.NAMESPACE namespace_) is
-            enter(namespace_);
+            IO.Std.err.println("pre namespace: " + namespace_);
+
+            enter_namespace(namespace_.name.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            pop(namespace_);
-        si        
-
+            pop_namespace(namespace_.name.name);
+        si   
+        
         void visit(Definition.USE use_) is
             // TODO: insert into current scope:
         si

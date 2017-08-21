@@ -74,7 +74,7 @@ namespace Syntax is
 
         void visit(Definition.ENUM_MEMBER enum_member) is
             throwNotImplemented("enum member", enum_member);
-        si        
+        si
 
         void visit(Definition.FUNCTION function) is
             throwNotImplemented("function", function);
