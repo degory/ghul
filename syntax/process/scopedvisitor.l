@@ -15,17 +15,9 @@ namespace Syntax is namespace Process is
             );
         si
 
-        private void log(String name, NODE node) is
-            IO.Std.err.println("what to do with this?: % % %" % Object{this, name, Object.dump(node)});
-        si
-
-        // node
-        void visit(NODE node) is
-            log("node", node);
-        si
-
         // modifiers
 
+        /*
         void visit(Modifier.NODE modifier) is
             log("modifier", modifier);
         si
@@ -33,6 +25,7 @@ namespace Syntax is namespace Process is
         void visit(Modifier.LIST modifiers) is
             log("modifiers", modifiers);
         si        
+        */
 
         bool pre(Definition.NAMESPACE namespace_) is
             enter_namespace(namespace_.name);
@@ -63,15 +56,11 @@ namespace Syntax is namespace Process is
         si        
 
         bool pre(Definition.ENUM enum_) is
-            IO.Std.err.println("SV: pre-enum, before enter: " + Object.dump(enum_));
             enter(enum_);
-            IO.Std.err.println("SV: pre-enum, after enter: " + Object.dump(enum_));
         si
 
         void visit(Definition.ENUM enum_) is
-            IO.Std.err.println("SV: visit-enum, before pop: " + Object.dump(enum_));
             pop(enum_);
-            IO.Std.err.println("SV: visit-enum, after pop: " + Object.dump(enum_));
         si
 
         bool pre(Definition.FUNCTION function) is

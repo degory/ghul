@@ -47,7 +47,7 @@ namespace Syntax is
         si
         
         String toString() is
-            return Object.dump(this) + " " + _symbols;
+            return this.ClassName + " " + _symbols;
         si
     si
 si

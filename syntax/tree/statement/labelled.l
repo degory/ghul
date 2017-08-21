@@ -20,13 +20,10 @@ namespace Syntax is namespace Tree is namespace Statement is
         si
 
         void accept(Visitor visitor) is
-            IO.Std.err.println("" + Object.dump(this) + "accept: " + Object.dump(visitor));
             visitor.visit(this);
         si
 
         void walk(Visitor visitor) is
-            IO.Std.err.println("" + Object.dump(this) + "pre: " + Object.dump(visitor));
-
             if !visitor.pre(this) then 
                 label.walk(visitor);
                 statement.walk(visitor);

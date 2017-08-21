@@ -74,8 +74,6 @@ namespace Ghul is
                             var definition = container.definition_parser.parse(context);
 
                             if definition != null then
-                                logger.info(definition.location, "read definition " + Object.dump(definition));
-
                                 definition.walk(new Syntax.Process.EXPAND_NAMESPACES());
 
                                 var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);

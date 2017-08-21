@@ -9,13 +9,13 @@ namespace Syntax is
         si
 
         private void throwNotImplemented(String name, NODE node) is
-            throw new NotImplementedException("Visitor % does not define a visit method for % % and/or this node does not accept this visitor" % Object{this, name, Object.dump(node)});
+            throw new NotImplementedException("Visitor % does not define a visit method for % % and/or this node does not accept this visitor" % Object{this, name, node.ClassName});
         si
 
         // node
 
         void visit(NODE node) is
-            throw new NotImplementedException("Visitor itself is missing a matching method for %" % Object{node});
+            throw new NotImplementedException("Visitor itself is missing a matching method for " + node.ClassName);
         si
 
         // identifiers

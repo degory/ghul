@@ -13,24 +13,17 @@ namespace Syntax is namespace Process is
             super.init(scopes, namespaces);
         si
 
-        private void log(String name, NODE node) is
-            IO.Std.err.println("what to do with this?: % % %" % Object{this, name, Object.dump(node)});
-        si
-
-        // node
-        void visit(NODE node) is
-            log("node", node);
-        si
-
         // modifiers
 
+        /*
         void visit(Modifier.NODE modifier) is
             log("modifier", modifier);
         si
 
         void visit(Modifier.LIST modifiers) is
             log("modifiers", modifiers);
-        si        
+        si
+        */        
 
         // definitions
 

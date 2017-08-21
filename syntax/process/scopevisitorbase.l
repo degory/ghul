@@ -64,22 +64,18 @@ namespace Syntax is
         si
 
         void push(NODE node) is
-            IO.Std.err.println("" + Object.dump(this) + " push: " + Object.dump(node));
             _scopes.push(node);
         si
 
         void push(LOCATION location, String name, NODE node) is
-            IO.Std.err.println("" + Object.dump(this) + " push: " + name + ", " + Object.dump(node));
             _scopes.push(location, name, node);
         si
 
         void push(Identifier.NODE identifier, NODE node) is
-            IO.Std.err.println("" + Object.dump(this) + " push: " + identifier + ", " + Object.dump(node));
             _scopes.push(identifier, node);
         si
         
         void enter(NODE node) is
-             IO.Std.err.println("" + Object.dump(this) + " enter: " + Object.dump(node));
             _scopes.enter(node);
         si
 
@@ -108,17 +104,14 @@ namespace Syntax is
         si        
 
         void declare(LOCATION location, String name, NODE node) is
-            IO.Std.err.println("declare:" + name + " as " + Object.dump(node));
             _scopes.declare(location, name, node);
         si        
 
         void declare(Identifier.NODE identifier, NODE node) is
-            IO.Std.err.println("declare:" + identifier + " as " + Object.dump(node));
             _scopes.declare(identifier, node);
         si
 
         SCOPE pop(NODE node) is
-            IO.Std.err.println("" + Object.dump(this) + " pop: " + Object.dump(node));
             return _scopes.pop(node);
         si
     si
