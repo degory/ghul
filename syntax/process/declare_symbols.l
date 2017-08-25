@@ -28,15 +28,23 @@ namespace Syntax is namespace Process is
         // definitions
 
         bool pre(Definition.NAMESPACE namespace_) is
+            enter_uses(namespace_);
+
             push_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
             pop_namespace(namespace_.name);
+
+            pop_uses(namespace_);
         si   
 
+        bool pre(Definition.USE use_) is
+            // push_use(use_);
+        si
+
         void visit(Definition.USE use_) is
-            // TODO: insert into current scope:
+            // pop_use(use_);
         si
 
         bool pre(Definition.CLASS class_) is

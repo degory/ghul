@@ -36,11 +36,14 @@ namespace Syntax is namespace Parser is namespace Expression is
                 Tree.Expression.NODE proc(CONTEXT context) is
                     return new Tree.Expression.UNARY(
                         context.location,
-                        Tree.Expression.OPERATION.SUBTRACT,
+                        new Tree.Identifier.NODE(
+                            context.location,
+                            context.current.string
+                        ),
                         parse(context)
                     );
                 si,
-                Lexical.TOKEN.MINUS
+                Lexical.TOKEN.OPERATOR
             );
 
             add_parser(

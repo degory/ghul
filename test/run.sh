@@ -35,7 +35,7 @@ else
     if ! diff $CASE/err $TMP/err >$TMP/err_diff ; then
        FAILED=1
        echo "${NAME}: compile error output differs"
-       # cat $TMP/err_diff
+       cat $TMP/err_diff
        cp $TMP/err $CASE/err.test
        cp $TMP/err_diff $CASE/err.diff
     fi
@@ -43,7 +43,7 @@ else
     if ! diff $CASE/warn $TMP/warn >$TMP/warn_diff ; then
        FAILED=1
        echo "${NAME}: compile warn output differs"
-       # cat $TMP/warn_diff
+       cat $TMP/warn_diff
        cp $TMP/warn $CASE/warn.test
        cp $TMP/warn_diff $CASE/warn.diff
     fi
@@ -87,6 +87,7 @@ else
     if ! diff $CASE/out $TMP/out >$TMP/out_diff ; then
        FAILED=1
        echo "${NAME}: test output differs"
+       cat $TMP/out_diff       
        cp $TMP/out $CASE/out.test
        cp $TMP/out_diff $CASE/out.diff
     fi

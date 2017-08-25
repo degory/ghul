@@ -21,13 +21,10 @@ namespace Lexical is
             names[TOKEN.ASSIGN] = "=";
             names[TOKEN.AT] = "@";
             names[TOKEN.BANG] = "!";
-            names[TOKEN.BOOL] = "bool";
             names[TOKEN.BREAK] = "break";
-            names[TOKEN.BYTE] = "byte";
             names[TOKEN.CASE] = "case";
             names[TOKEN.CAST] = "cast";
             names[TOKEN.CATCH] = "catch";
-            names[TOKEN.CHAR] = "char";
             names[TOKEN.CHAR_LITERAL] = "char literal";
             names[TOKEN.CLASS] = "class";
             names[TOKEN.COLON] = ":";
@@ -61,14 +58,12 @@ namespace Lexical is
             names[TOKEN.IF] = "if";
             names[TOKEN.IMPORT] = "import";
             names[TOKEN.IN] = "in";
-            names[TOKEN.INT] = "int";
             names[TOKEN.INTERFACE] = "interface";
             names[TOKEN.INT_LITERAL] = "int literal";
             names[TOKEN.IS] = "is";
             names[TOKEN.ISA] = "isa";
             names[TOKEN.LE] = "<=";
             names[TOKEN.LET] = "let";
-            names[TOKEN.LONG] = "long";
             names[TOKEN.LT] = "<";
             names[TOKEN.PERCENT] = "%";
             names[TOKEN.STAR] = "*";
@@ -118,10 +113,8 @@ namespace Lexical is
             names[TOKEN.USE] = "use";
             names[TOKEN.VAR] = "var";
             names[TOKEN.VECTOR] = "vector";
-            names[TOKEN.VOID] = "void";
             names[TOKEN.WHEN] = "when";
             names[TOKEN.WHILE] = "while";
-            names[TOKEN.WORD] = "word";
             names[TOKEN.YRT] = "yrt";
         si
 

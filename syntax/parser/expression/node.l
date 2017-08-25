@@ -7,6 +7,7 @@ namespace Syntax is namespace Parser is namespace Expression is
     enum PRECEDENCE is
         NONE,
         MIN,
+        UNDEFINED,
         BOOLEAN,
         RELATIONAL,
         RANGE,
@@ -19,8 +20,7 @@ namespace Syntax is namespace Parser is namespace Expression is
     si    
 
     class NODE isa BASE<Tree.Expression.NODE> is
-        Dict<Lexical.TOKEN, PRECEDENCE> precedence;
-        Dict<Lexical.TOKEN, Tree.Expression.OPERATION> operation;
+        Dict<String, PRECEDENCE> _precedence;
 
         Parser<Tree.Expression.NODE> expression_secondary_parser;
 
@@ -31,77 +31,51 @@ namespace Syntax is namespace Parser is namespace Expression is
 
             this.expression_secondary_parser = expression_secondary_parser;
 
-            precedence = new Map<Lexical.TOKEN, PRECEDENCE>();
+            _precedence = new Map<String, PRECEDENCE>();
 
-            precedence[Lexical.TOKEN.DOT] = PRECEDENCE.MEMBER;
-            precedence[Lexical.TOKEN.SQUARE_OPEN] = PRECEDENCE.MEMBER;
-            precedence[Lexical.TOKEN.PAREN_OPEN] = PRECEDENCE.MEMBER;
+            _precedence["*"] = PRECEDENCE.MULTIPLICATION;
+            _precedence["/"] = PRECEDENCE.MULTIPLICATION;
+            _precedence["%"] = PRECEDENCE.MULTIPLICATION;
 
-            precedence[Lexical.TOKEN.STAR] = PRECEDENCE.MULTIPLICATION;
-            precedence[Lexical.TOKEN.SLASH] = PRECEDENCE.MULTIPLICATION;
-            precedence[Lexical.TOKEN.PERCENT] = PRECEDENCE.MULTIPLICATION;
+            _precedence["+"] = PRECEDENCE.ADDITION;
+            _precedence["-"] = PRECEDENCE.ADDITION;
 
-            precedence[Lexical.TOKEN.PLUS] = PRECEDENCE.ADDITION;
-            precedence[Lexical.TOKEN.MINUS] = PRECEDENCE.ADDITION;
+            _precedence["&"] = PRECEDENCE.BITWISE;
+            _precedence["|"] = PRECEDENCE.BITWISE;
+            _precedence["^"] = PRECEDENCE.BITWISE;
 
-            precedence[Lexical.TOKEN.AND] = PRECEDENCE.BITWISE;
-            precedence[Lexical.TOKEN.OR] = PRECEDENCE.BITWISE;
-            precedence[Lexical.TOKEN.HAT] = PRECEDENCE.BITWISE;
+            _precedence[".."] = PRECEDENCE.RANGE;
 
-            precedence[Lexical.TOKEN.RANGE] = PRECEDENCE.RANGE;
+            _precedence["<<"] = PRECEDENCE.SHIFT;
+            _precedence[">>"] = PRECEDENCE.SHIFT;
 
-            precedence[Lexical.TOKEN.SHIFT_LEFT] = PRECEDENCE.SHIFT;
-            precedence[Lexical.TOKEN.SHIFT_RIGHT] = PRECEDENCE.SHIFT;
+            _precedence["=="] = PRECEDENCE.RELATIONAL;
+            _precedence["!="] = PRECEDENCE.RELATIONAL;
+            _precedence["=~"] = PRECEDENCE.RELATIONAL;
+            _precedence["!~"] = PRECEDENCE.RELATIONAL;
+            _precedence["<"] = PRECEDENCE.RELATIONAL;
+            _precedence[">"] = PRECEDENCE.RELATIONAL;
+            _precedence[">="] = PRECEDENCE.RELATIONAL;
+            _precedence["<="] = PRECEDENCE.RELATIONAL;
 
-            precedence[Lexical.TOKEN.EQ] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.NE] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.EQ_OBJ] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.NE_OBJ] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.LT] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.LE] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.GT] = PRECEDENCE.RELATIONAL;
-            precedence[Lexical.TOKEN.GE] = PRECEDENCE.RELATIONAL;
-
-            precedence[Lexical.TOKEN.AND_THEN] = PRECEDENCE.BOOLEAN;
-            precedence[Lexical.TOKEN.OR_ELSE] = PRECEDENCE.BOOLEAN;            
-
-            operation = new Map<Lexical.TOKEN, Tree.Expression.OPERATION>();
-
-            operation[Lexical.TOKEN.DOT] = Tree.Expression.OPERATION.MEMBER;
-            operation[Lexical.TOKEN.SQUARE_OPEN] = Tree.Expression.OPERATION.INDEX;
-            operation[Lexical.TOKEN.PAREN_OPEN] = Tree.Expression.OPERATION.CALL;
-
-            operation[Lexical.TOKEN.SLASH] = Tree.Expression.OPERATION.DIVIDE;
-            operation[Lexical.TOKEN.STAR] = Tree.Expression.OPERATION.MULTIPLY;
-            operation[Lexical.TOKEN.PERCENT] = Tree.Expression.OPERATION.MODULUS;
-
-            operation[Lexical.TOKEN.PLUS] = Tree.Expression.OPERATION.ADD;
-            operation[Lexical.TOKEN.MINUS] = Tree.Expression.OPERATION.SUBTRACT;
-
-            operation[Lexical.TOKEN.AND] = Tree.Expression.OPERATION.AND;
-            operation[Lexical.TOKEN.OR] = Tree.Expression.OPERATION.OR;  
-            operation[Lexical.TOKEN.HAT] = Tree.Expression.OPERATION.XOR;              
-
-            operation[Lexical.TOKEN.RANGE] = Tree.Expression.OPERATION.RANGE;
-
-            operation[Lexical.TOKEN.SHIFT_LEFT] = Tree.Expression.OPERATION.SHIFT_LEFT;
-            operation[Lexical.TOKEN.SHIFT_RIGHT] = Tree.Expression.OPERATION.SHIFT_RIGHT;
-
-            operation[Lexical.TOKEN.EQ] = Tree.Expression.OPERATION.EQUAL;
-            operation[Lexical.TOKEN.NE] = Tree.Expression.OPERATION.NOT_EQUAL;
-            operation[Lexical.TOKEN.EQ_OBJ] = Tree.Expression.OPERATION.EQUAL_OBJ;
-            operation[Lexical.TOKEN.NE_OBJ] = Tree.Expression.OPERATION.NOT_EQUAL_OBJ;
-            operation[Lexical.TOKEN.LT] = Tree.Expression.OPERATION.LESS;
-            operation[Lexical.TOKEN.LE] = Tree.Expression.OPERATION.LESS_OR_EQUAL;
-            operation[Lexical.TOKEN.GT] = Tree.Expression.OPERATION.GREATER;
-            operation[Lexical.TOKEN.GE] = Tree.Expression.OPERATION.GREATER_OR_EQUAL;
-
-            operation[Lexical.TOKEN.AND_THEN] = Tree.Expression.OPERATION.AND_THEN;
-            operation[Lexical.TOKEN.OR_ELSE] = Tree.Expression.OPERATION.OR_ELSE;
+            _precedence["&&"] = PRECEDENCE.BOOLEAN;
+            _precedence["||"] = PRECEDENCE.BOOLEAN;            
         si
 
         get String description is
             return "expression";
+        si
+
+        PRECEDENCE precedence(CONTEXT context) is            
+            var result = _precedence[context.current.string];
+
+            if result == PRECEDENCE.NONE then
+                context.error(context.current.location, "operator '" + context.current.string + "' has unknown precedence");
+
+                return PRECEDENCE.UNDEFINED;
+            fi
+
+            return result;
         si
 
         Tree.Expression.NODE parse(CONTEXT context) is
@@ -119,18 +93,21 @@ namespace Syntax is namespace Parser is namespace Expression is
         )
         is
             do
-                var left_precedence = precedence[context.current.token];
+                var left_precedence = precedence(context);
 
                 if left_precedence < min_precedence then break; fi
 
-                var op = operation[context.current.token];
+                var op = new Tree.Identifier.NODE(
+                    context.location,
+                    context.current.string
+                );
 
                 context.next_token();
 
                 Tree.Expression.NODE right = expression_secondary_parser.parse(context);
                 
                 do
-                    var right_precedence = precedence[context.current.token];
+                    var right_precedence = precedence(context);
 
                     if right_precedence <= left_precedence then
                         break;

@@ -59,6 +59,27 @@ namespace Syntax is
             fi
         si
 
+        void enter_uses(Definition.NAMESPACE namespace_) is
+            IO.Std.err.println("enter uses ...");
+            
+            foreach var u; namespace_.body.uses do
+                IO.Std.err.println("enter use: " + u);
+                foreach var i; u do
+                    // enter_namespace(i);
+                od
+            od
+        si
+
+        void pop_uses(Definition.NAMESPACE namespace_) is
+            IO.Std.err.println("exit uses ...");
+            foreach var u; namespace_.body.uses.ReverseIterator do
+                IO.Std.err.println("exit use: " + u);
+                foreach var i; u.ReverseIterator do
+                    // pop_namespace(i);
+                od
+            od
+        si
+        
         void add(NODE node, SCOPE parent) is
             _scopes.add(node, parent);
         si

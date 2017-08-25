@@ -23,43 +23,6 @@ namespace Syntax is namespace Parser is namespace Type is
 
             add_parser(
                 Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.VOID(context.location_and_next());
-                si,
-                Lexical.TOKEN.VOID);
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.BOOL(context.location_and_next());
-                si,
-                Lexical.TOKEN.BOOL);
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.BYTE(context.location_and_next());
-                si, 
-                Lexical.TOKEN.BYTE);
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.CHAR(context.location_and_next());
-                si,
-                Lexical.TOKEN.CHAR);
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.INT(context.location_and_next());
-                si,
-                Lexical.TOKEN.INT); 
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
-                    return new Tree.Type.WORD(context.location_and_next());
-                si,
-                Lexical.TOKEN.WORD);
-
-
-            add_parser(
-                Tree.Type.NODE proc(CONTEXT context) is
                     var start = context.location;
 
                     var identifier = identifier_qualified_parser.parse(context);

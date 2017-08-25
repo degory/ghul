@@ -22,6 +22,18 @@ namespace Syntax is namespace Tree is namespace Definition is
             return definitions.Iterator;
         si
 
+        get Vector<Definition.USE> uses is
+            Vector<Definition.USE> result = new Vector<USE>(definitions.Length);
+
+            foreach var d; definitions do
+                if isa Definition.USE(d) then
+                    result.add(cast Definition.USE(d));
+                fi
+            od
+
+            return result;
+        si
+
         void accept(Visitor visitor) is
             visitor.visit(this);
         si

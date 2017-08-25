@@ -2,12 +2,12 @@ namespace Syntax is namespace Tree is namespace Expression is
     use Source;
 
     class UNARY isa NODE is
-        public OPERATION operation;
+        public Identifier.NODE operation;
         public NODE right;
         
         void init(
             LOCATION location,
-            OPERATION operation,
+            Identifier.NODE operation,
             NODE right
         )
         is

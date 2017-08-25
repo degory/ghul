@@ -281,16 +281,17 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.UNARY unary) is
-            append(Expression.OPERATION_NAMES[unary.operation]);
+            unary.operation.accept(this);
+            append(' ');
 
             unary.right.accept(this);
         si
 
         void visit(Expression.BINARY binary) is
             binary.left.accept(this);
-
-            append(Expression.OPERATION_NAMES[binary.operation]);
-            
+            append(' ');
+            binary.operation.accept(this);
+            append(' ');            
             binary.right.accept(this);
         si
 

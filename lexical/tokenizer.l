@@ -4,9 +4,6 @@ import stream;
 
 namespace Lexical is
     use System;
-    use System;
-    use System;
-    use System;
 
     use Generic;
 
@@ -106,6 +103,8 @@ namespace Lexical is
 
         TOKEN_PAIR _token_pair;
         static TOKEN_MAP symbol_tokens;
+        static Set<char> operator_chars;
+
         TOKEN_BUFFER buffer;
 
         IO.Reader input;
@@ -116,8 +115,13 @@ namespace Lexical is
 
         String[] _token_name;
 
-        static void init_symbol_tokens() is
+        static void static_init() is
             if symbol_tokens == null then
+                operator_chars = new Set<char>(char{
+                    '!', '$', '%', '^', '&', '*', '-', '+', '=',
+                    '@', '~', '#', '\\', '<', '>', '.', '?', '/'
+                });
+
                 symbol_tokens = new TOKEN_MAP();
                 symbol_tokens["import"] = TOKEN.IMPORT;
                 symbol_tokens["namespace"] = TOKEN.NAMESPACE;
@@ -142,12 +146,6 @@ namespace Lexical is
                 symbol_tokens["continue"] = TOKEN.CONTINUE;
                 symbol_tokens["ref"] = TOKEN.REF;
                 symbol_tokens["ptr"] = TOKEN.PTR;
-                symbol_tokens["int"] = TOKEN.INT;
-                symbol_tokens["long"] = TOKEN.LONG;
-                symbol_tokens["word"] = TOKEN.WORD;
-                symbol_tokens["char"] = TOKEN.CHAR;
-                symbol_tokens["bool"] = TOKEN.BOOL;
-                symbol_tokens["void"] = TOKEN.VOID;
                 symbol_tokens["new"] = TOKEN.NEW;
                 symbol_tokens["throw"] = TOKEN.THROW;
                 symbol_tokens["return"] = TOKEN.RETURN;
@@ -192,7 +190,7 @@ namespace Lexical is
             end_of_file = false;
             input = i;
 
-            init_symbol_tokens();
+            static_init();
 
             cursor = new LOCATION_CURSOR(file_name);
 
@@ -303,60 +301,6 @@ namespace Lexical is
             return c;
         si
 
-        TOKEN_PAIR read_operator_method_token() is
-            var start = location;
-            var o = read_token_2(false);
-            var string = "";
-
-            case o.token 
-            is TOKEN.PLUS:
-                string = "operator-";
-
-            is TOKEN.STAR:
-                string = "operator*";
-
-            is TOKEN.SLASH:
-                string = "operator/";
-
-            is TOKEN.PERCENT:
-                string = "operator%";
-
-            is TOKEN.SHIFT_LEFT:
-                string = "operator<<";
-
-            is TOKEN.SHIFT_RIGHT:
-                string = "operator>>";
-
-            is TOKEN.AND:
-                string = "operator&";
-
-            is TOKEN.OR:
-                string = "operator|";
-
-            is TOKEN.HAT:
-                string = "operator^";
-
-            is TOKEN.EQ_OBJ:
-                string = "operator=~";
-
-            is TOKEN.GT:
-                string = "operator>";
-
-            is TOKEN.RANGE:
-                string = "operator..";
-
-            default:
-                // syntax error:
-                return o;
-            esac
-
-            return new TOKEN_PAIR(
-                TOKEN.IDENTIFIER,
-                start..location,
-                string
-            );
-        si
-
         void write_token(TOKEN_PAIR token) is 
             buffer.write(token);
         si
@@ -425,9 +369,28 @@ namespace Lexical is
                 prev_char(c);
                 r = symbol_tokens[buffer];
 
-                if r == TOKEN.OPERATOR then
-                    return read_operator_method_token();
-                fi
+                return new TOKEN_PAIR(
+                    r,
+                    location,
+                    buffer
+                );
+            elif operator_chars.contains(c) then
+                buffer = new StringBuffer();
+
+                while operator_chars.contains(c) do
+                    buffer.append(c);
+                    c = next_char();
+                od
+
+                prev_char(c);
+
+                if buffer =~ "=" then
+                    r = TOKEN.ASSIGN;
+                elif buffer =~ "." then
+                    r = TOKEN.DOT;
+                else
+                    r = TOKEN.OPERATOR;
+                fi    
 
                 return new TOKEN_PAIR(
                     r,

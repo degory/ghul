@@ -3,13 +3,13 @@ namespace Syntax is namespace Tree is namespace Expression is
     use Source;
 
     class BINARY isa NODE is
-        public OPERATION operation;
+        public Identifier.NODE operation;
         public NODE left;
         public NODE right;
         
         void init(
             LOCATION location,
-            OPERATION operation,
+            Identifier.NODE operation,
             NODE left,
             NODE right
         )
