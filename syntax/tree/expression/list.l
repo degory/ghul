@@ -29,5 +29,15 @@ namespace Syntax is namespace Tree is namespace Expression is
 
             accept(visitor);
         si
+
+        void rewrite(MAP m) is
+            var ne = new Vector<NODE>(expressions.Length);
+
+            foreach var e; expressions do
+                ne.add(cast NODE(m[e]));
+            od
+
+            expressions = ne;
+        si
     si
 si si si

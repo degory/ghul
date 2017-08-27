@@ -30,6 +30,11 @@ namespace Syntax is namespace Tree is namespace Expression is
             fi
 
             accept(visitor);
-        si        
+        si
+
+        void rewrite(MAP m) is
+            type = cast Type.NODE(m[type]);
+            body = cast Type.NODE(m[body]);
+        si
     si
 si si si

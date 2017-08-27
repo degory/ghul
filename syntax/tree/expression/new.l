@@ -29,5 +29,10 @@ namespace Syntax is namespace Tree is namespace Expression is
 
             accept(visitor);
         si
+
+        void rewrite(MAP m) is
+            type = cast Type.NODE(m[type]);
+            arguments = cat TUPLE(m[arguments]);
+        si
     si
 si si si

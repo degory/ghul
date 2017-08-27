@@ -101,5 +101,8 @@ namespace Syntax is namespace Tree is namespace Expression is
         void accept(Visitor visitor) is
             visitor.visit(this);
         si
+
+        void rewrite(Dict<NODE,NODE> map) is
+        si
     si
 si si si

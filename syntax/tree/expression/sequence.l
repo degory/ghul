@@ -26,5 +26,10 @@ namespace Syntax is namespace Tree is namespace Expression is
                 type.walk(visitor);
             fi
         si
+
+        void rewrite(MAP m) is
+            type = cast Type.NODE(m[type]);
+            elements = cast LIST(m[elements]);
+        si
     si
 si si si

@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Expression is
+    use System;
+    
     use Source;
 
     class CALL isa NODE is
@@ -23,6 +25,11 @@ namespace Syntax is namespace Tree is namespace Expression is
             fi
 
             accept(visitor);
+        si
+
+        void rewrite(MAP m) is
+            function = cast NODE(m[function]);
+            arguments = cast LIST(m[arguments]);
         si
     si
 si si si

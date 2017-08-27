@@ -20,5 +20,9 @@ namespace Syntax is namespace Tree is namespace Expression is
 
             accept(visitor);            
         si
+
+        void rewrite(MAP m) is
+            identifier = cast Identifier.NODE(m[identifier]);
+        si
     si
 si si si

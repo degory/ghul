@@ -25,5 +25,9 @@ namespace Syntax is namespace Tree is namespace Expression is
 
             accept(visitor);
         si
+
+        void rewrite(MAP m) is
+            elements = cast LIST(m[elements]);
+        si
     si
 si si si
