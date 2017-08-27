@@ -39,6 +39,7 @@ namespace Syntax is
             var parent = identifier.parent;
             
             if parent != null then
+                IO.Std.err.println("find defintion for " + identifier.name + " in parent " + parent + "...");
                 var parent_node = find_definition(parent);
 
                 if parent_node == null then
@@ -52,6 +53,8 @@ namespace Syntax is
                    IO.Std.err.println("not a searchable scope: " + parent_node);
                    return null;
                 fi
+
+                IO.Std.err.println("find defintion for " + identifier.name + " in parent scope " + parent_scope + "...");
                    
                 return parent_scope[identifier.name];
             else
@@ -65,7 +68,15 @@ namespace Syntax is
             foreach var u; namespace_.body.uses do
                 IO.Std.err.println("enter use: " + u);
                 foreach var i; u do
-                    enter_namespace(i);
+                    var n = find_definition(i);
+
+                    IO.Std.err.println("" + i + " resolves to " + n + ": should use this namespace");
+
+                    if n != null then
+                        enter(n);
+                    fi
+
+                    // enter_namespace(i);
                 od
             od
         si
@@ -75,7 +86,15 @@ namespace Syntax is
             foreach var u; namespace_.body.uses.ReverseIterator do
                 IO.Std.err.println("exit use: " + u);
                 foreach var i; u.ReverseIterator do
-                    pop_namespace(i);
+                    var n = find_definition(i);
+
+                    IO.Std.err.println("" + i + " resolves to " + n + ": should un-use this namespace");
+
+                    if n != null then
+                        pop(n);
+                    fi
+                    
+                    // pop_namespace(i);
                 od
             od
         si
