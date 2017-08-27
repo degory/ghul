@@ -16,7 +16,7 @@ namespace Syntax is namespace Parser is namespace Identifier is
                 var name = context.current.string;
                 var result = new Tree.Identifier.NODE(context.location, name);
 
-                context.next_token();                    
+                context.next_token();   
 
                 return result;
             fi

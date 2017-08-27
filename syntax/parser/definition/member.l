@@ -50,7 +50,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                 return indexer_parser.parse(context);
 
             elif context.current.token == Lexical.TOKEN.PAREN_OPEN then
-                // backtrack  to the identifier and parse as a function:
+                // backtrack to the identifier or operator and parse as a function:
                 context.backtrack();
                 return function_parser.parse(context); 
             fi

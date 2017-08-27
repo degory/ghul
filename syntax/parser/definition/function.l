@@ -4,14 +4,14 @@ namespace Syntax is namespace Parser is namespace Definition is
     use Source;
 
     class FUNCTION isa BASE<Tree.Definition.FUNCTION> is
-        Parser<Tree.Identifier.NODE> identifier_parser;
+        Parser<Tree.Identifier.NODE> identifier_function_name_parser;
         Parser<Tree.Type.NODE> type_parser;
         Parser<Tree.Modifier.LIST> modifier_list_parser;        
         Parser<Tree.Body.NODE> body_parser;
         Parser<Tree.Variable.LIST> variable_list_parser;
 
         void init(
-            Parser<Tree.Identifier.NODE> identifier_parser,
+            Parser<Tree.Identifier.NODE> identifier_function_name_parser,
             Parser<Tree.Type.NODE> type_parser,
             Parser<Tree.Modifier.LIST> modifier_list_parser,            
             Parser<Tree.Body.NODE> body_parser,
@@ -19,7 +19,7 @@ namespace Syntax is namespace Parser is namespace Definition is
         ) is
             super.init();
             
-            this.identifier_parser = identifier_parser;
+            this.identifier_function_name_parser = identifier_function_name_parser;
             this.type_parser = type_parser;
             this.modifier_list_parser = modifier_list_parser;
             this.body_parser = body_parser;
@@ -28,7 +28,7 @@ namespace Syntax is namespace Parser is namespace Definition is
 
         Tree.Definition.FUNCTION parse(CONTEXT context) is
             var start = context.location;
-            var name = identifier_parser.parse(context);
+            var name = identifier_function_name_parser.parse(context);
             context.next_token(Lexical.TOKEN.PAREN_OPEN);
 
             Tree.Variable.LIST arguments;

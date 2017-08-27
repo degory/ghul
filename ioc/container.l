@@ -20,6 +20,7 @@ namespace IoC is
 
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_parser;
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_qualified_parser;
+        Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_function_name_parser;
         Syntax.Parser.Parser<Tree.Modifier.NODE> modifier_parser;
 
         // Parsers are mutually recursive, and so the corresponding classes are mutually
@@ -65,6 +66,7 @@ namespace IoC is
             // non circular/leaf dependencies
             identifier_parser = new Parser.Identifier.NODE();
             identifier_qualified_parser = new Parser.Identifier.QUALIFIED();
+            identifier_function_name_parser = new Parser.Identifier.FUNCTION_NAME();
             modifier_parser = new Parser.Modifier.NODE();
 
             // circular dependencies
@@ -225,7 +227,7 @@ namespace IoC is
             definition_function_parser.create = 
                 Parser.Parser<Tree.Definition.FUNCTION> proc() is
                     return new Parser.Definition.FUNCTION(
-                        identifier_parser,
+                        identifier_function_name_parser,
                         type_parser,
                         modifier_list_parser,
                         body_parser,
