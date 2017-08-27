@@ -40,6 +40,8 @@ namespace Syntax is namespace Process is namespace Printer is
             if !isa Type.INFER(variable.type) then
                 variable.type.accept(this);
                 append(' ');
+            else
+                append("var ");
             fi
 
             variable.name.accept(this);
@@ -497,7 +499,7 @@ namespace Syntax is namespace Process is namespace Printer is
         // Statements
 
         void visit(Statement.LET l) is
-            dent_append("var ");
+            // dent_append("var ");
             l.variables.accept(this);
             append(";");
             nl();

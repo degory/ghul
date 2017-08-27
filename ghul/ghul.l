@@ -99,7 +99,7 @@ namespace Ghul is
                                 if want_legacy then
                                     to_build.add(legacy_output);
                                     
-                                    var writer = IO.File.openWrite(legacy_output);
+                                    var writer = IO.File.openCreate(legacy_output);
 
                                     writer.print(printer.result);
 

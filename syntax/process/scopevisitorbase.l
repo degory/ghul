@@ -65,7 +65,7 @@ namespace Syntax is
             foreach var u; namespace_.body.uses do
                 IO.Std.err.println("enter use: " + u);
                 foreach var i; u do
-                    // enter_namespace(i);
+                    enter_namespace(i);
                 od
             od
         si
@@ -75,7 +75,7 @@ namespace Syntax is
             foreach var u; namespace_.body.uses.ReverseIterator do
                 IO.Std.err.println("exit use: " + u);
                 foreach var i; u.ReverseIterator do
-                    // pop_namespace(i);
+                    pop_namespace(i);
                 od
             od
         si

@@ -385,7 +385,7 @@ namespace Syntax is namespace Process is namespace Printer is
         void visit(Statement.VAR v) is
             dent();
 
-            append("var ");
+            // append("var ");
             v.variables.accept(this);
             append(";");
 
