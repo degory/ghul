@@ -104,6 +104,7 @@ namespace Lexical is
         TOKEN_PAIR _token_pair;
         static TOKEN_MAP symbol_tokens;
         static Set<char> operator_chars;
+        static Map<String, TOKEN> operator_tokens;
 
         TOKEN_BUFFER buffer;
 
@@ -121,6 +122,12 @@ namespace Lexical is
                     '!', '$', '%', '^', '&', '*', '-', '+', '=',
                     '@', '~', '#', '\\', '<', '>', '.', '?', '/'
                 });
+
+                operator_tokens = new Map<String, TOKEN>();
+                operator_tokens["="] = TOKEN.ASSIGN;
+                operator_tokens["."] = TOKEN.DOT;
+                operator_tokens["->"] = TOKEN.ARROW_THIN;
+                operator_tokens["=>"] = TOKEN.ARROW_FAT;
 
                 symbol_tokens = new TOKEN_MAP();
                 symbol_tokens["import"] = TOKEN.IMPORT;
@@ -316,6 +323,37 @@ namespace Lexical is
 
             return read_token_2(false);
         si
+
+        TOKEN_PAIR read_operator(char c) is
+            var buffer = new StringBuffer();
+
+            while operator_chars.contains(c) do
+                buffer.append(c);
+                c = next_char();
+            od
+
+            prev_char(c);
+
+            if buffer.Length < 1 then
+                return new TOKEN_PAIR(
+                    TOKEN.FIRST,
+                    location,
+                    null
+                );
+            fi
+
+            var r = operator_tokens[buffer];
+
+            if r == TOKEN.FIRST then
+                r = TOKEN.OPERATOR;
+            fi
+
+            return new TOKEN_PAIR(
+                r,
+                location,
+                buffer
+            );
+        si
     
         TOKEN_PAIR read_token_2(bool for_comment) is
             TOKEN r;            
@@ -374,29 +412,66 @@ namespace Lexical is
                     location,
                     buffer
                 );
-            elif operator_chars.contains(c) then
-                buffer = new StringBuffer();
+            elif c == '/' then
+                c = next_char();
+                if c == '/' then
+                    buffer = new StringBuffer("//");
+                    do
+                        c = next_char();
+                        if c != '\n' then
+                            buffer.append( c );
+                        fi
+                        if !( !end_of_file && c != '\n' ) then break; fi;
+                    od
 
-                while operator_chars.contains(c) do
-                    buffer.append(c);
-                    c = next_char();
-                od
+                    if buffer.startsWith("///") then
+                        buffer.append( "\n" );
+                        /*
+                        if for_comment then
+                            ParseTree.appendLastComment(buffer);
+                        else
+                            ParseTree.LastComment = buffer;
+                        fi
+                        */
+                        return read_token_2(true);
+                    else
+                        return read_token_2(false);
+                    fi
+                elif c == '*' then
+                    buffer = new StringBuffer("/*");
+                    do
+                        c = next_char();
 
-                prev_char(c);
+                        if c == '*' then
+                            c = next_char();
+                            if c == '/' then
+                                break;
+                            fi
+                            buffer.append( '*' );
+                        fi
+                        buffer.append( c );
+                        if end_of_file then break; fi
+                    od
 
-                if buffer =~ "=" then
-                    r = TOKEN.ASSIGN;
-                elif buffer =~ "." then
-                    r = TOKEN.DOT;
+                    if buffer.startsWith( "/**" ) then
+                        buffer.append( "*/" );
+                        /*
+                        if for_comment then
+                            ParseTree.appendLastComment(buffer);
+                        else
+                            ParseTree.LastComment = buffer;
+                        fi
+                        */
+                        return read_token_2(true);            
+                    else
+                        return read_token_2(false);
+                    fi
                 else
-                    r = TOKEN.OPERATOR;
-                fi    
-
-                return new TOKEN_PAIR(
-                    r,
-                    location,
-                    buffer
-                );
+                    prev_char(c);
+                    return read_operator('/');
+                fi
+            elif operator_chars.contains(c) then
+                return read_operator(c);
             fi
 
             case c
@@ -582,64 +657,6 @@ namespace Lexical is
                 fi
 
             is '*': return new TOKEN_PAIR(TOKEN.STAR, location, null);
-            is '/':
-                c = next_char();
-                if c == '/' then
-                    buffer = new StringBuffer("//");
-                    do
-                        c = next_char();
-                        if c != '\n' then
-                            buffer.append( c );
-                        fi
-                        if !( !end_of_file && c != '\n' ) then break; fi;
-                    od
-
-                    if buffer.startsWith("///") then
-                        buffer.append( "\n" );
-                        /*
-                        if for_comment then
-                            ParseTree.appendLastComment(buffer);
-                        else
-                            ParseTree.LastComment = buffer;
-                        fi
-                        */
-                        return read_token_2(true);
-                    else
-                        return read_token_2(false);
-                    fi
-                elif c == '*' then
-                    buffer = new StringBuffer("/*");
-                    do
-                        c = next_char();
-
-                        if c == '*' then
-                            c = next_char();
-                            if c == '/' then
-                                break;
-                            fi
-                            buffer.append( '*' );
-                        fi
-                        buffer.append( c );
-                        if end_of_file then break; fi
-                    od
-
-                    if buffer.startsWith( "/**" ) then
-                        buffer.append( "*/" );
-                        /*
-                        if for_comment then
-                            ParseTree.appendLastComment(buffer);
-                        else
-                            ParseTree.LastComment = buffer;
-                        fi
-                        */
-                        return read_token_2(true);            
-                    else
-                        return read_token_2(false);
-                    fi
-                else
-                    prev_char(c);
-                    return new TOKEN_PAIR(TOKEN.SLASH, location, null);
-                fi
             is '%': return new TOKEN_PAIR(TOKEN.PERCENT, location, null);
 
             is '.': 

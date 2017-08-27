@@ -58,11 +58,24 @@ namespace Syntax is namespace Parser is
                 populate_expected_tokens();
             fi                    
 
-            context.error(context.location, "%: expected % but found %" 
-                % Object{
-                    syntax_error_message,
-                    Lexical.TOKEN_NAMES[expected_tokens],
-                    context.current.name});
+            if context.current.string != null then
+                context.error(context.location, "%: expected % but found % %" 
+                    % Object{
+                        syntax_error_message,
+                        Lexical.TOKEN_NAMES[expected_tokens],
+                        context.current.name,
+                        context.current.string
+                    }
+                );            
+            else
+                context.error(context.location, "%: expected % but found %" 
+                    % Object{
+                        syntax_error_message,
+                        Lexical.TOKEN_NAMES[expected_tokens],
+                        context.current.name
+                    }
+                );
+            fi
         si
 
         private void populate_expected_tokens() is

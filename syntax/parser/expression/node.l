@@ -66,7 +66,11 @@ namespace Syntax is namespace Parser is namespace Expression is
             return "expression";
         si
 
-        PRECEDENCE precedence(CONTEXT context) is            
+        PRECEDENCE precedence(CONTEXT context) is
+            if context.current.token != Lexical.TOKEN.OPERATOR then
+               return PRECEDENCE.NONE;
+            fi
+
             var result = _precedence[context.current.string];
 
             if result == PRECEDENCE.NONE then
