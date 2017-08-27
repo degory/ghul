@@ -524,7 +524,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.FOR for_) is
-            dent_append("foreach var ");
+            dent_append("foreach ");
 
             for_.variable.accept(this);
 

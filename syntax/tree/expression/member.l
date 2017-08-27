@@ -21,6 +21,8 @@ namespace Syntax is namespace Tree is namespace Expression is
                 left.walk(visitor);
                 identifier.walk(visitor);
             fi
+
+            accept(visitor);
         si
     si
 si si si

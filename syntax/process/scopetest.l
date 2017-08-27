@@ -15,6 +15,8 @@ namespace Syntax is namespace Process is
         si
 
         void visit(Identifier.QUALIFIED identifier) is
+            IO.Std.err.println("search for qualified: " + identifier);
+
             var definition = this[identifier];
 
             if definition != null then
@@ -25,6 +27,8 @@ namespace Syntax is namespace Process is
         si
 
         void visit(Identifier.NODE identifier) is
+            IO.Std.err.println("search for unqualified: " + identifier);
+
             var definition = this[identifier];
 
             if definition != null then
@@ -32,6 +36,12 @@ namespace Syntax is namespace Process is
             else
                 _logger.error(identifier.location, "symbol not defined: " + identifier);
             fi            
+        si
+
+        bool pre(Expression.MEMBER member) is
+            IO.Std.err.println("Cannot search for member: " + member);
+
+            return true;            
         si
     si
 si si

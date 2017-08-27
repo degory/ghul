@@ -26,6 +26,7 @@ fi
 echo "${NAME}: compile ..."
 $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 # mv test $CASE
+
 grep error: $TMP/err_out | sort >$TMP/err
 grep warn: $TMP/err_out | sort >$TMP/warn
 if [ "$2" = "capture" ]; then
