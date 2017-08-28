@@ -30,14 +30,17 @@ namespace Syntax is namespace Tree is namespace Expression is
             accept(visitor);
         si
 
-        void rewrite(Dict<NODE,NODE> m) is
-            var ne = new Vector<NODE>(expressions.Length);
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            IO.Std.err.println("rewrite expression list: " + this);
+            var ne = new Vector<NODE>();
 
             foreach var e; expressions do
                 ne.add(cast NODE(m[e]));
             od
 
             expressions = ne;
+
+            IO.Std.err.println("rewriten expression list: " + this);
         si
     si
 si si si

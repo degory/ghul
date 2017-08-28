@@ -29,130 +29,132 @@ namespace Syntax is
         // identifiers
 
         bool pre(Identifier.NODE identifier) is
+            identifier.rewrite(_map);
             return false;
         si
 
         void visit(Identifier.NODE identifier) is
-            identifier.rewrite(_map);        
+
         si
 
         bool pre(Identifier.QUALIFIED identifier) is
+            identifier.rewrite(_map);
             return false;
         si
 
         void visit(Identifier.QUALIFIED identifier) is
-            identifier.rewrite(_map);
         si
 
         // modifiers
 
         bool pre(Modifier.NODE modifier) is
+            modifier.rewrite(_map);
             return false;
         si
 
         void visit(Modifier.NODE modifier) is
-            modifier.rewrite(_map);
         si
 
         bool pre(Modifier.LIST modifiers) is
+            modifiers.rewrite(_map);
             return false;
         si
 
         void visit(Modifier.LIST modifiers) is
-            modifiers.rewrite(_map);
         si        
 
         // definitions
 
         bool pre(Definition.NODE definition) is
+            definition.rewrite(_map);
             return false;
         si
 
         void visit(Definition.NODE definition) is
-            definition.rewrite(_map);
         si
 
         bool pre(Definition.LIST definitions) is
+            definitions.rewrite(_map);
             return false;
         si
 
         void visit(Definition.LIST definitions) is
-            definitions.rewrite(_map);
         si
 
         bool pre(Definition.IMPORT import_) is
+            import_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.IMPORT import_) is
-            import_.rewrite(_map);
         si        
         
         bool pre(Definition.NAMESPACE namespace_) is
+            namespace_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.NAMESPACE namespace_) is
-            namespace_.rewrite(_map);
         si        
 
         bool pre(Definition.USE use_) is
+            use_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.USE use_) is
-            use_.rewrite(_map);
         si
 
         bool pre(Definition.CLASS class_) is
+            class_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.CLASS class_) is
-            class_.rewrite(_map);
         si
 
         bool pre(Definition.INTERFACE interface_) is
+            interface_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.INTERFACE interface_) is
-            interface_.rewrite(_map);
         si        
 
         bool pre(Definition.ENUM enum_) is
+            enum_.rewrite(_map);
             return false;
         si
 
         void visit(Definition.ENUM enum_) is
-            enum_.rewrite(_map);
         si
 
         bool pre(Definition.ENUM_MEMBER enum_member) is
+            enum_member.rewrite(_map);
             return false;
         si
 
         void visit(Definition.ENUM_MEMBER enum_member) is
-            enum_member.rewrite(_map);
         si        
 
         bool pre(Definition.FUNCTION function) is
+            function.rewrite(_map);
             return false;
         si
 
         void visit(Definition.FUNCTION function) is
-            function.rewrite(_map);
         si
 
         bool pre(Definition.PROPERTY property) is
+            property.rewrite(_map);
             return false;
         si
 
         void visit(Definition.PROPERTY property) is
-            property.rewrite(_map);
         si
 
         bool pre(Definition.INDEXER indexer) is
+            indexer.rewrite(_map);
             return false;
         si
 
@@ -162,6 +164,7 @@ namespace Syntax is
         // variables
         
         bool pre(Variable.NODE variable) is
+            variable.rewrite(_map);
             return false;
         si
 
@@ -169,6 +172,7 @@ namespace Syntax is
         si
 
         bool pre(Variable.LIST variables) is
+            variables.rewrite(_map);
             return false;
         si
 
@@ -178,6 +182,7 @@ namespace Syntax is
         // types
 
         bool pre(Type.NODE type) is
+            type.rewrite(_map);
             return false;
         si
 
@@ -185,6 +190,7 @@ namespace Syntax is
         si
 
         bool pre(Type.INFER infer) is
+            infer.rewrite(_map);
             return false;
         si
 
@@ -192,6 +198,7 @@ namespace Syntax is
         si        
 
         bool pre(Type.BUILT_IN built_in) is
+            built_in.rewrite(_map);
             return false;
         si
 
@@ -199,6 +206,7 @@ namespace Syntax is
         si        
 
         bool pre(Type.STRUCTURED structured) is
+            structured.rewrite(_map);
             return false;
         si
 
@@ -206,6 +214,7 @@ namespace Syntax is
         si
 
         bool pre(Type.ARRAY array) is
+            array.rewrite(_map);
             return false;
         si
 
@@ -213,6 +222,7 @@ namespace Syntax is
         si
 
         bool pre(Type.POINTER pointer) is
+            pointer.rewrite(_map);
             return false;
         si
 
@@ -220,6 +230,7 @@ namespace Syntax is
         si
 
         bool pre(Type.REFERENCE reference) is
+            reference.rewrite(_map);
             return false;
         si
 
@@ -227,6 +238,7 @@ namespace Syntax is
         si
 
         bool pre(Type.NAMED named) is
+            named.rewrite(_map);
             return false;
         si
 
@@ -234,6 +246,7 @@ namespace Syntax is
         si
 
         bool pre(Type.LIST types) is
+            types.rewrite(_map);
             return false;
         si
 
@@ -241,6 +254,7 @@ namespace Syntax is
         si
 
         bool pre(Type.GENERIC generic) is
+            generic.rewrite(_map);
             return false;
         si
 
@@ -248,6 +262,7 @@ namespace Syntax is
         si
 
         bool pre(Type.FUNCTION function) is
+            function.rewrite(_map);
             return false;
         si
 
@@ -255,6 +270,7 @@ namespace Syntax is
         si
         
         bool pre(Type.TUPLE tuple) is
+            tuple.rewrite(_map);
             return false;
         si
 
@@ -262,6 +278,7 @@ namespace Syntax is
         si
 
         bool pre(Type.NAMED_TUPLE_ELEMENT element) is
+            element.rewrite(_map);
             return false;
         si
 
@@ -271,6 +288,7 @@ namespace Syntax is
         // expressions
 
         bool pre(Expression.NODE expression) is
+            expression.rewrite(_map);
             return false;
         si
 
@@ -278,6 +296,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.IDENTIFIER identifier) is
+            identifier.rewrite(_map);
             return false;
         si
 
@@ -285,6 +304,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.Literal.NODE literal) is
+            literal.rewrite(_map);
             return false;
         si
 
@@ -292,6 +312,7 @@ namespace Syntax is
         si                        
 
         bool pre(Expression.Literal.STRING string) is
+            string.rewrite(_map);
             return false;
         si
 
@@ -299,6 +320,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.Literal.CHARACTER character) is
+            character.rewrite(_map);
             return false;
         si
 
@@ -306,6 +328,7 @@ namespace Syntax is
         si
                 
         bool pre(Expression.VARIABLE variable) is
+            variable.rewrite(_map);
             return false;
         si
 
@@ -313,6 +336,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.Literal.NONE none) is
+            none.rewrite(_map);
             return false;
         si
 
@@ -320,6 +344,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.NEW new_) is
+            new_.rewrite(_map);
             return false;
         si
 
@@ -327,6 +352,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.CAST cast_) is
+            cast_.rewrite(_map);
             return false;
         si
 
@@ -334,6 +360,7 @@ namespace Syntax is
         si        
 
         bool pre(Syntax.Tree.Expression.FUNCTION function) is
+            function.rewrite(_map);
             return false;
         si
 
@@ -341,6 +368,7 @@ namespace Syntax is
         si        
 
         bool pre(Expression.TUPLE tuple) is
+            tuple.rewrite(_map);
             return false;
         si
 
@@ -348,6 +376,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.SEQUENCE sequence) is
+            sequence.rewrite(_map);
             return false;
         si
 
@@ -355,6 +384,7 @@ namespace Syntax is
         si                           
 
         bool pre(Expression.LIST list) is
+            list.rewrite(_map);
             return false;
         si
 
@@ -362,6 +392,7 @@ namespace Syntax is
         si        
 
         bool pre(Expression.CALL call) is
+            call.rewrite(_map);
             return false;
         si
 
@@ -369,6 +400,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.MEMBER member) is
+            member.rewrite(_map);
             return false;
         si
 
@@ -376,6 +408,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.INDEX index) is
+            index.rewrite(_map);
             return false;
         si
 
@@ -383,6 +416,7 @@ namespace Syntax is
         si        
 
         bool pre(Expression.HAS_VALUE has_value) is
+            has_value.rewrite(_map);
             return false;
         si
 
@@ -390,6 +424,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.UNARY unary) is
+            unary.rewrite(_map);
             return false;
         si
 
@@ -397,6 +432,7 @@ namespace Syntax is
         si
 
         bool pre(Expression.BINARY binary) is
+            binary.rewrite(_map);
             return false;
         si
 

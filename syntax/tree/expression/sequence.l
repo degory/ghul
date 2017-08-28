@@ -29,7 +29,7 @@ namespace Syntax is namespace Tree is namespace Expression is
             fi
         si
 
-        void rewrite(Dict<NODE,NODE> m) is
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
             type = cast Type.NODE(m[type]);
             elements = cast LIST(m[elements]);
         si

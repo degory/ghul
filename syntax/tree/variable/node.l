@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Variable is
+    use Generic;
+    
     use Source;
     
     class NODE isa Tree.NODE is
@@ -36,6 +38,12 @@ namespace Syntax is namespace Tree is namespace Variable is
             fi
 
             accept(visitor);
+        si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            name = cast Identifier.NODE(m[name]);
+            type = cast Type.NODE(m[type]);
+            initializer = cast Expression.NODE(m[initializer]);
         si
     si
 si si si

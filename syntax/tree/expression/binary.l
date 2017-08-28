@@ -35,9 +35,13 @@ namespace Syntax is namespace Tree is namespace Expression is
             accept(visitor);
         si
 
-        void rewrite(Dict<NODE,NODE> m) is
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            IO.Std.err.println("rewrite binary: " + left + " and " + right);
+
             left = cast NODE(m[left]);
             right = cast NODE(m[right]);
+
+            IO.Std.err.println("rewritten binary: " + left + " and " + right);
         si
     si
 si si si

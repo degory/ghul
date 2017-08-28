@@ -17,8 +17,7 @@ namespace Syntax is namespace Tree is namespace Variable is
         is
             super.init(location);
 
-            this.variables = new Vector<NODE>();
-            this.variables.add(variables);
+            this.variables = new Vector<NODE>(variables);
         si
 
         void accept(Visitor visitor) is
@@ -33,6 +32,16 @@ namespace Syntax is namespace Tree is namespace Variable is
             fi
 
             accept(visitor);
+        si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            var nv = new Vector<NODE>();
+
+            foreach var v; variables do
+                nv.add(cast NODE(m[v]));
+            od
+
+            variables = nv;
         si
     si
 si si si

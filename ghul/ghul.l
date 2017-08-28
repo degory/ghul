@@ -76,13 +76,17 @@ namespace Ghul is
                             if definition != null then
                                 definition.walk(new Syntax.Process.EXPAND_NAMESPACES());
 
+                                var ops = new Syntax.Process.REWRITE_OPERATORS_AS_CALLS();
+
+                                ops.apply(definition);
+
                                 var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);
 
                                 definition.walk(ds);
 
                                 IO.Std.err.println(ds);
 
-                                definition.walk(new Syntax.Process.SCOPE_TEST(logger, scopes, namespaces));
+                                // definition.walk(new Syntax.Process.SCOPE_TEST(logger, scopes, namespaces));
 
                                 Syntax.Process.Printer.BASE printer;
 
