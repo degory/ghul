@@ -30,7 +30,7 @@ namespace Syntax is namespace Tree is namespace Expression is
             accept(visitor);
         si
 
-        void rewrite(MAP m) is
+        void rewrite(Dict<NODE,NODE> m) is
             var ne = new Vector<NODE>(expressions.Length);
 
             foreach var e; expressions do

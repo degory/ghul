@@ -1,5 +1,8 @@
 namespace Syntax is namespace Tree is namespace Expression is
+    use Generic;
+
     use Source;
+
     class IDENTIFIER isa NODE is
         public Identifier.NODE identifier;
 
@@ -21,7 +24,7 @@ namespace Syntax is namespace Tree is namespace Expression is
             accept(visitor);            
         si
 
-        void rewrite(MAP m) is
+        void rewrite(Dict<NODE,NODE> m) is
             identifier = cast Identifier.NODE(m[identifier]);
         si
     si

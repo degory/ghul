@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Expression is
+    use Generic;
+    
     use Source;
     class SEQUENCE isa NODE is
         public Type.NODE type;
@@ -27,7 +29,7 @@ namespace Syntax is namespace Tree is namespace Expression is
             fi
         si
 
-        void rewrite(MAP m) is
+        void rewrite(Dict<NODE,NODE> m) is
             type = cast Type.NODE(m[type]);
             elements = cast LIST(m[elements]);
         si

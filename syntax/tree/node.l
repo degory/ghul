@@ -56,6 +56,9 @@ namespace Syntax is
                 accept(visitor);
             si
 
+            void rewrite(Dict<NODE,NODE> m) is
+            si
+
             String toString() is
                 var printer = new Process.Printer.GHUL();
 
