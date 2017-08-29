@@ -145,6 +145,14 @@ namespace Syntax is
         void visit(Definition.FUNCTION function) is
         si
 
+        bool pre(Definition.FUNCTION_GROUP functions) is
+            functions.rewrite(_map);
+            return false;
+        si
+
+        void visit(Definition.FUNCTION_GROUP functions) is
+        si
+        
         bool pre(Definition.PROPERTY property) is
             property.rewrite(_map);
             return false;
@@ -268,7 +276,15 @@ namespace Syntax is
 
         void visit(Type.FUNCTION function) is
         si
-        
+
+        bool pre(Type.FUNCTION_GROUP functions) is
+            functions.rewrite(_map);
+            return false;
+        si
+
+        void visit(Type.FUNCTION_GROUP functions) is
+        si
+                
         bool pre(Type.TUPLE tuple) is
             tuple.rewrite(_map);
             return false;

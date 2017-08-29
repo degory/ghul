@@ -87,11 +87,13 @@ namespace Ghul is
                                         .apply(definition);
                                 fi
 
-                                var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);
+                                new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces)
+                                    .apply(definition);
 
-                                definition.walk(ds);
-
-                                IO.Std.err.println(ds);
+                                if want_experiments then
+                                    new Syntax.Process.INFER_TYPES(logger, scopes, namespaces)
+                                        .apply(definition);
+                                fi
 
                                 // definition.walk(new Syntax.Process.SCOPE_TEST(logger, scopes, namespaces));
 

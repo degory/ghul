@@ -133,6 +133,13 @@ namespace Syntax is
         void visit(Definition.FUNCTION function) is
         si
 
+        bool pre(Definition.FUNCTION_GROUP functions) is
+            return false;
+        si
+
+        void visit(Definition.FUNCTION_GROUP functions) is
+        si        
+
         bool pre(Definition.PROPERTY property) is
             return false;
         si
@@ -241,7 +248,14 @@ namespace Syntax is
 
         void visit(Type.FUNCTION function) is
         si
-        
+
+        bool pre(Type.FUNCTION_GROUP functions) is
+            return false;
+        si
+
+        void visit(Type.FUNCTION_GROUP functions) is
+        si
+                
         bool pre(Type.TUPLE tuple) is
             return false;
         si

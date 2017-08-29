@@ -161,7 +161,15 @@ namespace Syntax is namespace Process is namespace Printer is
                 member.initializer.accept(this);
             fi
         si
-                    
+
+        void visit(Definition.FUNCTION_GROUP functions) is
+            append("function group ");
+            foreach var f; functions.functions do
+                f.accept(this);
+                append(' ');
+            od
+        si                           
+
         // types
         void visit(Type.INFER type) is
             append("infer");
@@ -185,6 +193,14 @@ namespace Syntax is namespace Process is namespace Printer is
             reference.element.accept(this);
             append(" ref");
         si
+
+        void visit(Type.FUNCTION_GROUP functions) is
+            append("function group ");
+            foreach var f; functions.functions do
+                f.accept(this);
+                append(' ');
+            od
+        si        
 
         void visit(Type.NAMED named) is
             named.name.accept(this);

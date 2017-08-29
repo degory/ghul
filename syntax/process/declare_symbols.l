@@ -13,6 +13,10 @@ namespace Syntax is namespace Process is
             super.init(scopes, namespaces);
         si
 
+        public void apply(NODE node) is
+            node.walk(this);
+        si
+
         // modifiers
 
         /*
