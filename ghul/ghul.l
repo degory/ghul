@@ -27,6 +27,7 @@ namespace Ghul is
             var want_legacy = false;
             var any_errors = false;
             var ignore_errors = false;
+            var want_experiments = false;
 
             var to_build = new Vector<String>({"lc"});
 
@@ -51,6 +52,8 @@ namespace Ghul is
                         want_legacy = false;
                     elif s =~ "-E" then
                         ignore_errors = true;
+                    elif s =~ "-X" then
+                        want_experiments = true;
                     elif is_legacy(s) then
                         to_build.add(s);
                     elif is_ghul(s) then
@@ -76,9 +79,13 @@ namespace Ghul is
                             if definition != null then
                                 definition.walk(new Syntax.Process.EXPAND_NAMESPACES());
 
-                                var ops = new Syntax.Process.REWRITE_OPERATORS_AS_CALLS();
+                                if want_experiments then
+                                    new Syntax.Process.REWRITE_OPERATORS_AS_CALLS()
+                                        .apply(definition);
 
-                                ops.apply(definition);
+                                    new Syntax.Process.REWRITE_STRUCTURED_TYPES_AS_CLASSES()
+                                        .apply(definition);
+                                fi
 
                                 var ds = new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces);
 

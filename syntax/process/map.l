@@ -25,11 +25,8 @@ namespace Syntax is namespace Process is
             if result == _delete then
                 return null;
             elif result == null then
-                IO.Std.err.println("no rewrite for " + n);
                 return n;
             else
-                IO.Std.err.println("get rewrite " + n + " as " + result);
-
                 return result;
             fi        
         si
@@ -44,8 +41,6 @@ namespace Syntax is namespace Process is
                     IO.Std.err.println("replacing previously updated value " + prev + " at " + n + " with " + m);
                 fi
             fi
-
-            IO.Std.err.println("will rewrite " + n + " as " + m);
 
             super[n] = m;
         si

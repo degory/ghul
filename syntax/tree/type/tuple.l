@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Type is 
+    use Generic;
+
     use Source;
 
     class TUPLE isa NODE is
@@ -19,6 +21,10 @@ namespace Syntax is namespace Tree is namespace Type is
             fi
 
             accept(visitor);
+        si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            elements = cast LIST(m[elements]);
         si
     si
 si si si

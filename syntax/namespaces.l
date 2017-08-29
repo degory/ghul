@@ -26,7 +26,6 @@ namespace Syntax is
         si
 
         void push(LOCATION location, String name) is
-            IO.Std.err.println("push ns: " + location + ", " + name);
             var qualified_name = get_qualified_name(name);
 
             var node = find_or_add_namespace(qualified_name);
@@ -52,8 +51,6 @@ namespace Syntax is
         si
 
         void enter(LOCATION location, String name) is
-            IO.Std.err.println("enter ns: " + location + ", " + name);
-
             var qualified_name = get_qualified_name(name);
 
             var node = find_namespace(qualified_name);
@@ -70,8 +67,6 @@ namespace Syntax is
         si
 
         void pop(LOCATION location, String name) is
-            IO.Std.err.println("pop ns: " + location + ", " + name);
-
             var node = find_namespace(_prefixes.Top);
 
             assert(node != null, "could not find aggregate namespace " + _prefixes.Top);

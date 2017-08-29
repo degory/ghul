@@ -28,5 +28,15 @@ namespace Syntax is namespace Tree is namespace Type is
 
             accept(visitor);
         si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            var ne = new Vector<NODE>();
+
+            foreach var e; elements do
+                ne.add(cast NODE(m[e]));
+            od
+
+            elements = ne;
+        si           
     si
 si si si

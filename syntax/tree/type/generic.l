@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Type is 
+    use Generic;
+    
     use Source;
     
     class GENERIC isa NAMED is
@@ -20,5 +22,10 @@ namespace Syntax is namespace Tree is namespace Type is
 
             accept(visitor);
         si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            super.rewrite(m);
+            arguments = cast LIST(m[arguments]);
+        si           
     si
 si si si 

@@ -1,4 +1,6 @@
 namespace Syntax is namespace Tree is namespace Type is 
+    use Generic;
+
     use Source;
     
     class FUNCTION isa NODE is
@@ -24,5 +26,10 @@ namespace Syntax is namespace Tree is namespace Type is
 
             accept(visitor);
         si
+
+        void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
+            result = cast NODE(m[result]);
+            arguments = cast LIST(m[arguments]);
+        si   
     si
 si si si

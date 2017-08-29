@@ -23,6 +23,9 @@ namespace Syntax is
         void visit(NODE node) is
         si
 
+        void post(NODE node) is
+        si
+
         // identifiers
 
         bool pre(Identifier.NODE identifier) is
@@ -30,6 +33,9 @@ namespace Syntax is
         si
 
         void visit(Identifier.NODE identifier) is
+        si
+
+        void post(Identifier.NODE identifier) is
         si
 
         bool pre(Identifier.QUALIFIED identifier) is

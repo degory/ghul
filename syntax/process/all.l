@@ -8,15 +8,12 @@ namespace Syntax is
         void init() is
             super.init();
 
-            IO.Std.err.println("new all-visitor...");
-
             _log = new Map<NODE, String>(65521);
         si
 
         Map<NODE, String> _log;
 
         private void log(String name, NODE node) is
-            IO.Std.err.println("log...");
             _log[node] = "visitor % visit % %" % Object{this, name, Object.dump(node)};
         si
 

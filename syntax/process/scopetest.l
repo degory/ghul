@@ -15,8 +15,6 @@ namespace Syntax is namespace Process is
         si
 
         void visit(Identifier.QUALIFIED identifier) is
-            IO.Std.err.println("search for qualified: " + identifier);
-
             var definition = this[identifier];
 
             if definition != null then
@@ -27,8 +25,6 @@ namespace Syntax is namespace Process is
         si
 
         void visit(Identifier.NODE identifier) is
-            IO.Std.err.println("search for unqualified: " + identifier);
-
             var definition = this[identifier];
 
             if definition != null then

@@ -14,6 +14,6 @@ namespace Syntax is namespace Tree is namespace Type is
             fi
 
             accept(visitor);
-        si
+        si     
     si
 si si si

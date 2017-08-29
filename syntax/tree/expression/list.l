@@ -31,7 +31,6 @@ namespace Syntax is namespace Tree is namespace Expression is
         si
 
         void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
-            IO.Std.err.println("rewrite expression list: " + this);
             var ne = new Vector<NODE>();
 
             foreach var e; expressions do
@@ -39,8 +38,6 @@ namespace Syntax is namespace Tree is namespace Expression is
             od
 
             expressions = ne;
-
-            IO.Std.err.println("rewriten expression list: " + this);
         si
     si
 si si si

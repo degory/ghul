@@ -7,13 +7,9 @@ namespace Syntax is namespace Process is
         si
 
         void visit(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("namespace: " + namespace_.name);
-
             var names = namespace_.name.parent_names;
 
             if names.Length > 0 then
-                IO.Std.err.println("namespace requires expansion: " + namespace_.name + " " + names);
-
                 // FIXME: redundant?
                 namespace_.name =
                     new Identifier.NODE(
@@ -26,8 +22,6 @@ namespace Syntax is namespace Process is
                 var current = namespace_;
                 
                 foreach var n; names do
-                    IO.Std.err.println("wrap with " + n);
-
                     current.body = 
                         new Definition.LIST(
                             current.location,
