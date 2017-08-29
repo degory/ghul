@@ -164,10 +164,12 @@ namespace Syntax is namespace Process is namespace Printer is
 
         void visit(Definition.FUNCTION_GROUP functions) is
             append("function group ");
+            nl();
+            in();
             foreach var f; functions.functions do
                 f.accept(this);
-                append(' ');
             od
+            out();
         si                           
 
         // types

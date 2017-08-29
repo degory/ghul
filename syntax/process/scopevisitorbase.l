@@ -63,17 +63,15 @@ namespace Syntax is
         si
 
         void enter_uses(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("enter uses ...");
-            
             foreach var u; namespace_.body.uses do
-                IO.Std.err.println("enter use: " + u);
                 foreach var i; u do
                     var n = find_definition(i);
 
-                    IO.Std.err.println("" + i + " resolves to " + n + ": should use this namespace");
-
                     if n != null then
+                        // IO.Std.err.println("" + i + " resolves to " + n + ": should use this namespace");
                         enter(n);
+                    else
+                        IO.Std.err.println("used namespace not found: " + i);
                     fi
 
                     // enter_namespace(i);
@@ -82,15 +80,12 @@ namespace Syntax is
         si
 
         void pop_uses(Definition.NAMESPACE namespace_) is
-            IO.Std.err.println("exit uses ...");
             foreach var u; namespace_.body.uses.ReverseIterator do
-                IO.Std.err.println("exit use: " + u);
                 foreach var i; u.ReverseIterator do
                     var n = find_definition(i);
 
-                    IO.Std.err.println("" + i + " resolves to " + n + ": should un-use this namespace");
-
                     if n != null then
+                        IO.Std.err.println("" + i + " resolves to " + n + ": should un-use this namespace");                        
                         pop(n);
                     fi
                     

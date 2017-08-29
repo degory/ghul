@@ -38,21 +38,15 @@ namespace Syntax is
             var existing = _symbols[name];
 
             if isa Definition.FUNCTION(node) then
-                IO.Std.err.println("function definintion: " + node);
-
                 if existing != null then
                     function_group = cast Definition.FUNCTION_GROUP(existing);
-                    IO.Std.err.println("add to existing function group");
                 else
                     function_group = new Definition.FUNCTION_GROUP(LOCATION.dummy);
-                    IO.Std.err.println("create new function group");
                 fi
 
                 function_group.add(cast Definition.FUNCTION(node));
 
                 node = function_group;
-
-                IO.Std.err.println("function group now: " + node);
             else
                 if existing != null then
                     _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
