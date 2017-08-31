@@ -2,11 +2,12 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use IoC;
     use Logging;
     use Source;
 
     interface Scope is
-        // look in this scope only any nowhere else:
+        // look in this scope only and nowhere else:
         Symbol.BASE find_direct(String name);
 
         // look in this scope and any class or trait ancestors:
@@ -17,7 +18,7 @@ namespace Syntax is
         // - any class or trait ancestors
         // - any used namespaces
         // - any namespaces enclosing the current class
-        Symbol.BASE find_anywhere(String name);
+        Symbol.BASE find_enclosing(String name);
 
         Symbol.BASE declare_class(LOCATION location, String name);
         Symbol.BASE declare_trait(LOCATION location, String name);
@@ -28,18 +29,16 @@ namespace Syntax is
     si
 
     class BLOCK_SCOPE do Scope is
-        LOGGER _logger;
         Scope _enclosing;
         Dict<String, Symbol.BASE> _symbols;
 
-        void init(LOGGER logger, Scope enclosing) is
-            this._logger = logger;
-            this._enclosing = enclosing;
-            _symbols = new SortedMap<String, Symbol.BASE>();
+        void init() is
+            init(null);
         si
 
-        void init(LOGGER logger) is
-            init(logger, null);
+        void init(Scope enclosing) is
+            this._enclosing = enclosing;
+            _symbols = new SortedMap<String, Symbol.BASE>();
         si
 
         Symbol.BASE find_direct(String name) is
@@ -50,22 +49,22 @@ namespace Syntax is
             throw new NotImplementedException("cannot search for member " + name + " in block scope");
         si
 
-        Symbol.BASE find_anywhere(String name) is
-            var result = find_direct[name];
+        Symbol.BASE find_enclosing(String name) is
+            var result = find_direct(name);
 
             if result != null then
                 return result;
             elif _enclosing != null then
-                return _enclosing.find_anywhere(name);
+                return _enclosing.find_enclosing(name);
             else
                 return null;
             fi
-        si      
+        si
 
         Symbol.BASE declare_undefined(LOCATION location, String kind, String name) is
-            _logger.error(name.location, "cannot declare " + kind + " here");
+            CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
-            return new Symbol.UNDEFINED(name);
+            return new Symbol.UNDEFINED(location, name);
         si
 
         Symbol.BASE declare_class(LOCATION location, String name) is
@@ -92,13 +91,17 @@ namespace Syntax is
             var existing = find_direct(name);
 
             if existing != null then
-                _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
-                _logger.error(node.location, "symbol " + name + " is redefined at " + location);
+                CONTAINER.instance.logger.error(location, "redefining symbol " + name + " originally defined at " + existing.location);
+                CONTAINER.instance.logger.error(existing.location, "symbol " + name + " is redefined at " + location);
 
-                return;
+                return new Symbol.UNDEFINED(location, name);
             fi            
 
-            _symbols[name] = symbol;
+            var result = new Symbol.LOCAL_VARIABLE(location, name);
+
+            _symbols[name] = result;
+
+            return result;
         si 
         
         String toString() is

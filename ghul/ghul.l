@@ -32,13 +32,12 @@ namespace Ghul is
             var to_build = new Vector<String>({"lc"});
 
             try 
-                var logger = new LOGGER(); 
+                var container = IoC.CONTAINER.instance;
+                var logger = container.logger;
 
-                var scopes = new Syntax.SCOPES(logger);
+                var symbol_table = new Syntax.SYMBOL_TABLE(logger);
                 var namespaces = new Syntax.NAMESPACES(logger, scopes);
             
-                var container = new IoC.CONTAINER();
-
                 IO.Std.err.FlushOnPrintln = true;
 
                 var args = Arguments.ProgramArguments.Iterator;

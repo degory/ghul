@@ -1,5 +1,9 @@
 namespace Syntax is namespace Symbol is
     use System;
+    use Generic;
+
+    use Source;
+    use IoC;
 
     enum ACCESS is
         PRIVATE,
@@ -8,6 +12,8 @@ namespace Syntax is namespace Symbol is
     si
 
     class BASE is
+        public LOCATION location;
+
         protected String _name;
         protected Type.TYPE _type;
 
@@ -19,16 +25,20 @@ namespace Syntax is namespace Symbol is
             return ACCESS.PUBLIC;
         si
 
-        void init(String name, Tree.Type.NODE type) is
+        void init(LOCATION location, String name) is
+            location = location;
             _name = name;
-            _type = type;
         si
 
         BASE find_direct(String name) is
             return null;
         si
 
-        BASE find(String name) is
+        BASE find_member(String name) is
+            return null;
+        si
+
+        BASE find_enclosing(String name) is
             return null;
         si
     si
@@ -36,7 +46,8 @@ namespace Syntax is namespace Symbol is
     class Scoped isa BASE do Scope is
         SortedMap<String, BASE> _symbols;
 
-        void init() is
+        void init(LOCATION location, String name) is
+            super.init(location, name);
             _symbols = new SortedMap<String, BASE>();
         si
 
@@ -52,8 +63,8 @@ namespace Syntax is namespace Symbol is
             var existing = find_direct(symbol.name);
 
             if existing != null then
-                _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
-                _logger.error(node.location, "symbol " + name + " is redefined at " + location);
+                CONTAINER.instance.logger.error(location, "redefining symbol " + name + " originally defined at " + existing.location);
+                CONTAINER.instance.logger.error(existing.location, "symbol " + name + " is redefined at " + location);
 
                 return;
             fi            
@@ -62,9 +73,9 @@ namespace Syntax is namespace Symbol is
         si        
 
         BASE declare_undefined(LOCATION location, String kind, String name) is
-            _logger.error(name.location, "cannot declare " + kind + " here");
+            CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
-            return new Symbol.UNDEFINED(name);
+            return new Symbol.UNDEFINED(location, name);
         si
 
         BASE declare_class(LOCATION location, String name) is
@@ -94,15 +105,17 @@ namespace Syntax is namespace Symbol is
         BASE declare_function_group(LOCATION location, Function function) is
             var existing = _symbols[function.name];
 
+            Symbol.FUNCTION_GROUP function_group;
+
             if existing != null then
-                if !isa Symbol.FUNCTION_GROUP(exiting) then
-                    _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
-                    _logger.error(node.location, "symbol " + name + " is redefined at " + location);
+                if !isa Symbol.FUNCTION_GROUP(existing) then
+                    CONTAINER.instance.logger.error(location, "redefining symbol " + name + " originally defined at " + existing.location);
+                    CONTAINER.instance.logger.error(existing.location, "symbol " + name + " is redefined at " + location);
                 fi
 
                 function_group = cast Symbol.FUNCTION_GROUP(existing);
             else
-                function_group = new Symbol.FUNCTION_GROUP(LOCATION.dummy);
+                function_group = new Symbol.FUNCTION_GROUP(LOCATION.dummy, function.name);
 
                 _symbols[function.name] = function_group;                
             fi
@@ -113,63 +126,136 @@ namespace Syntax is namespace Symbol is
         si
     si
 
-    class ScopedWithParentScope isa Scoped is
-        Scope _parent_scope;
-
-        void init(String name, Scope parent_scope) is
-            super.init(name);
-
-            _parent_scope = parent_scope;
+    class UNDEFINED isa BASE do Scope is
+        void init(LOCATION location, String name) is
+            super.init(location, name);
         si
 
-        BASE find(String name) is
-            var result = find_direct(name);
+        BASE declare_undefined(LOCATION location, String kind, String name) is
+            CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
-            if result != null then 
-                return result;
-            elif _parent_scope != null then
-                return _parent_scope.find(name);
-            else
-                return null;
-            fi
-        si
-    si
-
-    class ScopedWithInheritedScopes isa Scoped is
-        Scope _parent_scope;
-        Vector<Scope> _inherited_scopes;
-
-        void init(String name, Scope parent_scope) is
-            super.init(name);
-
-            _parent_scope = parent_scope;
-            _inherited_scopes = new Vector<Scope>();
-        si
-
-        BASE find(String name) is
-            var result = find_direct(name);
-
-            if result != null then 
-                return result;
-            elif _parent_scope != null then
-                return _parent_scope.find(name);
-            else
-                return null;
-            fi
-        si
-
-        void find_all(String name, FUNCTION_GROUP result) is
-
-        si
-    si
-        
-    class NAMESPACE isa ScopedWithParentScope is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+            return new Symbol.UNDEFINED(location, name);
         si
 
         BASE declare_class(LOCATION location, String name) is
-            var result = new Symbol.CLASS(name, this);
+            return declare_undefined(location, "class", name);
+        si
+
+        BASE declare_trait(LOCATION location, String name) is
+            return declare_undefined(location, "trait", name);
+        si
+
+        BASE declare_enum(LOCATION location, String name) is
+            return declare_undefined(location, "enum", name);
+        si
+
+        BASE declare_enum_member(LOCATION location, String name) is
+            return declare_undefined(location, "enum member", name);
+        si
+
+        BASE declare_function(LOCATION location, String name) is
+            return declare_undefined(location, "function", name);
+        si
+
+        BASE declare_variable(LOCATION location, String name) is
+            return declare_undefined(location, "variable", name);
+        si
+    si    
+
+    class ScopedWithEnclosingScope isa Scoped is
+        Scope _enclosing_scope;
+
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name);
+
+            _enclosing_scope = enclosing_scope;
+        si
+
+        BASE find_enclosing_only(String name) is
+            if _enclosing_scope != null then
+                return _enclosing_scope.find_enclosing(name);
+            fi
+
+            return null;
+        si
+        
+        BASE find_enclosing(String name) is
+            var result = find_direct(name);
+
+            if result != null then 
+                return result;
+            else
+                return find_enclosing_only(name);
+            fi
+        si
+    si
+
+    class ScopedWithInheritedScopes isa ScopedWithEnclosingScope is
+        protected Vector<Scope> _inherited_scopes;
+
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name, enclosing_scope);
+
+            _inherited_scopes = new Vector<Scope>();
+        si
+
+        BASE find_member(String name) is
+            var result = find_direct(name);
+
+            if result != null then
+                return result;
+            fi
+
+            result = find_member_only(name);
+
+            if result != null then
+                return result;
+            fi
+
+            return null;
+        si
+
+        BASE find_enclosing(String name) is
+            var result = find_direct(name);
+
+            if result != null then
+                return result;
+            fi
+
+            result = find_member_only(name);
+
+            if result != null then
+                return result;
+            fi
+
+            result = find_enclosing_only(name);
+
+            if result != null then
+                return result;
+            fi
+
+            return null;
+        si
+
+        BASE find_member_only(String name) is
+            foreach var i; _inherited_scopes do
+                var result = i.find_member(name);
+                if result != null then
+                    return result;
+                fi
+            od
+
+            return null;
+        si
+    si
+        
+    class NAMESPACE isa ScopedWithEnclosingScope is
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name, enclosing_scope);
+        si
+
+        BASE declare_class(LOCATION location, String name) is
+            var result = new Symbol.CLASS(location, name, this);
 
             declare(location, result);
 
@@ -177,7 +263,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_trait(LOCATION location, String name) is
-            var result = new Symbol.TRAIT(name, this);
+            var result = new Symbol.TRAIT(location, name, this);
 
             declare(location, result);
 
@@ -185,7 +271,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_enum(LOCATION location, String name) is
-            var result = new Symbol.ENUM(name);
+            var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
 
@@ -193,7 +279,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_function(LOCATION location, String name) is
-            var result = new Symbol.GLOBAL_FUNCTION(name);
+            var result = new Symbol.GLOBAL_FUNCTION(location, name, this);
 
             declare_function_group(location, result);
 
@@ -201,7 +287,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_variable(LOCATION location, String name) is
-            var result = new Symbol.GLOBAL_VARIABLE(name);
+            var result = new Symbol.GLOBAL_VARIABLE(location, name);
 
             declare(location, result);
 
@@ -209,13 +295,33 @@ namespace Syntax is namespace Symbol is
         si
     si
 
-    class CLASS isa ScopedWithParentScope is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+    class ENUM isa Scoped is
+        void init(LOCATION location, String name) is
+            super.init(location, name);
+        si
+
+        BASE declare_enum_member(LOCATION location, String name) is
+            var result = new Symbol.ENUM_MEMBER(location, name);
+
+            declare(location, result);
+
+            return result;
+        si        
+    si
+
+    class ENUM_MEMBER isa BASE is
+        void init(LOCATION location, String name) is
+            super.init(location, name);
+        si
+    si
+    
+    class CLASS isa ScopedWithInheritedScopes is
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name, enclosing_scope);
         si
 
         BASE declare_enum(LOCATION location, String name) is
-            var result = new Symbol.ENUM(name);
+            var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
 
@@ -223,7 +329,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_function(LOCATION location, String name) is
-            var result = new Symbol.INSTANCE_FUNCTION(name);
+            var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
 
             declare_function_group(location, result);
 
@@ -231,22 +337,21 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_variable(LOCATION location, String name) is
-            var result = new Symbol.INSTANCE_VARIABLE(name);
+            var result = new Symbol.INSTANCE_VARIABLE(location, name);
 
             declare(location, result);
 
             return result;
         si
-        
     si
 
-    class TRAIT isa ScopedWithParentScope is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+    class TRAIT isa ScopedWithInheritedScopes is
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name, enclosing_scope);
         si
         
         BASE declare_enum(LOCATION location, String name) is
-            var result = new Symbol.ENUM(name);
+            var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
 
@@ -254,7 +359,7 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE declare_function(LOCATION location, String name) is
-            var result = new Symbol.INSTANCE_FUNCTION(name);
+            var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
 
             declare(location, result);
 
@@ -262,17 +367,13 @@ namespace Syntax is namespace Symbol is
         si
     si
 
-    class Function isa ScopedWithParentScope is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+    class Function isa ScopedWithEnclosingScope is
+        void init(LOCATION location, String name, Scope enclosing_scope) is
+            super.init(location, name, enclosing_scope);
         si
         
-        void init(String name, Tree.Type.NODE type) is
-            super.init(name, type);
-        si
-
         BASE declare_variable(LOCATION location, String name) is
-            var result = new Symbol.LOCAL_VARIABLE(name);
+            var result = new Symbol.LOCAL_VARIABLE(location, name);
 
             declare(location, result);
 
@@ -281,42 +382,51 @@ namespace Syntax is namespace Symbol is
     si        
 
     class GLOBAL_FUNCTION isa Function is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+        void init(LOCATION location, String name, Scope parent_scope) is
+            super.init(location, name, parent_scope);
         si
     si
 
     class INSTANCE_FUNCTION isa Function is
-        void init(String name, Scope parent_scope) is
-            super.init(name, parent_scope);
+        void init(LOCATION location, String name, Scope parent_scope) is
+            super.init(location, name, parent_scope);
         si
     si
 
     class FUNCTION_GROUP isa BASE is
+        Vector<Function> _functions;
 
+        void init(LOCATION location, String name) is
+            super.init(location, name);
+            _functions = new Vector<Function>();
+        si
+
+        void add(Function function) is
+            _functions.add(function);
+        si
     si    
 
     class Variable isa BASE is
-        void init(String name) is
-            super.init(name);
+        void init(LOCATION location, String name) is
+            super.init(location, name);
         si
     si
 
     class LOCAL_VARIABLE isa BASE is
-        void init(String name) is
-            super.init(name);
+        void init(LOCATION location, String name) is
+            super.init(location, name);
         si
     si
 
     class GLOBAL_VARIABLE isa BASE is
-        void init(String name) is
-            super.init(name);
+        void init(LOCATION location, String name) is
+            super.init(location, name);
         si
     si
 
     class INSTANCE_VARIABLE isa BASE is
-        void init(String name) is
-            super.init(name);
+        void init(LOCATION location, String name) is
+            super.init(location, name);
         si
     si
 si si

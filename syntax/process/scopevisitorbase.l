@@ -5,67 +5,30 @@ namespace Syntax is
     use Source;
     use Tree;
 
-
-
     class ScopeVisitorBase isa Visitor is
-        SCOPES _scopes;
+        SYMBOL_TABLE _symbol_table;
         NAMESPACES _namespaces;
         
         get Scope current_scope is
-            return _scopes.top;
+            return _symbol_table.current_scope;
         si
 
-/*
-        get NODE[String name] is
-            return _scopes[name];
-        si
-
-        get NODE[Identifier.NODE identifier] is
-            return find_definition(identifier);
-        si
-*/
         void init(
-            SCOPES scopes,
+            SYMBOL_TABLE symbol_table,
             NAMESPACES namespaces)
         is
             super.init();
 
-            _scopes = scopes;
+            _symbol_table = symbol_table;
             _namespaces = namespaces;
-
-            _contexts = new Vector<CONTEXT>();
-            push(CONTEXT.GLOBAL);
         si
 
         Scope scope_for(NODE node) is
-            return _scopes[node];
+            return _symbol_table.scope_for(node);
         si
 
-        NODE find_definition(Identifier.NODE identifier) is
-            var parent = identifier.parent;
-            
-            if parent != null then
-                IO.Std.err.println("find defintion for " + identifier.name + " in parent " + parent + "...");
-                var parent_node = find_definition(parent);
-
-                if parent_node == null then
-                    IO.Std.err.println("scope not found: " + parent);
-                    return null;
-                fi
-
-                var parent_scope = this[parent_node];
-
-                if parent_scope == null then
-                   IO.Std.err.println("not a searchable scope: " + parent_node);
-                   return null;
-                fi
-
-                IO.Std.err.println("find defintion for " + identifier.name + " in parent scope " + parent_scope + "...");
-                   
-                return parent_scope[identifier.name];
-            else
-                return this[identifier.name];
-            fi
+        Symbol find_symbol(Identifier.NODE identifier) is
+            return current_scope.find_enclosing(identifier.name);
         si
 
         void enter_uses(Definition.NAMESPACE namespace_) is
@@ -97,19 +60,19 @@ namespace Syntax is
         si
         
         void add(NODE node, SCOPE parent) is
-            _scopes.add(node, parent);
+            _symbol_table.add(node, parent);
         si
 
         void push_scope(Scope scope) is
-            _scopes.push(scope);
+            _symbol_table.push(scope);
         si
 
         void push(Symbol.BASE symbol, NODE node) is
-            _scopes.push(symbol, node);
+            _symbol_table.push(symbol, node);
         si
         
         void enter(NODE node) is
-            _scopes.enter(node);
+            _symbol_table.enter(node);
         si
 
         void push_namespace(Identifier.NODE identifier) is
@@ -125,7 +88,7 @@ namespace Syntax is
         si        
 
         void declare(Symbol.BASE symbol, NODE node) is
-            _scopes.declare(symbol, node);
+            _symbol_table.declare(symbol, node);
         si
 
         void push(CONTEXT context) is
@@ -139,7 +102,7 @@ namespace Syntax is
         si
 
         SCOPE pop(NODE node) is
-            return _scopes.pop(node);
+            return _symbol_table.pop(node);
         si
     si
 si

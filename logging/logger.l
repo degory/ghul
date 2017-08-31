@@ -35,6 +35,16 @@ namespace Logging is
             );
         si
 
+        void fatal(
+            LOCATION location,
+            String message
+        )
+        is
+            write(location, "error", message);
+            
+            throw new Exception("fatal error");
+        si
+
         void error(
             LOCATION location,
             String message

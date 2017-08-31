@@ -1,4 +1,10 @@
 namespace Syntax is
+    use System;
+    use Generic;
+
+    use Logging;
+    use Tree;
+
     class SYMBOL_TABLE is
         LOGGER _logger;
 
@@ -14,7 +20,11 @@ namespace Syntax is
             _stack = new Vector<Scope>(50);
             _scopes = new Map<NODE, Scope>(65521);
 
-            _stack.add(new GLOBAL_SCOPE(_logger));
+            _stack.add(new BLOCK_SCOPE());
+        si
+
+        Scope scope_for(NODE node) is
+            return _scopes[node];
         si
         
         void push_scope(Tree.NODE node, Scope scope) is
@@ -30,7 +40,7 @@ namespace Syntax is
             var scope = _scopes[node];
 
             if scope == null then
-                _logger.fatal(node.location, "no scope found for " + node);                
+                _logger.fatal(node.location, "no scope found for " + node);                              
             fi
 
             push_scope(scope);

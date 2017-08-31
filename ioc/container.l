@@ -10,13 +10,15 @@ namespace IoC is
     class CONTAINER is
         static CONTAINER _instance;
 
-        get CONTAINER instance is
+        static get CONTAINER instance is
             if _instance == null then
                 _instance = new CONTAINER();
             fi
 
             return _instance;
         si
+
+        public Logging.LOGGER logger;
 
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_parser;
         Syntax.Parser.Parser<Tree.Identifier.NODE> identifier_qualified_parser;
@@ -63,6 +65,8 @@ namespace IoC is
         LAZY_PARSER<Tree.Body.NODE> body_parser;        
 
         void init() is
+            logger = new Logging.LOGGER();
+
             // non circular/leaf dependencies
             identifier_parser = new Parser.Identifier.NODE();
             identifier_qualified_parser = new Parser.Identifier.QUALIFIED();
