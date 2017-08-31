@@ -36,7 +36,7 @@ namespace Ghul is
                 var logger = container.logger;
 
                 var symbol_table = new Syntax.SYMBOL_TABLE(logger);
-                var namespaces = new Syntax.NAMESPACES(logger, scopes);
+                var namespaces = new Syntax.NAMESPACES(logger, symbol_table);
             
                 IO.Std.err.FlushOnPrintln = true;
 
@@ -86,15 +86,15 @@ namespace Ghul is
                                         .apply(definition);
                                 fi
 
-                                new Syntax.Process.DECLARE_SYMBOLS(scopes, namespaces)
+                                new Syntax.Process.DECLARE_SYMBOLS(symbol_table, namespaces)
                                     .apply(definition);
 
                                 if want_experiments then
-                                    new Syntax.Process.INFER_TYPES(logger, scopes, namespaces)
+                                    new Syntax.Process.INFER_TYPES(logger, symbol_table, namespaces)
                                         .apply(definition);
                                 fi
 
-                                // definition.walk(new Syntax.Process.SCOPE_TEST(logger, scopes, namespaces));
+                                // definition.walk(new Syntax.Process.SCOPE_TEST(logger, symbol_table, namespaces));
 
                                 Syntax.Process.Printer.BASE printer;
 

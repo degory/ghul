@@ -20,12 +20,14 @@ namespace Syntax is
         // - any namespaces enclosing the current class
         Symbol.BASE find_enclosing(String name);
 
-        Symbol.BASE declare_class(LOCATION location, String name);
-        Symbol.BASE declare_trait(LOCATION location, String name);
-        Symbol.BASE declare_enum(LOCATION location, String name);
-        Symbol.BASE declare_enum_member(LOCATION location, String name);
-        Symbol.BASE declare_function(LOCATION location, String name);
-        Symbol.BASE declare_variable(LOCATION location, String name);
+        void add_namespace(LOCATION location, String name, Symbol.NAMESPACE namespace_);
+        Scope declare_class(LOCATION location, String name);
+        Scope declare_trait(LOCATION location, String name);
+        Scope declare_enum(LOCATION location, String name);
+        void declare_enum_member(LOCATION location, String name);
+        Scope declare_function(LOCATION location, String name);
+        void declare_variable(LOCATION location, String name);
+        void declare_label(LOCATION location, String name);
     si
 
     class BLOCK_SCOPE do Scope is
@@ -61,48 +63,60 @@ namespace Syntax is
             fi
         si
 
-        Symbol.BASE declare_undefined(LOCATION location, String kind, String name) is
+        Scope declare_undefined(LOCATION location, String kind, String name) is
             CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
             return new Symbol.UNDEFINED(location, name);
         si
 
-        Symbol.BASE declare_class(LOCATION location, String name) is
-            declare_undefined(location, "class", name);
+        Scope declare_class(LOCATION location, String name) is
+            return declare_undefined(location, "class", name);
         si
 
-        Symbol.BASE declare_trait(LOCATION location, String name) is
-            declare_undefined(location, "trait", name);
+        Scope declare_trait(LOCATION location, String name) is
+            return declare_undefined(location, "trait", name);
         si
 
-        Symbol.BASE declare_enum(LOCATION location, String name) is
-            declare_undefined(location, "enum", name);
+        Scope declare_enum(LOCATION location, String name) is
+            return declare_undefined(location, "enum", name);
         si
 
-        Symbol.BASE declare_enum_member(LOCATION location, String name) is
+        void declare_enum_member(LOCATION location, String name) is
             declare_undefined(location, "enum member", name);
         si
 
-        Symbol.BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             declare_undefined(location, "function", name);
         si
 
-        Symbol.BASE declare_variable(LOCATION location, String name) is
-            var existing = find_direct(name);
+        void add_namespace(LOCATION location, String name, Symbol.NAMESPACE namespace_) is
+            declare_undefined(location, "namespace", name);            
+        si
+
+        void declare_label(LOCATION location, String name) is
+            var label = new Symbol.LABEL(location, name);
+
+            declare(location, label);
+        si
+
+        void declare_variable(LOCATION location, String name) is 
+            var variable = new Symbol.LOCAL_VARIABLE(location, name);
+
+            declare(location, variable);
+        si
+
+        void declare(LOCATION location, Symbol.BASE symbol) is
+            var name = symbol.name;
+
+            var existing = find_direct(symbol.name);
 
             if existing != null then
                 CONTAINER.instance.logger.error(location, "redefining symbol " + name + " originally defined at " + existing.location);
                 CONTAINER.instance.logger.error(existing.location, "symbol " + name + " is redefined at " + location);
-
-                return new Symbol.UNDEFINED(location, name);
             fi            
 
-            var result = new Symbol.LOCAL_VARIABLE(location, name);
-
-            _symbols[name] = result;
-
-            return result;
-        si 
+            _symbols[name] = symbol;
+        si        
         
         String toString() is
             return this.ClassName + " " + _symbols;

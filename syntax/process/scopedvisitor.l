@@ -6,11 +6,11 @@ namespace Syntax is namespace Process is
 
     class ScopedVisitor isa ScopeVisitorBase is
         void init(
-            SCOPES scopes,
+            SYMBOL_TABLE symbol_table,
             NAMESPACES namespaces)
         is
             super.init(
-                scopes,
+                symbol_table,
                 namespaces
             );
         si
@@ -34,9 +34,9 @@ namespace Syntax is namespace Process is
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            pop_namespace(namespace_.name);
+            leave_namespace(namespace_.name);
 
-            pop_uses(namespace_);
+            leave_uses(namespace_);
         si   
         
         /*
@@ -46,143 +46,143 @@ namespace Syntax is namespace Process is
         */
 
         bool pre(Definition.CLASS class_) is
-            enter(class_);
+            enter_scope(class_);
         si
 
         void visit(Definition.CLASS class_) is
-            pop(class_);
+            leave_scope(class_);
         si
 
         bool pre(Definition.INTERFACE interface_) is
-            enter(interface_);
+            enter_scope(interface_);
         si
 
         void visit(Definition.INTERFACE interface_) is
-            pop(interface_);
+            leave_scope(interface_);
         si        
 
         bool pre(Definition.ENUM enum_) is
-            enter(enum_);
+            enter_scope(enum_);
         si
 
         void visit(Definition.ENUM enum_) is
-            pop(enum_);
+            leave_scope(enum_);
         si
 
         bool pre(Definition.FUNCTION function) is
-            enter(function);
+            enter_scope(function);
         si
 
         void visit(Definition.FUNCTION function) is
-            pop(function);
+            leave_scope(function);
         si
 
         bool pre(Definition.PROPERTY property) is
-            enter(property);
+            enter_scope(property);
         si
 
         void visit(Definition.PROPERTY property) is
-            pop(property);
+            leave_scope(property);
         si
 
         bool pre(Definition.INDEXER indexer) is
-            enter(indexer);
+            enter_scope(indexer);
         si        
 
         void visit(Definition.INDEXER indexer) is
-            pop(indexer);
+            leave_scope(indexer);
         si        
 
         // statements
 
         bool pre (Statement.IF if_) is
-            enter(if_);
+            enter_scope(if_);
         si
 
         void visit(Statement.IF if_) is
-            pop(if_);
+            leave_scope(if_);
         si
 
         bool pre(Statement.CASE case_) is
-            enter(case_);
+            enter_scope(case_);
         si
 
         void visit(Statement.CASE case_) is
-            pop(case_);
+            leave_scope(case_);
         si
 
         bool pre(Statement.CASE_MATCH case_match) is
-            enter(case_match);
+            enter_scope(case_match);
         si
 
         void visit(Statement.CASE_MATCH case_match) is
-            pop(case_match);
+            leave_scope(case_match);
         si
 
         bool pre(Statement.TRY try_) is
-            enter(try_);
+            enter_scope(try_);
         si
 
         void visit(Statement.TRY try_) is
-            pop(try_);
+            leave_scope(try_);
         si
 
         bool pre(Statement.CATCH catch_) is
-            enter(catch_);
+            enter_scope(catch_);
         si
 
         void visit(Statement.CATCH catch_) is
-            pop(catch_);
+            leave_scope(catch_);
         si        
 
         bool pre(Statement.DO do_) is
-            enter(do_);
+            enter_scope(do_);
         si
 
         void visit(Statement.DO do_) is
-            pop(do_);
+            leave_scope(do_);
         si
 
         bool pre(Statement.FOR for_) is
-            enter(for_);
+            enter_scope(for_);
         si
 
         void visit(Statement.FOR for_) is
-            pop(for_);
+            leave_scope(for_);
         si
 
         bool pre(Statement.LABELLED labelled) is
-            enter(labelled);
+            enter_scope(labelled);
         si
         
         void visit(Statement.LABELLED labelled) is
-            pop(labelled);
+            leave_scope(labelled);
         si
 
         // function body
 
         bool pre(Body.NODE body) is
-            enter(body);
+            enter_scope(body);
         si
 
         void visit(Body.NODE body) is
-            pop(body);
+            leave_scope(body);
         si
 
         bool pre(Body.EXPRESSION expression) is
-            enter(expression);
+            enter_scope(expression);
         si
 
         void visit(Body.EXPRESSION expression) is
-            pop(expression);
+            leave_scope(expression);
         si
 
         bool pre(Body.BLOCK block) is
-            enter(block);
+            enter_scope(block);
         si
 
         void visit(Body.BLOCK block) is
-            pop(block);
+            leave_scope(block);
         si
     si
 si si

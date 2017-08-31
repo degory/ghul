@@ -15,7 +15,7 @@ namespace Syntax is namespace Symbol is
         public LOCATION location;
 
         protected String _name;
-        protected Type.TYPE _type;
+        // protected Type.TYPE _type;
 
         get String name is
             return _name;
@@ -72,38 +72,46 @@ namespace Syntax is namespace Symbol is
             _symbols[symbol.name] = symbol;
         si        
 
-        BASE declare_undefined(LOCATION location, String kind, String name) is
+        UNDEFINED declare_undefined(LOCATION location, String kind, String name) is
             CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
-            return new Symbol.UNDEFINED(location, name);
+            return new UNDEFINED(location, name);
         si
 
-        BASE declare_class(LOCATION location, String name) is
+        void add_namespace(LOCATION location, String name, NAMESPACE namespace_) is
+            declare_undefined(location, "namespace", name);
+        si
+
+        Scope declare_class(LOCATION location, String name) is
             return declare_undefined(location, "class", name);
         si
 
-        BASE declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name) is
             return declare_undefined(location, "trait", name);
         si
 
-        BASE declare_enum(LOCATION location, String name) is
+        Scope declare_enum(LOCATION location, String name) is
             return declare_undefined(location, "enum", name);
         si
 
-        BASE declare_enum_member(LOCATION location, String name) is
-            return declare_undefined(location, "enum member", name);
+        void declare_enum_member(LOCATION location, String name) is
+            declare_undefined(location, "enum member", name);
         si
 
-        BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             return declare_undefined(location, "function", name);
         si
 
-        BASE declare_variable(LOCATION location, String name) is
-            return declare_undefined(location, "variable", name);
+        void declare_variable(LOCATION location, String name) is
+            declare_undefined(location, "variable", name);
         si
 
-        BASE declare_function_group(LOCATION location, Function function) is
-            var existing = _symbols[function.name];
+        void declare_label(LOCATION location, String name) is
+            declare_undefined(location, "label", name);
+        si        
+
+        void declare_function_group(LOCATION location, Function function) is
+            var existing = find_direct(function.name);
 
             Symbol.FUNCTION_GROUP function_group;
 
@@ -121,8 +129,6 @@ namespace Syntax is namespace Symbol is
             fi
 
             function_group.add(function);
-
-            return function;
         si
     si
 
@@ -131,35 +137,43 @@ namespace Syntax is namespace Symbol is
             super.init(location, name);
         si
 
-        BASE declare_undefined(LOCATION location, String kind, String name) is
+        UNDEFINED declare_undefined(LOCATION location, String kind, String name) is
             CONTAINER.instance.logger.error(location, "cannot declare " + kind + " here");
 
-            return new Symbol.UNDEFINED(location, name);
+            return new UNDEFINED(location, name);
         si
 
-        BASE declare_class(LOCATION location, String name) is
+        void add_namespace(LOCATION location, String name, NAMESPACE namespace_) is
+            declare_undefined(location, "namespace", name);
+        si
+        
+        Scope declare_class(LOCATION location, String name) is
             return declare_undefined(location, "class", name);
         si
 
-        BASE declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name) is
             return declare_undefined(location, "trait", name);
         si
 
-        BASE declare_enum(LOCATION location, String name) is
+        Scope declare_enum(LOCATION location, String name) is
             return declare_undefined(location, "enum", name);
         si
 
-        BASE declare_enum_member(LOCATION location, String name) is
-            return declare_undefined(location, "enum member", name);
+        void declare_enum_member(LOCATION location, String name) is
+            declare_undefined(location, "enum member", name);
         si
 
-        BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             return declare_undefined(location, "function", name);
         si
 
-        BASE declare_variable(LOCATION location, String name) is
-            return declare_undefined(location, "variable", name);
+        void declare_variable(LOCATION location, String name) is
+            declare_undefined(location, "variable", name);
         si
+
+        void declare_label(LOCATION location, String name) is
+            declare_undefined(location, "label", name);
+        si        
     si    
 
     class ScopedWithEnclosingScope isa Scoped is
@@ -250,11 +264,18 @@ namespace Syntax is namespace Symbol is
     si
         
     class NAMESPACE isa ScopedWithEnclosingScope is
-        void init(LOCATION location, String name, Scope enclosing_scope) is
+        public String qualified_name;
+
+        void init(LOCATION location, String name, Scope enclosing_scope, String qualified_name) is
             super.init(location, name, enclosing_scope);
+            this.qualified_name = qualified_name;
         si
 
-        BASE declare_class(LOCATION location, String name) is
+        void add_namespace(LOCATION location, String name, Symbol.NAMESPACE namespace_) is
+            declare(location, namespace_);
+        si
+
+        Scope declare_class(LOCATION location, String name) is
             var result = new Symbol.CLASS(location, name, this);
 
             declare(location, result);
@@ -262,7 +283,7 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name) is
             var result = new Symbol.TRAIT(location, name, this);
 
             declare(location, result);
@@ -270,7 +291,7 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_enum(LOCATION location, String name) is
+        Scope declare_enum(LOCATION location, String name) is
             var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
@@ -278,7 +299,7 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             var result = new Symbol.GLOBAL_FUNCTION(location, name, this);
 
             declare_function_group(location, result);
@@ -286,13 +307,11 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_variable(LOCATION location, String name) is
+        void declare_variable(LOCATION location, String name) is
             var result = new Symbol.GLOBAL_VARIABLE(location, name);
 
             declare(location, result);
-
-            return result;
-        si
+        si        
     si
 
     class ENUM isa Scoped is
@@ -300,12 +319,10 @@ namespace Syntax is namespace Symbol is
             super.init(location, name);
         si
 
-        BASE declare_enum_member(LOCATION location, String name) is
+        void declare_enum_member(LOCATION location, String name) is
             var result = new Symbol.ENUM_MEMBER(location, name);
 
             declare(location, result);
-
-            return result;
         si        
     si
 
@@ -314,13 +331,19 @@ namespace Syntax is namespace Symbol is
             super.init(location, name);
         si
     si
+
+    class LABEL isa BASE is
+        void init(LOCATION location, String name) is
+            super.init(location, name);
+        si
+    si    
     
     class CLASS isa ScopedWithInheritedScopes is
         void init(LOCATION location, String name, Scope enclosing_scope) is
             super.init(location, name, enclosing_scope);
         si
 
-        BASE declare_enum(LOCATION location, String name) is
+        Scope declare_enum(LOCATION location, String name) is
             var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
@@ -328,7 +351,7 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
 
             declare_function_group(location, result);
@@ -336,12 +359,10 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_variable(LOCATION location, String name) is
+        void declare_variable(LOCATION location, String name) is
             var result = new Symbol.INSTANCE_VARIABLE(location, name);
 
             declare(location, result);
-
-            return result;
         si
     si
 
@@ -350,7 +371,7 @@ namespace Syntax is namespace Symbol is
             super.init(location, name, enclosing_scope);
         si
         
-        BASE declare_enum(LOCATION location, String name) is
+        Scope declare_enum(LOCATION location, String name) is
             var result = new Symbol.ENUM(location, name);
 
             declare(location, result);
@@ -358,10 +379,10 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        BASE declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name) is
             var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
 
-            declare(location, result);
+            declare_function_group(location, result);
 
             return result;
         si
@@ -372,12 +393,10 @@ namespace Syntax is namespace Symbol is
             super.init(location, name, enclosing_scope);
         si
         
-        BASE declare_variable(LOCATION location, String name) is
+        void declare_variable(LOCATION location, String name) is
             var result = new Symbol.LOCAL_VARIABLE(location, name);
 
             declare(location, result);
-
-            return result;
         si        
     si        
 
