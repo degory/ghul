@@ -5,18 +5,17 @@ namespace Syntax is
     use Source;
     use Tree;
 
+
+
     class ScopeVisitorBase isa Visitor is
         SCOPES _scopes;
         NAMESPACES _namespaces;
         
-        get SCOPE top is
+        get Scope current_scope is
             return _scopes.top;
         si
 
-        get SCOPE[NODE node] is
-            return _scopes[node];
-        si
-
+/*
         get NODE[String name] is
             return _scopes[name];
         si
@@ -24,7 +23,7 @@ namespace Syntax is
         get NODE[Identifier.NODE identifier] is
             return find_definition(identifier);
         si
-
+*/
         void init(
             SCOPES scopes,
             NAMESPACES namespaces)
@@ -33,6 +32,13 @@ namespace Syntax is
 
             _scopes = scopes;
             _namespaces = namespaces;
+
+            _contexts = new Vector<CONTEXT>();
+            push(CONTEXT.GLOBAL);
+        si
+
+        Scope scope_for(NODE node) is
+            return _scopes[node];
         si
 
         NODE find_definition(Identifier.NODE identifier) is
@@ -73,8 +79,6 @@ namespace Syntax is
                     else
                         IO.Std.err.println("used namespace not found: " + i);
                     fi
-
-                    // enter_namespace(i);
                 od
             od
         si
@@ -88,8 +92,6 @@ namespace Syntax is
                         IO.Std.err.println("" + i + " resolves to " + n + ": should un-use this namespace");                        
                         pop(n);
                     fi
-                    
-                    // pop_namespace(i);
                 od
             od
         si
@@ -98,52 +100,42 @@ namespace Syntax is
             _scopes.add(node, parent);
         si
 
-        void push(NODE node) is
-            _scopes.push(node);
+        void push_scope(Scope scope) is
+            _scopes.push(scope);
         si
 
-        void push(LOCATION location, String name, NODE node) is
-            _scopes.push(location, name, node);
-        si
-
-        void push(Identifier.NODE identifier, NODE node) is
-            _scopes.push(identifier, node);
+        void push(Symbol.BASE symbol, NODE node) is
+            _scopes.push(symbol, node);
         si
         
         void enter(NODE node) is
             _scopes.enter(node);
         si
 
-        void push_namespace(LOCATION location, String name) is
-            _namespaces.push(location, name);
-        si
-
         void push_namespace(Identifier.NODE identifier) is
             _namespaces.push(identifier);
-        si
-
-        void enter_namespace(LOCATION location, String name) is
-            _namespaces.enter(location, name);
         si
 
         void enter_namespace(Identifier.NODE identifier) is
             _namespaces.enter(identifier);
         si
 
-        void pop_namespace(LOCATION location, String name) is
-            _namespaces.pop(location, name);
-        si
-
         void pop_namespace(Identifier.NODE identifier) is
             _namespaces.pop(identifier);
         si        
 
-        void declare(LOCATION location, String name, NODE node) is
-            _scopes.declare(location, name, node);
-        si        
+        void declare(Symbol.BASE symbol, NODE node) is
+            _scopes.declare(symbol, node);
+        si
 
-        void declare(Identifier.NODE identifier, NODE node) is
-            _scopes.declare(identifier, node);
+        void push(CONTEXT context) is
+            _contexts.add(context);
+        si
+
+        void pop(CONTEXT context) is
+            assert(_contexts.Top == context);
+
+            _contexts.pop();
         si
 
         SCOPE pop(NODE node) is

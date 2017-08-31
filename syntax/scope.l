@@ -4,64 +4,102 @@ namespace Syntax is
 
     use Logging;
     use Source;
-    use Tree;
 
-    class SCOPE is
+    interface Scope is
+        // look in this scope only any nowhere else:
+        Symbol.BASE find_direct(String name);
+
+        // look in this scope and any class or trait ancestors:
+        Symbol.BASE find_member(String name);
+
+        // look in:
+        // - this scope
+        // - any class or trait ancestors
+        // - any used namespaces
+        // - any namespaces enclosing the current class
+        Symbol.BASE find_anywhere(String name);
+
+        Symbol.BASE declare_class(LOCATION location, String name);
+        Symbol.BASE declare_trait(LOCATION location, String name);
+        Symbol.BASE declare_enum(LOCATION location, String name);
+        Symbol.BASE declare_enum_member(LOCATION location, String name);
+        Symbol.BASE declare_function(LOCATION location, String name);
+        Symbol.BASE declare_variable(LOCATION location, String name);
+    si
+
+    class BLOCK_SCOPE do Scope is
         LOGGER _logger;
-        SCOPE _parent;
-        Dict<String, NODE> _symbols;
+        Scope _enclosing;
+        Dict<String, Symbol.BASE> _symbols;
 
-        get NODE[String name] is
-            var result = _symbols[name];
-
-            if result != null then
-                return result;
-            elif _parent != null then
-                return _parent[name];
-            else
-                return null;
-            fi
-        si
-
-        void init(LOGGER logger, SCOPE parent) is
+        void init(LOGGER logger, Scope enclosing) is
             this._logger = logger;
-            this._parent = parent;
-            _symbols = new SortedMap<String, NODE>();
+            this._enclosing = enclosing;
+            _symbols = new SortedMap<String, Symbol.BASE>();
         si
 
         void init(LOGGER logger) is
             init(logger, null);
         si
-        
-        void declare(LOCATION location, String name, NODE node) is
-            Definition.FUNCTION_GROUP function_group;
-            var existing = _symbols[name];
 
-            if isa Definition.FUNCTION(node) then
-                if existing != null then
-                    function_group = cast Definition.FUNCTION_GROUP(existing);
-                else
-                    function_group = new Definition.FUNCTION_GROUP(LOCATION.dummy);
-                fi
+        Symbol.BASE find_direct(String name) is
+            return _symbols[name];
+        si
 
-                function_group.add(cast Definition.FUNCTION(node));
+        Symbol.BASE find_member(String name) is
+            throw new NotImplementedException("cannot search for member " + name + " in block scope");
+        si
 
-                node = function_group;
+        Symbol.BASE find_anywhere(String name) is
+            var result = find_direct[name];
+
+            if result != null then
+                return result;
+            elif _enclosing != null then
+                return _enclosing.find_anywhere(name);
             else
-                if existing != null then
-                    _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
-                    _logger.error(node.location, "symbol " + name + " is redefined at " + location);
-
-                    return;
-                fi
+                return null;
             fi
+        si      
 
-            _symbols[name] = node;
+        Symbol.BASE declare_undefined(LOCATION location, String kind, String name) is
+            _logger.error(name.location, "cannot declare " + kind + " here");
+
+            return new Symbol.UNDEFINED(name);
         si
 
-        void declare(Identifier.NODE identifier, NODE node) is
-            declare(identifier.location, identifier.name, node);
+        Symbol.BASE declare_class(LOCATION location, String name) is
+            declare_undefined(location, "class", name);
         si
+
+        Symbol.BASE declare_trait(LOCATION location, String name) is
+            declare_undefined(location, "trait", name);
+        si
+
+        Symbol.BASE declare_enum(LOCATION location, String name) is
+            declare_undefined(location, "enum", name);
+        si
+
+        Symbol.BASE declare_enum_member(LOCATION location, String name) is
+            declare_undefined(location, "enum member", name);
+        si
+
+        Symbol.BASE declare_function(LOCATION location, String name) is
+            declare_undefined(location, "function", name);
+        si
+
+        Symbol.BASE declare_variable(LOCATION location, String name) is
+            var existing = find_direct(name);
+
+            if existing != null then
+                _logger.error(location, "redefining symbol " + name + " originally defined at " + node.location);
+                _logger.error(node.location, "symbol " + name + " is redefined at " + location);
+
+                return;
+            fi            
+
+            _symbols[name] = symbol;
+        si 
         
         String toString() is
             return this.ClassName + " " + _symbols;

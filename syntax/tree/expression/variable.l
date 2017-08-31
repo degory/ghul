@@ -7,7 +7,6 @@ namespace Syntax is namespace Tree is namespace Expression is
     // is it exactly the same thing?
     class VARIABLE isa NODE is
         public Identifier.NODE identifier;
-        public Type.NODE type;
         public NODE initializer;
 
         void init(

@@ -3,8 +3,9 @@ namespace Syntax is namespace Tree is namespace Expression is
     use Source;
 
     class FUNCTION isa NODE is
+        // public Type.NODE type;
+
         public TUPLE arguments;
-        public Type.NODE type;
         public Body.NODE body;
 
         void init(

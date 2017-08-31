@@ -3,7 +3,7 @@ namespace Syntax is namespace Tree is namespace Expression is
     use Source;
 
     class CAST isa NODE is
-        public Type.NODE type;
+        // public Type.NODE type;
         public NODE right;
         
         void init(

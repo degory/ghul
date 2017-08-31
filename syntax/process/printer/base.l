@@ -202,7 +202,7 @@ namespace Syntax is namespace Process is namespace Printer is
                 f.accept(this);
                 append(' ');
             od
-        si        
+        si
 
         void visit(Type.NAMED named) is
             named.name.accept(this);

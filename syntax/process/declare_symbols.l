@@ -32,6 +32,10 @@ namespace Syntax is namespace Process is
         // definitions
 
         bool pre(Definition.NAMESPACE namespace_) is
+            if !is_global_context then
+                _logger.error(function.location, "cannot declare namespace here");
+            fi
+
             enter_uses(namespace_);
 
             push_namespace(namespace_.name);
@@ -52,65 +56,99 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.CLASS class_) is
-            push(class_.name, class_);
+            push_scope(
+                class_,
+                current_scope.declare_class(class_.location, class_.name.name)
+            );
         si
 
         void visit(Definition.CLASS class_) is
-            pop(class_);
+            pop_scope(class_);
         si
 
         bool pre(Definition.INTERFACE interface_) is
-            push(interface_.name, interface_);
+            push_scope(
+                interface_, 
+                current_scope.declare_trait(interface_.location, interface_.name.name)
+            );
         si        
 
         void visit(Definition.INTERFACE interface_) is
-            pop(interface_);
-        si        
+            pop_scope(interface_);
+        si
 
         bool pre(Definition.ENUM enum_) is
-            push(enum_.name, enum_);
+            push_scope(
+                enum_,
+                current_scope.declare_enum(enum_.location, enum_.name.name)
+            );
         si
 
         void visit(Definition.ENUM enum_) is
-            pop(enum_);
+            pop_scope(enum_);
         si
 
         bool pre(Definition.ENUM_MEMBER enum_member) is
-            declare(enum_member.name, enum_member);
+            current_scope.declare_enum_member(
+                enum_.location,
+                new Symbol.ENUM_MEMBER(enum_member.name)
+            );
         si
 
         bool pre(Definition.FUNCTION function) is
-            push(function.name, function);
+            push_scope(
+                function,
+                current_scope.declare_function(
+                    function.location,
+                    function.name.name
+                )
+            );
         si
 
         void visit(Definition.FUNCTION function) is
-            pop(function);
+            pop_scope(function);
         si
 
         bool pre(Definition.PROPERTY property) is
-            push(property.name, property);
+            push_scope(
+                property,
+                current_scope.declare_property(
+                    property.location,
+                    property.nane.name
+                )            
+            );
         si
 
         void visit(Definition.PROPERTY property) is
-            pop(property);
+            pop_scope(property);
         si
 
         bool pre(Definition.INDEXER indexer) is
+            String name;
+
             if indexer.name != null then
-                push(indexer.name, indexer);
+                name = indexer.name;
             else
-                push(indexer);
+                name = "[]";
             fi
+
+            push_scope(
+                indexer,
+                current_scope.declare_indexer(
+                    indexer.location,
+                    name
+                )
+            );
         si        
 
         void visit(Definition.INDEXER indexer) is
-            pop(indexer);
+            pop_scope(indexer);
         si        
 
         // variables
         
         void visit(Variable.NODE variable) is
-            declare(variable.name, variable);
+            current_scope.declare_variable(variable.location, variable.name.name);
         si
 
         // expressions
@@ -126,93 +164,93 @@ namespace Syntax is namespace Process is
         // statements
 
         bool pre (Statement.IF if_) is
-            push(if_);
+            push_scope(if_);
         si
 
         void visit(Statement.IF if_) is
-            pop(if_);
+            pop_scope(if_);
         si
 
         bool pre(Statement.CASE case_) is
-            push(case_);
+            push_scope(case_);
         si
 
         void visit(Statement.CASE case_) is
-            pop(case_);
+            pop_scope(case_);
         si
 
         bool pre(Statement.CASE_MATCH case_match) is
-            push(case_match);
+            push_scope(case_match);
         si
 
         void visit(Statement.CASE_MATCH case_match) is
-            pop(case_match);
+            pop_scope(case_match);
         si
 
         bool pre(Statement.TRY try_) is
-            push(try_);
+            push_scope(try_);
         si
 
         void visit(Statement.TRY try_) is
-            pop(try_);
+            pop_scope(try_);
         si
 
         bool pre(Statement.CATCH catch_) is
-            push(catch_);
+            push_scope(catch_);
         si
 
         void visit(Statement.CATCH catch_) is
-            pop(catch_);
+            pop_scope(catch_);
         si        
 
         bool pre(Statement.DO do_) is
-            push(do_);
+            push_scope(do_);
         si
 
         void visit(Statement.DO do_) is
-            pop(do_);
+            pop_scope(do_);
         si
 
         bool pre(Statement.FOR for_) is
-            push(for_);
+            push_scope(for_);
         si
 
         void visit(Statement.FOR for_) is
-            pop(for_);
+            pop_scope(for_);
         si
 
         bool pre(Statement.LABELLED labelled) is
-            push(labelled.label, labelled);
+            // note: the label for a labelled statement does not point at a named scope:
+            current_scope.declare_label(labelled.location, labelled.label.name);
         si
         
         void visit(Statement.LABELLED labelled) is
-            pop(labelled);
         si
 
         // function body
 
         bool pre(Body.NODE body) is
-            push(body);
+            push_scope(body);
         si
 
         void visit(Body.NODE body) is
-            pop(body);
+            pop_scope(body);
         si
 
         bool pre(Body.EXPRESSION expression) is
-            push(expression);
+            push_scope(expression);
         si
 
         void visit(Body.EXPRESSION expression) is
-            pop(expression);
+            pop_scope(expression);
         si
 
         bool pre(Body.BLOCK block) is
-            push(block);
+            push_scope(block);
         si
 
         void visit(Body.BLOCK block) is
-            pop(block);
+            pop_scope(block);
         si
     si
 si si

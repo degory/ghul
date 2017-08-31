@@ -8,6 +8,13 @@ namespace Syntax is
 
     class SCOPES is
         LOGGER _logger;
+
+        // map nodes to symbols instead of scopes. symbols contain scopes. symbols can delagate lookups to scopes they contain
+        // symbol lookups should return a path to the symbol?
+        // Or else have scopes specific to particular symbol types
+
+        // make Scope an interface and have some Symbols implement it
+
         Map<NODE, SCOPE> _scopes;
 
         Vector<SCOPE> _stack;

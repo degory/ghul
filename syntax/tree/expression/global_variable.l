@@ -1,21 +1,22 @@
 namespace Syntax is namespace Tree is namespace Expression is
+    use System;
     use Generic;
     
     use Source;
-    class SEQUENCE isa NODE is
-        // public Type.NODE type;
-        public LIST elements;
 
+    class GLOBAL_VARIABLE isa NODE is
+        public String name;
+        
         void init(
             LOCATION location,
-            LIST elements,
+            String name,
             Type.NODE type
         )
         is
             super.init(location);
 
-            this.elements = elements;
-            this.type = type;
+            this.name = name;
+            this.type = type;    
         si
 
         void accept(Visitor visitor) is
@@ -24,14 +25,14 @@ namespace Syntax is namespace Tree is namespace Expression is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                elements.walk(visitor);
                 type.walk(visitor);
             fi
+
+            accept(visitor);            
         si
 
         void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
             type = cast Type.NODE(m[type]);
-            elements = cast LIST(m[elements]);
-        si
+        si        
     si
 si si si

@@ -5,7 +5,7 @@ namespace Syntax is namespace Process is
     use Logging;
     use Tree;
 
-    class INFER_TYPES isa ScopedVisitor is
+    class REWRITE_IDENTIFIERS isa ScopedVisitor is
         LOGGER _logger;
         Map<NODE,NODE> _map;
 
@@ -20,46 +20,15 @@ namespace Syntax is namespace Process is
             root.walk(this);
         si
 
-/*
-        void visit(Identifier.QUALIFIED identifier) is
-            var definition = this[identifier];
-
-            if definition != null then
-                IO.Std.err.println("" + identifier + " => " + definition);
-                _map[identifier] = definition;
-            else
-                _logger.error(identifier.location, "symbol not defined: " + identifier);
-            fi
-        si
-
-        void visit(Identifier.NODE identifier) is
-            var definition = this[identifier];
-
-            if definition != null then
-                IO.Std.err.println("" + identifier + " => " + definition);
-                _map[identifier] = definition;                
-            else
-                _logger.error(identifier.location, "symbol not defined: " + identifier);
-            fi            
-        si
-*/
-        void visit(Variable.NODE variable) is
-            if isa Type.INFER(variable.type) then
-                if variable.initializer != null then
-                    if variable.initializer.type == null then
-                        _logger.error(variable.location, "initializer has no type");
-                    else
-                        variable.type = variable.initializer.type;
-                    fi
-                fi
-            fi
-        si 
-
         void visit(Expression.IDENTIFIER identifier) is
+            IO.Std.err.println("bare identifier: " + identifier);
+
             var definition = this[identifier.identifier];
 
             if definition != null then
                 IO.Std.err.println("expression identifier " + identifier + " (" + Object.dump(identifier.identifier) + ") => " + definition);
+
+
 
                 var t = _map[definition];
                 if t != null then

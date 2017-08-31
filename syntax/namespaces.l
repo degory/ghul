@@ -8,7 +8,7 @@ namespace Syntax is
 
     class NAMESPACES is
         LOGGER _logger;
-        SCOPES _scopes;
+        SYMBOL_TABLE _symbol_table;
 
         Map<String, NODE> _namespaces;
         Vector<String> _prefixes;
@@ -17,66 +17,54 @@ namespace Syntax is
             return _prefixes.Top + '.' + name;
         si
 
-        void init(LOGGER logger, SCOPES scopes) is
+        void init(LOGGER logger, SYMBOL_TABLE symbol_table) is
             _logger = logger;
-            _scopes = scopes;
+            _symbol_table = symbol_table;
             _namespaces = new Map<String, NODE>(65521);
             _prefixes = new Vector<String>();
             _prefixes.add(""); // global scope
         si
 
-        void push(LOCATION location, String name) is
+        void push_namespace(LOCATION location, String name) is
             var qualified_name = get_qualified_name(name);
 
             var node = find_or_add_namespace(qualified_name);
 
-            var existing = _scopes.top[name];
+            var existing = _symbol_table.top[name];
 
             if existing == null then
-                _scopes.push(location, name, node);                
+                _symbol_table.push(location, name, node);                
             else
                 if existing != node then
                     _logger.error(location, "redefining symbol " + name + " as a namespace, originally defined at " + existing.location);
                     _logger.error(existing.location, "symbol " + name + " is redefined as namespace at " + location);
                 fi
 
-                _scopes.enter(node);
+                _symbol_table.enter(node);
             fi
             
             _prefixes.add(qualified_name);
         si
 
-        void push(Identifier.NODE identifier) is
-            push(identifier.location, identifier.name);
-        si
-
-        void enter(LOCATION location, String name) is
+        void enter_namespace(LOCATION location, String name) is
             var qualified_name = get_qualified_name(name);
 
             var node = find_namespace(qualified_name);
 
             assert(node != null, "No pre-existing aggregate namespace found for: " + name);
 
-            _scopes.enter(node);
+            _symbol_table.enter(node);
 
             _prefixes.add(qualified_name);
         si
 
-        void enter(Identifier.NODE identifier) is
-            enter(identifier.location, identifier.name);
-        si
-
-        void pop(LOCATION location, String name) is
+        void pop_namespace(LOCATION location, String name) is
             var node = find_namespace(_prefixes.Top);
 
             assert(node != null, "could not find aggregate namespace " + _prefixes.Top);
 
             _prefixes.pop();
-            _scopes.pop(node);
-        si
-
-        void pop(Identifier.NODE identifier) is
-            pop(identifier.location, identifier.name);
+            _symbol_table.pop(node);
         si
 
         NODE find_or_add_namespace(String qualified_name) is

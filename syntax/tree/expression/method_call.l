@@ -1,21 +1,28 @@
 namespace Syntax is namespace Tree is namespace Expression is
+    use System;
     use Generic;
     
     use Source;
 
-    class NEW isa NODE is
-        public TUPLE arguments;
+    class INSTANCE_CALL isa NODE is
+        public NODE self;
+        public String name;
+        public LIST arguments;
         
         void init(
             LOCATION location,
-            Type.NODE type,
-            TUPLE arguments
+            NODE self,
+            String name,
+            LIST arguments,
+            Type.NODE type
         )
         is
             super.init(location);
-            
-            this.type = type;
+
+            this.self = self;
+            this.name = name;
             this.arguments = arguments;
+            this.type = type;    
         si
 
         void accept(Visitor visitor) is
@@ -24,16 +31,18 @@ namespace Syntax is namespace Tree is namespace Expression is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                type.walk(visitor);
+                self.walk(visitor);
                 arguments.walk(visitor);
+                type.walk(visitor);
             fi
 
             accept(visitor);
         si
 
         void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
-            type = cast Type.NODE(m[type]);
-            arguments = cast TUPLE(m[arguments]);
-        si
+            self = cast NODE(m[self]);
+            arguments = cast LIST(m[arguments]);
+            type = cast Type.NODE(m[self]);
+        si        
     si
 si si si
