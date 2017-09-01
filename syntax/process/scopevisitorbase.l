@@ -2,10 +2,12 @@ namespace Syntax is
     use System;
     use Generic;
 
+    use Logging;
     use Source;
     use Tree;
 
     class ScopeVisitorBase isa Visitor is
+        LOGGER _logger;
         SYMBOL_TABLE _symbol_table;
         NAMESPACES _namespaces;
         
@@ -13,12 +15,22 @@ namespace Syntax is
             return _symbol_table.current_scope;
         si
 
+        get NamespaceContext current_namespace_context is
+            return _symbol_table.current_namespace_context;
+        si
+
+        get DeclarationContext current_declaration_context is
+            return _symbol_table.current_declaration_context;
+        si
+
         void init(
+            LOGGER logger,
             SYMBOL_TABLE symbol_table,
             NAMESPACES namespaces)
         is
             super.init();
 
+            _logger = logger;
             _symbol_table = symbol_table;
             _namespaces = namespaces;
         si
@@ -39,7 +51,13 @@ namespace Syntax is
                     return null;
                 fi
             else
-                return current_scope.find_member(identifier.name);
+                var result = current_scope.find_member(identifier.name);
+
+                if result == null then
+                    IO.Std.err.println("indentifier " + identifier + " not found in scope " + current_scope);
+                fi
+
+                return result;
             fi
         si
 
@@ -55,48 +73,18 @@ namespace Syntax is
                     return null;
                 fi
             else
-                return current_scope.find_enclosing(identifier.name);
+                var result = current_scope.find_enclosing(identifier.name);
+
+                if result == null then
+                    IO.Std.err.println("indentifier " + identifier + " not found in scope " + current_scope);
+                fi
+
+                return result;
             fi
         si
 
-        void enter_uses(Definition.NAMESPACE namespace_) is
-            foreach var u; namespace_.body.uses do
-                foreach var i; u do
-                    var n = find_enclosing(i);
-
-                    if n != null then
-                        if isa Symbol.NAMESPACE(n) then
-                        // IO.Std.err.println("" + i + " resolves to " + n + ": should use this namespace");
-                            enter_scope(cast Symbol.NAMESPACE(n));
-                        else 
-                            IO.Std.err.println("not a namespace: " + i);
-                        fi
-                    else
-                        IO.Std.err.println("used namespace not found: " + i);
-                    fi
-                od
-            od
-        si
-
-        void leave_uses(Definition.NAMESPACE namespace_) is
-            foreach var u; namespace_.body.uses.ReverseIterator do
-                foreach var i; u.ReverseIterator do
-                    var n = find_enclosing(i);
-
-                    if n != null then
-                        if isa Symbol.NAMESPACE(n) then
-                            // IO.Std.err.println("" + i + " resolves to " + n + ": should un-use this namespace");                        
-                            leave_scope(cast Symbol.NAMESPACE(n));
-                        else
-                            IO.Std.err.println("not a namespace: " + i);
-                        fi
-                    fi
-                od
-            od
-        si
-
         void create_and_enter_block_scope(NODE node) is
-            var scope = new BLOCK_SCOPE();
+            var scope = new BLOCK_SCOPE(current_scope);
 
             associate_and_enter_scope(node, scope);
         si
@@ -145,6 +133,11 @@ namespace Syntax is
 
         void leave_namespace(Identifier.NODE identifier) is
             _namespaces.leave_namespace(identifier.location, identifier.name);
-        si        
+        si
+
+        void dump_symbol_table(NODE node) is
+            IO.Std.err.println("after " + Object.dump(node));
+            IO.Std.err.println(_symbol_table);
+        si
     si
 si

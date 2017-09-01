@@ -2,17 +2,24 @@ namespace Syntax is namespace Process is
     use System;
     use Generic;
 
+    use Logging;
     use Tree;
 
     class ScopedVisitor isa ScopeVisitorBase is
+        LOGGER _logger;
+
         void init(
+            LOGGER logger,
             SYMBOL_TABLE symbol_table,
             NAMESPACES namespaces)
         is
             super.init(
+                logger,
                 symbol_table,
                 namespaces
             );
+
+            this._logger = logger;
         si
 
         // modifiers
@@ -28,15 +35,19 @@ namespace Syntax is namespace Process is
         */
 
         bool pre(Definition.NAMESPACE namespace_) is
-            enter_uses(namespace_);
+            // enter_uses(namespace_, true);
+
+            _logger._trace("namespace", "pre enter namespace " + namespace_.name);
 
             enter_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
+            _logger._trace("namespace", "pre leave namespace " + namespace_.name);
+
             leave_namespace(namespace_.name);
 
-            leave_uses(namespace_);
+            // leave_uses(namespace_);
         si   
         
         /*

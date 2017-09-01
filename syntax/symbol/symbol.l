@@ -2,8 +2,9 @@ namespace Syntax is namespace Symbol is
     use System;
     use Generic;
 
-    use Source;
     use IoC;
+    use Logging;
+    use Source;
 
     enum ACCESS is
         PRIVATE,
@@ -26,37 +27,44 @@ namespace Syntax is namespace Symbol is
         si
 
         void init(LOCATION location, String name) is
-            location = location;
+            this.location = location;
             _name = name;
         si
 
         BASE find_direct(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find direct: " + name + ": not a scope");            
             return null;
         si
 
         BASE find_member(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member: " + name + ": not a scope");            
             return null;
         si
 
         BASE find_enclosing(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + ": not a scope");            
             return null;
+        si
+
+        String toString() is
+            return Class.Name + " " + name + " @ " + location; 
         si
     si
 
-    class Scoped isa BASE do Scope is
-        SortedMap<String, BASE> _symbols;
+    // Bodge...
+    class Scoped isa BASE do Scope, DeclarationContext is
+        // SortedMap<String, BASE> _symbols;
+        Map<String, BASE> _symbols;
 
         void init(LOCATION location, String name) is
             super.init(location, name);
-            _symbols = new SortedMap<String, BASE>();
+            // _symbols = new SortedMap<String, BASE>();
+            _symbols = new Map<String, BASE>();
         si
 
         BASE find_direct(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name + " find direct: " + name + "...");            
             return _symbols[name];            
-        si
-
-        BASE find(String name) is
-            return find_direct(name);
         si
 
         void declare(LOCATION location, BASE symbol) is
@@ -130,9 +138,28 @@ namespace Syntax is namespace Symbol is
 
             function_group.add(function);
         si
+
+        String toString() is
+            var result = new StringBuffer();
+
+            result
+                .append(Class.Name)
+                .append(" ")
+                .append(name)
+                .append(location)
+                .append(":\n");
+
+            foreach var s; _symbols.Pairs do
+                result
+                    .append(s)
+                    .append("\n");
+            od
+
+            return result;
+        si        
     si
 
-    class UNDEFINED isa BASE do Scope is
+    class UNDEFINED isa BASE do Scope, DeclarationContext is
         void init(LOCATION location, String name) is
             super.init(location, name);
         si
@@ -186,17 +213,31 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE find_enclosing_only(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing only: " + name + "...");            
+
             if _enclosing_scope != null then
-                return _enclosing_scope.find_enclosing(name);
+                var result = _enclosing_scope.find_enclosing(name);
+                if result != null then
+                    LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing only: " + name + ": result is " + Object.dump(result));            
+                else
+                    LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing only: " + name + ": no result");            
+                fi
+
+                return result;                
             fi
 
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing only: " + name + ": no enclosing scope");            
             return null;
         si
         
         BASE find_enclosing(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + "...");            
+            
             var result = find_direct(name);
 
             if result != null then 
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + ": result is " + Object.dump(result));            
+                
                 return result;
             else
                 return find_enclosing_only(name);
@@ -214,18 +255,23 @@ namespace Syntax is namespace Symbol is
         si
 
         BASE find_member(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member: " + name + "...");            
+            
             var result = find_direct(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member: " + name + ": result is " + Object.dump(result));            
                 return result;
             fi
 
             result = find_member_only(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member: " + name + ": result is " + Object.dump(result));            
                 return result;
             fi
 
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member: " + name + " no result");            
             return null;
         si
 
@@ -233,37 +279,45 @@ namespace Syntax is namespace Symbol is
             var result = find_direct(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + ": result is " + Object.dump(result));            
                 return result;
             fi
 
             result = find_member_only(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + ": result is " + Object.dump(result));            
                 return result;
             fi
 
             result = find_enclosing_only(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + ": result is " + Object.dump(result));            
                 return result;
             fi
 
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find enclosing: " + name + " no result");            
             return null;
         si
 
         BASE find_member_only(String name) is
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member only: " + name + "..."); 
+
             foreach var i; _inherited_scopes do
                 var result = i.find_member(name);
                 if result != null then
+                    LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member only: " + name + ": result is " + Object.dump(result)); 
                     return result;
                 fi
             od
 
+            LOGGER.trace("find-symbol", ClassName + " " + this.name +  " find member only: " + name + " no result"); 
             return null;
         si
     si
         
-    class NAMESPACE isa ScopedWithEnclosingScope is
+    class NAMESPACE isa ScopedWithEnclosingScope do NamespaceContext is
         public String qualified_name;
 
         void init(LOCATION location, String name, Scope enclosing_scope, String qualified_name) is
@@ -423,6 +477,10 @@ namespace Syntax is namespace Symbol is
         void add(Function function) is
             _functions.add(function);
         si
+
+        String toString() is
+            return Class.Name + " " + name + " @ " + location + " (" + _functions + ")";
+        si        
     si    
 
     class Variable isa BASE is

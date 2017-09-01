@@ -11,17 +11,10 @@ namespace Syntax is
         SYMBOL_TABLE _symbol_table;
 
         Map<String, Symbol.NAMESPACE> _namespaces;
+        Vector<String> _prefixes;
         
         get String current_prefix is
-            if _symbol_table.current_scope == null then
-                return "";
-            else
-                var ns = _symbol_table.current_scope;
-
-                assert(isa Symbol.NAMESPACE(ns), "expected current scope to be a namespace");
-
-                return cast Symbol.NAMESPACE(ns).qualified_name;
-            fi
+            return _prefixes.Top;
         si
 
         String get_qualified_name(String name) is
@@ -32,9 +25,12 @@ namespace Syntax is
             _logger = logger;
             _symbol_table = symbol_table;
             _namespaces = new Map<String, Symbol.NAMESPACE>(65521);
+            _prefixes = new Vector<String>();
+            _prefixes.add("");
         si
 
         void declare_and_enter_namespace(LOCATION location, String name) is
+            _logger._trace("namespace", "declare and enter " + name + ", prefixes initially " + _prefixes);
             var qualified_name = get_qualified_name(name);
 
             var ns = find_or_add_namespace(name, qualified_name);
@@ -42,7 +38,7 @@ namespace Syntax is
             var existing = _symbol_table.current_scope.find_direct(name);
 
             if existing == null then
-                _symbol_table.current_scope.add_namespace(location, name, ns);
+                _symbol_table.current_namespace_context.add_namespace(location, name, ns);
             else
                 if existing != ns then
                     _logger.error(location, "redefining symbol " + name + " as a namespace, originally defined at " + existing.location);
@@ -51,9 +47,13 @@ namespace Syntax is
             fi
 
             _symbol_table.enter_scope(ns);              
+            _prefixes.add(qualified_name);
+
+            _logger._trace("namespace", "declare and enter " + name + ", prefixes now " + _prefixes);            
         si
 
         void enter_namespace(LOCATION location, String name) is
+            _logger._trace("namespace", "enter " + name + ", prefixes initially " + _prefixes);
             var qualified_name = get_qualified_name(name);
 
             var ns = find_namespace(qualified_name);
@@ -61,29 +61,44 @@ namespace Syntax is
             assert(ns != null, "No pre-existing aggregate namespace found for: " + name);
 
             _symbol_table.enter_scope(ns);
+            _prefixes.add(qualified_name);
+
+            _logger._trace("namespace", "entered " + name + ", prefixes now " + _prefixes);
         si
 
         void leave_namespace(LOCATION location, String name) is
+            _logger._trace("namespace", "leave " + name + ", prefixes initially " + _prefixes);
+
             var ns = find_namespace(current_prefix);
 
             assert(ns != null, "could not find aggregate namespace " + name);
 
+            _prefixes.pop();
             _symbol_table.leave_scope(ns);
+
+            _logger._trace("namespace", "left " + name + ", prefixes now " + _prefixes);            
         si
 
         Symbol.NAMESPACE find_or_add_namespace(String name, String qualified_name) is
+            _logger._trace("namespace", "find or add namespace " + name + "/" + qualified_name + "...");
+
             var result = _namespaces[qualified_name];
 
             if result == null then
+                _logger._trace("namespace", "find or add namespace " + name + "/" + qualified_name + ": creating");
+                
                 result = new Symbol.NAMESPACE(LOCATION.dummy, name, _symbol_table.current_scope, qualified_name);
 
                 _namespaces[qualified_name] = result;
             fi
 
+            _logger._trace("namespace", "find or add namespace " + name + "/" + qualified_name + ": result is " + result);
             return result;
         si        
 
         Symbol.NAMESPACE find_namespace(String qualified_name) is
+            _logger._trace("namespace", "find " + qualified_name + "...");
+
             var result = _namespaces[qualified_name];
             assert(result != null, "expected aggregate namespace " + qualified_name + " to already exist");
             return result;

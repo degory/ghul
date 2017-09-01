@@ -2,15 +2,17 @@ namespace Syntax is namespace Process is
     use System;
     use Generic;
 
+    use Logging;
     use Source;
     use Tree;
 
     class DECLARE_SYMBOLS isa ScopeVisitorBase is
         void init(
+            LOGGER logger,
             SYMBOL_TABLE symbol_table,
             NAMESPACES namespaces)
         is
-            super.init(symbol_table, namespaces);
+            super.init(logger, symbol_table, namespaces);
         si
 
         public void apply(NODE node) is
@@ -32,15 +34,19 @@ namespace Syntax is namespace Process is
         // definitions
 
         bool pre(Definition.NAMESPACE namespace_) is
-            enter_uses(namespace_);
+            // FIXME: how can this work out of order?
+
+            // DO NOT DO THIS HERE. Either create use scopes on fly in scoped visitor or do in another pass
+            // enter_uses(namespace_, true);
 
             declare_and_enter_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            leave_namespace(namespace_.name);
+            // dump_symbol_table(namespace_);
 
-            leave_uses(namespace_);
+            leave_namespace(namespace_.name);
+            // leave_uses(namespace_);
         si   
 
         bool pre(Definition.USE use_) is
@@ -54,29 +60,33 @@ namespace Syntax is namespace Process is
         bool pre(Definition.CLASS class_) is
             associate_and_enter_scope(
                 class_,
-                current_scope.declare_class(class_.location, class_.name.name)
+                current_declaration_context.declare_class(class_.location, class_.name.name)
             );
         si
 
         void visit(Definition.CLASS class_) is
+            // dump_symbol_table(class_);
+
             leave_scope(class_);
         si
 
         bool pre(Definition.INTERFACE interface_) is
             associate_and_enter_scope(
                 interface_, 
-                current_scope.declare_trait(interface_.location, interface_.name.name)
+                current_declaration_context.declare_trait(interface_.location, interface_.name.name)
             );
         si        
 
         void visit(Definition.INTERFACE interface_) is
+            // dump_symbol_table(interface_);
+
             leave_scope(interface_);
         si
 
         bool pre(Definition.ENUM enum_) is
             associate_and_enter_scope(
                 enum_,
-                current_scope.declare_enum(enum_.location, enum_.name.name)
+                current_declaration_context.declare_enum(enum_.location, enum_.name.name)
             );
         si
 
@@ -85,7 +95,7 @@ namespace Syntax is namespace Process is
         si
 
         bool pre(Definition.ENUM_MEMBER enum_member) is
-            current_scope.declare_enum_member(
+            current_declaration_context.declare_enum_member(
                 enum_member.location,
                 enum_member.name.name
             );
@@ -94,7 +104,7 @@ namespace Syntax is namespace Process is
         bool pre(Definition.FUNCTION function) is
             associate_and_enter_scope(
                 function,
-                current_scope.declare_function(
+                current_declaration_context.declare_function(
                     function.location,
                     function.name.name
                 )
@@ -145,7 +155,7 @@ namespace Syntax is namespace Process is
         // variables
         
         void visit(Variable.NODE variable) is
-            current_scope.declare_variable(variable.location, variable.name.name);
+            current_declaration_context.declare_variable(variable.location, variable.name.name);
         si
 
         // expressions
@@ -218,7 +228,7 @@ namespace Syntax is namespace Process is
 
         bool pre(Statement.LABELLED labelled) is
             // note: the label for a labelled statement does not point at a named scope:
-            current_scope.declare_label(labelled.location, labelled.label.name);
+            current_declaration_context.declare_label(labelled.location, labelled.label.name);
         si
         
         void visit(Statement.LABELLED labelled) is

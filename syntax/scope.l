@@ -19,8 +19,9 @@ namespace Syntax is
         // - any used namespaces
         // - any namespaces enclosing the current class
         Symbol.BASE find_enclosing(String name);
+    si
 
-        void add_namespace(LOCATION location, String name, Symbol.NAMESPACE namespace_);
+    interface DeclarationContext is
         Scope declare_class(LOCATION location, String name);
         Scope declare_trait(LOCATION location, String name);
         Scope declare_enum(LOCATION location, String name);
@@ -30,7 +31,54 @@ namespace Syntax is
         void declare_label(LOCATION location, String name);
     si
 
-    class BLOCK_SCOPE do Scope is
+    interface NamespaceContext is
+        void add_namespace(LOCATION location, String name, Symbol.NAMESPACE namespace_);
+    si
+
+    class USE_SCOPE do Scope is
+        SortedMap<String, Symbol.BASE> _used_symbols;
+        Vector<Scope> _used_scopes;
+
+        void init() is 
+            _used_scopes = new Vector<Scope>();
+        si
+
+        Symbol.BASE find_direct(String name) is
+            var result = _used_symbols[name];
+
+            if result != null then
+                return result;
+            fi
+
+            foreach var scope; _used_scopes do
+                result = scope.find_direct(name);
+
+                if result != null then
+                    return result;
+                fi
+            od
+
+            return null;
+        si
+
+        Symbol.BASE find_member(String name) is
+            return find_direct(name);
+        si
+
+        Symbol.BASE find_enclosing(String name) is
+            return find_direct(name);
+        si
+        
+        void add_scope(Scope scope) is
+            _used_scopes.add(scope);
+        si
+
+        void add_symbol(Symbol.BASE symbol) is
+            _used_symbols[symbol.name] = symbol;
+        si
+    si
+
+    class BLOCK_SCOPE do Scope, DeclarationContext is
         Scope _enclosing;
         Dict<String, Symbol.BASE> _symbols;
 
@@ -48,17 +96,22 @@ namespace Syntax is
         si
 
         Symbol.BASE find_member(String name) is
+            LOGGER.trace("find-symbol", Object.dump(this) + " find member: " + name);
             throw new NotImplementedException("cannot search for member " + name + " in block scope");
         si
 
         Symbol.BASE find_enclosing(String name) is
+            LOGGER.trace("find-symbol", Object.dump(this) + " find enclosing: " + name);
             var result = find_direct(name);
 
             if result != null then
+                LOGGER.trace("find-symbol", Object.dump(this) + " find enclosing: " + name + " success");
                 return result;
             elif _enclosing != null then
+                LOGGER.trace("find-symbol", Object.dump(this) + " find enclosing: " + name + " try enclosing...");
                 return _enclosing.find_enclosing(name);
             else
+                LOGGER.trace("find-symbol", Object.dump(this) + " find enclosing: " + name + " no result...");
                 return null;
             fi
         si

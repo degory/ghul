@@ -10,7 +10,7 @@ namespace Syntax is namespace Process is
         Map<NODE,NODE> _map;
 
         void init(LOGGER logger, SYMBOL_TABLE symbol_table, NAMESPACES namespaces) is
-            super.init(symbol_table, namespaces);
+            super.init(logger, symbol_table, namespaces);
 
             _logger = logger;
             _map = new Map<NODE,NODE>();

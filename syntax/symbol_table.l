@@ -20,13 +20,31 @@ namespace Syntax is
             fi
         si
 
+        get NamespaceContext current_namespace_context is
+            foreach var scope; _stack.ReverseIterator do
+                if isa NamespaceContext(scope) then
+                    return cast NamespaceContext(scope);
+                fi
+            od
+
+            assert(false, "no current namespace");
+        si
+
+        get DeclarationContext current_declaration_context is
+            foreach var scope; _stack.ReverseIterator do
+                if isa DeclarationContext(scope) then
+                    return cast DeclarationContext(scope);
+                fi
+            od
+        si
+
         void init(LOGGER logger) is
             _logger = logger;
             _stack = new Vector<Scope>(50);
             _scopes = new Map<NODE, Scope>(65521);
 
             enter_scope(
-                new Symbol.NAMESPACE(LOCATION.dummy, "", null, ".")
+                new Symbol.NAMESPACE(LOCATION.dummy, "", null, "")
             );
         si
 
@@ -66,6 +84,19 @@ namespace Syntax is
             assert(current_scope == scope, "scope stack corrupt");
 
             _stack.pop();
+        si
+
+        String toString() is
+            var result = new StringBuffer();
+            result.append("symbol table:\n");
+            foreach var scope; _stack.ReverseIterator do
+                result
+                    .append(scope)
+                    .append("\n");
+            od
+            result.append("\n");
+
+            return result;
         si
     si
 si

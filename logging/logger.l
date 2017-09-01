@@ -1,9 +1,13 @@
 namespace Logging is
     use System;
+    use Generic;
 
     use Source;
 
     class LOGGER is
+        static bool _enable_trace;
+        Set<String> _trace_channels;
+        
         int error_count;
 
         IO.Writer writer;
@@ -15,7 +19,22 @@ namespace Logging is
         void init() is
             super.init();
 
+            _enable_trace = true;
+            _trace_channels = new Set<String>({"find-symbol", "namespace"});
+
             this.writer = IO.Std.err;
+        si
+
+        void _trace(String channel, String message) is
+            if _enable_trace && _trace_channels.contains(channel) then
+                writer.write("trace: " + channel + ": " + message + "\n");
+            fi
+        si
+
+        static void trace(String channel, String message) is
+            if _enable_trace then
+                IoC.CONTAINER.instance.logger._trace(channel, message);
+            fi
         si
 
         void write(LOCATION location, String severity, String message) is
