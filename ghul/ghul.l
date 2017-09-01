@@ -33,6 +33,28 @@ namespace Ghul is
         si
     si
 
+    class PASS is
+        String _description;
+        void proc(WORK_ITEM) _apply;
+
+        void init(
+            String description,
+            void proc(WORK_ITEM) apply
+        )
+        is
+            this._description = description;
+            this._apply = apply;
+        si
+
+        void apply(WORK_ITEM work_item) is
+            _apply(work_item);
+        si
+
+        String toString() is
+            return _description;
+        si
+    si
+
     class COMPILER is
         CONTAINER container;
         LOGGER logger;
@@ -41,7 +63,7 @@ namespace Ghul is
 
         Vector<WORK_ITEM> work_items;
 
-        Vector<void proc(WORK_ITEM)> passes;
+        Vector<PASS> passes;
 
         Vector<String> results;
 
@@ -55,12 +77,16 @@ namespace Ghul is
             work_items = new Vector<WORK_ITEM>();
             results = new Vector<String>();
 
-            passes = new Vector<void proc(WORK_ITEM)>();
+            passes = new Vector<PASS>();
 
-            passes.add(void proc(WORK_ITEM)(this.declare_symbols_pass));
-            passes.add(void proc(WORK_ITEM)(this.resolve_uses_pass));
-            passes.add(void proc(WORK_ITEM)(this.experiments_pass));
-            passes.add(void proc(WORK_ITEM)(this.write_objects_pass));
+            add_pass("declare-symbols", void proc(WORK_ITEM)(this.declare_symbols_pass));
+            add_pass("resolve-uses", void proc(WORK_ITEM)(this.resolve_uses_pass));
+            add_pass("experiments", void proc(WORK_ITEM)(this.experiments_pass));
+            add_pass("write-objects", void proc(WORK_ITEM)(this.write_objects_pass));
+        si
+
+        void add_pass(String description, void proc(WORK_ITEM) apply) is
+            passes.add(new PASS(description, apply));
         si
 
         void parse(String path, BUILD_FLAGS build_flags) is
@@ -85,9 +111,13 @@ namespace Ghul is
 
         Iterable<String> build() is
             foreach var pass; passes do
+                IO.Std.err.println("start pass " + pass);
                 foreach var i; work_items do
-                    pass(i);
+                    IO.Std.err.println("running pass " + pass + " on " + i.definition.location);
+                    pass.apply(i);
                 od
+
+                IO.Std.err.println("completed pass " + pass);                
             od
 
             return results;

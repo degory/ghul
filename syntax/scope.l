@@ -44,20 +44,27 @@ namespace Syntax is
         si
 
         Symbol.BASE find_direct(String name) is
+            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name);
+            
             var result = _used_symbols[name];
 
             if result != null then
+                LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": result is " + result);
                 return result;
             fi
+
+            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": not in used symbols, trying namespaces...");            
 
             foreach var scope; _used_scopes do
                 result = scope.find_direct(name);
 
                 if result != null then
+                    LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": found in namespace, result is " + result);            
                     return result;
                 fi
             od
 
+            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": not found");            
             return null;
         si
 
