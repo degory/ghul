@@ -90,11 +90,11 @@ namespace Syntax is namespace Symbol is
             declare_undefined(location, "namespace", name);
         si
 
-        Scope declare_class(LOCATION location, String name) is
+        Scope declare_class(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "class", name);
         si
 
-        Scope declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "trait", name);
         si
 
@@ -106,7 +106,7 @@ namespace Syntax is namespace Symbol is
             declare_undefined(location, "enum member", name);
         si
 
-        Scope declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "function", name);
         si
 
@@ -156,7 +156,11 @@ namespace Syntax is namespace Symbol is
             od
 
             return result;
-        si        
+        si
+        
+        String dump_stack() is
+            return ClassName + "\n";
+        si                
     si
 
     class UNDEFINED isa BASE do Scope, DeclarationContext is
@@ -174,11 +178,11 @@ namespace Syntax is namespace Symbol is
             declare_undefined(location, "namespace", name);
         si
         
-        Scope declare_class(LOCATION location, String name) is
+        Scope declare_class(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "class", name);
         si
 
-        Scope declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "trait", name);
         si
 
@@ -190,7 +194,7 @@ namespace Syntax is namespace Symbol is
             declare_undefined(location, "enum member", name);
         si
 
-        Scope declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "function", name);
         si
 
@@ -200,7 +204,11 @@ namespace Syntax is namespace Symbol is
 
         void declare_label(LOCATION location, String name) is
             declare_undefined(location, "label", name);
-        si        
+        si
+        
+        String dump_stack() is
+            return ClassName + "\n";
+        si                
     si    
 
     class ScopedWithEnclosingScope isa Scoped is
@@ -243,6 +251,16 @@ namespace Syntax is namespace Symbol is
                 return find_enclosing_only(name);
             fi
         si
+
+        String dump_stack() is
+            String result = ClassName + "\n";
+
+            if _enclosing_scope != null then
+                result = result + _enclosing_scope.dump_stack();
+            fi
+
+            return result;
+        si        
     si
 
     class ScopedWithInheritedScopes isa ScopedWithEnclosingScope is
@@ -329,16 +347,16 @@ namespace Syntax is namespace Symbol is
             declare(location, namespace_);
         si
 
-        Scope declare_class(LOCATION location, String name) is
-            var result = new Symbol.CLASS(location, name, this);
+        Scope declare_class(LOCATION location, String name, Scope enclosing) is
+            var result = new Symbol.CLASS(location, name, enclosing);
 
             declare(location, result);
 
             return result;
         si
 
-        Scope declare_trait(LOCATION location, String name) is
-            var result = new Symbol.TRAIT(location, name, this);
+        Scope declare_trait(LOCATION location, String name, Scope enclosing) is
+            var result = new Symbol.TRAIT(location, name, enclosing);
 
             declare(location, result);
 
@@ -353,8 +371,8 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        Scope declare_function(LOCATION location, String name) is
-            var result = new Symbol.GLOBAL_FUNCTION(location, name, this);
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
+            var result = new Symbol.GLOBAL_FUNCTION(location, name, enclosing);
 
             declare_function_group(location, result);
 
@@ -405,8 +423,8 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        Scope declare_function(LOCATION location, String name) is
-            var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
+            var result = new Symbol.INSTANCE_FUNCTION(location, name, enclosing);
 
             declare_function_group(location, result);
 
@@ -433,8 +451,8 @@ namespace Syntax is namespace Symbol is
             return result;
         si
 
-        Scope declare_function(LOCATION location, String name) is
-            var result = new Symbol.INSTANCE_FUNCTION(location, name, this);
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
+            var result = new Symbol.INSTANCE_FUNCTION(location, name, enclosing);
 
             declare_function_group(location, result);
 

@@ -83,8 +83,8 @@ namespace Syntax is
         void leave_scope(Scope scope) is
 
             if current_scope != scope then
-                IO.Std.err.println("current scope: " + current_scope);
-                IO.Std.err.println("scope to pop:  " + scope);
+                _logger._trace("find-symbol", "current scope: " + current_scope);
+                _logger._trace("find-symbol", "scope to pop:  " + scope);
             fi
 
             assert(current_scope == scope, "scope stack corrupt");
@@ -100,6 +100,20 @@ namespace Syntax is
                     .append(scope)
                     .append("\n");
             od
+            result.append("\n");
+
+            return result;
+        si
+
+        String dump_stack() is
+            var result = new StringBuffer();
+
+            result.append("scope stack:\n");
+
+            foreach var scope; _stack.ReverseIterator do
+                result.append(Object.dump(scope) + "\n");
+            od
+
             result.append("\n");
 
             return result;

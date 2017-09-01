@@ -19,14 +19,16 @@ namespace Syntax is
         // - any used namespaces
         // - any namespaces enclosing the current class
         Symbol.BASE find_enclosing(String name);
+
+        String dump_stack();        
     si
 
     interface DeclarationContext is
-        Scope declare_class(LOCATION location, String name);
-        Scope declare_trait(LOCATION location, String name);
+        Scope declare_class(LOCATION location, String name, Scope enclosing);
+        Scope declare_trait(LOCATION location, String name, Scope enclosing);
         Scope declare_enum(LOCATION location, String name);
         void declare_enum_member(LOCATION location, String name);
-        Scope declare_function(LOCATION location, String name);
+        Scope declare_function(LOCATION location, String name, Scope enclosing);
         void declare_variable(LOCATION location, String name);
         void declare_label(LOCATION location, String name);
     si
@@ -36,44 +38,77 @@ namespace Syntax is
     si
 
     class USE_SCOPE do Scope is
+        Scope _enclosing;
         SortedMap<String, Symbol.BASE> _used_symbols;
         Vector<Scope> _used_scopes;
 
-        void init() is 
+        void init(Scope enclosing) is
+            _enclosing = enclosing; 
+            _used_symbols = new SortedMap<String, Symbol.BASE>();
             _used_scopes = new Vector<Scope>();
         si
 
-        Symbol.BASE find_direct(String name) is
-            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name);
+        Symbol.BASE _find_direct(String name) is
+            LOGGER.trace("find-symbol", Object.dump(this) + " _ find direct: " + name);
             
             var result = _used_symbols[name];
 
             if result != null then
-                LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": result is " + result);
+                LOGGER.trace("find-symbol", Object.dump(this) + " _ find direct: " + name + ": result is " + result);
                 return result;
             fi
 
-            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": not in used symbols, trying namespaces...");            
+            LOGGER.trace("find-symbol", Object.dump(this) + " _ find direct: " + name + ": not in used symbols, trying namespaces...");            
 
             foreach var scope; _used_scopes do
                 result = scope.find_direct(name);
 
                 if result != null then
-                    LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": found in namespace, result is " + result);            
+                    LOGGER.trace("find-symbol", Object.dump(this) + " _ find direct: " + name + ": found in namespace, result is " + result);            
                     return result;
                 fi
             od
 
-            LOGGER.trace("find-symbol", Object.dump(this) + " find direct: " + name + ": not found");            
+            LOGGER.trace("find-symbol", Object.dump(this) + " _ find direct: " + name + ": not found");            
             return null;
         si
 
         Symbol.BASE find_member(String name) is
-            return find_direct(name);
+            LOGGER.trace("find-symbol", Object.dump(this) + " find member: " + name);
+            throw new NotImplementedException("cannot search for member " + name + " in use scope");
+        si
+
+        // FIXME...
+        Symbol.BASE find_direct(String name) is
+            LOGGER.trace("find-symbol", ClassName + " find direct: " + name + "...");            
+
+            var result = _find_direct(name);
+
+            LOGGER.trace("find-symbol", ClassName + " find direct: " + name + ": direct result " + result);
+
+            if result == null && _enclosing != null then
+                result = _enclosing.find_direct(name);
+                LOGGER.trace("find-symbol", ClassName + " find direct: " + name + ": enclosing result " + result);                            
+            fi
+
+            LOGGER.trace("find-symbol", ClassName + " find direct: " + name + ": final result " + result);
+            return result;
         si
 
         Symbol.BASE find_enclosing(String name) is
-            return find_direct(name);
+            LOGGER.trace("find-symbol", ClassName + " find enclosing: " + name + "...");            
+            
+            var result = _find_direct(name);
+
+            LOGGER.trace("find-symbol", ClassName + " find enclosing: " + name + ": direct result " + result);
+
+            if result == null && _enclosing != null then
+                result = _enclosing.find_enclosing(name);
+                LOGGER.trace("find-symbol", ClassName + " find enclosing: " + name + ": enclosing result " + result);                            
+            fi
+
+            LOGGER.trace("find-symbol", ClassName + " find enclosing: " + name + ": final result " + result);
+            return result;
         si
         
         void add_scope(Scope scope) is
@@ -82,6 +117,20 @@ namespace Syntax is
 
         void add_symbol(Symbol.BASE symbol) is
             _used_symbols[symbol.name] = symbol;
+        si
+
+        String toString() is
+            return ClassName + "\n" + _used_symbols + "\n" + _used_scopes;
+        si
+
+        String dump_stack() is
+            String result = ClassName + "\n";
+
+            if _enclosing != null then
+                result = result + _enclosing.dump_stack();
+            fi
+
+            return result;
         si
     si
 
@@ -129,11 +178,11 @@ namespace Syntax is
             return new Symbol.UNDEFINED(location, name);
         si
 
-        Scope declare_class(LOCATION location, String name) is
+        Scope declare_class(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "class", name);
         si
 
-        Scope declare_trait(LOCATION location, String name) is
+        Scope declare_trait(LOCATION location, String name, Scope enclosing) is
             return declare_undefined(location, "trait", name);
         si
 
@@ -145,7 +194,7 @@ namespace Syntax is
             declare_undefined(location, "enum member", name);
         si
 
-        Scope declare_function(LOCATION location, String name) is
+        Scope declare_function(LOCATION location, String name, Scope enclosing) is
             declare_undefined(location, "function", name);
         si
 
@@ -181,5 +230,15 @@ namespace Syntax is
         String toString() is
             return this.ClassName + " " + _symbols;
         si
+
+        String dump_stack() is
+            String result = ClassName + "\n";
+
+            if _enclosing != null then
+                result = result + _enclosing.dump_stack();
+            fi
+
+            return result;
+        si        
     si
 si

@@ -35,24 +35,34 @@ namespace Syntax is namespace Process is
 
         bool pre(Definition.NAMESPACE namespace_) is
             declare_and_enter_namespace(namespace_.name);
-        si        
+
+            foreach var u; namespace_.body.uses do
+                LOGGER.trace("namespace", "about to create use scope for: " + u);
+
+                var use_scope = new USE_SCOPE(current_scope);
+
+                LOGGER.trace("namespace", "create use scope for: " + u + ", top scope before: " + current_scope);
+
+                associate_and_enter_scope(u, use_scope);                
+
+                LOGGER.trace("namespace", "top scope now: " + current_scope);
+            od
+        si
 
         void visit(Definition.NAMESPACE namespace_) is
+            leave_uses(namespace_);
+
             leave_namespace(namespace_.name);
         si   
-
-        bool pre(Definition.USE use_) is
-            // push_use(use_);
-        si
-
-        void visit(Definition.USE use_) is
-            // pop_use(use_);
-        si
 
         bool pre(Definition.CLASS class_) is
             associate_and_enter_scope(
                 class_,
-                current_declaration_context.declare_class(class_.location, class_.name.name)
+                current_declaration_context.declare_class(
+                    class_.location, 
+                    class_.name.name,
+                    current_scope
+                )
             );
         si
 
@@ -65,7 +75,11 @@ namespace Syntax is namespace Process is
         bool pre(Definition.INTERFACE interface_) is
             associate_and_enter_scope(
                 interface_, 
-                current_declaration_context.declare_trait(interface_.location, interface_.name.name)
+                current_declaration_context.declare_trait(
+                    interface_.location,
+                    interface_.name.name,
+                    current_scope
+                )
             );
         si        
 
@@ -98,7 +112,8 @@ namespace Syntax is namespace Process is
                 function,
                 current_declaration_context.declare_function(
                     function.location,
-                    function.name.name
+                    function.name.name,
+                    current_scope
                 )
             );
         si

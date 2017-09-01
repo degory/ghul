@@ -35,16 +35,24 @@ namespace Syntax is
 
             var ns = find_or_add_namespace(name, qualified_name);
 
+            _logger._trace("namespace", "declare and enter " + name + ", ns is " + ns + ", current scope is " + Object.dump(_symbol_table.current_scope));
             var existing = _symbol_table.current_scope.find_direct(name);
 
+            _logger._trace("namespace", "declare and enter " + name + ", existing is " + existing);
+
             if existing == null then
+                _logger._trace("namespace", "declare and enter " + name + ", add to symbol table");
                 _symbol_table.current_namespace_context.add_namespace(location, name, ns);
             else
+                _logger._trace("namespace", "declare and enter " + name + ", already existing");
+            
                 if existing != ns then
                     _logger.error(location, "redefining symbol " + name + " as a namespace, originally defined at " + existing.location);
                     _logger.error(existing.location, "symbol " + name + " is redefined as namespace at " + location);
                 fi
             fi
+
+            _logger._trace("namespace", "declare and enter " + name + ", enter scope");
 
             _symbol_table.enter_scope(ns);              
             _prefixes.add(qualified_name);

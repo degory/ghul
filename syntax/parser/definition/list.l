@@ -31,7 +31,7 @@ namespace Syntax is namespace Parser is namespace Definition is
                     end = definition.location;
                     definitions.add(definition);
                 else
-                    IO.Std.err.println("read null definition around " + context.location);
+                    IoC.CONTAINER.instance.logger.fatal(context.location, "read null defintion");
                 fi
             od
 

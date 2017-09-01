@@ -111,13 +111,14 @@ namespace Ghul is
 
         Iterable<String> build() is
             foreach var pass; passes do
-                IO.Std.err.println("start pass " + pass);
+                logger._trace("pass", "start pass " + pass);
                 foreach var i; work_items do
-                    IO.Std.err.println("running pass " + pass + " on " + i.definition.location);
+                    logger._trace("pass", "running pass " + pass + " on " + i.definition.location);
                     pass.apply(i);
+                    logger._trace("pass", "completed pass " + pass + " on " + i.definition.location);
                 od
 
-                IO.Std.err.println("completed pass " + pass);                
+                logger._trace("pass", "completed pass " + pass);                
             od
 
             return results;
@@ -240,13 +241,9 @@ namespace Ghul is
                     elif is_legacy(s) then
                         legacy_source_files.add(s);
                     elif is_ghul(s) then
-                        IO.Std.err.println("will parse: " + s + "...");
-
                         flags.legacy_object_name = legacy_source_file_name(s);
 
                         compiler.parse(s, flags.copy());
-
-                        IO.Std.err.println("after parse: " + s + "...");                        
                     fi
                 od
 

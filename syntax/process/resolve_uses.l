@@ -26,43 +26,40 @@ namespace Syntax is namespace Process is
 
         // definitions
 
-        bool pre(Definition.NAMESPACE namespace_) is
+        bool pre(Definition.NAMESPACE namespace_) is            
             enter_namespace(namespace_.name);
+
+            foreach var u; namespace_.body.uses do
+                _logger._trace("use", "existing use scope for " + u + ": " + scope_for(u));
+
+                var use_scope = cast USE_SCOPE(scope_for(u));
+        
+                foreach var i; u do
+                    _logger._trace("use", "used identifier is " + i);
+
+                    var used_symbol = find_enclosing(i);
+
+                    if used_symbol == null then
+                        _logger._trace("use", "used identifier " + i + " is not defined in " + _symbol_table);
+
+                        _logger.error(i.location, "used identifier " + i + " is not defined ");                        
+                    elif isa Symbol.NAMESPACE(used_symbol) then
+                        use_scope.add_scope(cast Symbol.NAMESPACE(used_symbol));
+                        _logger._trace("use", "used namespace for " + i + " is: " + used_symbol);
+                    else
+                        _logger._trace("use", "used symbol for " + i + " is: " + used_symbol);
+                        use_scope.add_symbol(used_symbol);
+                    fi                    
+                od
+
+                enter_scope(use_scope);
+            od            
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
+            leave_uses(namespace_);
+
             leave_namespace(namespace_.name);
         si   
-
-        bool pre(Definition.USE use_) is
-            var use_scope = new USE_SCOPE();
-
-            _logger._trace("use", "new use for " + use_ + " is: " + use_scope);
-    
-            foreach var i; use_ do
-                _logger._trace("use", "used identifier is " + i);
-
-                var used_symbol = find_enclosing(i);
-
-                if used_symbol == null then
-                    _logger._trace("use", "used identifier " + i + " is not defined in " + _symbol_table);
-                    
-                    IO.Std.err.println("used symbol " + i + " is not defined");
-                elif isa Symbol.NAMESPACE(used_symbol) then
-                    use_scope.add_scope(cast Symbol.NAMESPACE(used_symbol));
-                    _logger._trace("use", "used namespace for " + i + " is: " + used_symbol);
-                else
-                    _logger._trace("use", "used symbol for " + i + " is: " + used_symbol);
-                    use_scope.add_symbol(used_symbol);
-                fi
-            od
-
-            associate_and_enter_scope(use_, use_scope);
-        si
-
-        void visit(Definition.USE use_) is
-            _logger._trace("use", "leave use scope for: " + use_);
-            leave_scope(use_);
-        si
     si
 si si

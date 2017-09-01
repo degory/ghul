@@ -54,7 +54,7 @@ namespace Syntax is
                 var result = current_scope.find_member(identifier.name);
 
                 if result == null then
-                    IO.Std.err.println("indentifier " + identifier + " not found in scope " + current_scope);
+                    _logger._trace("find-symbol", "indentifier " + identifier + " not found in scope " + current_scope);
                 fi
 
                 return result;
@@ -76,7 +76,7 @@ namespace Syntax is
                 var result = current_scope.find_enclosing(identifier.name);
 
                 if result == null then
-                    IO.Std.err.println("indentifier " + identifier + " not found in scope " + current_scope);
+                    _logger._trace("find-symbol", "indentifier " + identifier + " not found in scope " + current_scope);
                 fi
 
                 return result;
@@ -118,11 +118,6 @@ namespace Syntax is
             _symbol_table.leave_scope(scope);
         si
 
-/*
-        void declare(Symbol.BASE symbol, NODE node) is
-            _symbol_table.current_scope.declare(symbol, node);
-        si
-*/
         void declare_and_enter_namespace(Identifier.NODE identifier) is
             _namespaces.declare_and_enter_namespace(identifier.location, identifier.name);
         si
@@ -134,10 +129,21 @@ namespace Syntax is
         void leave_namespace(Identifier.NODE identifier) is
             _namespaces.leave_namespace(identifier.location, identifier.name);
         si
+        
+        void enter_uses(Definition.NAMESPACE namespace_) is
+            foreach var u; namespace_.body.uses do
+                _logger._trace("use", "enter use for: " + u + ", top scope before: " + _symbol_table.current_scope);
+                enter_scope(u);
+                _logger._trace("use", "top scope now: " + _symbol_table.current_scope);
+            od
+        si
 
-        void dump_symbol_table(NODE node) is
-            IO.Std.err.println("after " + Object.dump(node));
-            IO.Std.err.println(_symbol_table);
+        void leave_uses(Definition.NAMESPACE namespace_) is
+            foreach var u; namespace_.body.uses.ReverseIterator do
+                _logger._trace("use", "exit use for: " + u + ", top scope before: " + _symbol_table.current_scope);
+                leave_scope(u);
+                _logger._trace("use", "top scope now: " + _symbol_table.current_scope);
+            od
         si
     si
 si

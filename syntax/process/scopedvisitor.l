@@ -35,28 +35,20 @@ namespace Syntax is namespace Process is
         */
 
         bool pre(Definition.NAMESPACE namespace_) is
-            // enter_uses(namespace_, true);
-
             _logger._trace("namespace", "pre enter namespace " + namespace_.name);
 
             enter_namespace(namespace_.name);
+
+            enter_uses(namespace_);            
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
             _logger._trace("namespace", "pre leave namespace " + namespace_.name);
 
+            leave_uses(namespace_);
+
             leave_namespace(namespace_.name);
-
-            // leave_uses(namespace_);
         si   
-        
-        bool pre(Definition.USE use_) is
-            enter_scope(use_);
-        si
-
-        void visit(Definition.USE use_) is
-            leave_scope(use_);
-        si
 
         bool pre(Definition.CLASS class_) is
             enter_scope(class_);
