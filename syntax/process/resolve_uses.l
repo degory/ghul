@@ -8,6 +8,7 @@ namespace Syntax is namespace Process is
 
     class RESOLVE_USES isa ScopeVisitorBase is
         LOGGER _logger;
+        SYMBOL_TABLE _symbol_table;
 
         void init(
             LOGGER logger,
@@ -16,6 +17,7 @@ namespace Syntax is namespace Process is
         is
             super.init(logger, symbol_table, namespaces);
             this._logger = logger;
+            this._symbol_table = symbol_table;
         si
 
         public void apply(NODE node) is
@@ -35,27 +37,32 @@ namespace Syntax is namespace Process is
         bool pre(Definition.USE use_) is
             var use_scope = new USE_SCOPE();
 
-            _logger._trace("use", "new use scope is: " + use_scope);
+            _logger._trace("use", "new use for " + use_ + " is: " + use_scope);
     
             foreach var i; use_ do
+                _logger._trace("use", "used identifier is " + i);
+
                 var used_symbol = find_enclosing(i);
 
                 if used_symbol == null then
-                    IO.Std.err.println("used symbol is not defined: " + used_symbol);
+                    _logger._trace("use", "used identifier " + i + " is not defined in " + _symbol_table);
+                    
+                    IO.Std.err.println("used symbol " + i + " is not defined");
                 elif isa Symbol.NAMESPACE(used_symbol) then
                     use_scope.add_scope(cast Symbol.NAMESPACE(used_symbol));
-                    _logger._trace("use", "used namespace is: " + used_symbol);
+                    _logger._trace("use", "used namespace for " + i + " is: " + used_symbol);
                 else
+                    _logger._trace("use", "used symbol for " + i + " is: " + used_symbol);
                     use_scope.add_symbol(used_symbol);
                 fi
             od
 
-            associate_and_enter_scope(use_, use_scope);            
+            associate_and_enter_scope(use_, use_scope);
         si
 
         void visit(Definition.USE use_) is
-            // pop_use(use_);
+            _logger._trace("use", "leave use scope for: " + use_);
+            leave_scope(use_);
         si
-
     si
 si si

@@ -74,6 +74,8 @@ namespace Syntax is
             assert(ns != null, "could not find aggregate namespace " + name);
 
             _prefixes.pop();
+
+            _logger._trace("namespace", "leaving " + name + ", aggregate ns: " + ns);
             _symbol_table.leave_scope(ns);
 
             _logger._trace("namespace", "left " + name + ", prefixes now " + _prefixes);            

@@ -28,7 +28,7 @@ namespace Syntax is namespace Process is
             if symbol != null then
                 IO.Std.err.println("type " + named + " => " + symbol);
             else
-                _logger.warn(named.location, "named type not found");
+                _logger.warn(named.location, "named type " + named.name + " not found");
             fi
         si
 
@@ -49,7 +49,7 @@ namespace Syntax is namespace Process is
             if symbol != null then
                 IO.Std.err.println("type " + generic + " => " + symbol);
             else
-                _logger.warn(generic.location, "named type not found");
+                _logger.warn(generic.location, "named type " + generic.name + " not found");
             fi
         si
 

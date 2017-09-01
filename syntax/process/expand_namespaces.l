@@ -6,6 +6,10 @@ namespace Syntax is namespace Process is
             super.init();
         si
 
+        public void apply(NODE node) is
+            node.walk(this);
+        si
+
         void visit(Definition.NAMESPACE namespace_) is
             var names = namespace_.name.parent_names;
 

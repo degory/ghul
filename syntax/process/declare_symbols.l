@@ -34,19 +34,11 @@ namespace Syntax is namespace Process is
         // definitions
 
         bool pre(Definition.NAMESPACE namespace_) is
-            // FIXME: how can this work out of order?
-
-            // DO NOT DO THIS HERE. Either create use scopes on fly in scoped visitor or do in another pass
-            // enter_uses(namespace_, true);
-
             declare_and_enter_namespace(namespace_.name);
         si        
 
         void visit(Definition.NAMESPACE namespace_) is
-            // dump_symbol_table(namespace_);
-
             leave_namespace(namespace_.name);
-            // leave_uses(namespace_);
         si   
 
         bool pre(Definition.USE use_) is

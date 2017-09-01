@@ -81,6 +81,12 @@ namespace Syntax is
         si
 
         void leave_scope(Scope scope) is
+
+            if current_scope != scope then
+                IO.Std.err.println("current scope: " + current_scope);
+                IO.Std.err.println("scope to pop:  " + scope);
+            fi
+
             assert(current_scope == scope, "scope stack corrupt");
 
             _stack.pop();

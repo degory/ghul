@@ -50,11 +50,13 @@ namespace Syntax is namespace Process is
             // leave_uses(namespace_);
         si   
         
-        /*
-        void visit(Definition.USE use_) is
-            // TODO: insert into current scope:
+        bool pre(Definition.USE use_) is
+            enter_scope(use_);
         si
-        */
+
+        void visit(Definition.USE use_) is
+            leave_scope(use_);
+        si
 
         bool pre(Definition.CLASS class_) is
             enter_scope(class_);
