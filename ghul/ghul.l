@@ -12,7 +12,6 @@ namespace Ghul is
         public bool want_legacy;
         public bool want_experiments;
         public bool ignore_errors;
-        public String legacy_object_name;
 
         void init() is
         si
@@ -25,29 +24,33 @@ namespace Ghul is
     class WORK_ITEM is
         public BUILD_FLAGS build_flags;
 
+        public String legacy_object_file_name;
+
         public Syntax.Tree.Definition.NODE definition;
 
-        void init(BUILD_FLAGS build_flags, Syntax.Tree.Definition.NODE definition) is
+        void init(
+            BUILD_FLAGS build_flags,
+            String legacy_object_file_name,
+            Syntax.Tree.Definition.NODE definition
+        )
+        is
             this.build_flags = build_flags;
+            this.legacy_object_file_name = legacy_object_file_name;
             this.definition = definition;
         si
     si
 
-    class PASS is
+    class Pass is
         String _description;
-        void proc(WORK_ITEM) _apply;
 
         void init(
-            String description,
-            void proc(WORK_ITEM) apply
-        )
+            String description        )
         is
             this._description = description;
-            this._apply = apply;
         si
 
         void apply(WORK_ITEM work_item) is
-            _apply(work_item);
+            throw new NotImplementedException();
         si
 
         String toString() is
@@ -55,15 +58,65 @@ namespace Ghul is
         si
     si
 
+    class PASS isa Pass is
+        void proc(WORK_ITEM) _apply;
+
+        void init(
+            String description,
+            void proc(WORK_ITEM) apply
+        )
+        is
+            super.init(description);
+            this._apply = apply;
+        si
+
+        void apply(WORK_ITEM work_item) is
+            _apply(work_item);
+        si
+    si
+    
+    class SOURCE_FILE_CATEGORIZER is
+        static bool is_legacy(String file_name) is
+            return file_name.endsWith(".l");
+        si
+
+        static bool is_ghul(String file_name) is
+            return file_name.endsWith(".ghul");
+        si
+    si
+
+    class LEGACY_OBJECT_FILE_NAME_GENERATOR is
+        SortedMap<String,int> _object_number;
+
+        void init() is
+            _object_number = new SortedMap<String,int>();
+        si
+
+        String new_object_file_name_for(String file_name) is
+            if !SOURCE_FILE_CATEGORIZER.is_ghul(file_name) then
+                throw new Exception("not a ghul source file: " + file_name);
+            fi
+
+            var result = file_name.substring(0, file_name.Length - 5);
+            var on = _object_number[result];
+            _object_number[result] = on + 1;
+            
+            return result + "." + on + ".lo";
+        si
+    si
+
     class COMPILER is
         CONTAINER container;
         LOGGER logger;
+
+        LEGACY_OBJECT_FILE_NAME_GENERATOR legacy_object_file_name_generator;
+
         Syntax.SYMBOL_TABLE symbol_table;
         Syntax.NAMESPACES namespaces;
 
         Vector<WORK_ITEM> work_items;
 
-        Vector<PASS> passes;
+        Vector<Pass> passes;
 
         Vector<String> results;
 
@@ -71,13 +124,15 @@ namespace Ghul is
             container = IoC.CONTAINER.instance;
             logger = container.logger;
 
+            legacy_object_file_name_generator = new LEGACY_OBJECT_FILE_NAME_GENERATOR();
+
             symbol_table = new Syntax.SYMBOL_TABLE(logger);
             namespaces = new Syntax.NAMESPACES(logger, symbol_table);
 
             work_items = new Vector<WORK_ITEM>();
             results = new Vector<String>();
 
-            passes = new Vector<PASS>();
+            passes = new Vector<Pass>();
 
             add_pass("declare-symbols", void proc(WORK_ITEM)(this.declare_symbols_pass));
             add_pass("resolve-uses", void proc(WORK_ITEM)(this.resolve_uses_pass));
@@ -103,8 +158,16 @@ namespace Ghul is
             while !context.is_end_of_file do
                 var definition = container.definition_parser.parse(context);
 
+                logger._trace("parse", "parsed " + path + " as " + definition);
+
                 if definition != null then
-                    work_items.add(new WORK_ITEM(build_flags, definition));
+                    work_items.add(
+                        new WORK_ITEM(
+                            build_flags,
+                            legacy_object_file_name_generator.new_object_file_name_for(path),
+                            definition
+                        )
+                    );
                 fi
             od
         si     
@@ -178,9 +241,9 @@ namespace Ghul is
             IO.Std.err.println(printer.result);
 
             if flags.want_legacy then
-                results.add(flags.legacy_object_name);
+                results.add(work_item.legacy_object_file_name);
                 
-                var writer = IO.File.openCreate(flags.legacy_object_name);
+                var writer = IO.File.openCreate(work_item.legacy_object_file_name);
 
                 writer.print(printer.result);
 
@@ -193,27 +256,11 @@ namespace Ghul is
     si
 
     class Main is
-        static bool is_legacy(String file_name) is
-            return file_name.endsWith(".l");
-        si
-
-        static bool is_ghul(String file_name) is
-            return file_name.endsWith(".ghul");
-        si
-
-        static String legacy_source_file_name(String file_name) is
-            if !is_ghul(file_name) then
-                throw new Exception("not a ghul source file: " + file_name);
-            fi
-
-            return file_name.substring(0, file_name.Length - 5) + ".lo";
-        si
-
         void init() is
-            var flags = new BUILD_FLAGS();
-            var compiler = new COMPILER();
-
             try 
+                var flags = new BUILD_FLAGS();
+                var compiler = new COMPILER();
+            
                 var container = IoC.CONTAINER.instance;
                 var logger = container.logger;
             
@@ -238,11 +285,9 @@ namespace Ghul is
                         LOGGER.enable_trace = true;
                         logger.trace_channels.add(args.nextElement().split(','));
 
-                    elif is_legacy(s) then
+                    elif SOURCE_FILE_CATEGORIZER.is_legacy(s) then
                         legacy_source_files.add(s);
-                    elif is_ghul(s) then
-                        flags.legacy_object_name = legacy_source_file_name(s);
-
+                    elif SOURCE_FILE_CATEGORIZER.is_ghul(s) then
                         compiler.parse(s, flags.copy());
                     fi
                 od

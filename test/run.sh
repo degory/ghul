@@ -1,3 +1,4 @@
+#!/bin/bash
 FAILED=0
 NAME=$1
 CASE=cases/$NAME
