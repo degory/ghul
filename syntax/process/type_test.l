@@ -29,7 +29,6 @@ namespace Syntax is namespace Process is
             _logger._trace("experiment", "top scope stack is\n" + _symbol_table.current_scope.dump_stack());
         si
 
-
         bool pre(Type.NAMED named) is
             return false;
         si
