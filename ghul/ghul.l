@@ -123,14 +123,23 @@ namespace Ghul is
                 return;
             fi
 
-            IO.Std.err.println("LFLAGS is " + env);
-
             foreach var f; env.split(' ') do
                 var flag = f.trim();
                 if flag !~ "" then
                     _flags.add(flag);
                 fi
             od
+
+            var t = new StringBuffer();
+
+            foreach var f; _flags do
+                t
+                    .append("\'")
+                    .append(f)
+                    .append("\' '");
+            od
+
+            IO.Std.err.println("LFLAGS is: " + flags); 
         si
     si
 
@@ -284,6 +293,40 @@ namespace Ghul is
         si
     si
 
+    class OUTPUT_FILE_NAME_GENERATOR is
+        String _current;
+
+        get String result is
+            if _current != null then
+                return _current;
+            else
+                return "binary";
+            fi
+        si
+
+        void init() is
+        si
+
+        void force(String path) is
+            _current = path;
+        si
+
+        void seen_file(String path) is
+            if _current != null then
+                return;
+            fi
+
+            var extensions = {".l", ".ghul"};
+
+            foreach var e; extensions do
+                if path.endsWith(e) then
+                    _current = path.substring(0, path.Length - e.Length);
+                    return;
+                fi
+            od      
+        si
+    si
+
     class Main is
         void init() is
             try 
@@ -292,7 +335,10 @@ namespace Ghul is
 
                 var legacy_compiler_flags = new LEGACY_COMPILER_FLAGS();
                 var flags = new BUILD_FLAGS();
-                var compiler = new COMPILER();            
+                var compiler = new COMPILER();
+                var output_file_name_generator = new OUTPUT_FILE_NAME_GENERATOR();
+
+                String output;       
             
                 IO.Std.err.FlushOnPrintln = true;
 
@@ -315,9 +361,13 @@ namespace Ghul is
                         LOGGER.enable_trace = true;
                         logger.trace_channels.add(args.nextElement().split(','));
 
+                    elif s =~ "-o" then
+                        output_file_name_generator.force(args.nextElement().trim());
                     elif SOURCE_FILE_CATEGORIZER.is_legacy(s) then
+                        output_file_name_generator.seen_file(s);
                         legacy_source_files.add(s);
                     elif SOURCE_FILE_CATEGORIZER.is_ghul(s) then
+                        output_file_name_generator.seen_file(s);
                         compiler.parse(s, flags.copy());
                     fi
                 od
@@ -341,7 +391,7 @@ namespace Ghul is
                         to_build.add(legacy_compiler_flags.flags);
 
                         to_build.add("-o");
-                        to_build.add("binary");
+                        to_build.add(output_file_name_generator.result);
 
                         var process = new Util.Process();
 

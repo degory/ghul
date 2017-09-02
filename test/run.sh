@@ -8,7 +8,7 @@ if [ "$TMP" = "" ] ; then
 fi
 
 if [ -f $CASE/ghulflags ] ; then
-    GHULFLAGS="$GHULFLAGS `cat $CASE/ghulflags`"
+    GHULFLAGS="-o binary $GHULFLAGS `cat $CASE/ghulflags`"
 fi
 
 LCACHE="/tmp/lcache"
