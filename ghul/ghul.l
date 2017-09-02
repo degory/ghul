@@ -105,6 +105,35 @@ namespace Ghul is
         si
     si
 
+    class LEGACY_COMPILER_FLAGS is
+        Vector<String> _flags;
+
+        get Iterable<String> flags is
+            return _flags;
+        si
+
+        void init() is
+            _flags = new Vector<String>();
+            
+            var env = Util.ProgramEnvironment.Map["LFLAGS"];
+
+            if env == null || env =~ "" then
+                IO.Std.err.println("No LFLAGS set");
+       
+                return;
+            fi
+
+            IO.Std.err.println("LFLAGS is " + env);
+
+            foreach var f; env.split(' ') do
+                var flag = f.trim();
+                if flag !~ "" then
+                    _flags.add(flag);
+                fi
+            od
+        si
+    si
+
     class COMPILER is
         CONTAINER container;
         LOGGER logger;
@@ -258,11 +287,12 @@ namespace Ghul is
     class Main is
         void init() is
             try 
-                var flags = new BUILD_FLAGS();
-                var compiler = new COMPILER();
-            
                 var container = IoC.CONTAINER.instance;
                 var logger = container.logger;
+
+                var legacy_compiler_flags = new LEGACY_COMPILER_FLAGS();
+                var flags = new BUILD_FLAGS();
+                var compiler = new COMPILER();            
             
                 IO.Std.err.FlushOnPrintln = true;
 
@@ -296,6 +326,8 @@ namespace Ghul is
 
                 to_build.add(compiler.build());
 
+                to_build.add(legacy_source_files);
+
                 if logger.any_errors then
                     IO.Std.err.println("FAILED");                    
                 else
@@ -306,6 +338,8 @@ namespace Ghul is
 
                 if flags.ignore_errors || !logger.any_errors then
                     if to_build.Length > 1 then
+                        to_build.add(legacy_compiler_flags.flags);
+
                         to_build.add("-o");
                         to_build.add("binary");
 

@@ -7,4 +7,7 @@ if [ ! -d /tmp/lcache-$JOB_NAME ]; then
     mkdir /tmp/lcache-$JOB_NAME
 fi
 
-find ghul ioc system logging source lexical syntax -name '*.l' | xargs lc $LFLAGS -p $JOB_NAME
+export LFLAGS="$LFLAGS -p $JOB_NAME"
+
+find ghul ioc system logging source lexical syntax -name '*.l' | xargs ghul
+
