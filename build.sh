@@ -9,5 +9,5 @@ fi
 
 export LFLAGS="$LFLAGS -p $JOB_NAME"
 
-# find ghul ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' | xargs ghul -o ghul/ghul imports.l -E -L
-find ghul ioc system logging source lexical syntax -name '*.l' | xargs ghul -o ghul/ghul imports.l
+# find ghul ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs ghul -E -L -o ghul/ghul imports.l
+find ghul ioc system logging source lexical syntax -name '*.l' | xargs ghul -o ghul/ghul imports.l  

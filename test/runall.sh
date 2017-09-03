@@ -9,6 +9,8 @@ let failed=0
 
 mkdir -p tmp
 
+export QUIET=1
+
 while [ $i -lt $last ] ; do
 	if [ -d cases/$i ] ; then
 	    if ./run.sh $i $CAPTURE ; then

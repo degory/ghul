@@ -1,7 +1,13 @@
 #!/bin/bash
+
 FAILED=0
-NAME=$1
-CASE=cases/$NAME
+if [ "$NAME" = "" ] ; then
+    NAME=$1
+fi
+
+if [ "$CASE" = "" ] ; then
+    CASE=cases/$NAME
+fi
 
 if [ "$TMP" = "" ] ; then
     TMP=tmp
@@ -28,6 +34,10 @@ echo "${NAME}: compile ..."
 $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 # mv test $CASE
 
+if [ -z "$QUIET" ] ; then
+    cat $TMP/err_out
+fi
+
 grep error: $TMP/err_out | sort >$TMP/err
 grep warn: $TMP/err_out | sort >$TMP/warn
 if [ "$2" = "capture" ]; then
@@ -52,12 +62,16 @@ else
 fi  
 
 if [ -f ./${BINARY} ] ; then
-    if [ -f $CASE/fail.expected ] ; then
+    if [ -f $CASE/fail.expected ] ; then   
         echo "${NAME}: expected compile failure but binary present ${BINARY}"
         exit 1
     fi
 
     ./${BINARY} 2>&1 | cat >$TMP/out
+
+    if [ -z "$QUIET" ] ; then
+        cat $TMP/out
+    fi
 elif [ -f $CASE/fail.expected ] ; then
 
     if [ "$2" = "capture" ]; then
