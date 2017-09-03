@@ -86,6 +86,7 @@ namespace Syntax is namespace Process is namespace Printer is
 
         void nl() is
             _current_line = _current_line + 1;
+            append("\n");
         si
 
         StringBuffer dent_append(String string) is
