@@ -2,28 +2,36 @@
 
 CAPTURE=$1
 
-let i=1
-let last=200
-
 let failed=0
-
-mkdir -p tmp
 
 export QUIET=1
 
-while [ $i -lt $last ] ; do
-	if [ -d cases/$i ] ; then
+let total=0
+let passed=0
+let failed=0
+
+for d in cases/* ; do
+	if [ -d $d ] ; then
+        i=`basename $d`
 	    if ./run.sh $i $CAPTURE ; then
             echo "$i: passed"
+            let passed=passed+1
         else
             echo "$i: FAILED"
             let failed=failed+1
         fi
-	fi
 
-    let i=i+1
+        let total=total+1        
+	fi
 done
 
-echo "$failed tests failed"
+echo "passed: $passed/$total"
+echo "failed: $failed/$total"
+
+if [[ $failed == 0 ]] ; then
+    echo "PASSED"  
+else
+    echo "FAILED"
+fi
 
 exit $failed

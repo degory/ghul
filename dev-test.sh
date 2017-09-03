@@ -1,15 +1,22 @@
 #!/bin/bash
-FILE=$1
-if [[ ${FILE: -5} = ".ghul" ]] ; then
-    CASE=`dirname $FILE`
+
+if [[ $1 =~ .ghul$ ]] ; then
+    CASE=`dirname $1`
     NAME=`basename $CASE`
+    PARENT=`dirname $CASE`
 
-    echo "Explicit case given $CASE $NAME"
+    if [[ $PARENT =~ test/cases$ ]] ; then
+        echo "Run test containing $1, test case $NAME"
 
-    docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source --user dev -t docker.giantblob.com/dev /bin/bash -c "./test.sh $NAME"
+        ARGUMENT=$NAME
+    else
+        echo "Run all tests"
+    fi    
+elif [ -d test/cases/$1 ] ; then
+    echo "Run test case $1"
+    ARGUMENT=$1
 else
-    docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source --user dev -t docker.giantblob.com/dev /bin/bash -c "./test.sh $1"
+    echo "Not a test case or a test source file $1, running all tests"
 fi
 
-
-
+docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source --user dev -t docker.giantblob.com/dev /bin/bash -c "./test.sh $ARGUMENT"
