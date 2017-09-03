@@ -450,10 +450,11 @@ namespace Syntax is namespace Process is namespace Printer is
             append(")");
         si
 
+/*
         void visit(Type.NAMED_TUPLE_ELEMENT element) is
             error(element.location, "legacy compiler does not support tuples");
         si      
-
+*/
         void visit(Type.LIST types) is
             var seen_any = false;
             foreach var t; types.Iterator do
@@ -471,11 +472,30 @@ namespace Syntax is namespace Process is namespace Printer is
 
         void visit(Expression.SELF self) is
             append("this");
-        si        
+        si
 
+        void visit(Expression.VARIABLE variable) is
+            if !isa Type.INFER(variable.type) then
+                variable.type.accept(this);
+                append(' ');
+            else
+                _logger.error(variable.location, "legacy compiler cannot infer type here");
+            fi
+
+            variable.identifier.accept(this);
+
+            if variable.initializer != null then
+                append(" = ");
+
+                variable.initializer.accept(this);
+            fi
+        si
+        
+        /*
         void visit(Expression.VARIABLE variable) is
             error(variable.location, "legacy compiler does not support tuples");
         si
+        */
 
         void visit(Syntax.Tree.Expression.FUNCTION function) is
             append(function.location, function.type);
