@@ -31,10 +31,10 @@ $GHUL $GHULFLAGS $CASE/*.ghul 2>$TMP/err_out
 grep error: $TMP/err_out | sort >$TMP/err
 grep warn: $TMP/err_out | sort >$TMP/warn
 if [ "$2" = "capture" ]; then
-    cp $TMP/err $CASE/err
-    cp $TMP/warn $CASE/warn
+    cp $TMP/err $CASE/err.expected
+    cp $TMP/warn $CASE/warn.expected
 else
-    if ! diff $CASE/err $TMP/err >$TMP/err_diff ; then
+    if ! diff $CASE/err.expected $TMP/err >$TMP/err_diff ; then
        FAILED=1
        echo "${NAME}: compile error output differs"
        cat $TMP/err_diff
@@ -42,7 +42,7 @@ else
        cp $TMP/err_diff $CASE/err.diff
     fi
 
-    if ! diff $CASE/warn $TMP/warn >$TMP/warn_diff ; then
+    if ! diff $CASE/warn.expected $TMP/warn >$TMP/warn_diff ; then
        FAILED=1
        echo "${NAME}: compile warn output differs"
        cat $TMP/warn_diff
@@ -52,20 +52,20 @@ else
 fi  
 
 if [ -f ./${BINARY} ] ; then
-    if [ -f $CASE/expectfail ] ; then
+    if [ -f $CASE/fail.expected ] ; then
         echo "${NAME}: expected compile failure but binary present ${BINARY}"
         exit 1
     fi
 
     ./${BINARY} 2>&1 | cat >$TMP/out
-elif [ -f $CASE/expectfail ] ; then
+elif [ -f $CASE/fail.expected ] ; then
 
     if [ "$2" = "capture" ]; then
         echo "${NAME}: captured errors:"
-        cat $CASE/err;
+        cat $CASE/err.expected
 
         echo "${NAME}: captured warnings:"
-        cat $CASE/warn
+        cat $CASE/warn.expected
     fi
     
     exit $FAILED
@@ -75,18 +75,18 @@ else
 fi
 
 if [ "$2" = "capture" ]; then
-    cp $TMP/out $CASE/out
+    cp $TMP/out $CASE/out.expected
 
     echo "${NAME}: captured output:"
-    cat $CASE/out
+    cat $CASE/out.expected
 
     echo "${NAME}: captured errors:"
-    cat $CASE/err;
+    cat $CASE/err.expected
 
     echo "${NAME}: captured warnings:"
-    cat $CASE/warn
+    cat $CASE/warn.expected
 else
-    if ! diff $CASE/out $TMP/out >$TMP/out_diff ; then
+    if ! diff $CASE/out.expected $TMP/out >$TMP/out_diff ; then
        FAILED=1
        echo "${NAME}: test output differs"
        cat $TMP/out_diff       
