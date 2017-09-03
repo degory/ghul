@@ -95,9 +95,28 @@ namespace Syntax is namespace Parser is namespace Statement is
 
             add_parser(
                 Tree.Statement.NODE proc(CONTEXT context) is
-                    var result = parse_if(context);
+                    var start = context.location;
+                    var end = context.location;
 
-                    context.next_token(Lexical.TOKEN.FI);
+                    if context.next_token(Lexical.TOKEN.THROW, syntax_error_message) then
+                        Tree.Expression.NODE expression;
+
+                        if context.current.token != Lexical.TOKEN.SEMICOLON then
+                            expression = expression_parser.parse(context);
+                            end = expression.location;
+                        fi
+
+                        context.next_token(Lexical.TOKEN.SEMICOLON);
+                        
+                        return new Tree.Statement.THROW(start..end, expression);
+                    fi
+                si,
+                Lexical.TOKEN.THROW
+            );
+            
+            add_parser(
+                Tree.Statement.NODE proc(CONTEXT context) is
+                    var result = parse_if(context);
 
                     return result;
                 si,
@@ -315,30 +334,41 @@ namespace Syntax is namespace Parser is namespace Statement is
 
         Tree.Statement.IF parse_if(CONTEXT context) is
             var start = context.location;
+            var branches = new Vector<Tree.Statement.IF_BRANCH>();
 
-            context.next_token();
+            do
+                var branch_start = context.location;
 
-            var condition = expression_parser.parse(context);
+                Tree.Expression.NODE condition;
 
-            context.next_token(Lexical.TOKEN.THEN);
+                if context.current.token == Lexical.TOKEN.ELIF || context.current.token == Lexical.TOKEN.IF then
+                    context.next_token();
+                    condition = expression_parser.parse(context);                    
+                    context.next_token(Lexical.TOKEN.THEN);
+                else
+                    context.next_token(Lexical.TOKEN.ELSE);
+                    condition = null;
+                fi
 
-            var then_branch = statement_list_parser.parse(context);
-            Tree.Statement.LIST else_branch;
-            Tree.Statement.IF elif_branch;
+                var body = statement_list_parser.parse(context);
 
-            if context.current.token == Lexical.TOKEN.ELSE then
-                context.next_token();
-                else_branch = statement_list_parser.parse(context);
-            elif context.current.token == Lexical.TOKEN.ELIF then
-                elif_branch = parse_if(context);
-            fi
+                branches.add(
+                    new Tree.Statement.IF_BRANCH(
+                        branch_start..body.location,
+                        condition,
+                        body
+                    )
+                );
+ 
+                if context.current.token == Lexical.TOKEN.FI then
+                    context.next_token();
+                    break;
+                fi
+            od
 
             return new Tree.Statement.IF(
                 start..context.location,
-                condition,
-                then_branch,
-                else_branch,
-                elif_branch
+                branches
             );
         si
 

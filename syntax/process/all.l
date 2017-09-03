@@ -190,6 +190,14 @@ namespace Syntax is
             log("none", none);
         si
 
+        void visit(Expression.SELF self) is
+            log("self", self);
+        si        
+
+        void visit(Expression.SUPER super_) is
+            log("super", super_);
+        si        
+
         void visit(Expression.NEW new_) is
             log("new", new_);
         si
@@ -268,8 +276,16 @@ namespace Syntax is
             log("return", return_);
         si
 
+        void visit(Statement.THROW throw_) is
+            log("throw", throw_);
+        si        
+
         void visit(Statement.IF if_) is
             log("if", if_);
+        si
+
+        void visit(Statement.IF_BRANCH if_branch) is
+            log("if branch", if_branch);
         si
 
         void visit(Statement.CASE case_) is

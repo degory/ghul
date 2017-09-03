@@ -9,7 +9,11 @@ namespace Syntax is namespace Process is namespace Printer is
         LOGGER _logger;
 
         void init(LOGGER logger) is
-            super.init();
+            super.init(true);
+
+            IO.Std.err.println("initialized legacy printer");
+
+            IO.Std.err.flush();
 
             _logger = logger;
         si
@@ -26,7 +30,8 @@ namespace Syntax is namespace Process is namespace Printer is
             if !isa Type.INFER(type) then
                 type.accept(this);
             else
-                error(location, "legacy compiler cannot infer type here");
+                _logger.warn(location, "legacy compiler cannot infer type here, assuming void");
+                append("void");
             fi
         si
 
@@ -144,6 +149,8 @@ namespace Syntax is namespace Process is namespace Printer is
                     fi
 
                     ancestor.accept(this);
+
+                    count = count + 1;
                 od
             fi
 
@@ -461,6 +468,10 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         // expression 
+
+        void visit(Expression.SELF self) is
+            append("this");
+        si        
 
         void visit(Expression.VARIABLE variable) is
             error(variable.location, "legacy compiler does not support tuples");

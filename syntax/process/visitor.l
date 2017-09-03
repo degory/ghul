@@ -321,6 +321,20 @@ namespace Syntax is
         void visit(Expression.Literal.NONE none) is
         si
 
+        bool pre(Expression.SELF self) is
+            return false;
+        si        
+
+        void visit(Expression.SELF self) is
+        si        
+
+        bool pre(Expression.SUPER super_) is
+            return false;
+        si        
+
+        void visit(Expression.SUPER super_) is
+        si        
+
         bool pre(Expression.NEW new_) is
             return false;
         si
@@ -454,6 +468,13 @@ namespace Syntax is
         si
 
         void visit(Statement.RETURN return_) is
+        si
+
+        bool pre(Statement.THROW throw_) is
+            return false;
+        si
+
+        void visit(Statement.THROW throw_) is
         si
 
         bool pre(Statement.IF if_) is

@@ -27,11 +27,10 @@ namespace Syntax is namespace Parser is namespace Definition is
             while context.current.token != Lexical.TOKEN.SI do
                 var definition = definition_parser.parse(context);
 
+                // assuming if definition is null, then any associated error has already been reported
                 if definition != null then
                     end = definition.location;
                     definitions.add(definition);
-                else
-                    IoC.CONTAINER.instance.logger.fatal(context.location, "read null defintion");
                 fi
             od
 

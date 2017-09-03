@@ -4,7 +4,7 @@ namespace Syntax is namespace Process is namespace Printer is
 
     class GHUL isa BASE is
         void init() is
-            super.init();
+            super.init(false);
         si
 
         // definitions
@@ -314,6 +314,10 @@ namespace Syntax is namespace Process is namespace Printer is
         si      
 
         // expression 
+
+        void visit(Expression.SELF self) is
+            append("self");
+        si        
 
         void visit(Expression.VARIABLE variable) is
             variable.identifier.accept(this);

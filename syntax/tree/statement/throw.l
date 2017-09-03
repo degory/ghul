@@ -3,7 +3,7 @@ namespace Syntax is namespace Tree is namespace Statement is
 
     use Source;
 
-    class RETURN isa NODE is
+    class THROW isa NODE is
         public Expression.NODE expression;
 
         void init(
@@ -21,9 +21,7 @@ namespace Syntax is namespace Tree is namespace Statement is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                if expression != null then
-                    expression.walk(visitor);
-                fi
+                expression.walk(visitor);
             fi
 
             accept(visitor);

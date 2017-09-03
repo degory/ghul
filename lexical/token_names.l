@@ -101,10 +101,10 @@ namespace Lexical is
             names[TOKEN.STRING_LITERAL] = "string literal";
             names[TOKEN.STRUCT] = "struct";
             names[TOKEN.MINUS] = "-";
+            names[TOKEN.SELF] = "self";            
             names[TOKEN.SUPER] = "super";
             names[TOKEN.SWITCH] = "switch";
             names[TOKEN.THEN] = "then";
-            names[TOKEN.THIS] = "this";
             names[TOKEN.THROW] = "throw";
             names[TOKEN.TRUE] = "true";
             names[TOKEN.TRY] = "try";

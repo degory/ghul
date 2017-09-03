@@ -120,7 +120,7 @@ namespace Lexical is
             if symbol_tokens == null then
                 operator_chars = new Set<char>(char{
                     '!', '$', '%', '^', '&', '*', '-', '+', '=',
-                    '@', '~', '#', '\\', '<', '>', '.', '?', '/'
+                    '|', '@', '~', '#', '\\', '<', '>', '.', '?', '/'
                 });
 
                 operator_tokens = new Map<String, TOKEN>();
@@ -128,6 +128,7 @@ namespace Lexical is
                 operator_tokens["."] = TOKEN.DOT;
                 operator_tokens["->"] = TOKEN.ARROW_THIN;
                 operator_tokens["=>"] = TOKEN.ARROW_FAT;
+                operator_tokens["?"] = TOKEN.QUESTION;
 
                 symbol_tokens = new TOKEN_MAP();
                 symbol_tokens["import"] = TOKEN.IMPORT;
@@ -162,13 +163,13 @@ namespace Lexical is
                 symbol_tokens["let"] = TOKEN.LET;
                 symbol_tokens["catch"] = TOKEN.CATCH;
                 symbol_tokens["finally"] = TOKEN.FINALLY;
-                symbol_tokens["this"] = TOKEN.THIS;
+                symbol_tokens["self"] = TOKEN.SELF;
                 symbol_tokens["super"] = TOKEN.SUPER;
                 symbol_tokens["null"] = TOKEN.NULL;
-                symbol_tokens["true"] = TOKEN.TRUE;
-                symbol_tokens["false"] = TOKEN.FALSE;
+                // symbol_tokens["true"] = TOKEN.TRUE;
+                // symbol_tokens["false"] = TOKEN.FALSE;
                 symbol_tokens["use"] = TOKEN.USE;
-                symbol_tokens["native"] = TOKEN.NATIVE;
+                // symbol_tokens["native"] = TOKEN.NATIVE;
                 symbol_tokens["pragma"] = TOKEN.PRAGMA;
                 symbol_tokens["get"] = TOKEN.GET;
                 symbol_tokens["set"] = TOKEN.SET;

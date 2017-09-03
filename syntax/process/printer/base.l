@@ -2,21 +2,31 @@ namespace Syntax is namespace Process is namespace Printer is
     use System;
     use Tree;
 
+    use Source;
+
     class BASE isa StrictVisitor is
         int _indent;
         int _depth;
 
         bool _run_on;
 
+        bool _want_locations;
+
+        int _current_line;
+
         StringBuffer _result;
 
-        void init() is
+        void init(bool want_locations) is
             super.init();
+
+            _want_locations = want_locations;
 
             _depth = 0;
             _indent = 2;
             
             _result = new StringBuffer();
+
+            _current_line = 1;
         si
 
         get String result is
@@ -54,8 +64,28 @@ namespace Syntax is namespace Process is namespace Printer is
             _run_on = true;
         si
 
+        void location(NODE node) is
+            location(node.location);
+        si
+
+        void location(LOCATION location) is
+            var new_line = location.start_line;
+
+            if new_line != _current_line then                
+                _current_line = new_line;
+
+                if _want_locations then
+                    append("#");
+                    append("" + _current_line);
+                    append("\n");
+                fi
+
+                dent();
+            fi
+        si
+
         void nl() is
-            append('\n');
+            _current_line = _current_line + 1;
         si
 
         StringBuffer dent_append(String string) is
@@ -70,10 +100,12 @@ namespace Syntax is namespace Process is namespace Printer is
         // Identifiers
 
         void visit(Identifier.NODE identifier) is
+            location(identifier);
             append(identifier.name);
         si
 
         void visit(Identifier.QUALIFIED identifier) is
+            location(identifier);
             identifier.parent.accept(this);
             
             _result
@@ -84,10 +116,12 @@ namespace Syntax is namespace Process is namespace Printer is
         // modifiers
 
         void visit(Modifier.NODE modifier) is
+            location(modifier);
             append(modifier.name);
         si
 
         void visit(Modifier.LIST modifiers) is
+            location(modifiers);
             if modifiers.access_modifier != null then
                 modifiers.access_modifier.accept(this);
                 append(' ');
@@ -102,6 +136,7 @@ namespace Syntax is namespace Process is namespace Printer is
         // definitions
 
         void visit(Variable.LIST variables) is
+            location(variables);
             var first = true;
 
             foreach var v; variables do
@@ -114,18 +149,21 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Definition.LIST definitions) is
+            location(definitions);
             foreach var d; definitions do
                 d.accept(this);
             od
         si
 
         void visit(Definition.ENUM enum_) is
+            location(enum_);
             dent();
 
             append("enum ");
 
             enum_.name.accept(this);
-            append(" is\n");
+            append(" is");
+            nl();
 
             in();
 
@@ -133,7 +171,8 @@ namespace Syntax is namespace Process is namespace Printer is
 
             foreach var member; enum_.members do
                 if seen_any then
-                    append(",\n");
+                    append(",");
+                    nl();
                 fi
 
                 member.accept(this);
@@ -151,6 +190,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Definition.ENUM_MEMBER member) is
+            location(member);
             dent();
             
             member.name.accept(this);
@@ -205,10 +245,12 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Type.NAMED named) is
+            location(named);
             named.name.accept(this);
         si
 
         void visit(Type.TUPLE tuple) is
+            location(tuple);
             append("(");
 
             tuple.elements.accept(this);
@@ -217,12 +259,14 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Type.NAMED_TUPLE_ELEMENT element) is
+            location(element);
             element.name.accept(this);
             append(": ");
             element.type.accept(this);
         si      
 
         void visit(Type.LIST types) is
+            location(types);
             var seen_any = false;
             foreach var t; types.Iterator do
                 if seen_any then
@@ -238,14 +282,22 @@ namespace Syntax is namespace Process is namespace Printer is
         // expression 
 
         void visit(Expression.Literal.NONE none) is
+            location(none);            
             append("none");
         si
 
         void visit(Expression.IDENTIFIER identifier) is
+            location(identifier);
             identifier.identifier.accept(this);
         si
 
+        void visit(Expression.SUPER super_) is
+            location(super_);            
+            append("super");
+        si
+
         void visit(Expression.NEW new_) is
+            location(new_);
             append("new ");
 
             new_.type.accept(this);
@@ -253,6 +305,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.CAST cast_) is
+            location(cast_);
             append("cast ");
 
             cast_.type.accept(this);
@@ -263,6 +316,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.TUPLE tuple) is
+            location(tuple);            
             append('(');
 
             tuple.elements.accept(this);
@@ -271,6 +325,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.CALL call) is
+            location(call);
             call.function.accept(this);
 
             append('(');
@@ -281,6 +336,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si            
 
         void visit(Expression.MEMBER member) is
+            location(member);
             member.left.accept(this);
 
             append('.');
@@ -289,6 +345,7 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.INDEX index) is
+            location(index);
             index.left.accept(this);
 
             append('[');
@@ -299,6 +356,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.UNARY unary) is
+            location(unary);
+
             unary.operation.accept(this);
             append(' ');
 
@@ -306,6 +365,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.BINARY binary) is
+            location(binary);
+
             binary.left.accept(this);
             append(' ');
             binary.operation.accept(this);
@@ -314,6 +375,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.LIST expressions) is
+            location(expressions);
+            
             var seen_any = false;
             foreach var e; expressions do
                 if seen_any then
@@ -327,10 +390,12 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.Literal.NODE literal) is
+            location(literal);
+            
             append(literal.value);
         si
 
-        void append_escape_char(char c) is
+        void append_escape_char(char c) is            
             var ci = cast int(c);
 
             if ci == 9 then
@@ -357,6 +422,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si                
 
         void visit(Expression.Literal.STRING string) is
+            location(string);
+            
             // VS Code wigs out over L char escape sequences for some reason
             append(cast char(34));
             foreach var c; string.value do
@@ -367,6 +434,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Expression.Literal.CHARACTER character) is
+            location(character);
+            
             append("'");
             append_escape_char(character.value[0]);
             append("'");
@@ -375,12 +444,16 @@ namespace Syntax is namespace Process is namespace Printer is
         // Statements
 
         void visit(Statement.LIST list) is
+            location(list);
+            
             foreach var s; list.Iterator do
                 s.accept(this);
             od
         si
 
         void visit(Statement.ASSIGNMENT assign) is
+            location(assign);
+            
             dent();
 
             assign.left.accept(this);
@@ -392,6 +465,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.EXPRESSION expression) is
+            location(expression);
+            
             dent();
 
             expression.expression.accept(this);
@@ -401,6 +476,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.VAR v) is
+            location(v);
+            
             dent();
 
             // append("var ");
@@ -411,6 +488,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.RETURN r) is
+            location(r);
+
             dent();
 
             append("return");
@@ -425,38 +504,87 @@ namespace Syntax is namespace Process is namespace Printer is
             nl();
         si
 
-        void visit(Statement.IF i) is
+        void visit(Statement.THROW t) is
+            location(t);
+            
             dent();
-            append("if ");
-            i.condition.accept(this);
-            append(" then\n");
 
-            in();
+            append("throw");
 
-            i.then_branch.accept(this);
-
-            if i.else_branch != null then
-                out();
-                dent();
-                append("else\n");
-                in();
-
-                i.else_branch.accept(this);
-            elif i.elif_branch != null then
-                // FIXME: this is a bodge!
-                append("el");
-
-                run_on();
-
-                i.elif_branch.accept(this);
+            if t.expression != null then
+                append(' ');
+                t.expression.accept(this);
             fi
 
-            out();
+            append(";");
 
-            dent_append("fi\n");                
+            nl();
+        si        
+
+        void visit(Statement.IF i) is
+            location(i);
+            
+            var is_first = true;
+            var seen_else = false;
+
+            IO.Std.err.println("print if...");
+
+            assert(i != null);
+
+            if i.branches == null then
+                IO.Std.err.println("print if no branches");
+            else
+                IO.Std.err.println("print if has branches");
+            fi
+
+            assert(i.branches != null);
+
+            foreach var b; i.branches do
+                location(b);
+                
+                IO.Std.err.println("print branch...");
+
+                assert(!seen_else);
+
+                dent();
+                if b.condition != null then
+                    IO.Std.err.println("has condition " + b.condition);
+
+                    if is_first then
+                        append("if ");
+                    else
+                        append("elif ");
+                    fi
+
+                    b.condition.accept(this);
+
+                    append(" then\n");
+                else
+                    IO.Std.err.println("no condition, must be else");
+                    seen_else = true;
+
+                    append("else\n");
+                fi
+
+                IO.Std.err.println("walk body...");
+
+                in();
+                b.body.accept(this);
+                out();
+
+                is_first = false;
+
+                IO.Std.err.println("done branch");
+            od
+
+            IO.Std.err.println("done fi");
+            dent();
+            append("fi\n");
         si
 
         void visit(Statement.CASE case_) is
+            location(case_);
+            
             dent();
             append("case ");
 
@@ -473,6 +601,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.CASE_MATCH match) is
+            location(match);
+            
             dent();
 
             if match.expression != null then
@@ -491,6 +621,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.TRY try_) is
+            location(try_);
+            
             dent();
             append("try\n");
 
@@ -512,10 +644,12 @@ namespace Syntax is namespace Process is namespace Printer is
             fi
 
             dent();
-            append("esac\n");
+            append("yrt\n");
         si
 
         void visit(Statement.CATCH catch_) is
+            location(catch_);
+            
             dent_append("catch ");
 
             catch_.variable.accept(this);
@@ -530,6 +664,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si            
 
         void visit(Statement.DO do_) is
+            location(do_);
+            
             dent();
 
             if do_.condition != null then
@@ -547,6 +683,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.LABELLED labelled) is
+            location(labelled);
+            
             dent();
 
             labelled.label.accept(this);
@@ -559,6 +697,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.BREAK break_) is
+            location(break_);
+            
             dent();
             append("break");
             if break_.label != null then
@@ -570,6 +710,8 @@ namespace Syntax is namespace Process is namespace Printer is
         si
 
         void visit(Statement.CONTINUE continue_) is
+            location(continue_);
+            
             dent();
             append("continue");
             if continue_.label != null then

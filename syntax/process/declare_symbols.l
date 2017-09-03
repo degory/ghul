@@ -177,12 +177,12 @@ namespace Syntax is namespace Process is
 
         // statements
 
-        bool pre (Statement.IF if_) is
-            create_and_enter_block_scope(if_);
+        bool pre (Statement.IF_BRANCH if_branch) is
+            create_and_enter_block_scope(if_branch);
         si
 
-        void visit(Statement.IF if_) is
-            leave_scope(if_);
+        void visit(Statement.IF_BRANCH if_branch) is
+            leave_scope(if_branch);
         si
 
         bool pre(Statement.CASE case_) is

@@ -34,13 +34,20 @@ namespace Syntax is namespace Parser is namespace Expression is
 
             add_parser(
                 Tree.Expression.NODE proc(CONTEXT context) is
-                    return new Tree.Expression.UNARY(
-                        context.location,
+                    var name = 
                         new Tree.Identifier.NODE(
                             context.location,
-                            context.current.string
-                        ),
-                        parse(context)
+                            context.current_string
+                        );
+                    
+                    context.next_token();
+
+                    var right = parse(context);
+
+                    return new Tree.Expression.UNARY(
+                        name.location..right.location,
+                        name,
+                        right
                     );
                 si,
                 Lexical.TOKEN.OPERATOR
@@ -225,6 +232,24 @@ namespace Syntax is namespace Parser is namespace Expression is
                 si,
                 Lexical.TOKEN.NONE
             );            
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    context.next_token();
+                    return new Tree.Expression.SELF(location);
+                si,
+                Lexical.TOKEN.SELF
+            );            
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    context.next_token();
+                    return new Tree.Expression.SUPER(location);
+                si,
+                Lexical.TOKEN.SUPER
+            );                        
         si
     si
 si si si

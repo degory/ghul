@@ -3,7 +3,7 @@ namespace Syntax is namespace Tree is namespace Expression is
     
     use Source;
 
-    class SELF isa NODE is
+    class SUPER isa NODE is
         void init(
             LOCATION location
         )
@@ -13,6 +13,6 @@ namespace Syntax is namespace Tree is namespace Expression is
 
         void accept(Visitor visitor) is
             visitor.visit(this);
-        si
+        si        
     si
 si si si

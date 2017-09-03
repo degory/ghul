@@ -8,8 +8,17 @@ namespace Syntax is namespace Parser is
     si
     
     class BASE<T> do Parser<T> is
+        Vector<Lexical.TOKEN> _expected_tokens;
+
         Generic.Map<Lexical.TOKEN,T proc(CONTEXT)> parsers;
-        Iterable<Lexical.TOKEN> expected_tokens;
+
+        get Iterable<Lexical.TOKEN> expected_tokens is
+            if _expected_tokens == null then
+                populate_expected_tokens();
+            fi                    
+
+            return _expected_tokens;
+        si
 
         void init() is
             parsers = new Generic.Map<Lexical.TOKEN, T proc(CONTEXT)>();
@@ -31,7 +40,7 @@ namespace Syntax is namespace Parser is
 
         void add_parser(T proc(CONTEXT) p, Lexical.TOKEN token) is
             if parsers[token] != null then
-                throw new Exception("% alread has a parser (%)" % Object{token, p});
+                throw new Exception("% already has a parser (%)" % Object{token, p});
             fi
 
             parsers[token] = p;
@@ -54,28 +63,13 @@ namespace Syntax is namespace Parser is
         si
 
         T other_token(CONTEXT context) is
-            if expected_tokens == null then
-                populate_expected_tokens();
-            fi                    
-
-            if context.current.string != null then
-                context.error(context.location, "%: expected % but found % %" 
-                    % Object{
-                        syntax_error_message,
-                        Lexical.TOKEN_NAMES[expected_tokens],
-                        context.current.name,
-                        context.current.string
-                    }
-                );            
-            else
-                context.error(context.location, "%: expected % but found %" 
-                    % Object{
-                        syntax_error_message,
-                        Lexical.TOKEN_NAMES[expected_tokens],
-                        context.current.name
-                    }
-                );
-            fi
+            context.error(context.location, "%: expected % but found %" 
+                % Object{
+                    syntax_error_message,
+                    Lexical.TOKEN_NAMES[expected_tokens],
+                    context.current_token_name
+                }
+            );            
         si
 
         private void populate_expected_tokens() is
@@ -85,7 +79,9 @@ namespace Syntax is namespace Parser is
                 et.add(k);                        
             od
 
-            expected_tokens = et;
+            assert(et.Length > 0, "should have at least one expected token");
+
+            _expected_tokens = et;
         si
     si
 si si

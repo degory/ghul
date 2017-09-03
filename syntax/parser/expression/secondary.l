@@ -76,7 +76,8 @@ namespace Syntax is namespace Parser is namespace Expression is
                 is Lexical.TOKEN.ARROW_THIN, Lexical.TOKEN.ARROW_FAT, Lexical.TOKEN.IS:
                     if
                         isa Tree.Expression.TUPLE(result) || 
-                        isa Tree.Expression.IDENTIFIER(result)
+                        isa Tree.Expression.IDENTIFIER(result) ||
+                        isa Tree.Expression.VARIABLE(result)
                     then
                         Tree.Type.NODE type;
                         Tree.Expression.TUPLE arguments;

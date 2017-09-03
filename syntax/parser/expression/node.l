@@ -2,6 +2,7 @@ namespace Syntax is namespace Parser is namespace Expression is
     use System;
     use Generic;
 
+    use Logging;
     use Source;
 
     enum PRECEDENCE is
@@ -97,9 +98,15 @@ namespace Syntax is namespace Parser is namespace Expression is
         )
         is
             do
+                LOGGER.trace("expression", "start parse min precedence " + cast int(min_precedence) + " left " + left);
+
                 var left_precedence = precedence(context);
 
-                if left_precedence < min_precedence then break; fi
+                if left_precedence < min_precedence then
+                    LOGGER.trace("expression", "break at left precedence " + cast int(left_precedence) + " left " + left);
+                    
+                    break;
+                fi
 
                 var op = new Tree.Identifier.NODE(
                     context.location,
@@ -108,15 +115,24 @@ namespace Syntax is namespace Parser is namespace Expression is
 
                 context.next_token();
 
+                LOGGER.trace("expression", "start parse secondary...");                
+
                 Tree.Expression.NODE right = expression_secondary_parser.parse(context);
-                
+
+                LOGGER.trace("expression", "parsed secondary right " + right);
+
                 do
                     var right_precedence = precedence(context);
 
+                    LOGGER.trace("expression", "start right precedence " + cast int(right_precedence) + " left " + left + ", right " + right);
+
                     if right_precedence <= left_precedence then
+                        LOGGER.trace("expression", "break precedence " + cast int(right_precedence) + " <= " + cast int(right_precedence) + " left " + left + ", right " + right);
+                    
                         break;
                     fi
 
+                    LOGGER.trace("expression", "sub parse right precedence " + cast int(right_precedence) + " left " + left + ", right " + right);
                     right = parse(context, right, right_precedence);
                 od
 

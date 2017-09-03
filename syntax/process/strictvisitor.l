@@ -182,6 +182,14 @@ namespace Syntax is
             throwNotImplemented("none", none);
         si
 
+        void visit(Expression.SELF self) is
+            throwNotImplemented("self", self);
+        si        
+
+        void visit(Expression.SUPER super_) is
+            throwNotImplemented("super", super_);
+        si        
+
         void visit(Expression.NEW new_) is
             throwNotImplemented("new", new_);
         si
@@ -258,6 +266,10 @@ namespace Syntax is
 
         void visit(Statement.RETURN return_) is
             throwNotImplemented("return", return_);
+        si
+
+        void visit(Statement.THROW throw_) is
+            throwNotImplemented("throw", throw_);
         si
 
         void visit(Statement.IF if_) is

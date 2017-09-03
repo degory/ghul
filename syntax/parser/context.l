@@ -123,12 +123,26 @@ namespace Syntax is
                 return tokenizer.is_end_of_file;
             si
 
+            get String current_token_name is
+                var result = Lexical.TOKEN_NAMES[current_token];
+
+                if result == null then
+                    result = "unknown";
+                fi
+
+                if current_string != null && current_string !~ result then
+                    result = result + ' ' + current_string;
+                fi
+
+                return result;
+            si
+
             public bool expect_token(Lexical.TOKEN token, String message) is
                 if current_token != token then
                     error(
                         location,
                         "%: expected % but found %"
-                            % Object{message, Lexical.TOKEN_NAMES[token], Lexical.TOKEN_NAMES[current_token]});
+                            % Object{message, Lexical.TOKEN_NAMES[token], current_token_name});
                     return false;
                 else
                     return true;
@@ -144,7 +158,7 @@ namespace Syntax is
                     error(
                         location,
                         "%: expected % but found %"
-                            % Object{message, Lexical.TOKEN_NAMES[tokens], Lexical.TOKEN_NAMES[current_token]});
+                            % Object{message, Lexical.TOKEN_NAMES[tokens], current_token_name});
                     return false;
                 else
                     return true;

@@ -11,6 +11,10 @@ namespace Syntax is namespace Parser is namespace Definition is
 
         get String description is return "member"; si
 
+        get Iterable<Lexical.TOKEN> expected_tokens is
+            return property_tokens;
+        si
+        
         List<Lexical.TOKEN> property_tokens;
 
         void init(

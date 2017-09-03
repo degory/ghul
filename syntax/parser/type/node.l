@@ -122,6 +122,15 @@ namespace Syntax is namespace Parser is namespace Type is
                     result = new Tree.Type.POINTER(result.location..context.location, result);
                     context.next_token();
 
+                is Lexical.TOKEN.ARROW_THIN:
+                    context.next_token();
+                    // FIXME: this will be right associative, which may not be what we want:
+                    var return_type = parse(context);
+
+                    var arguments = new Tree.Type.LIST(element.location, Tree.Type.NODE{element});
+
+                    result = new Tree.Type.FUNCTION(result.location..return_type.location, arguments, return_type);
+
                 default:
                     return result;
                 esac
