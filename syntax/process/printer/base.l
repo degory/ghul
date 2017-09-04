@@ -528,29 +528,16 @@ namespace Syntax is namespace Process is namespace Printer is
             var is_first = true;
             var seen_else = false;
 
-            IO.Std.err.println("print if...");
-
             assert(i != null);
-
-            if i.branches == null then
-                IO.Std.err.println("print if no branches");
-            else
-                IO.Std.err.println("print if has branches");
-            fi
-
             assert(i.branches != null);
 
             foreach var b; i.branches do
                 location(b);
-                
-                IO.Std.err.println("print branch...");
 
                 assert(!seen_else);
 
                 dent();
                 if b.condition != null then
-                    IO.Std.err.println("has condition " + b.condition);
-
                     if is_first then
                         append("if ");
                     else
@@ -561,26 +548,20 @@ namespace Syntax is namespace Process is namespace Printer is
 
                     append(" then\n");
                 else
-                    IO.Std.err.println("no condition, must be else");
                     seen_else = true;
 
-                    append("else\n");
+                    append("else\n");                    
                 fi
-
-                IO.Std.err.println("walk body...");
 
                 in();
                 b.body.accept(this);
                 out();
 
                 is_first = false;
-
-                IO.Std.err.println("done branch");
             od
 
-            IO.Std.err.println("done fi");
             dent();
-            append("fi\n");
+            append("fi\n");            
         si
 
         void visit(Statement.CASE case_) is
