@@ -194,6 +194,11 @@ namespace Syntax is namespace Process is namespace Printer is
         void visit(Definition.FUNCTION function) is
             dent();
 
+            if function.modifiers != null then
+                function.modifiers.accept(this);
+                append(' ');
+            fi
+
             append(function.location, function.type);
 
             append(' ');
