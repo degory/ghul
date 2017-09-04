@@ -182,6 +182,10 @@ namespace Syntax is
             throwNotImplemented("none", none);
         si
 
+        void visit(Expression.NULL null_) is
+            throwNotImplemented("null", null_);
+        si        
+
         void visit(Expression.SELF self) is
             throwNotImplemented("self", self);
         si        

@@ -37,6 +37,20 @@ namespace Syntax is namespace Process is namespace Printer is
 
         // Identifiers
 
+        void append_name(String name) is
+            var c = name[0];
+
+            if 
+                (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') ||
+                c == '_'
+            then
+                append(name);
+            else
+                append("operator");
+                append(name);
+            fi
+        si
 
         // definitions
 
@@ -475,8 +489,32 @@ namespace Syntax is namespace Process is namespace Printer is
 
         // expression 
 
+        void visit(Expression.NULL null_) is
+            append("null");
+        si        
+
         void visit(Expression.SELF self) is
             append("this");
+        si
+
+
+        void visit(Expression.UNARY unary) is
+            location(unary);
+
+            append(unary.operation.name);
+            append(' ');
+
+            unary.right.accept(this);
+        si
+
+        void visit(Expression.BINARY binary) is
+            location(binary);
+
+            binary.left.accept(this);
+            append(' ');
+            append(binary.operation.name);
+            append(' ');            
+            binary.right.accept(this);
         si
 
         void visit(Expression.VARIABLE variable) is

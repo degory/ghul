@@ -100,18 +100,21 @@ namespace Syntax is namespace Process is namespace Printer is
 
         // Identifiers
 
+        void append_name(String name) is
+            append(name);
+        si
+
         void visit(Identifier.NODE identifier) is
             location(identifier);
-            append(identifier.name);
+            append_name(identifier.name);
         si
 
         void visit(Identifier.QUALIFIED identifier) is
             location(identifier);
             identifier.parent.accept(this);
             
-            _result
-                .append('.')
-                .append(identifier.name);
+            append('.');
+            append_name(identifier.name);
         si
 
         // modifiers

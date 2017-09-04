@@ -321,6 +321,13 @@ namespace Syntax is
         void visit(Expression.Literal.NONE none) is
         si
 
+        bool pre(Expression.NULL null_) is
+            return false;
+        si        
+
+        void visit(Expression.NULL null_) is
+        si                
+
         bool pre(Expression.SELF self) is
             return false;
         si        

@@ -237,10 +237,19 @@ namespace Syntax is namespace Parser is namespace Expression is
                 Tree.Expression.NODE proc(CONTEXT context) is
                     var location = context.location;
                     context.next_token();
+                    return new Tree.Expression.NULL(location);
+                si,
+                Lexical.TOKEN.NULL
+            );                        
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var location = context.location;
+                    context.next_token();
                     return new Tree.Expression.SELF(location);
                 si,
                 Lexical.TOKEN.SELF
-            );            
+            );
 
             add_parser(
                 Tree.Expression.NODE proc(CONTEXT context) is

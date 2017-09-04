@@ -190,6 +190,10 @@ namespace Syntax is
             log("none", none);
         si
 
+        void visit(Expression.NULL null_) is
+            log("self", null_);
+        si                
+
         void visit(Expression.SELF self) is
             log("self", self);
         si        
