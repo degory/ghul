@@ -9,6 +9,11 @@ fi
 
 export LFLAGS="$LFLAGS -p $JOB_NAME"
 
+if [ -z "$GHUL"]; then
+    export PATH=$PATH:`pwd`
+    export GHUL=`which ghul`
+fi
+
 echo Building with $GHUL...
 find driver ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs $GHUL -E -L -o ghul imports.l
 # find driver ioc system logging source lexical syntax -name '*.l' | xargs ghul -o ghul/ghul imports.l  
