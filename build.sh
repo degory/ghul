@@ -1,4 +1,4 @@
-#!/bin/bash
+
 if [ -z "$JOB_NAME" ]; then
     export JOB_NAME=rewrite-ci
 fi
@@ -9,5 +9,6 @@ fi
 
 export LFLAGS="$LFLAGS -p $JOB_NAME"
 
-find driver ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs ghul -E -L -o ghul imports.l
+echo Building with $GHUL...
+find driver ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs $GHUL -E -L -o ghul imports.l
 # find driver ioc system logging source lexical syntax -name '*.l' | xargs ghul -o ghul/ghul imports.l  

@@ -4,5 +4,5 @@ if [ -z "$JOB_NAME" ]; then
 fi
 
 if [ -d /tmp/lcache-$JOB_NAME ]; then
-    rm -rf /tmp/lcache-$JOB_NAME
+    rm -rf /tmp/lcache-$JOB_NAME/*
 fi
