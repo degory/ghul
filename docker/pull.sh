@@ -4,6 +4,10 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
+if [ ! -z "$2" ]; then
+    BUILD_NUMBER=$2
+fi
+
 if [ -z "$BUILD_NUMBER" ]; then
     echo "Pull latest version of $1..."
     
