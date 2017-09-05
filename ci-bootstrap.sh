@@ -1,5 +1,47 @@
+
 #!/bin/bash
-pushd docker
-./pull-all.sh latest
-popd
-docker run -e GHUL=/usr/bin/ghul -v $WORKSPACE:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t docker.giantblob.com/ghul-ci ./bootstrap.sh
+
+if [ -z "$BUILD_WITH" ]; then
+    BUILD_WITH=stable
+fi
+
+if [ -z "$BUILD_NUMBER" ]; then
+    BUILD_NUMBER=ad-hoc
+fi
+
+echo $BUILD_NUMBER: Starting bootstrap...
+
+docker pull docker.giantblob.com/ghul:$BUILD_WITH || exit 1
+
+for p in 1 2 3 ; do
+    PASS=${BUILD_NUMBER}-${p}
+
+    echo $PASS: Start compile...
+
+    echo "namespace Source is class BUILD is public static System.String number=\"$PASS\"; si si" >source/build.l
+
+    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t ghul:$BUILD_WITH bash -c ./build.sh || exit 1
+
+    echo $PASS: Compilation complete
+
+    echo $PASS: Start tests... 
+
+    docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t ghul:$BUILD_WITH /bin/bash ./test.sh || exit 1
+
+    echo $PASS: Tests complete
+    echo $PASS: Build image...
+
+    docker build --pull . -t ghul:$PASS || exit 1
+
+    echo $PASS: Image built
+
+    BUILD_WITH=$PASS
+done
+
+echo $BUILD_NUMBER: Bootstrap complete, pushing stable image to repository...
+
+docker tag ghul:$PASS docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
+docker tag ghul:$PASS docker.giantblob.com/ghul:release-candidate || exit 1
+docker push docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
+docker push docker.giantblob.com/ghul:release-candidate || exit 1
+

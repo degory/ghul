@@ -24,6 +24,10 @@ if ! [ -d $LCACHE ] ; then
     mkdir $LCACHE
 fi
 
+if ! [ -d $TMP ] ; then
+    mkdir $TMP
+fi
+
 rm -f $BINARY ${BINARY}.bc ${BINARY}.lh ${LCACHE}/* ${TMP}/* 2>/dev/null
 
 if [ "$GHUL" = "" ] ; then

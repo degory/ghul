@@ -1,5 +1,3 @@
 #!/bin/bash
-cd $WORKSPACE/docker
-cp ../ghul ghul-ci && \
-cp ../ghul ghul-dev && \
-./build-all.sh
+docker tag docker.giantblob.com/ghul:release-candidate docker.giantblob.com/ghul:stable
+docker push docker.giantblob.com/ghul:stable
