@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 if [ -z "$BUILD_WITH" ]; then

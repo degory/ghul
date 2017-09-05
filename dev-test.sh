@@ -19,4 +19,4 @@ else
     echo "Not a test case or a test source file $1, running all tests"
 fi
 
-docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t docker.giantblob.com/ghul-dev ./test.sh $ARGUMENT
+docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t docker.giantblob.com/ghul:stable ./test.sh $ARGUMENT

@@ -1,4 +1,4 @@
-
+#!/bin/bash
 if [ -z "$JOB_NAME" ]; then
     export JOB_NAME=rewrite-ci
 fi

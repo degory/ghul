@@ -5,8 +5,6 @@ echo Testing "$GHUL (`$GHUL`)"
 
 cd test
 
-pwd
-
 if [ ! -z $1 ] ; then
     ./run.sh $1
 else
