@@ -9,7 +9,7 @@ fi
 
 export LFLAGS="$LFLAGS -p $JOB_NAME"
 
-if [ -z "$GHUL"]; then
+if [ -z "$GHUL" ]; then
     export PATH=$PATH:`pwd`
     export GHUL=`which ghul`
 fi
