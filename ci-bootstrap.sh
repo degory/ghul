@@ -2,7 +2,8 @@
 #!/bin/bash
 
 if [ -z "$BUILD_WITH" ]; then
-    BUILD_WITH=stable
+    BUILD_WITH=docker.giantblob.com/ghul:stable
+    docker pull $BUILD_WITH || exit 1
 fi
 
 if [ -z "$BUILD_NUMBER" ]; then
@@ -11,8 +12,6 @@ fi
 
 echo $BUILD_NUMBER: Starting bootstrap...
 
-docker pull docker.giantblob.com/ghul:$BUILD_WITH || exit 1
-
 for p in 1 2 3 ; do
     PASS=${BUILD_NUMBER}-${p}
 
@@ -20,22 +19,22 @@ for p in 1 2 3 ; do
 
     echo "namespace Source is class BUILD is public static System.String number=\"$PASS\"; si si" >source/build.l
 
-    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t ghul:$BUILD_WITH bash -c ./build.sh || exit 1
+    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH bash -c ./build.sh || exit 1
 
     echo $PASS: Compilation complete
 
     echo $PASS: Start tests... 
 
-    docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t ghul:$BUILD_WITH /bin/bash ./test.sh || exit 1
+    docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH /bin/bash ./test.sh || exit 1
 
     echo $PASS: Tests complete
     echo $PASS: Build image...
 
-    docker build --pull . -t ghul:$PASS || exit 1
+    BUILD_WITH=ghul:$PASS
+
+    docker build --pull . -t $BUILD_WITH || exit 1
 
     echo $PASS: Image built
-
-    BUILD_WITH=$PASS
 done
 
 echo $BUILD_NUMBER: Bootstrap complete, pushing stable image to repository...
