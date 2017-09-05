@@ -1,3 +1,4 @@
 #!/bin/bash
-docker run -v /var/lib/jenkins/workspace/:/var/lib/jenkins/workspace/ -w $WORKSPACE --user jenkins -t docker.giantblob.com/ghul-ci /bin/bash -c "./test.sh"
+docker run docker -v $WORKSPACE:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t docker.giantblob.com/ghul-ci /bin/bash ./test.sh
+
 

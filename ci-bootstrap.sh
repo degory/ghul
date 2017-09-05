@@ -2,4 +2,4 @@
 pushd docker
 ./pull-all.sh latest
 popd
-docker run -v /var/lib/jenkins/workspace/:/var/lib/jenkins/workspace/ -w $WORKSPACE --user jenkins -t docker.giantblob.com/ghul-ci ./bootstrap.sh
+docker run -e GHUL=/usr/bin/ghul -v $WORKSPACE:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t docker.giantblob.com/ghul-ci ./bootstrap.sh
