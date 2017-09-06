@@ -26,18 +26,18 @@ namespace Syntax is namespace Process is namespace Printer is
             node.accept(this);
         si
 
-        void append(LOCATION location, Type.NODE type) is
+        void print(LOCATION location, Type.NODE type) is
             if !isa Type.INFER(type) then
                 type.accept(this);
             else
                 _logger.warn(location, "legacy compiler cannot infer type here, assuming void");
-                append("void");
+                print("void");
             fi
         si
 
         // Identifiers
 
-        void append_name(String name) is
+        void print_name(String name) is
             var c = name[0];
 
             if 
@@ -45,10 +45,10 @@ namespace Syntax is namespace Process is namespace Printer is
                 (c >= 'A' && c <= 'Z') ||
                 c == '_'
             then
-                append(name);
+                print(name);
             else
-                append("operator");
-                append(name);
+                print("operator");
+                print(name);
             fi
         si
 
@@ -58,93 +58,83 @@ namespace Syntax is namespace Process is namespace Printer is
             // FIXME: not OOP
             if !isa Type.INFER(variable.type) then
                 variable.type.accept(this);
-                append(' ');
+                print(' ');
             else
-                append("var ");
+                print("var ");
             fi
 
             variable.name.accept(this);
 
             if variable.initializer != null then
-                append(" = ");
+                print(" = ");
                 variable.initializer.accept(this);
             fi
         si
 
         void visit(Definition.IMPORT import_) is
             foreach var i; import_.imports do
-                dent();
-
-                append("import ");
+                print("import ");
 
                 i.accept(this);
 
-                append(';');
-
-                nl();            
+                println(";");
             od
         si        
         
         void visit(Definition.NAMESPACE namespace_) is
-            dent();
-
             var seen_any = false;
 
             foreach var ns; namespace_.name do
                 if seen_any then
-                    append(' ');
+                    print(' ');
                 fi
 
-                append("namespace ");
-                append(ns);
-                append(" is");
+                print("namespace ");
+                print(ns);
+                print(" is");
 
                 seen_any = true;
             od
 
-            nl();
-            in();
+            println();
+            indent();
             namespace_.body.accept(this);
-            out();
+            outdent();
 
             seen_any = false;
 
             foreach var ns; namespace_.name do
                 if seen_any then
-                    append(' ');
+                    print(' ');
                 fi
 
-                append("si");
+                print("si");
 
                 seen_any = true;
             od            
 
-            nl();
+            println();
         si
 
         void visit(Definition.USE use_) is
             foreach var u; use_.uses do
-                dent();
-
-                append("use ");
+                print("use ");
 
                 u.accept(this);
 
-                append(';');
-
-                nl();            
+                println(";");
             od
         si        
 
         void visit(Definition.CLASS class_) is
-            dent_append("class ");
+            print("class ");
 
             class_.name.accept(this);
 
             if class_.arguments != null then 
-                append('<');
+                print('<');
                 class_.arguments.accept(this);
-                append('>');
+                print('>');
             fi
 
             if class_.ancestors != null then
@@ -155,11 +145,11 @@ namespace Syntax is namespace Process is namespace Printer is
                     // FIXME: this is a bodge - can't accurately map ghul syntax on to L here
                     // without a symbol table:
                     if count == 0 then
-                        append(" isa ");
+                        print(" isa ");
                     elif count == 1 then
-                        append(" do ");
+                        print(" do ");
                     else
-                        append(", ");
+                        print(", ");
                     fi
 
                     ancestor.accept(this);
@@ -168,101 +158,99 @@ namespace Syntax is namespace Process is namespace Printer is
                 od
             fi
 
-            append(" is\n");
-            in();
+            println(" is");
+            indent();
             class_.body.accept(this);
-            out();
-            dent_append("si\n");
+            outdent();
+            println("si");
         si
 
         void visit(Definition.INTERFACE interface_) is
-            dent_append("interface ");
+            print("interface ");
             interface_.name.accept(this);
 
             if interface_.arguments != null then
-                append('<');
+                print('<');
                 interface_.arguments.accept(this);
-                append('>');
+                print('>');
             fi
 
             if interface_.ancestors != null then
-                append("do ");
+                print("do ");
 
                 interface_.ancestors.accept(this);
             fi
 
-            append(" is\n");
-            in();
+            println(" is");
+            indent();
             interface_.body.accept(this);
-            out();
-            dent_append("si\n");
+            outdent();
+            println("si");
         si
 
-        void append_newline_after_body(Body.NODE body) is
+        void print_newline_after_body(Body.NODE body) is
             if !body.is_block then
                 // non-block body doesn't add a newline, but we always want one:
-                nl();
+                println();
             fi
         si
 
         void visit(Definition.FUNCTION function) is
-            dent();
-
             if function.modifiers != null then
                 function.modifiers.accept(this);
-                append(' ');
+                print(' ');
             fi
 
-            append(function.location, function.type);
+            print(function.location, function.type);
 
-            append(' ');
+            print(' ');
             
             function.name.accept(this);
-            append('(');
+            print('(');
             function.arguments.accept(this);
-            append(')');
+            print(')');
 
             if function.body != null then
-                append(' ');
+                print(' ');
                 function.body.accept(this);
-                nl();
+                println();
             fi
         si
 
-        void append_getter_modifiers(Modifier.LIST modifiers, Identifier.NODE name) is
+        void print_getter_modifiers(Modifier.LIST modifiers, Identifier.NODE name) is
             if modifiers.is_explicit_access then
                 modifiers.access_modifier.accept(this);
-                append(' ');
+                print(' ');
             elif name != null && name.name.startsWith('_') then
-                append("private ");
+                print("private ");
             fi
 
             if modifiers.storage_class != null then
                 modifiers.storage_class.accept(this);
-                append(' ');
+                print(' ');
             fi
         si
 
-        void append_setter_modifiers(Modifier.LIST modifiers) is
+        void print_setter_modifiers(Modifier.LIST modifiers) is
             if modifiers.is_explicit_access then
                 modifiers.access_modifier.accept(this);
-                append(' ');
+                print(' ');
             else
-                append("private ");
+                print("private ");
             fi
 
             if modifiers.storage_class != null then
                 modifiers.storage_class.accept(this);
-                append(' ');
+                print(' ');
             fi                    
         si
 
-        void append_backing_field_modifiers(Modifier.LIST modifiers) is
-            append("private ");
+        void print_backing_field_modifiers(Modifier.LIST modifiers) is
+            print("private ");
 
             if modifiers.storage_class != null then
                 modifiers.storage_class.accept(this);
-                append(' ');
+                print(' ');
             fi
         si
 
@@ -271,146 +259,132 @@ namespace Syntax is namespace Process is namespace Printer is
             if property.getter_body != null || property.setter_body != null then
 
                 if property.getter_body != null then
-                    dent();
+                    print_getter_modifiers(property.modifiers, property.name);
 
-                    append_getter_modifiers(property.modifiers, property.name);
+                    print("get ");
 
-                    append("get ");
+                    print(property.location, property.type);
 
-                    append(property.location, property.type);
-
-                    append(' ');
+                    print(' ');
 
                     property.name.accept(this);
 
-                    append(' ');
+                    print(' ');
         
                     property.getter_body.accept(this);
-                    nl();
+
+                    println();
                 fi
 
                 if property.setter_body != null then
-                    dent();
+                    print_setter_modifiers(property.modifiers);
 
-                    append_setter_modifiers(property.modifiers);
+                    print("set ");
 
-                    append("set ");
+                    print(property.location, property.type);
 
-                    append(property.location, property.type);
-
-                    append(' ');
+                    print(' ');
 
                     property.name.accept(this);
 
-                    append(' ');
+                    print(' ');
                     
-                    append(" = ");
+                    print(" = ");
                     property.setter_argument.accept(this);
-                    append(' ');
+                    print(' ');
 
                     property.setter_body.accept(this);
-                    nl();
+                    println();
                 fi
             elif !property.name.name.startsWith('_') && !property.modifiers.is_private then
                 // auto property:
 
-                dent();
-
-                append_backing_field_modifiers(property.modifiers);
+                print_backing_field_modifiers(property.modifiers);
                 
-                append(property.location, property.type);
+                print(property.location, property.type);
                 
-                append(" _");
+                print(" _");
                 property.name.accept(this);
-                append(";\n");
+                println(";");
 
-                dent();
+                print_getter_modifiers(property.modifiers, property.name);
 
-                append_getter_modifiers(property.modifiers, property.name);
-
-                append("get ");
-                append(property.location, property.type);
-                append(" ");
+                print("get ");
+                print(property.location, property.type);
+                print(" ");
                 property.name.accept(this);
-                append(" is return _");
+                print(" is return _");
                 property.name.accept(this);
-                append("; si\n");
+                println("; si");
 
-                dent();
-
-                append_setter_modifiers(property.modifiers);
+                print_setter_modifiers(property.modifiers);
                 
-                append("set ");
-                append(property.location, property.type);
-                append(" ");
+                print("set ");
+                print(property.location, property.type);
+                print(" ");
                 property.name.accept(this);
-                append(" = __value is _");
+                print(" = __value is _");
                 property.name.accept(this);
-                append(" = __value; si\n");                
+                println(" = __value; si");                
             else 
-                dent();
-
                 property.modifiers.accept(this);
 
-                append(property.location, property.type);
+                print(property.location, property.type);
                 
-                append(" ");
+                print(" ");
                 property.name.accept(this);
-                append(";\n");
+                println(";");
             fi
         si
 
         void visit(Definition.INDEXER indexer) is
             if indexer.getter_body != null || indexer.setter_body != null then
                 if indexer.getter_body != null then
-                    dent();
-                    append_getter_modifiers(indexer.modifiers, indexer.name);
+                    print_getter_modifiers(indexer.modifiers, indexer.name);
                     
-                    append("get ");
+                    print("get ");
 
-                    append(indexer.location, indexer.type);
+                    print(indexer.location, indexer.type);
 
                     if indexer.name != null then
-                        append(' ');
+                        print(' ');
 
                         indexer.name.accept(this);
                     fi
 
-                    append("[");
+                    print("[");
 
                     indexer.index_argument.accept(this);
 
-                    append("]");
+                    print("]");
         
                     indexer.getter_body.accept(this);
-                    nl();
+                    println();
                 fi
 
                 if indexer.setter_body != null then
-                    dent();
+                    print_setter_modifiers(indexer.modifiers);
 
-                    append_setter_modifiers(indexer.modifiers);
+                    print("set ");
 
-                    append("set ");
-
-                    append(indexer.location, indexer.type);
+                    print(indexer.location, indexer.type);
 
                     if indexer.name != null then
-                        append(' ');
+                        print(' ');
 
                         indexer.name.accept(this);
                     fi
 
-                    append("[");
+                    print("[");
 
                     indexer.index_argument.accept(this);
 
-                    append("] =");
+                    print("] =");
 
                     indexer.setter_argument.accept(this);
         
                     indexer.setter_body.accept(this);
-                    nl();
+                    println();
                 fi
             else
                 error(indexer.location, "indexer must have at at least read or assign body");
@@ -420,22 +394,22 @@ namespace Syntax is namespace Process is namespace Printer is
         // types
 
         void visit(Type.BUILT_IN type) is
-            append(type.name);
+            print(type.name);
         si
 
         void visit(Type.ARRAY array) is
             array.element.accept(this);
-            append("[]");
+            print("[]");
         si
 
         void visit(Type.POINTER pointer) is
             pointer.element.accept(this);
-            append(" ptr");
+            print(" ptr");
         si
 
         void visit(Type.REFERENCE reference) is
             reference.element.accept(this);
-            append(" ref");
+            print(" ref");
         si
 
         void visit(Type.NAMED named) is
@@ -444,29 +418,29 @@ namespace Syntax is namespace Process is namespace Printer is
 
         void visit(Type.GENERIC generic) is
             generic.name.accept(this);
-            append('<');
+            print('<');
 
             generic.arguments.accept(this);
 
-            append('>');
+            print('>');
         si
 
         void visit(Type.FUNCTION function) is
-            append(function.location, function.result);
+            print(function.location, function.result);
 
-            append(" proc(");
+            print(" proc(");
 
             function.arguments.accept(this);
 
-            append(")");
+            print(")");
         si
 
         void visit(Type.TUPLE tuple) is
-            append("(");
+            print("(");
 
             tuple.elements.accept(this);
 
-            append(")");
+            print(")");
         si
 
 /*
@@ -478,7 +452,7 @@ namespace Syntax is namespace Process is namespace Printer is
             var seen_any = false;
             foreach var t; types.Iterator do
                 if seen_any then
-                    append(',');
+                    print(',');
                 fi
 
                 t.accept(this);
@@ -490,22 +464,22 @@ namespace Syntax is namespace Process is namespace Printer is
         // expression 
 
         void visit(Expression.NULL null_) is
-            append("null");
+            print("null");
         si        
 
         void visit(Expression.SELF self_) is
-            append("this");
+            print("this");
         si
 
         void visit(Expression.NEW new_) is
             location(new_);
-            append("new ");
+            print("new ");
 
             if isa Tree.Type.ARRAY(new_.type) then
                 cast Tree.Type.ARRAY(new_.type).element.accept(this);
-                append('[');
+                print('[');
                 new_.arguments.elements.accept(this);
-                append(']');
+                print(']');
             else
                 new_.type.accept(this);
                 new_.arguments.accept(this);
@@ -515,8 +489,8 @@ namespace Syntax is namespace Process is namespace Printer is
         void visit(Expression.UNARY unary) is
             location(unary);
 
-            append(unary.operation.name);
-            append(' ');
+            print(unary.operation.name);
+            print(' ');
 
             unary.right.accept(this);
         si
@@ -525,16 +499,16 @@ namespace Syntax is namespace Process is namespace Printer is
             location(binary);
 
             binary.left.accept(this);
-            append(' ');
-            append(binary.operation.name);
-            append(' ');            
+            print(' ');
+            print(binary.operation.name);
+            print(' ');            
             binary.right.accept(this);
         si
 
         void visit(Expression.VARIABLE variable) is
             if !isa Type.INFER(variable.type) then
                 variable.type.accept(this);
-                append(' ');
+                print(' ');
             else
                 _logger.error(variable.location, "legacy compiler cannot infer type here");
             fi
@@ -542,7 +516,7 @@ namespace Syntax is namespace Process is namespace Printer is
             variable.identifier.accept(this);
 
             if variable.initializer != null then
-                append(" = ");
+                print(" = ");
 
                 variable.initializer.accept(this);
             fi
@@ -555,13 +529,13 @@ namespace Syntax is namespace Process is namespace Printer is
         */
 
         void visit(Syntax.Tree.Expression.FUNCTION function) is
-            append(function.location, function.type);
+            print(function.location, function.type);
 
-            append(" proc");
+            print(" proc");
 
             function.arguments.accept(this);
 
-            append(" ");
+            print(" ");
 
             function.body.accept(this);
         si
@@ -571,78 +545,75 @@ namespace Syntax is namespace Process is namespace Printer is
                 sequence.type.accept(this);
             fi        
 
-            append('{');
+            print('{');
 
             sequence.elements.accept(this);
 
-            append('}');
+            print('}');
         si            
 
         void visit(Expression.HAS_VALUE has_value) is
-            append("((");
+            print("((");
             has_value.left.accept(this);
-            append(")!=null)");
+            print(")!=null)");
         si
 
         // Statements
 
         void visit(Statement.LET l) is
-            // dent_append("var ");
+            // print("var ");
             l.variables.accept(this);
-            append(";");
-            nl();
+            println(";");
         si
 
         void visit(Statement.CASE_MATCH match) is
-            dent();
-
             if match.expressions != null then
-                append("is ");
+                print("is ");
 
                 match.expressions.accept(this);
 
-                append(":\n");
+                println(":");
             else
-                append("default:\n");
+                println("default:");
             fi
 
-            in();
+            indent();
             match.statements.accept(this);
-            out();
+            outdent();
         si
 
         void visit(Statement.FOR for_) is
-            dent_append("foreach ");
+            print("foreach ");
 
             for_.variable.accept(this);
 
-            append("; ");
+            print("; ");
 
             for_.expression.accept(this);
 
-            append(" do\n");
+            println(" do");
 
-            in();
+            indent();
             for_.body.accept(this);
-            out();
+            outdent();
 
-            dent_append("od\n"); 
+            println("od"); 
         si
 
         // function body
 
         void visit(Body.EXPRESSION expression) is
-            append(" is return ");
+            print(" is return ");
             expression.expression.accept(this);
-            append("; si");
+            print("; si");
         si
 
         void visit(Body.BLOCK block) is
-            append("is\n");
-            in();
+            println("is");
+            indent();
             block.statements.accept(this);
-            out();
-            dent_append("si");
+            outdent();
+            print("si");
         si            
     si
 si si si
