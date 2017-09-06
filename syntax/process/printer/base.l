@@ -601,10 +601,10 @@ namespace Syntax is namespace Process is namespace Printer is
             
             dent();
 
-            if match.expression != null then
+            if match.expressions != null then
                 append("when ");
 
-                match.expression.accept(this);
+                match.expressions.accept(this);
 
                 append(":\n");
             else
