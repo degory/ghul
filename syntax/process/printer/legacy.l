@@ -382,6 +382,8 @@ namespace Syntax is namespace Process is namespace Printer is
                     print("] =");
 
                     indexer.setter_argument.accept(this);
+
+                    print(" ");
         
                     indexer.setter_body.accept(this);
                     println();
