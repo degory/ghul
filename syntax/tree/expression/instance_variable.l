@@ -5,12 +5,12 @@ namespace Syntax is namespace Tree is namespace Expression is
     use Source;
 
     class INSTANCE_VARIABLE isa NODE is
-        public NODE self;
+        public NODE self_;
         public String name;
         
         void init(
             LOCATION location,
-            NODE self,
+            NODE self_,
             String name,            
             Type.NODE type
         )
@@ -27,7 +27,7 @@ namespace Syntax is namespace Tree is namespace Expression is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                self.walk(visitor);
+                self_.walk(visitor);
                 type.walk(visitor);
             fi
 
@@ -35,7 +35,7 @@ namespace Syntax is namespace Tree is namespace Expression is
         si
 
         void rewrite(Dict<Tree.NODE,Tree.NODE> m) is
-            self = cast NODE(m[self]);
+            self_ = cast NODE(m[self_]);
             type = cast Type.NODE(m[type]);
         si        
     si

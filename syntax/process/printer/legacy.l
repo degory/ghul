@@ -493,7 +493,7 @@ namespace Syntax is namespace Process is namespace Printer is
             append("null");
         si        
 
-        void visit(Expression.SELF self) is
+        void visit(Expression.SELF self_) is
             append("this");
         si
 

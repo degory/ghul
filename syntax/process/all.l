@@ -194,8 +194,8 @@ namespace Syntax is
             log("self", null_);
         si                
 
-        void visit(Expression.SELF self) is
-            log("self", self);
+        void visit(Expression.SELF self_) is
+            log("self", self_);
         si        
 
         void visit(Expression.SUPER super_) is

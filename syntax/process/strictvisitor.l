@@ -186,8 +186,8 @@ namespace Syntax is
             throwNotImplemented("null", null_);
         si        
 
-        void visit(Expression.SELF self) is
-            throwNotImplemented("self", self);
+        void visit(Expression.SELF self_) is
+            throwNotImplemented("self", self_);
         si        
 
         void visit(Expression.SUPER super_) is

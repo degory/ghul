@@ -360,12 +360,12 @@ namespace Syntax is
         si
 
         /*
-        bool pre(Expression.SELF self) is
-            self.rewrite(_map);
+        bool pre(Expression.SELF self_) is
+            self_.rewrite(_map);
             return false;
         si
 
-        void visit(Expression.SELF self) is
+        void visit(Expression.SELF self_) is
         si
 
         bool pre(Expression.SUPER super_) is

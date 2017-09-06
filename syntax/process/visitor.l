@@ -328,11 +328,11 @@ namespace Syntax is
         void visit(Expression.NULL null_) is
         si                
 
-        bool pre(Expression.SELF self) is
+        bool pre(Expression.SELF self_) is
             return false;
         si        
 
-        void visit(Expression.SELF self) is
+        void visit(Expression.SELF self_) is
         si        
 
         bool pre(Expression.SUPER super_) is

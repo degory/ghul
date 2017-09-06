@@ -38,18 +38,18 @@ namespace Syntax is namespace Tree is namespace Statement is
     si
 
     class CASE_MATCH isa NODE is
-        public Expression.NODE expression;
+        public Expression.LIST expressions;
         public LIST statements;
 
         void init(
             LOCATION location,
-            Expression.NODE expression,
+            Expression.LIST expressions,
             LIST statements
         )
         is
             super.init(location);
 
-            this.expression = expression;
+            this.expressions = expressions;
             this.statements = statements;
         si
 
@@ -59,8 +59,8 @@ namespace Syntax is namespace Tree is namespace Statement is
 
         void walk(Visitor visitor) is
             if !visitor.pre(this) then
-                if expression != null then
-                    expression.walk(visitor);
+                if expressions != null then
+                    expressions.walk(visitor);
                 fi
                 
                 statements.walk(visitor);

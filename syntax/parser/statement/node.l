@@ -9,6 +9,8 @@ namespace Syntax is namespace Parser is namespace Statement is
         Parser<Tree.Identifier.NODE> identifier_parser;
 
         Parser<Tree.Expression.NODE> expression_parser;
+        Parser<Tree.Expression.LIST> expression_list_parser;
+
         Parser<Tree.Variable.NODE> variable_parser;
         Parser<Tree.Variable.LIST> variable_list_parser;
 
@@ -22,6 +24,7 @@ namespace Syntax is namespace Parser is namespace Statement is
             List<Lexical.TOKEN> labellable_statement_tokens,
             Parser<Tree.Identifier.NODE> identifier_parser,
             Parser<Tree.Expression.NODE> expression_parser,
+            Parser<Tree.Expression.LIST> expression_list_parser,
             Parser<Tree.Variable.NODE> variable_parser,
             Parser<Tree.Variable.LIST> variable_list_parser,
             Parser<Tree.Statement.LIST> statement_list_parser
@@ -32,6 +35,7 @@ namespace Syntax is namespace Parser is namespace Statement is
             this.labellable_statement_tokens = labellable_statement_tokens;
             this.identifier_parser = identifier_parser;
             this.expression_parser = expression_parser;
+            this.expression_list_parser = expression_list_parser;
             this.variable_parser = variable_parser;
             this.variable_list_parser = variable_list_parser;
             this.statement_list_parser = statement_list_parser;
@@ -137,11 +141,11 @@ namespace Syntax is namespace Parser is namespace Statement is
 
                     while context.current.token != Lexical.TOKEN.ESAC do
                         var match_start = context.location;
-                        Tree.Expression.NODE match_expression;
+                        Tree.Expression.LIST match_expressions;
 
                         if context.current.token != Lexical.TOKEN.DEFAULT then
                             context.next_token(Lexical.TOKEN.WHEN);
-                            match_expression = expression_parser.parse(context);
+                            match_expressions = expression_list_parser.parse(context);
 
                             context.next_token(Lexical.TOKEN.COLON);
                         else
@@ -154,13 +158,13 @@ namespace Syntax is namespace Parser is namespace Statement is
                             context.next_token(Lexical.TOKEN.DEFAULT);                            
                         fi
 
-                        var match_statement = statement_list_parser.parse(context);
+                        var match_statements = statement_list_parser.parse(context);
 
                         match_list.add(
                             new Tree.Statement.CASE_MATCH(
-                                match_start..match_statement.location,
-                                match_expression,
-                                match_statement
+                                match_start..match_statements.location,
+                                match_expressions,
+                                match_statements
                             )
                         );
                     od
