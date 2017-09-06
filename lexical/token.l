@@ -38,7 +38,6 @@ namespace Lexical is
     EQ,
     EQ_OBJ,
     ESAC,
-    EXTENDS,
     FALSE,
     FI,
     FINALLY,

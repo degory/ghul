@@ -319,6 +319,17 @@ namespace Syntax is namespace Process is namespace Printer is
             append(')');
         si
 
+        void visit(Expression.ISA isa_) is
+            location(isa_);
+            append("isa ");
+
+            isa_.type.accept(this);
+
+            append('(');
+            isa_.right.accept(this);
+            append(')');
+        si        
+
         void visit(Expression.TUPLE tuple) is
             location(tuple);            
             append('(');

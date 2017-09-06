@@ -194,6 +194,32 @@ namespace Syntax is namespace Parser is namespace Expression is
                 Lexical.TOKEN.CAST
             );       
 
+
+            add_parser(
+                Tree.Expression.NODE proc(CONTEXT context) is
+                    var start = context.location;
+
+                    context.next_token(Lexical.TOKEN.ISA);
+
+                    var type = type_parser.parse(context);
+
+                    context.next_token(Lexical.TOKEN.PAREN_OPEN);
+
+                    var value = expression_parser.parse(context);
+                    
+                    var result = new Tree.Expression.ISA(
+                        start..context.location,
+                        type,
+                        value
+                    );
+
+                    context.next_token(Lexical.TOKEN.PAREN_CLOSE);
+
+                    return result;
+                si,
+                Lexical.TOKEN.ISA
+            );                  
+
             add_parser(
                 Tree.Expression.NODE proc(CONTEXT context) is
                     var location = context.location;

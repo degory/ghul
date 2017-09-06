@@ -210,6 +210,10 @@ namespace Syntax is
             log("cast", cast_);
         si        
 
+        void visit(Expression.ISA isa_) is
+            log("isa", isa_);
+        si        
+
         void visit(Syntax.Tree.Expression.FUNCTION function) is
             log("function", function);
         si        

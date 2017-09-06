@@ -44,7 +44,6 @@ namespace Lexical is
             names[TOKEN.EQ] = "==";
             names[TOKEN.EQ_OBJ] = "=~";
             names[TOKEN.ESAC] = "esac";
-            names[TOKEN.EXTENDS] = "isa";
             names[TOKEN.FALSE] = "false";
             names[TOKEN.FI] = "fi";
             names[TOKEN.FINALLY] = "finally";

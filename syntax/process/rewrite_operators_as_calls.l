@@ -104,6 +104,13 @@ namespace Syntax is namespace Process is
         void visit(Expression.CAST cast_) is
         si
 
+        bool pre(Expression.ISA isa_) is
+            return false;
+        si
+
+        void visit(Expression.ISA isa_) is
+        si        
+
         bool pre(Expression.CALL call) is
             return false;
         si

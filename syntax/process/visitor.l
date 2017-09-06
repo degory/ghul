@@ -356,6 +356,13 @@ namespace Syntax is
         void visit(Expression.CAST cast_) is
         si        
 
+        bool pre(Expression.ISA isa_) is
+            return false;
+        si
+
+        void visit(Expression.ISA isa_) is
+        si        
+
         bool pre(Syntax.Tree.Expression.FUNCTION function) is
             return false;
         si
