@@ -497,6 +497,20 @@ namespace Syntax is namespace Process is namespace Printer is
             append("this");
         si
 
+        void visit(Expression.NEW new_) is
+            location(new_);
+            append("new ");
+
+            if isa Tree.Type.ARRAY(new_.type) then
+                cast Tree.Type.ARRAY(new_.type).element.accept(this);
+                append('[');
+                new_.arguments.elements.accept(this);
+                append(']');
+            else
+                new_.type.accept(this);
+                new_.arguments.accept(this);
+            fi
+        si        
 
         void visit(Expression.UNARY unary) is
             location(unary);
