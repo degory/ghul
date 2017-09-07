@@ -420,6 +420,8 @@ namespace Syntax is namespace Process is namespace Printer is
                 print(cast char(34));
             elif ci == 39 then
                 print("\'");
+            elif ci == 92 then
+                print("\\\\");
             else
                 print(c);
             fi
