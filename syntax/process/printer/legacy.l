@@ -214,6 +214,8 @@ namespace Syntax is namespace Process is namespace Printer is
                 print(' ');
                 function.body.accept(this);
                 println();
+            else
+                println(";");
             fi
         si
 
