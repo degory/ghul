@@ -29,10 +29,16 @@ namespace Syntax is namespace Parser is namespace Statement is
             var statements = new Vector<Tree.Statement.NODE>();
 
             while !at_terminator(context) do
-                var statement = statement_parser.parse(context);
+                if context.current.token == Lexical.TOKEN.SEMICOLON then
+                    IoC.CONTAINER.instance.logger.warn(context.current.location, "empty statement");
+                    context.next_token();
+                else
 
-                if statement != null then
-                    statements.add(statement);
+                    var statement = statement_parser.parse(context);
+
+                    if statement != null then
+                        statements.add(statement);
+                    fi
                 fi
             od                
 
