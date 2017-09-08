@@ -11,7 +11,7 @@ fi
 
 echo $BUILD_NUMBER: Starting bootstrap...
 
-for p in 1 2 3 ; do
+for p in 1 2 bs ; do
     PASS=${BUILD_NUMBER}-${p}
 
     echo $PASS: Start compile...
@@ -42,4 +42,9 @@ docker tag ghul:$PASS docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
 docker tag ghul:$PASS docker.giantblob.com/ghul:release-candidate || exit 1
 docker push docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
 docker push docker.giantblob.com/ghul:release-candidate || exit 1
+
+docker tag ghul:$PASS degory/ghul:${BUILD_NUMBER} || echo "Could not push to public Docker registry"
+docker tag ghul:$PASS degory/ghul:release-candidate || echo "Could not push to public Docker registry"
+docker push degory/ghul:${BUILD_NUMBER} || echo "Could not push to public Docker registry"
+docker push degory/ghul:release-candidate || echo "Could not push to public Docker registry"
 
