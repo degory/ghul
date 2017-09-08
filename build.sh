@@ -15,5 +15,5 @@ if [ -z "$GHUL" ]; then
 fi
 
 echo "Building with $GHUL (`$GHUL`)..."
-find driver ioc system logging source lexical syntax -name '*.ghul' |  xargs $GHUL -E -L -o ghul imports.l source/*.l
+find driver ioc system logging source lexical syntax -name '*.ghul' |  xargs $GHUL -L -o ghul imports.l source/*.l
 # find driver ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs $GHUL -E -L -o ghul imports.l
