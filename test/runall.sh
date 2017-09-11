@@ -11,7 +11,7 @@ let passed=0
 let failed=0
 
 for d in cases/* ; do
-	if [ -d $d ] ; then
+	if [ -d $d ] && [ ! -f $d/disabled ] ; then
         i=`basename $d`
 	    if ./run.sh $i $CAPTURE ; then
             echo "$i: passed"
