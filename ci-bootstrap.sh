@@ -36,7 +36,7 @@ for p in 1 2 bs ; do
     echo $PASS: Image built
 done
 
-echo $BUILD_NUMBER: Bootstrap complete, pushing stable image to repository...
+echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate image to repository...
 
 docker tag ghul:$PASS docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
 docker tag ghul:$PASS docker.giantblob.com/ghul:release-candidate || exit 1

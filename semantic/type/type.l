@@ -1,11 +1,13 @@
-namespace Type is
-    use System;
+namespace Semantic is
+    namespace Type is
+        use System;
 
-    interface Typed is
-        get BASE type;
-    si
+        interface Typed is
+            get BASE type;
+        si
 
-    interface SettableTyped isa Typed is
-        set BASE type = value;
+        interface SettableTyped isa Typed is
+            set BASE type = value;
+        si
     si
 si
