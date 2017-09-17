@@ -89,7 +89,7 @@ namespace Source is
         si
 
         String toString() is
-            return "% %,%..%,%" % Object{file_name, start_line, start_column, end_line, end_column};
+            return "% %,%..%,%" % {file_name, start_line, start_column, end_line, end_column};
         si
 
         LOCATION operator..(LOCATION with) is
