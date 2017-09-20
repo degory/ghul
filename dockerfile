@@ -1,4 +1,4 @@
-FROM docker.giantblob.com/ex:latest
+FROM degory/ex:latest
 COPY ghul /usr/bin/
 COPY lib/ /usr/lib/ghul/
 
