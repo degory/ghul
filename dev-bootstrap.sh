@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ -z "$BUILD_WITH" ]; then
-    BUILD_WITH=degory/ghul:stable
+    BUILD_WITH=ghul/compiler:stable
     docker pull $BUILD_WITH || exit 1
 fi
 

@@ -1,13 +1,20 @@
 #!/bin/bash
 
-if [ -z "$BUILD_WITH" ]; then
-    BUILD_WITH=docker.giantblob.com/ghul:stable
-    docker pull $BUILD_WITH || exit 1
-fi
+set -e
+
+BUILD_WITH=ghul/compiler:stable
+docker pull $BUILD_WITH
 
 if [ -z "$BUILD_NUMBER" ]; then
-    BUILD_NUMBER=ad-hoc
+    echo "No build number set"
+    exit 1;
 fi
+
+# pull the latest legacy compiler image and push to public repo
+# so it's available for development builds:
+docker pull docker.giantblob.com/ex
+docker tag docker.giantblob.com/ex ghul/llc:${BUILD_NUMBER}
+docker push ghul/llc:${BUILD_NUMBER}
 
 echo $BUILD_NUMBER: Starting bootstrap...
 
@@ -38,13 +45,8 @@ done
 
 echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate image to repository...
 
-docker tag ghul:$PASS docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
-docker tag ghul:$PASS docker.giantblob.com/ghul:release-candidate || exit 1
-docker push docker.giantblob.com/ghul:${BUILD_NUMBER} || exit 1
-docker push docker.giantblob.com/ghul:release-candidate || exit 1
+docker tag ghul:$PASS ghul/compiler:release-candidate || exit 1
+docker push ghul/compiler:release-candidate || exit 1
 
-docker tag ghul:$PASS degory/ghul:${BUILD_NUMBER} || echo "Could not push to public Docker registry"
-docker tag ghul:$PASS degory/ghul:release-candidate || echo "Could not push to public Docker registry"
-docker push degory/ghul:${BUILD_NUMBER} || echo "Could not push to public Docker registry"
-docker push degory/ghul:release-candidate || echo "Could not push to public Docker registry"
-
+docker tag ghul:$PASS ghul/compiler:${BUILD_NUMBER} || exit 1
+docker push ghul/compiler:${BUILD_NUMBER} || exit 1

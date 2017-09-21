@@ -1,7 +1,6 @@
 #!/bin/bash
-docker tag docker.giantblob.com/ghul:release-candidate docker.giantblob.com/ghul:stable
-docker push docker.giantblob.com/ghul:stable
+set -e
+docker tag ghul/compiler:release-candidate ghul/compiler:stable
+docker push ghul/compiler:stable
 
-docker tag degory/ghul:release-candidate degory/ghul:stable || echo "Could not push to public Docker registry"
-docker push degory/ghul:stable || echo "Could not push to public Docker registry"
 
