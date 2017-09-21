@@ -10,7 +10,7 @@ Prerequisites:
 - Bash shell (I develop on Linux but [GitBash](https://git-scm.com/download/win) should work on Windows)
 - [Visual Studio Code](https://code.visualstudio.com) (not strictly required, but using VSCode gets you syntax highlighting + integrated builds with error highlighting via the [ghūl VSCode extension](https://github.com/degory/ghul-vsce/releases))
 
-The compiler and any executables it produces currently require specific old versions of some dependencies that are difficult to get working on recent versions of Linux. These dependencies are all packaged in the `ghul/compiler` Docker image, so you do not have to deal with installing them directly, but the compiler needs to be built in, and be run in this container, and so do any compiled binaries.
+The compiler and any executables it produces currently require specific old versions of some dependencies that are difficult to get working on recent versions of Linux. These dependencies are all packaged in the `ghul/compiler` Docker image, so you do not have to deal with installing them directly, but the compiler needs to be both built in and  run in this container, as do any compiled binaries.
 
 To build and test from within Visual Studio Code:
 - Build the compiler: CTRL+SHIFT+B
