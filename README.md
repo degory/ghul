@@ -4,23 +4,23 @@ Compiler for the [ghūl programming language](https://www.ghul.io)
 [![Build Status](https://build.ghul.io/buildStatus/icon?job=ghul-ci)](https://build.ghul.io/job/ghul-ci)
 
 ## Getting started
-Prerequisites:
+### Prerequisites:
 - [Docker](https://www.docker.com) (any recent version should work)
 - Bash shell (I develop on Linux but [GitBash](https://git-scm.com/download/win) should work on Windows)
 - [Visual Studio Code](https://code.visualstudio.com) (not strictly required, but using VSCode gets you syntax highlighting + integrated builds with error highlighting via the [ghūl VSCode extension](https://github.com/degory/ghul-vsce/releases))
 
-To build and test from within Visual Studio Code:
+### To build and test from within Visual Studio Code:
 - Build the compiler: CTRL+SHIFT+B
 - Run all tests: CTRL+SHIFT+T
 - Run a specific test: navigate to a test.ghul under test/cases/.../ then CTRL+SHIFT+T
 
-To build and test from the command line:
+### To build and test from the command line:
 - Build the compiler: `./dev-build.sh`
 - Run all tests: `./dev-test.sh`
 - Run a specific test: `./dev-test.sh test-case-name`
 - Capture test output: `./dev-capture.sh test-case-name`
 - Bootstrap the compiler: `./dev-bootstrap.sh`
-- Start a shell in development container: `./dev.sh`
+- Start an interactive shell in the development container: `./dev.sh`
 
 ## Gotchas
 ### General
