@@ -11,12 +11,21 @@ if [[ $1 =~ .ghul$ ]] ; then
         ARGUMENT=$NAME
     else
         echo "Run all tests"
-    fi    
-elif [ -d test/cases/$1 ] ; then
+    fi
+elif [ -z $1 ] ; then
+    echo "Run all test cases"
+elif [[ -d test/cases/$1 ]] ; then
     echo "Run test case $1"
     ARGUMENT=$1
 else
-    echo "Not a test case or a test source file $1, running all tests"
+    CASE=`echo test/cases/$1*`
+
+    if [ -d $DIRECTORY ] ; then
+        ARGUMENT=`basename $CASE`
+        echo "Run test case $ARGUMENT"
+    else
+        echo "Not a test case or a test source file $1, running all tests"
+    fi
 fi
 
 docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $ARGUMENT
