@@ -1,5 +1,5 @@
 if [ -z $1 ] ; then
-    echo "usage: ./dev-test.sh test-case-name"
+    echo "usage: ./dev-capture.sh test-case-name"
     exit 1
 fi
 
