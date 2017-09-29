@@ -16,6 +16,8 @@ docker pull docker.giantblob.com/ex
 docker tag docker.giantblob.com/ex ghul/llc:${BUILD_NUMBER}
 docker push ghul/llc:${BUILD_NUMBER}
 
+docker tag docker.giantblob.com/ex ghul/llc:latest
+
 echo $BUILD_NUMBER: Starting bootstrap...
 
 for p in 1 2 bs ; do
@@ -38,7 +40,7 @@ for p in 1 2 bs ; do
 
     BUILD_WITH=ghul:$PASS
 
-    docker build --pull . -t $BUILD_WITH || exit 1
+    docker build . -t $BUILD_WITH || exit 1
 
     echo $PASS: Image built
 done
