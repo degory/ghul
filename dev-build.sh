@@ -1,4 +1,12 @@
 #!/bin/bash
-mkdir -p /tmp/lcache-dev 2>&1 >/dev/null
+export MSYS_NO_PATHCONV=1
+
+if [[ -d /tmp/lcache-dev ]]; then
+    LCACHE=/tmp/lcache-dev
+else
+    docker volume create lcache
+    LCACHE=lcache
+fi
+
 echo "namespace Source is class BUILD is public static System.String number=\"local\"; si si" >source/build.l
-docker run -e LFLAGS="-FB -FN" -e JOB_NAME=dev -v /tmp/lcache-dev:/tmp/lcache-dev -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./build.sh
+docker run -e LFLAGS="-FB -FN" -v ${LCACHE}:/tmp/lcache/ -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./build.sh

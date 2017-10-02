@@ -1,31 +1,38 @@
 #!/bin/bash
 
-if [[ $1 =~ .ghul$ ]] ; then
-    CASE=`dirname $1`
+if (which cygpath >/dev/nul 2>/dev/nul) ; then
+    ARG=`cygpath -a $1`
+else
+    ARG=$1
+fi
+
+if [[ $ARG =~ .ghul$ ]] ; then
+    CASE=`dirname $ARG`
     NAME=`basename $CASE`
     PARENT=`dirname $CASE`
 
     if [[ $PARENT =~ test/cases$ ]] ; then
-        echo "Run test containing $1, test case $NAME"
+        echo "Run test containing $ARG, test case $NAME"
 
-        ARGUMENT=$NAME
+        TEST=$NAME
     else
         echo "Run all tests"
     fi
-elif [ -z $1 ] ; then
+elif [ -z $ARG ] ; then
     echo "Run all test cases"
-elif [[ -d test/cases/$1 ]] ; then
-    echo "Run test case $1"
-    ARGUMENT=$1
+elif [[ -d test/cases/$ARG ]] ; then
+    echo "Run test case $ARG"
+    TEST=$ARG
 else
-    CASE=`echo test/cases/$1*`
+    CASE=`echo test/cases/$ARG*`
 
-    if [ -d $DIRECTORY ] ; then
-        ARGUMENT=`basename $CASE`
-        echo "Run test case $ARGUMENT"
+    if [ -d $CASE ] ; then
+        TEST=`basename $CASE`
+        echo "Run test case $TEST"
     else
-        echo "Not a test case or a test source file $1, running all tests"
+        echo "Not a test case or a test source file $ARG, running all tests"
     fi
 fi
 
-docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $ARGUMENT
+MSYS_NO_PATHCONV=1 \
+docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $TEST

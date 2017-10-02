@@ -1,3 +1,7 @@
+#!/bin/bash
+
+export MSYS_NO_PATHCONV=1
+
 if [ -z $1 ] ; then
     echo "usage: ./dev-capture.sh test-case-name"
     exit 1
