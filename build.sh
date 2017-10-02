@@ -1,13 +1,15 @@
 #!/bin/bash
-if [ -z "$JOB_NAME" ]; then
-    export JOB_NAME=rewrite-ci
-fi
+if [ -z "$JOB_NAME" ]; then    
+    if [ ! -d /tmp/lcache ]; then
+        mkdir /tmp/lcache
+    fi
+else
+    if [ ! -d /tmp/lcache-$JOB_NAME ]; then
+        mkdir /tmp/lcache-$JOB_NAME
+    fi
 
-if [ ! -d /tmp/lcache-$JOB_NAME ]; then
-    mkdir /tmp/lcache-$JOB_NAME
+    export LFLAGS="$LFLAGS -p $JOB_NAME"
 fi
-
-export LFLAGS="$LFLAGS -p $JOB_NAME"
 
 if [ -z "$GHUL" ]; then
     export PATH=$PATH:`pwd`
@@ -16,4 +18,3 @@ fi
 
 echo "Building with $GHUL (`$GHUL`)..."
 find driver ioc system logging source lexical syntax semantic -name '*.ghul' |  xargs $GHUL -L -o ghul imports.l source/*.l semantic/type/*.l
-# find driver ioc system logging source lexical syntax -name '*.l' -o -name '*.ghul' |  xargs $GHUL -E -L -o ghul imports.l

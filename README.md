@@ -8,7 +8,7 @@ Compiler for the [ghūl programming language](https://www.ghul.io)
 - Compiler source code (git clone this repo)
 - [Docker](https://www.docker.com) (any recent version should work)
 - Docker image with latest stable version of the ghūl compiler (run `./dev-pull.sh` or `docker pull ghul/compiler:latest`) 
-- Bash shell. I develop on Linux but [GitBash](https://git-scm.com/download/win) or [Cygwin](https://cygwin.com/install.html)  should work on Windows,
+- Bash shell. I develop on Linux but [GitBash](https://git-scm.com/download/win) or [Cygwin](https://cygwin.com/install.html) should work on Windows.
 - [Visual Studio Code](https://code.visualstudio.com) (not strictly required, but using VSCode gets you syntax coloring + integrated builds with error highlighting provided you install the [ghūl VSCode extension](https://github.com/degory/ghul-vsce/releases)). If you're running under Windows, you will need to [switch the integrated terminal to use bash](https://code.visualstudio.com/docs/editor/integrated-terminal)
 
 ### To build and test from within Visual Studio Code:
