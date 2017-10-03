@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export MSYS_NO_PATHCONV=1
+
 if [ -z "$BUILD_WITH" ]; then
     BUILD_WITH=ghul/compiler:stable
     docker pull $BUILD_WITH || exit 1
