@@ -35,4 +35,4 @@ else
 fi
 
 MSYS_NO_PATHCONV=1 \
-docker run -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $TEST
+docker run --rm -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $TEST

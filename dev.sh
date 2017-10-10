@@ -8,4 +8,4 @@ else
 fi
 
 MSYS_NO_PATHCONV=1 \
-docker run -v ${LCACHE}:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -it ghul/compiler:stable /bin/bash
+docker run --rm -v ${LCACHE}:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -it ghul/compiler:stable /bin/bash
