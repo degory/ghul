@@ -3,7 +3,7 @@ $workspace=(pwd).path
 
 if (!${arg}) {
     echo "Run all tests"        
-} elseif (!${arg}.EndsWith('.ghul')) {
+} elseif (${arg}.EndsWith('.ghul')) {
     if (${arg}.ToLower().StartsWith(${workspace}.ToLower())) {
         ${test}=split-path -Leaf (split-path -Parent ${arg})
 
@@ -11,9 +11,11 @@ if (!${arg}) {
     } else {
         echo "Run all tests"
     }
+<#
 } elseif (test-path (join-path ${workspace} "test/cases/" ${arg})) {
     $test=$arg
     echo "Run test case ${test}"
+#>
 } else {
     echo "Not sure what you mean. Running all tests"    
 }

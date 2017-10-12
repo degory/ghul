@@ -2,6 +2,8 @@
 
 set -e
 
+export MSYS_NO_PATHCONV=1
+
 BUILD_WITH=ghul/compiler:stable
 docker pull $BUILD_WITH
 
