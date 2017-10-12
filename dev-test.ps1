@@ -11,7 +11,7 @@ if (!${arg}) {
     } else {
         echo "Run all tests"
     }
-} elseif (test-path (join-path "test/cases/" ${arg})) {
+} elseif (test-path (join-path ${workspace} "test/cases/" ${arg})) {
     $test=$arg
     echo "Run test case ${test}"
 } else {
