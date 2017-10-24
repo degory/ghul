@@ -41,8 +41,8 @@ namespace Source is
                 throw new BoundsException("invalid location %,%..%,%" % Object{ start_line, start_column, end_line, end_column });
             fi
 
-            start = (start_line << SHIFT) | start_column;
-            end = (end_line << SHIFT) | end_column;
+            start = pair(start_line, start_column);
+            end = pair(end_line, end_column);
 
             if end == 0 then
                 end = start;
@@ -65,19 +65,19 @@ namespace Source is
         si
 
         get int start_line is
-            return start >> SHIFT;
+            return line_of(start);
         si
 
         get int start_column is
-            return start & MASK;
+            return column_of(start);
         si
 
         get int end_line is
-            return end >> SHIFT;
+            return line_of(end);
         si
 
         get int end_column is
-            return end & MASK;
+            return column_of(end);
         si
 
         bool operator=~(LOCATION other) is
@@ -86,6 +86,46 @@ namespace Source is
             else
                 return this.start == other.start && this.end == other.end && this.file_name =~ other.file_name;
             fi
+        si
+
+        static int pair(int line, int column) is
+            return (line << SHIFT) | column;
+        si
+
+        static int line_of(int line_column) is
+            return line_column >> SHIFT;
+        si
+
+        static int column_of(int line_column) is
+            return line_column & MASK;
+        si
+
+        bool contains(int line_column) is
+            return
+                this.start <= line_column &&
+                this.end >= line_column;
+        si
+
+        bool contains(int line, int column) is
+            return
+                this.start_line <= line &&
+                this.end_line >= line &&
+                this.start_column <= column &&
+                this.end_column >= column;
+        si
+
+        bool contains(LOCATION l) is
+            return
+                this.file_name =~ l.file_name &&
+                this.contains(l.start) &&
+                this.contains(l.end);
+        si
+
+        bool overlaps(LOCATION l) is
+            return
+                this.file_name == l.file_name &&
+                    (this.contains(l.start) ||
+                    this.contains(l.end));
         si
 
         String toString() is
