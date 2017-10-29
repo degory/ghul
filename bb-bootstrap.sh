@@ -1,4 +1,5 @@
 #!/bin/bash
+echo "namespace Source is class BUILD is public static System.String number=\"bb\"; si si" >source/build.l
 echo "Bootstrap pass 1..."
 export GHUL=/usr/bin/ghul
 ./clean.sh
