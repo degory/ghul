@@ -54,3 +54,6 @@ docker push ghul/compiler:release-candidate || exit 1
 
 docker tag ghul:$PASS ghul/compiler:${BUILD_NUMBER} || exit 1
 docker push ghul/compiler:${BUILD_NUMBER} || exit 1
+
+docker build . -f bitbucket.dockerfile -t ghul/compiler:bitbucket || exit 1
+docker push ghul/compiler:bitbucket
