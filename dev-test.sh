@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if (which cygpath >/dev/nul 2>/dev/nul) ; then
+if (which cygpath >/dev/null 2>/dev/null) ; then
     ARG=`cygpath -a $1`
 else
     ARG=$1
