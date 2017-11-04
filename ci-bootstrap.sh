@@ -33,11 +33,14 @@ for p in 1 2 bs ; do
 
     echo $PASS: Compilation complete
 
-    echo $PASS: Start tests... 
+    if [ "$p" == "bs" ]; then
+      echo $PASS: Start tests... 
 
-    docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH /bin/bash ./test.sh || exit 1
+      docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH /bin/bash ./test.sh || exit 1
 
-    echo $PASS: Tests complete
+      echo $PASS: Tests complete
+    fi
+    
     echo $PASS: Build image...
 
     BUILD_WITH=ghul:$PASS
