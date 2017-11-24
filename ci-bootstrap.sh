@@ -14,11 +14,11 @@ fi
 
 # pull the latest legacy compiler image and push to public repo
 # so it's available for development builds:
-docker pull docker.giantblob.com/ex
-docker tag docker.giantblob.com/ex ghul/llc:${BUILD_NUMBER}
+docker pull ghul/ex
+docker tag ghul/ex ghul/llc:${BUILD_NUMBER}
 docker push ghul/llc:${BUILD_NUMBER}
 
-docker tag docker.giantblob.com/ex ghul/llc:latest
+docker tag ghul/ex ghul/llc:latest
 
 echo $BUILD_NUMBER: Starting bootstrap...
 
