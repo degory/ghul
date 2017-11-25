@@ -1,7 +1,7 @@
 # ghūl compiler
 Compiler for the [ghūl programming language](https://www.ghul.io)
 
-[![Build Status](https://build.ghul.io/buildStatus/icon?job=ghul-ci)](https://build.ghul.io/job/ghul-ci)
+Build [![Build Status](https://build.ghul.io/buildStatus/icon?job=ghul-ci)](https://build.ghul.io/job/ghul-ci)
 
 ## Getting started
 ### Prerequisites:
