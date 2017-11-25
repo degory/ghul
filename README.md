@@ -1,7 +1,7 @@
 # ghūl compiler
 Compiler for the [ghūl programming language](https://www.ghul.io)
 
-Build [![Build Status](https://build.ghul.io/buildStatus/icon?job=ghul-ci)](https://build.ghul.io/job/ghul-ci)
+Build [![CircleCI](https://circleci.com/gh/degory/ghul.svg?style=svg&circle-token=a8cc18c732765321822d80fe474272d461c3dc8c)](https://circleci.com/gh/degory/ghul)
 
 ## Getting started
 ### Prerequisites:
