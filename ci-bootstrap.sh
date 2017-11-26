@@ -12,14 +12,6 @@ if [ -z "$BUILD_NUMBER" ]; then
     exit 1;
 fi
 
-# pull the latest legacy compiler image and push to public repo
-# so it's available for development builds:
-docker pull ghul/ex
-docker tag ghul/ex ghul/llc:${BUILD_NUMBER}
-docker push ghul/llc:${BUILD_NUMBER}
-
-docker tag ghul/ex ghul/llc:latest
-
 echo $BUILD_NUMBER: Starting bootstrap...
 
 for p in 1 2 bs ; do
