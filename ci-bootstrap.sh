@@ -42,9 +42,9 @@ for p in 1 2 bs ; do
 
         mkdir ~/results
 
-        mv test/junit.xml ~results
+        mv test/junit.xml ~/results
 
-        cat ~results/junit.xml
+        cat ~/results/junit.xml
 
         echo $PASS: Tests complete
     fi
