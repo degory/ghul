@@ -38,14 +38,6 @@ for p in 1 2 bs ; do
 
         docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` $BUILD_WITH ../tester/tester
 
-        ls -l test/junit.xml
-
-        mkdir ~/results
-
-        mv test/junit.xml ~/results
-
-        cat ~/results/junit.xml
-
         echo $PASS: Tests complete
     fi
     
