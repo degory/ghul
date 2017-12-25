@@ -26,11 +26,19 @@ for p in 1 2 bs ; do
     echo $PASS: Compilation complete
 
     if [ "$p" == "bs" ]; then
-      echo $PASS: Start tests... 
+        pushd tester
 
-      docker run -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH /bin/bash ./test.sh || exit 1
+        echo $PASS: Build tester...
 
-      echo $PASS: Tests complete
+        ./dev-build.sh
+
+        popd
+
+        echo $PASS: Start tests... 
+
+        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester    
+        
+        echo $PASS: Tests complete
     fi
     
     echo $PASS: Build image...
