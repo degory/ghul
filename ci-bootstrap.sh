@@ -36,7 +36,11 @@ for p in 1 2 bs ; do
 
         echo $PASS: Start tests... 
 
-        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester    
+        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester
+
+        mkdir ~/results
+
+        mv test/junit.xml ~results
         
         echo $PASS: Tests complete
     fi
