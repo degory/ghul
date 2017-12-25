@@ -21,7 +21,7 @@ for p in 1 2 bs ; do
 
     echo "namespace Source is class BUILD is public static System.String number=\"$PASS\"; si si" >source/build.l
 
-    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` -t $BUILD_WITH bash -c ./build.sh || exit 1
+    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
 
     echo $PASS: Compilation complete
 
@@ -36,11 +36,13 @@ for p in 1 2 bs ; do
 
         echo $PASS: Start tests... 
 
-        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester
+        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` $BUILD_WITH ../tester/tester
 
         mkdir ~/results
 
         mv test/junit.xml ~results
+
+        cat ~results/junit.xml
         
         echo $PASS: Tests complete
     fi
