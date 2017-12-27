@@ -1,10 +1,6 @@
 #!/bin/bash
 
-if (which cygpath >/dev/null 2>/dev/null) ; then
-    ARG=`cygpath -a $1`
-else
-    ARG=$1
-fi
+ARG=$1
 
 if [[ $ARG =~ .ghul$ ]] ; then
     CASE=`dirname $ARG`
@@ -22,7 +18,6 @@ elif [ -z $ARG ] ; then
     echo "Run all test cases"
 elif [[ -d test/cases/$ARG ]] ; then
     echo "Run test case $ARG"
-    TEST=$ARG
 else
     CASE=`echo test/cases/$ARG*`
 
@@ -34,5 +29,6 @@ else
     fi
 fi
 
-MSYS_NO_PATHCONV=1 \
-docker run --rm -e GHULFLAGS -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./test.sh $TEST
+docker run --rm --env PATH='/home/dev/source:/bin:/usr/bin:/usr/local/bin' -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester $TEST
+
+cat test/junit.xml
