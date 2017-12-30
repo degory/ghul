@@ -1,5 +1,5 @@
-import "/home/dev/source/libLLVM-5.0.so";
-import "--unresolved-symbols=ignore-in-shared-libs";
+// import "/home/dev/source/libLLVM-5.0.so";
+// import "--unresolved-symbols=ignore-in-shared-libs";
 import args;
 import envmap;
 import exec;
