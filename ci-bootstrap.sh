@@ -16,14 +16,12 @@ fi
 
 echo $BUILD_NUMBER: Starting bootstrap...
 
-for p in 1 2 bs ; do
-    PASS=${BUILD_NUMBER}-${p}
-
+for PASS in "${BUILD_NUMBER}-1" "${BUILD_NUMBER}-2" "${BUILD_NUMBER}" ; do
     echo $PASS: Start compile...
 
     echo "namespace Source is class BUILD is public static System.String number=\"$PASS\"; si si" >source/build.l
 
-    docker run --rm -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
+    docker run --name "bootstrap-`date +'%s'`" --rm -e LFLAGS="$LFLAGS" -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
 
     echo $PASS: Compilation complete
     
@@ -35,7 +33,7 @@ for p in 1 2 bs ; do
 
     echo $PASS: Image built
 
-    if [ "$p" == "bs" ]; then
+    if [ "$p" == "${BUILD_NUMBER}" ]; then
         pushd tester
 
         echo $PASS: Build tester...
@@ -46,7 +44,7 @@ for p in 1 2 bs ; do
 
         echo $PASS: Start tests... 
 
-        docker run --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` $BUILD_WITH ../tester/tester
+        docker run --name "bootstrap-`date +'%s'`" --rm -v test-lcache:/tmp/lcache -v `pwd`:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` $BUILD_WITH ../tester/tester
 
         echo $PASS: Tests complete
     fi

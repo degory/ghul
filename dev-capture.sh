@@ -14,4 +14,4 @@ else
 fi
 
 MSYS_NO_PATHCONV=1 \
-docker run --rm -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./capture.sh $ARGUMENT
+docker run --name "capture-`date +'%s'`" --rm -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./capture.sh $ARGUMENT
