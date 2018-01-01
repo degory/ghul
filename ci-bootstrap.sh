@@ -4,6 +4,8 @@ set -e
 
 export MSYS_NO_PATHCONV=1
 
+export LFLAGS="${LFLAGS} -Ws -WM"
+
 BUILD_WITH=ghul/compiler:stable
 docker pull $BUILD_WITH
 
