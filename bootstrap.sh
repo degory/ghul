@@ -2,16 +2,16 @@
 
 set -e
 
-export MSYS_NO_PATHCONV=1
-
 export LFLAGS="${LFLAGS} -Ws -WM"
 
-BUILD_WITH=ghul/compiler:stable
+if [ -z "$BUILD_WITH" ]; then
+    BUILD_WITH=ghul/compiler:stable
+fi
+
 docker pull $BUILD_WITH
 
 if [ -z "$BUILD_NUMBER" ]; then
-    echo "No build number set"
-    exit 1;
+    BUILD_NUMBER="ad-hoc-`date +'%s'`"
 fi
 
 echo $BUILD_NUMBER: Starting bootstrap...
