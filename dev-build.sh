@@ -1,13 +1,13 @@
 #!/bin/bash
 
-if [[ -d /tmp/lcache-dev ]]; then
-    LCACHE=/tmp/lcache-dev
-else
-    docker volume create lcache
-    LCACHE=lcache
+echo "namespace Source is class BUILD is public static System.String number=\"local-`date +'%s'`\"; si si" >source/build.l
+
+if [ -z "$GHUL" ]; then
+    export PATH=$PATH:`pwd`
+    export GHUL=`which ghul`
 fi
 
-echo "namespace Source is class BUILD is public static System.String number=\"local\"; si si" >source/build.l
+export LFLAGS="-Ws -WM -FB -FN"
 
-MSYS_NO_PATHCONV=1 \
-docker run --name "dev-`date +'%s'`" --rm -e LFLAGS="-FB -FN -Ws -WM" -v ${LCACHE}:/tmp/lcache/ -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./build.sh
+echo "Building with $GHUL (`$GHUL`)..."
+find compiler driver ioc system logging source lexical syntax semantic llvm -name '*.ghul' |  xargs $GHUL -D -P ghul -L $GHULFLAGS -o ghul imports.l source/*.l
