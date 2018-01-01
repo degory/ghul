@@ -21,7 +21,7 @@ for p in 1 2 bs ; do
 
     echo "namespace Source is class BUILD is public static System.String number=\"$PASS\"; si si" >source/build.l
 
-    docker run -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
+    docker run --rm -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
 
     echo $PASS: Compilation complete
     

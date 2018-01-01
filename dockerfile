@@ -1,4 +1,4 @@
-FROM ghul/ex:latest
+FROM ghul/ex:stable
 COPY ghul /usr/bin/
 COPY lib/ /usr/lib/ghul/
 RUN mkdir /tmp/lcache && chmod 1777 /tmp/lcache
