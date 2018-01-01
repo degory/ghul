@@ -33,7 +33,7 @@ for PASS in "${BUILD_NUMBER}-1" "${BUILD_NUMBER}-2" "${BUILD_NUMBER}" ; do
 
     echo $PASS: Image built
 
-    if [ "$p" == "${BUILD_NUMBER}" ]; then
+    if [ "$PASS" == "${BUILD_NUMBER}" ]; then
         pushd tester
 
         echo $PASS: Build tester...
