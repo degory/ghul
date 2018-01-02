@@ -10,4 +10,4 @@ fi
 export LFLAGS="-Ws -WM -FB -FN"
 
 echo "Building with $GHUL (`$GHUL`)..."
-find compiler driver ioc system logging source lexical syntax semantic llvm -name '*.ghul' |  xargs $GHUL -D -P ghul -L $GHULFLAGS -o ghul imports.l source/*.l
+find compiler driver ioc system logging source lexical syntax semantic llvm ir -name '*.ghul' |  xargs $GHUL -D -P ghul -L $GHULFLAGS -o ghul imports.l source/*.l
