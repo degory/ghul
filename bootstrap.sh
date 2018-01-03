@@ -2,7 +2,7 @@
 
 set -e
 
-export LFLAGS="${LFLAGS} -Ws -WM"
+export LFLAGS="${LFLAGS} -Ws -WM -WC"
 
 if [ -z "$BUILD_WITH" ]; then
     BUILD_WITH=ghul/compiler:stable

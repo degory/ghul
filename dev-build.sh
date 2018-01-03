@@ -7,7 +7,7 @@ if [ -z "$GHUL" ]; then
     export GHUL=`which ghul`
 fi
 
-export LFLAGS="-Ws -WM -FB -FN"
+export LFLAGS="-Ws -WM -FC"
 
 echo "Building with $GHUL (`$GHUL`)..."
 find compiler driver ioc system logging source lexical syntax semantic llvm ir -name '*.ghul' |  xargs $GHUL -D -P ghul -L $GHULFLAGS -o ghul imports.l source/*.l
