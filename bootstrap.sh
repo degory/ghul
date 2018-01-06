@@ -50,10 +50,20 @@ for PASS in "${BUILD_NUMBER}-1" "${BUILD_NUMBER}-2" "${BUILD_NUMBER}" ; do
     fi
 done
 
-echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate image to repository...
+echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate docker images...
 
 docker tag ghul:$PASS ghul/compiler:release-candidate || exit 1
 docker push ghul/compiler:release-candidate || exit 1
 
+if [ ! -z $DOCKER_REGISTRY_2 ]; then
+    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:release-candidate || exit 1
+    docker push ${DOCKER_REGISTRY_2}/compiler:release-candidate || exit 1
+fi
+
 docker tag ghul:$PASS ghul/compiler:${BUILD_NUMBER} || exit 1
 docker push ghul/compiler:${BUILD_NUMBER} || exit 1
+
+if [ ! -z $DOCKER_REGISTRY_2 ]; then
+    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:${BUILD_NUMBER} || exit 1
+    docker push ${DOCKER_REGISTRY_2}/compiler:${BUILD_NUMBER} || exit 1
+fi
