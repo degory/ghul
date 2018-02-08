@@ -2,8 +2,6 @@
 
 set -e
 
-./build-llvm-stub.sh
-
 export LFLAGS="${LFLAGS} -Ws -WM -FC"
 
 if [ -z "$BUILD_WITH" ]; then
