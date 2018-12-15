@@ -1,4 +1,4 @@
-import "LLVM-6.0";
+import "LLVM-7";
 import args;
 import envmap;
 import exec;
