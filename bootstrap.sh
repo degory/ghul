@@ -11,7 +11,7 @@ fi
 docker pull $BUILD_WITH
 
 if [ ! -z '$GITHUB_RUN_ID' ]; then
-    BUILD_NUMBER=ci-$GITHUB_RUN_ID
+    BUILD_NUMBER=$GITHUB_RUN_ID
 fi
 
 if [ -z "$BUILD_NUMBER" ]; then
@@ -22,9 +22,9 @@ if [ -z "$BRANCH_NAME" ]; then
     BRANCH_NAME=`git branch | sed -n -e 's/^\* \(.*\)/\1/p'`
 fi
 
-echo $BUILD_NUMBER: Starting bootstrap...
+BUILD_NAME="${BRANCH_NAME}-${BUILD_NUMBER}"
 
-BUILD_NAME="${BUILD_NUMBER}-${BRANCH_NAME}"
+echo $BUILD_NUMBER: Starting bootstrap...
 
 for PASS in "${BUILD_NAME}-1" "${BUILD_NAME}-2" "${BUILD_NAME}" ; do
     echo $PASS: Start compile...
@@ -62,18 +62,10 @@ done
 
 echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate docker images...
 
-docker tag ghul:$PASS ghul/compiler:${BRANCH_NAME} || exit 1
-docker push ghul/compiler:${BRANCH_NAME} || exit 1
+docker tag ghul:$PASS ghul/compiler:${BUILD_NAME} || exit 1
+docker push ghul/compiler:${BUILD_NAME} || exit 1
 
 if [ ! -z $DOCKER_REGISTRY_2 ]; then
-    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:${BRANCH_NAME} || exit 1
-    docker push ${DOCKER_REGISTRY_2}/compiler:${BRANCH_NAME} || exit 1
-fi
-
-docker tag ghul:$PASS ghul/compiler:${BRANCH_NAME}-${BUILD_NUMBER} || exit 1
-docker push ghul/compiler:${BRANCH_NAME}-${BUILD_NUMBER} || exit 1
-
-if [ ! -z $DOCKER_REGISTRY_2 ]; then
-    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:${BRANCH_NAME}-${BUILD_NUMBER} || exit 1
-    docker push ${DOCKER_REGISTRY_2}/compiler:${BRANCH_NAME}-${BUILD_NUMBER} || exit 1
+    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:${BUILD_NAME} || exit 1
+    docker push ${DOCKER_REGISTRY_2}/compiler:${BUILD_NAME} || exit 1
 fi
