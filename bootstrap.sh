@@ -10,6 +10,10 @@ fi
 
 docker pull $BUILD_WITH
 
+if [ ! -z '$GITHUB_RUN_ID' ]; then
+    BUILD_NUMBER=ci-$GITHUB_RUN_ID
+fi
+
 if [ -z "$BUILD_NUMBER" ]; then
     BUILD_NUMBER="ad-hoc-`date +'%s'`"
 fi
