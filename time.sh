@@ -10,4 +10,4 @@ fi
 export LFLAGS="-Ws -WM -FB -FN"
 
 echo "Profiling $GHUL (`$GHUL`)..."
-find lib compiler driver ioc system logging source lexical syntax semantic llvm ir -name '*.ghul' | xargs time -v $GHUL -D -P ghul -G -X -o ghul imports.l source/*.l
+find lib compiler driver ioc system logging source lexical syntax semantic ir -name '*.ghul' | xargs time -v $GHUL -D -P ghul -G -X -o ghul imports.l source/*.l
