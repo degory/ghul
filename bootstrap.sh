@@ -29,7 +29,7 @@ echo $BUILD_NUMBER: Starting bootstrap...
 for PASS in "${BUILD_NAME}-1" "${BUILD_NAME}-2" "${BUILD_NAME}" ; do
     echo $PASS: Start compile...
 
-    echo "namespace Source is class BUILD is public static System.String number=\"${PASS}\"; si si" >source/build.l
+    echo "namespace Source is class BUILD is number: System.String public static => \"local-${PASS}\"; si si" >source/build.ghul
 
     docker run --name "bootstrap-`date +'%s'`" --rm -e LFLAGS="$LFLAGS" -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./build.sh || exit 1
 
