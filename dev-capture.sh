@@ -5,13 +5,38 @@ if [ -z $1 ] ; then
     exit 1
 fi
 
-CASE=`echo test/cases/$1*`
+CASE=$1
 
-if [ -d $CASE ] ; then
-    ARGUMENT=`basename $CASE`
-else
-    ARGUMENT=$1
+if [ ! -d $CASE ] ; then
+    CASE=test/cases/$CASE
 fi
 
-MSYS_NO_PATHCONV=1 \
-docker run --name "capture-`date +'%s'`" --rm -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` -t ghul/compiler:stable ./capture.sh $ARGUMENT
+if [ -d $CASE ] ; then
+    if [ ! -f $CASE/failed ] ; then
+        echo "expected to find failed marker in $CASE"
+        exit 1
+    fi
+
+    if [ -f $CASE/err.sort ] ; then
+        mv $CASE/err.sort $CASE/err.expected
+    fi
+
+    if [ -f $CASE/warn.sort ] ; then
+        mv $CASE/warn.sort $CASE/warn.expected
+    fi
+    
+    if [ -f $CASE/run.out ] ; then
+        mv $CASE/run.out $CASE/run.expected
+        rm $CASE/fail.expected
+    else
+        echo >$CASE/fail.expected
+    fi
+
+    rm $CASE/failed
+
+    exit 0
+else
+    echo "doesn't seem to be a test case: $CASE"
+    exit 1
+fi
+
