@@ -7,23 +7,21 @@ Build ![CI](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)
 ### Prerequisites:
 - Compiler source code (git clone this repo)
 - [Docker](https://www.docker.com)
-- Bash shell. I develop on Linux but [GitBash](https://git-scm.com/download/win) or [Cygwin](https://cygwin.com/install.html) should work on Windows
+- Bash shell
 
 ### Optional
 - [L Language runtime](https://github.com/degory/llc/releases) allows built ghūl binaries to run on Linux systems outside of the ghūl compiler Docker container
 - [Visual Studio Code](https://code.visualstudio.com) will give you syntax coloring + integrated builds with error highlighting provided you install the [ghūl VSCode extension](https://github.com/degory/ghul-vsce/releases)). If you're running under Windows, you will need to [switch the integrated terminal to use bash](https://code.visualstudio.com/docs/editor/integrated-terminal)
 
-### To build and test from within Visual Studio Code:
-- Build the compiler: CTRL+SHIFT+B
-- Run all tests: CTRL+SHIFT+T
-- Run a specific test: navigate to a test.ghul under test/cases/.../ then CTRL+SHIFT+T
+### To build from Visual Studio Code
+- Build the compiler: \<Ctrl>+\<Shift>+B
 
 ### To build and test from the command line:
-- Build the compiler: `./dev-build.sh`
-- Run all tests: `./dev-test.sh`
-- Run a specific test: `./dev-test.sh test-case-name`
-- Capture test output: `./dev-capture.sh test-case-name`
-- Bootstrap the compiler: `./dev-bootstrap.sh`
+- Build the compiler: `./build.sh`
+- Run all tests: `./test.sh`
+- Run a specific test: `./test.sh test-case-folder-name`
+- Capture a failed test's output as its new expected output: `./capture.sh test-case-folder-name`
+- Bootstrap the compiler: `./bootstrap.sh`
 - Start an interactive shell in the development container: `./dev.sh`
 
 ## Gotchas
