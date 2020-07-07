@@ -10,26 +10,15 @@ fi
 
 docker pull $BUILD_WITH
 
-if [ ! -z '$GITHUB_RUN_ID' ]; then
-    BUILD_NUMBER=$GITHUB_RUN_ID
-fi
+source ./set-build-name.sh
 
-if [ -z "$BUILD_NUMBER" ]; then
-    BUILD_NUMBER="ad-hoc-`date +'%s'`"
-fi
+echo $BUILD_NAME: Starting bootstrap...
 
-if [ -z "$BRANCH_NAME" ]; then
-    BRANCH_NAME=`git branch | sed -n -e 's/^\* \(.*\)/\1/p'`
-fi
 
-BUILD_NAME="${BRANCH_NAME}-${BUILD_NUMBER}"
-
-echo $BUILD_NUMBER: Starting bootstrap...
-
-for PASS in "${BUILD_NAME}-1" "${BUILD_NAME}-2" "${BUILD_NAME}" ; do
+for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" "${BUILD_NAME}" ; do
     echo $PASS: Start compile...
 
-    echo "namespace Source is class BUILD is number: System.String public static => \"local-${PASS}\"; si si" >src/source/build.ghul
+    echo "namespace Source is class BUILD is number: System.String public static => \"${PASS}\"; si si" >src/source/build.ghul
 
     docker run --name "bootstrap-`date +'%s'`" --rm -e LFLAGS="$LFLAGS" -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH bash -c ./_build.sh || exit 1
 
@@ -60,7 +49,7 @@ for PASS in "${BUILD_NAME}-1" "${BUILD_NAME}-2" "${BUILD_NAME}" ; do
     fi
 done
 
-echo $BUILD_NUMBER: Bootstrap complete, pushing release candidate docker images...
+echo $BUILD_NAME: Bootstrap complete, pushing release candidate docker images...
 
 docker tag ghul:$PASS ghul/compiler:${BUILD_NAME} || exit 1
 docker push ghul/compiler:${BUILD_NAME} || exit 1
