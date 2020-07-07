@@ -1,12 +1,6 @@
 #!/bin/bash
-if [ ! -d /tmp/lcache ]; then
-    mkdir /tmp/lcache
-fi
 
-if [ -z "$GHUL" ]; then
-    export PATH=$PATH:`pwd`
-    export GHUL=`which ghul`
-fi
+LCACHE=lcache-test
+docker volume create $LCACHE
 
-echo "Building with $GHUL (`$GHUL`)..."
-find src -name '*.ghul' | xargs $GHUL -L $GHULFLAGS -o tester imports.l
+docker run --name "dev-`date +'%s'`" --rm -e LFLAGS="-FB -FN -Ws -WM" -v ${LCACHE}:/tmp/lcache/ -v `pwd`:/home/dev/source/ -w /home/dev/source -u `id -u`:`id -g` ghul/compiler:stable ./_build.sh
