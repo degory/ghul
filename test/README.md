@@ -9,7 +9,7 @@ Each of the folders in the `test/cases` folder constitutes a single test case an
 
 ### Test case names
 
-Test cases are named based on the directory they sit in under `test/cases` for example `test/cases/fibonacci` holds the `fibonacci` test case. Test case names should be in `kebab-case` - that is, all lower case, no spaces, and words separated by dashes.
+Test cases are named based on the directory they sit in under `test/cases`. For example `test/cases/fibonacci` holds the `fibonacci` test case. Test case names should be in `kebab-case`: all lower case, no spaces, and words separated by dashes.
 
 ### Test runner
 
@@ -52,21 +52,22 @@ The test runner is driven by various config, source, and expectation files in th
 
 ## Working with tests
 
-The process of writing a test consists of:
-- Create a new empty test from the test template
-- Design a test scenario that will exercise the code you want to test
-- Write code to actually execute that scenario, ensuring that a successful test run will deterministically produce the same output from the compiler and from any built executable on every test run
-- Also try to ensure that any test failures will produce different output!
-- Capture the expected test output as expectation files
+Writing a test involves:
+- Creating a new empty test from the test template
+- Designing a test scenario that will exercise the code you want to test
+- Writing code to actually execute that scenario
+- Ensuring that a successful test run will deterministically produce the same output from the compiler and from any built executable on every test run
+- Also ensuing any test failures will produce different output!
+- Finally, capturing the expected test output as expectation files
 
-This process is most easily done from Visual Studio Code, but it can also be done from the command line.
+This process can be managed from Visual Studio Code or from from the command line.
 
 ### Visual Studio Code
-Each test case is a mini ghul project in its own right and can be opened in Visual Studio Code individually. It's generally better to open a test case in a separate Visual Studio Code instance, rather than editing its files from VSCode alongside the compiler - you may get confusing errors from the ghul language server if you also have the compiler project open in VSCode.
+Each test case is a mini ghul project in its own right and can be opened as a project folder in Visual Studio Code individually. It's generally better to open a test case in a separate Visual Studio Code instance, rather than editing its files from VSCode alongside the compiler (because having files open from multiple different ghul projects in the same VSCode instance can result in confusing/misleading messages from the ghul language extension).
 
 #### Creating a new test case
 
-With the compiler ##project open in Visual Studio Code, run the create test task:
+With the ghul compiler folder open in Visual Studio Code, run the create test task:
 
 `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Create new test`
 
@@ -76,7 +77,7 @@ A new VSCode window will open pointing at the new test project
 
 #### Running a test case
 
-With a test case project open in Visual Studio Code, run the default test task to execute the test:
+With a test case folder open in Visual Studio Code, run the default test task to execute the test:
 
 `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Run test`
 
@@ -88,7 +89,7 @@ The test results will appear in the terminal window
 
 Once you have a test case that generates the appropriate output, you need to capture that output as expectation files. If on a future test run the test produces different output to what was expected, the test runner will flag the test as failed
 
-With a test case project open in Visual Studio Code, run the default build task to execute the test:
+With a test case folder open in Visual Studio Code, run the default build task to execute the test:
 
 `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Capture test expectations`
 
