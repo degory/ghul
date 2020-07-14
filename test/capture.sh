@@ -21,6 +21,10 @@ if [ -d $CASE ] ; then
     if [ -f $CASE/warn.sort ] ; then
         mv $CASE/warn.sort $CASE/warn.expected
     fi
+
+    if [ -f $CASE/il.out ] ; then
+        mv $CASE/il.out $CASE/il.expected
+    fi
     
     if [ -f $CASE/run.out ] ; then
         mv $CASE/run.out $CASE/run.expected
