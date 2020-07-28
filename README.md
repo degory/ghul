@@ -16,11 +16,13 @@ Build ![CI](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)
 
 - [L Language runtime](https://github.com/degory/llc/releases) allows built ghūl binaries to run on Linux systems outside of the ghūl compiler Docker container
 - [Visual Studio Code](https://code.visualstudio.com) will give you syntax coloring + integrated builds with error highlighting provided you install the [ghūl VSCode extension](https://github.com/degory/ghul-vsce/releases)). If you're running under Windows, you will need to [switch the integrated terminal to use bash](https://code.visualstudio.com/docs/editor/integrated-terminal)
+- [mono](https://www.mono-project.com/docs/getting-started/install/linux/) if you want to try out ghūl's experimental CIL backend, which targets DotNET Core (you'll need mono's `ilasm` to produce CIL PE executables and either the mono runtime or DotNet Core 3.1 or 5.0 run them)
+- The ghūl [hello-world](https://github.com/degory/hello-world) example project, which has a small example program, Visual Studio Code config for the ghūl lanugage extension, and a VSCode build task
 
 ### To build from Visual Studio Code
 
 - Build the compiler: `<Ctrl>+<Shift>+B`
-- Run all the tests: `<Ctrl>+<Shift>+P`|`Tasks: Run task`|`Run all tests`
+- Run all the tests: `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Run all tests`
 
 ### To build and test from the command line
 
