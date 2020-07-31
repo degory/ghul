@@ -27,9 +27,9 @@ Build ![CI](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)
 ### To build and test from the command line
 
 - Build the compiler: `./build/build.sh`
-- Run all tests: `./test/test.sh`
-- Run a specific test: `./test/test.sh test-case-folder-name`
-- Capture a failed test's output as its new expected output: `./test/capture.sh test-case-folder-name`
+- Run all tests: `./tests/test.sh`
+- Run a specific test: `./tests/test.sh test-case-folder-name`
+- Capture a failed test's output as its new expected output: `./tests/capture.sh test-case-folder-name`
 - Bootstrap the compiler: `./build/bootstrap.sh`
 - Start an interactive shell in the development container: `./build/dev.sh`
 
