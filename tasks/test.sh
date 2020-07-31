@@ -11,5 +11,9 @@ if [ ! -f $CASE/ghulflags ] ; then
     exit 1;
 fi
 
-docker run --name "test-`date +'%s'`" --rm --env PATH='/home/dev/source:/bin:/usr/bin:/usr/local/bin' -v `pwd`/../../..:/home/dev/source/ -w /home/dev/source/test -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester ${@:1}
+# docker run --name "test-`date +'%s'`" --rm --env PATH='/home/dev/source:/bin:/usr/bin:/usr/local/bin' -v `pwd`/../../..:/home/dev/source/ -w /home/dev/source/tests -u `id -u`:`id -g` ghul/compiler:stable ../tester/tester ${@:1}
+pwd
+cd ../..
+pwd
+../tester/tester ${@:1}
 
