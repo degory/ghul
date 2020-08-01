@@ -1,7 +1,10 @@
 #!/bin/bash
-pushd `dirname "$0"`
+
+PATH=`pwd`:$PATH
+
+pushd `dirname "$0"` >/dev/null
 
 ../tester/tester
 
-popd
+popd >/dev/null
 
