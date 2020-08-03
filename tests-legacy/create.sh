@@ -15,11 +15,11 @@ if [ -z "${TEST_NAME}" ] ; then
     exit 1
 fi
 
-if [ ! -d ${ROOT}/test/cases ] ; then
-    echo "expected to find test/cases folder under ${ROOT}"
+if [ ! -d ${ROOT}/tests/cases ] ; then
+    echo "expected to find tests/cases folder under ${ROOT}"
     exit 1
 fi
 
-cp -r test/template ${ROOT}/test/cases/${TEST_NAME}
+cp -r tests/template ${ROOT}/tests/cases/${TEST_NAME}
 
-code ${ROOT}/test/cases/${TEST_NAME}
+code ${ROOT}/tests/cases/${TEST_NAME}

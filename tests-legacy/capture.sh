@@ -3,7 +3,7 @@
 CASE=`basename $1`
 
 
-if [[ ! "$CASE" =~ "^test/cases/.*" ]] ; then
+if [[ ! "$CASE" =~ "^tests/cases/.*" ]] ; then
     echo "usage: ./scripts/capture.sh test-case-name"
     exit 1
 fi
