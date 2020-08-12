@@ -1,5 +1,7 @@
 #!/bin/bash
 
+echo "namespace Source is class BUILD is number: System.String static => \"local-`date +'%s'`\"; si si" >src/source/build.ghul
+
 docker run --name "typecheck-`date +'%s'`" --rm \
     -v `pwd`:/usr/local/bin \
     -v `pwd`:/home/dev/source/ \
