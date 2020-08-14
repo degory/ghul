@@ -10,4 +10,4 @@ fi
 export LFLAGS="-Ws -WM -FC"
 
 echo "Building with $GHUL (`$GHUL`)..."
-find src -name '*.ghul' | xargs $GHUL -D -P ghul -L -G $GHULFLAGS -o ghul imports.l lib/ghul.ghul
+find src -name '*.ghul' | xargs $GHUL -D -P ghul -L $GHULFLAGS -o ghul imports.l lib/ghul.ghul
