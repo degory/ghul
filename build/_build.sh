@@ -20,4 +20,4 @@ if [ -z "$GHUL" ]; then
 fi
 
 echo "Building with $GHUL (`$GHUL`)..."
-find src -name '*.ghul' | xargs $GHUL -L -G $GHULFLAGS -o ghul imports.l
+find src -name '*.ghul' | xargs $GHUL -L $GHULFLAGS -o ghul imports.l
