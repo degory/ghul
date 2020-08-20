@@ -9,4 +9,4 @@ docker run --name "typecheck-`date +'%s'`" --rm \
     -w /home/dev/source/ \
     -u `id -u`:`id -g` \
     ghul/mono-base \
-    bash -c "find src -name '*.ghul' | xargs ./ghul -G -X /usr/lib/ghul/ghul.ghul" 
+    bash -c "find src -name '*.ghul' | xargs ./ghul -G -X ./lib/ghul.ghul" 
