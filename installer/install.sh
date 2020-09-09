@@ -1,0 +1,1 @@
+sudo cp -rv usr /tmp
