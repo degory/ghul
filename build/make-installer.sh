@@ -11,3 +11,4 @@ cp -av ../lib root/usr/lib/ghul
 cp ../ghul root/usr/bin
 cp install.sh root
 bash ./makeself-2.4.2/makeself.sh root ghul.run "ghul compiler" ./install.sh
+rm -rf root
