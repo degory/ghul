@@ -7,8 +7,8 @@ mkdir root
 pushd root 2>/dev/null
 tar xvzf ../root.tar.gz
 popd 2>/dev/null
-cp -av ../lib root/usr/lib/ghul
+cp -av ../lib/dotnet ../lib/lang root/usr/lib/ghul
 cp ../ghul root/usr/bin
 cp install.sh root
-bash ./makeself-2.4.2/makeself.sh root ghul.run "ghul compiler" ./install.sh
+bash ./makeself-2.4.2/makeself.sh root ghul.run "ghūl compiler" ./install.sh
 rm -rf root
