@@ -13,3 +13,4 @@ cp ../tester/tester root/usr/bin
 cp install.sh root
 bash ./makeself-2.4.2/makeself.sh root ghul.run "ghūl compiler" ./install.sh
 rm -rf root
+rm -rf makeself-*

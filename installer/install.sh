@@ -55,6 +55,16 @@ if [ -d /usr/lib/ghul ] ; then
     fi
 fi
 
+if [ -x "`which docker`" ] ; then
+    if docker pull --quiet ghul/compiler:stable ; then
+        echo "✅ pulled latest ghul compiler container"
+    else
+        echo "❌ failed to pull the latest docker container"
+    fi
+else
+    echo "docker not found: legacy target will not be supported"
+fi
+
 if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -av usr / ; then
     echo "✅ ghūl compiler installed"
 else
