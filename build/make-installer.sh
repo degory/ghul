@@ -11,5 +11,9 @@ cp -av ../lib/dotnet ../lib/lang root/usr/lib/ghul
 cp ../ghul root/usr/bin
 cp install.sh root
 bash ./makeself-2.4.2/makeself.sh root ghul.run "ghūl compiler" ./install.sh
+if [ "$1" != "" ] ; then
+    mv ghul.run ghul-v$1.run
+fi
+
 rm -rf root
 rm -rf makeself-*
