@@ -14,7 +14,7 @@ source ./build/set-build-name.sh
 
 echo $BUILD_NAME: Starting bootstrap...
 
-for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" "${BUILD_NAME}" ; do
+for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" ; do
     echo $PASS: Start compile...
 
     echo "namespace Source is class BUILD is number: System.String public static => \"${PASS}\"; si si" >src/source/build.ghul
@@ -31,7 +31,7 @@ for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" "${BUILD_NAME}" ; do
 
     echo $PASS: Image built
 
-    if [ "$PASS" == "${BUILD_NAME}" ]; then
+    if [ "$PASS" == "${BUILD_NAME}-bs-2" ]; then
         pushd tester
 
         echo $PASS: Build tester...
