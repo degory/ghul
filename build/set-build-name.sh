@@ -1,5 +1,6 @@
 
 if [ ! -z "${BUILD_NAME}" ] ; then
+    echo BUILD_NAME overridden to "${BUILD_NAME}"
     exit
 fi
 
@@ -34,3 +35,6 @@ if [ -z "${ENVIRONMENT}" ] ; then
 fi
 
 BUILD_NAME="${BRANCH_NAME}-${ENVIRONMENT}-${BUILD_NUMBER}"
+
+echo BUILD_NAME set to "${BUILD_NAME}"
+
