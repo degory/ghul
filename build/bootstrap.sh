@@ -49,13 +49,3 @@ for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" "${BUILD_NAME}" ; do
         echo $PASS: Tests complete
     fi
 done
-
-echo $BUILD_NAME: Bootstrap complete, pushing release candidate docker images...
-
-docker tag ghul:$PASS ghul/compiler:${BUILD_NAME} || exit 1
-docker push ghul/compiler:${BUILD_NAME} || exit 1
-
-if [ ! -z $DOCKER_REGISTRY_2 ]; then
-    docker tag ghul:$PASS ${DOCKER_REGISTRY_2}/compiler:${BUILD_NAME} || exit 1
-    docker push ${DOCKER_REGISTRY_2}/compiler:${BUILD_NAME} || exit 1
-fi
