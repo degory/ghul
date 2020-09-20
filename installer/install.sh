@@ -73,3 +73,5 @@ else
 fi
 
 /usr/bin/ghul
+
+$PREFIX chown -R `id -u`:`id -g` ./usr
