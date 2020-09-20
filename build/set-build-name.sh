@@ -1,6 +1,7 @@
+echo BUILD_NAME initially: \"${BUILD_NAME}\"
 
 if [ ! -z "${BUILD_NAME}" ] ; then
-    echo BUILD_NAME overridden to "${BUILD_NAME}"
+    echo BUILD_NAME overridden to \"${BUILD_NAME}\"
     exit
 fi
 
