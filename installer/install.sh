@@ -7,11 +7,19 @@ else
     FAILED=1
 fi
 
-if [ -x "`which ilasm`" ] ; then
-    echo "✅ ilasm found"
+if [ "$1" == "-L" ] ; then
+    if [ -x "`which docker`" ] ; then
+        echo "✅ docker found"
+    else
+        echo "❌ legacy only install requested but docker not found: please install"
+    fi
 else
-    echo "❌ ilasm not found: please install mono SDK (https://www.mono-project.com/download/stable/)"
-    FAILED=1
+    if [ -x "`which ilasm`" ] ; then
+        echo "✅ ilasm found"
+    else
+        echo "❌ ilasm not found: please install mono SDK (https://www.mono-project.com/download/stable/)"
+        FAILED=1
+    fi
 fi
 
 if [ $FAILED ]; then
