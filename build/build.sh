@@ -1,6 +1,8 @@
 #!/bin/bash
 
-echo "namespace Source is class BUILD is number: System.String static => \"local-`date +'%s'`\"; si si" >src/source/build.ghul
+if [ ! -f src/source/build.ghul ] ; then
+    echo "namespace Source is class BUILD is number: System.String static => \"local-`date +'%s'`\"; si si" >src/source/build.ghul
+fi
 
 if [ "$1" != "no-docker" ] ; then
     WANT_DOCKER="-D"
