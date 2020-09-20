@@ -7,19 +7,26 @@ else
     FAILED=1
 fi
 
-if [ "$1" == "-L" ] ; then
-    if [ -x "`which docker`" ] ; then
-        echo "✅ docker found"
-    else
-        echo "❌ legacy only install requested but docker not found: please install"
-    fi
-else
+if [ "$1" != "-L" ] ; then
     if [ -x "`which ilasm`" ] ; then
         echo "✅ ilasm found"
     else
         echo "❌ ilasm not found: please install mono SDK (https://www.mono-project.com/download/stable/)"
         FAILED=1
     fi
+else
+    echo "✅ legacy only install: ilasm not needed"
+fi
+
+if [ "$1" != "-N" ] ; then
+    if [ -x "`which docker`" ] ; then
+        echo "✅ docker found"
+    else
+        echo "❌ docker not found: please install"
+        FAILED=1
+    fi
+else
+    echo "✅ dotnet only install: docker not needed"
 fi
 
 if [ $FAILED ]; then
@@ -58,10 +65,10 @@ else
     echo "docker not found: legacy target will not be supported"
 fi
 
-if $PREFIX cp -r usr / ; then
+if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -av usr / ; then
     echo "✅ ghūl compiler installed"
 else
-    echo "❌ failed to copy files"
+    echo "❌ installation failed"
     exit 1
 fi
 
