@@ -1,4 +1,8 @@
 
+if [ ! -z "${BUILD_NAME}" ] ; then
+    exit
+fi
+
 if [ ! -z "${GITHUB_RUN_ID}" ]; then
     BUILD_NUMBER=${GITHUB_RUN_ID}
 fi
