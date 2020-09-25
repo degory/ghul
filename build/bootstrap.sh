@@ -22,12 +22,16 @@ for PASS in "${BUILD_NAME}-bs-1" "${BUILD_NAME}-bs-2" ; do
     docker run --name "bootstrap-`date +'%s'`" --rm -e LFLAGS="$LFLAGS" -e GHUL=/usr/bin/ghul -v `pwd`:/home/dev/source -w /home/dev/source -u `id -u`:`id -g` $BUILD_WITH /bin/sh ./build/_build.sh || exit 1
 
     echo $PASS: Compilation complete
-    
+
+    echo $PASS: Build installer...
+
+    ./build/make-installer.sh
+
     echo $PASS: Build image...
 
     BUILD_WITH=ghul:$PASS
 
-    docker build . -t $BUILD_WITH || exit 1
+    docker build --pull -t $BUILD_WITH . || exit 1
 
     echo $PASS: Image built
 
