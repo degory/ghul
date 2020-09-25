@@ -7,7 +7,7 @@ else
     FAILED=1
 fi
 
-if [ "$1" != "-L" ] ; then
+if [ "$1" != "-L" ] && [ "$1" != "-D" ] ; then
     if [ -x "`which ilasm`" ] ; then
         echo "✅ ilasm found"
     else
@@ -18,15 +18,17 @@ else
     echo "✅ legacy only install: ilasm not needed"
 fi
 
-if [ "$1" != "-N" ] ; then
+if [ "$1" == "-N" ] ; then
+    echo "✅ dotnet only install: docker not needed"
+elif [ "$1" == "-D" ] ; then
+    echo "✅ legacy container install: docker not needed"
+else
     if [ -x "`which docker`" ] ; then
         echo "✅ docker found"
     else
         echo "❌ docker not found: please install"
         FAILED=1
     fi
-else
-    echo "✅ dotnet only install: docker not needed"
 fi
 
 if [ $FAILED ]; then
@@ -55,17 +57,19 @@ if [ -d /usr/lib/ghul ] ; then
     fi
 fi
 
-if [ -x "`which docker`" ] ; then
-    if docker pull --quiet ghul/compiler:stable ; then
-        echo "✅ pulled latest ghul compiler container"
+if [ "$1" != "-D" ] ; then
+    if [ -x "`which docker`" ] ; then
+        if docker pull --quiet ghul/compiler:stable ; then
+            echo "✅ pulled latest ghul compiler container"
+        else
+            echo "❌ failed to pull the latest docker container"
+        fi
     else
-        echo "❌ failed to pull the latest docker container"
+        echo "docker not found: legacy target will not be supported"
     fi
-else
-    echo "docker not found: legacy target will not be supported"
 fi
 
-if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -av usr / ; then
+if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -a usr / ; then
     echo "✅ ghūl compiler installed"
 else
     echo "❌ installation failed"

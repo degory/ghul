@@ -7,7 +7,7 @@ mkdir root
 pushd root 2>/dev/null
 tar xvzf ../root.tar.gz
 popd 2>/dev/null
-cp -av ../lib/dotnet ../lib/lang root/usr/lib/ghul
+cp -av ../lib/dotnet ../lib/legacy root/usr/lib/ghul
 cp ../ghul root/usr/bin
 cp ../tester/tester root/usr/bin
 cp install.sh root
