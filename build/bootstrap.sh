@@ -14,7 +14,7 @@ source ./build/set-build-name.sh
 
 echo $BUILD_NAME: Starting bootstrap...
 
-for PASS in "ghul/bootstrap:${BUILD_NAME}-bs-1" "ghul/bootstrap:${BUILD_NAME}-bs-2" ; do
+for PASS in "ghul/bootstrap:${BUILD_NAME}-1" "ghul/bootstrap:${BUILD_NAME}" ; do
     echo $PASS: Start compile...
 
     echo "namespace Source is class BUILD is number: System.String public static => \"${PASS}\"; si si" >src/source/build.ghul
