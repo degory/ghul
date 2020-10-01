@@ -16,5 +16,5 @@ cd ../..
 pushd ..>/dev/null
 PATH=`pwd`:${PATH}
 popd
-../tester/tester ${@:1}
+CLI_RUNNER=dotnet ../tester/tester ${@:1}
 

@@ -1,7 +1,5 @@
-    .method private final virtual hidebysig newslot specialname instance default object System.Collections.IEnumerator.get_Current ()  cil managed 
+    .method private final virtual hidebysig newslot specialname instance default class [mscorlib]System.Object System.Collections.IEnumerator.get_Current ()  cil managed 
     {
-        // .custom instance void class [mscorlib]System.Runtime.CompilerServices.CompilerGeneratedAttribute::'.ctor'() =  (01 00 00 00 ) // ....
-
     	.override class [mscorlib]System.Collections.IEnumerator::get_Current
 	    .maxstack 8
 	    ldnull 
