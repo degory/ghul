@@ -78,4 +78,8 @@ fi
 
 /usr/bin/ghul
 
-$PREFIX chown -R `id -u`:`id -g` ./usr
+if [ -x "`which id`" ] ; then
+    $PREFIX chown -R `id -u`:`id -g` ./usr
+else
+    echo "unable to chown `pwd`: you may need to manually delete it"
+fi

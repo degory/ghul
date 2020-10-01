@@ -17,4 +17,3 @@ pushd ..>/dev/null
 PATH=`pwd`:${PATH}
 popd
 ../tester/tester ${@:1}
-

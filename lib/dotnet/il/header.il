@@ -1,8 +1,4 @@
-.assembly extern System.Runtime
-{
-  .ver 4:2:2:0
-}
-.assembly 'hello-world'
+.assembly 'ghul-app'
 {
 }
-.module helloqworld.dll
+.module 'ghul-app.exe'
