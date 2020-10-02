@@ -31,7 +31,7 @@ for PASS in "ghul/bootstrap:${BUILD_NAME}-1" "ghul/bootstrap:${BUILD_NAME}" ; do
 
     BUILD_WITH=$PASS
 
-    docker build --pull -t $BUILD_WITH . || exit 1
+    docker build -f legacy.dockerfile --pull -t $BUILD_WITH . || exit 1
 
     echo $PASS: Image built
 done
