@@ -10,19 +10,20 @@
 
 [Release](https://github.com/degory/ghul/releases/latest)
 
-### Template ghūl language project
-
-[hello-world](https://github.com/degory/hello-world)
-
 ### Continuous delivery status
 
  [![workflow](https://github.com/degory/ghul/workflows/Release/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ARelease)
+
 
 ## Targets
 
 The compiler can target both .NET and native x86-64 Linux via LLVM, however the native code target is deprecated and I'm concentrating solely on bootstrapping on .NET
 
 ## Getting started
+
+### Template ghūl application project
+
+If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl application template](https://github.com/degory/ghul-application-template) repository
 
 ### Required dependencies
 - [Mono](https://www.mono-project.com/) to build .NET executables, and/or
