@@ -1,0 +1,484 @@
+namespace Semantic.Symbol is
+    use System;
+    use Generic;
+
+    use IoC;
+    use Logging;
+    use Source;
+
+
+    class FUNCTION_GROUP: BASE, Type.Typed is
+        _overrides_resolved: bool;
+
+        description: String => qualified_name + "(...) // function group";
+        short_description: String => name + "(...)";
+        symbol_kind: SYMBOL_KIND => SYMBOL_KIND.FUNCTION;
+        completion_kind: COMPLETION_KIND => COMPLETION_KIND.FUNCTION;
+
+        type: Type.BASE public;
+
+        functions: Collections.MutableList[Function];
+
+        init(location: LOCATION, owner: Scope, name: String) is
+            super.init(location, owner, name);
+
+            type = new Type.FUNCTION_GROUP(name, self);
+            functions = new Collections.LIST[Function]();
+        si
+
+        specialize(type_map: Collections.MAP[String,Type.BASE], owner: GENERIC) -> FUNCTION_GROUP is
+            let result = cast FUNCTION_GROUP(clone());
+
+            result.specialized_from = self;
+
+            result.type = new Type.FUNCTION_GROUP(
+                name,
+                result
+            );
+
+            result.functions = new Collections.LIST[Function](functions);
+
+            for i in 0..functions.count do
+                result.functions[i] = functions[i].specialize(type_map, owner);
+            od
+
+            return result;
+        si
+
+        resolve_overrides() is
+            if _overrides_resolved then
+                return;
+            fi
+
+            if isa Classy(owner) then
+                _overrides_resolved = true;
+
+                cast Classy(owner).resolve_overrides(
+                    self,
+                    IoC.CONTAINER.instance.generic_cache
+                );
+            fi
+        si
+
+        add(function: Function) is
+            functions.add(function);
+        si
+
+        load(location: LOCATION, from: Graph.Value.BASE, loader: SYMBOL_LOADER) -> Graph.Value.BASE is
+            return loader.load_function_group(from, self);
+        si
+
+        call(location: Source.LOCATION, from: Graph.Value.BASE, arguments: Collections.LIST[Graph.Value.BASE], type: Semantic.Type.BASE, caller: FUNCTION_CALLER) -> Graph.Value.BASE is
+            throw new NotImplementedException("cannot call unresolved function overload group: " + self);
+        si
+
+        find_exact_match(arguments: Collections.LIST[Type.BASE], result: Type.BASE) -> Function is
+            for f in functions do
+                if f.is_exact_match(arguments, result) then
+                    return f;
+                fi
+            od
+        si
+
+        find_override(function: Function) -> Function is
+            var result: Function;
+
+            for f in functions do
+                if f != function && f.arguments.count == function.arguments.count then
+                    result = f;
+
+                    for i in 0..f.arguments.count do
+                        if f.arguments[i] !~ function.arguments[i] then
+
+                            result = null;
+                            break;
+                        fi
+                    od
+
+                    if result? then
+                        return result;
+                    fi
+                fi
+            od
+
+            return null;
+        si
+
+        merge(group: FUNCTION_GROUP) is            
+            group.resolve_overrides();
+            
+            for overridee in group.functions do
+                var overrider = find_override(overridee);
+
+                if overrider? then
+                    if isa INSTANCE_METHOD(overrider) then
+                        if isa INSTANCE_METHOD(overridee) then
+                            overrider.override = overridee;
+
+                            if !cast BASE(overrider.owner).is_trait && !cast BASE(overridee.owner).is_trait then
+                                let proposed_il_override_name = overrider.il_name_override;
+
+                                if proposed_il_override_name? then
+                                    if overrider.name =~ "init" && proposed_il_override_name !~ ".ctor" then
+                                        CONTAINER.instance.logger.error(
+                                            overrider.location,
+                                            "constructor IL name must be .ctor"
+                                        );                                        
+                                    elif overridee.il_name_override? && proposed_il_override_name !~ overridee.il_name_override then
+                                        CONTAINER.instance.logger.error(
+                                            overrider.location,
+                                            "cannot override " + overridee + " with different IL name (" + overridee.il_name_override + ", defined at " + overridee.location + ")" 
+                                        );                 
+                                    fi                                    
+                                elif overridee.il_name_override? then
+                                    overrider.il_name_override = overridee.il_name_override;                                    
+                                elif overrider.name =~ "init" then
+                                    overrider.il_name_override = ".ctor";
+                                fi
+                            fi
+                        else
+                            CONTAINER.instance.logger
+                                .warn(
+                                    overrider.location,
+                                    "hides " + overridee + " (defined at " + overridee.location + ")"
+                                );
+                        fi
+                    else
+                        CONTAINER.instance.logger
+                            .error(
+                                overrider.location,
+                                "non-virtual method cannot override " + overridee + " (defined at " + overridee.location + ")"
+                            );
+                    fi
+                elif overridee.name !~ "init" then
+                    add(overridee);
+                fi
+            od
+        si
+
+        collapse_group_if_single_member() -> Symbol.BASE is
+            if functions.count == 1 then
+                return functions[0];
+            else
+                return self;
+            fi
+        si
+
+        toString() -> String =>
+            ClassName + " " + name + " @ " + location + " (" + functions + ")";
+    si
+
+    class Function: ScopedWithEnclosingScope, Type.Typed is
+        _declaring_arguments: bool;
+
+        type: Type.BASE public;
+        return_type: Type.BASE public;
+        arguments: Collections.LIST[Type.BASE] public;
+
+        unspecialized_arguments: Collections.LIST[Type.BASE] public;
+        unspecialized_return_type: Type.BASE public;
+
+        argument_names: Collections.LIST[String] public;
+        symbol_kind: SYMBOL_KIND => SYMBOL_KIND.FUNCTION;
+        completion_kind: COMPLETION_KIND => COMPLETION_KIND.FUNCTION;
+
+        is_workspace_visible: bool => true;
+        is_abstract: bool => false;
+
+        short_description: String => name + "(" + short_argument_descriptions + ") -> " + return_type.short_description;
+
+        il_property_def: String => get_il_def("// not a property ");
+
+        il_qualified_name: String is
+            assert(
+                owner? && isa BASE(owner),
+                "null or invalid owner"
+            );
+
+            return cast BASE(owner).il_type_name + "::" + il_name;
+        si
+
+        il_type_name: String is
+            let result = new StringBuffer();
+
+            assert(self?, "function il_type_name self is null");
+
+            assert(unspecialized_arguments? || !specialized_from?, "function specialized from generic has no copy of original unspecialised arguments: " + self);
+            assert(unspecialized_return_type? || !specialized_from?, "function specialized from generic has no copy of original unspecialised arguments: " + self);
+
+            let rt = unspecialized_return_type;
+
+            if !rt? then
+                rt = return_type;
+            fi
+
+            if !rt? then
+                IO.Std.err.println("function has no return type");
+                IO.Std.err.println("function has no return type: " + name);
+                IO.Std.err.println("function has no return type: " + owner + "." + name);
+
+                result.append("void ");
+            else
+                result
+                .append(rt.il_type_name)
+                .append(' ');
+            fi
+            
+            result
+                .append(il_qualified_name)
+                .append('(');
+
+            let seen_any = false;
+
+
+            let args = unspecialized_arguments;
+
+            if !args? then
+                args = arguments;
+            fi
+            
+            for argument in args do
+                if seen_any then
+                    result.append(',');
+                fi
+
+                if argument? then
+                    result.append(argument.il_type_name);
+                else
+                    IO.Std.err.println("broken unspecialized_arguments: " + unspecialized_arguments);
+                fi
+
+                seen_any = true;
+            od
+
+            result.append(')');
+
+            return result;
+        si
+
+        argument_descriptions: String is
+            let result = new StringBuffer();
+
+            for i in 0..arguments.count do
+                if i > 0 then
+                    result.append(", ");
+                fi
+                result.append(get_argument_description(i));
+            od
+
+            return result;
+        si
+
+        short_argument_descriptions: String is
+            let result = new StringBuffer();
+
+            for i in 0..arguments.count do
+                if i > 0 then
+                    result.append(", ");
+                fi
+                result.append(get_short_argument_description(i));
+            od
+
+            return result;
+        si
+
+        override: Function public
+            => null,
+            = value
+                is throw new NotImplementedException("" + self + " cannot override " + value); si
+
+        init(location: LOCATION, owner: Scope, name: String, enclosing_scope: Scope) is
+            super.init(location, owner, name, enclosing_scope);
+
+            type = new Type.NAMED(self);
+        si
+
+        get_il_def(preamble: String) -> String is
+            let result = new StringBuffer();
+            
+            result
+                .append(preamble)
+                .append(' ')
+                .append(return_type.il_type_name)
+                .append(' ')
+                .append(il_name)
+                .append('(');
+
+            let seen_any = false;
+            
+            for i in 0..argument_names.count do
+                if seen_any then
+                    result.append(',');
+                fi
+                
+                result
+                    .append(arguments[i].il_type_name)
+                    .append(" '")
+                    .append(argument_names[i])
+                    .append("'");
+
+                seen_any = true;
+            od
+
+            result.append(") cil managed");
+
+            return result;    
+        si
+        
+        start_declaring_arguments() is
+            _declaring_arguments = true;
+        si
+
+        end_declaring_arguments() is
+            _declaring_arguments = false;
+        si
+
+        specialize(type_map: Collections.MAP[String,Type.BASE], owner: GENERIC) -> Function is
+            assert(owner?, "cannot specialize " + self + " with null owner");
+
+            if return_type == null then
+                IO.Std.err.println("oops: attempting to specialize function with null return type");
+                return self;
+            fi
+
+            let result = cast Function(clone());
+            
+            result.specialized_from = self;
+
+            // IO.Std.err.println("set specialized from: " + qualified_name);
+
+            result.return_type = return_type.specialize(type_map);
+
+            if result.owner != owner then
+                let new_owner = owner.find_owning_ancestor(result.owner);
+
+                if new_owner? then
+                    result.owner = new_owner;
+                else
+                    IO.Std.err.println("\nspecialize broken owner " + result.owner + " with " + owner);
+                    IO.Std.err.println("specializing: " + self + " with " + type_map);
+
+                    owner.dump_ancestors(1);
+
+                    result.owner = owner;                    
+                fi
+            else
+                IO.Std.err.println("" + result + " is already owned by " + owner);
+            fi
+            
+            if unspecialized_arguments? then
+                result.unspecialized_arguments = unspecialized_arguments;
+            else
+                result.unspecialized_arguments = arguments;
+            fi
+
+            if unspecialized_return_type? then
+                result.unspecialized_return_type = unspecialized_return_type;
+            else
+                result.unspecialized_return_type = return_type;
+            fi
+            
+            let ra = new Collections.LIST[Type.BASE](arguments);
+
+            result.arguments = ra;
+
+            for i in 0..arguments.count do
+                let a = arguments[i];
+
+                if a? then
+                    ra[i] = arguments[i].specialize(type_map);
+                fi
+            od
+
+            return result;
+        si
+
+        get_full_type(ghul_symbol_lookup: GHUL_SYMBOL_LOOKUP) -> Type.NAMED is
+            let types = new Collections.LIST[Type.BASE](arguments.count + 1);
+
+            types.add_range(arguments);
+            types.add(return_type);
+
+            return ghul_symbol_lookup.get_function_type(types);
+        si
+
+        is_exact_match(arguments: Collections.LIST[Type.BASE], type: Type.BASE) -> bool is
+            if arguments.count != self.arguments.count then
+                return false;
+            fi
+
+            for i in 0..arguments.count do
+                if arguments[i] != self.arguments[i] then
+                    return false;
+                fi
+            od
+
+            if return_type != self.return_type then
+                return false;
+            fi
+
+            return true;
+        si
+
+        declare_variable(location: LOCATION, name: String, is_static: bool, symbol_definition_listener: SymbolDefinitionListener) is
+            if _declaring_arguments then
+                var result = new Symbol.LOCAL_ARGUMENT(location, self, name);
+
+                declare(location, result, symbol_definition_listener);
+            else
+                var result = new Symbol.LOCAL_VARIABLE(location, self, name);
+
+                declare(location, result, symbol_definition_listener);                            
+            fi
+        si
+
+        declare_function(location: LOCATION, name: String, is_static: bool, is_private: bool, enclosing: Scope, symbol_definition_listener: SymbolDefinitionListener) -> Scope is
+            var result = new Symbol.GLOBAL_FUNCTION(location, self, name, enclosing);
+
+            declare_function_group(location, result, symbol_definition_listener);
+
+            return result;
+        si
+
+        get_argument_description(index: int) -> String is
+            let result = new StringBuffer();
+
+            result
+                .append(argument_names[index])
+                .append(": ")
+                .append(arguments[index]);
+
+            return result;
+        si
+
+        get_short_argument_description(index: int) -> String is
+            let result = new StringBuffer();
+
+            result
+                .append(argument_names[index])
+                .append(": ")
+                .append(arguments[index].short_description);
+
+            return result;
+        si
+
+        toString() -> String is
+            let result = new StringBuffer();
+
+            try
+                result.append(qualified_name);
+                result.append("(");
+                result.append(short_argument_descriptions);
+                result.append(") -> ");
+                result.append(return_type);
+
+                // return qualified_name + " (" + short_argument_descriptions + ") -> " + return_type;
+                return result;
+            catch ex: Exception
+                IO.Std.err.println("failed to convert function to string: " + name + ", got as far as: " + result);
+
+                return "[garbled function]";
+            yrt
+        si
+    si
+si
