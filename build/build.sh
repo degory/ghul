@@ -8,10 +8,6 @@ if [ "$1" != "no-docker" ] ; then
     WANT_DOCKER="-D"
 fi
 
-if [ "$1" != "no-docker" ] ; then
-    WANT_DOCKER="-D"
-fi
-
 if [ -z "$GHUL" ]; then
     export PATH=$PATH:`pwd`
     export GHUL=`which ghul`
