@@ -1,3 +1,5 @@
+
+    // start IEnumerator boilerplate
     .method private final virtual hidebysig newslot specialname instance default class [mscorlib]System.Object System.Collections.IEnumerator.get_Current ()  cil managed 
     {
     	.override class [mscorlib]System.Collections.IEnumerator::get_Current
@@ -17,3 +19,4 @@
 	    .maxstack 8
 	    ret 
     }
+    // end IEnumerator boilerplate
