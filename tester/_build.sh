@@ -9,4 +9,4 @@ if [ -z "$GHUL" ]; then
 fi
 
 echo "Building with $GHUL (`$GHUL`)..."
-find src -name '*.ghul' | xargs $GHUL -L $GHULFLAGS -o tester imports.l
+find src -name '*.ghul' | xargs $GHUL --no-type-check -L $GHULFLAGS -o tester imports.l
