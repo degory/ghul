@@ -15,5 +15,5 @@ fi
 
 export LFLAGS="-Ws -WM -FC"
 
-echo "Building with $GHUL (`$GHUL`)..."
+echo "Building with $GHUL (`$GHUL`) for legacy target..."
 find src -name '*.ghul' | xargs $GHUL $WANT_DOCKER -L -o ghul imports.l -p ./lib
