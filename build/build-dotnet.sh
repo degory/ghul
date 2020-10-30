@@ -3,4 +3,4 @@
 echo "namespace Source is class BUILD is number: System.String static => \"local-`date +'%s'`\"; si si" >src/source/build.ghul
 
 echo "Building with ./ghul (`./ghul`) for .NET target..."
-find src -name '*.ghul' | xargs ./ghul -p ./lib
+find src -name '*.ghul' | xargs ./ghul -p ./lib -o ghul.exe
