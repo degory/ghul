@@ -11,7 +11,7 @@ else
     fi
 
     if [ -z "${BRANCH_NAME}" ]; then
-        BRANCH_NAME=`git branch | sed -n -e 's/^\* \(.*\)/\1/p'`
+        BRANCH_NAME=`git branch | sed -n -e 's/^\* \(.*\)/\1/p' | sed -n -e 's@/@-@p'`
     fi
 
     if [ ${CI} ] ; then
