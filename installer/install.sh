@@ -50,7 +50,7 @@ else
 fi
 
 if [ -d /usr/lib/ghul ] ; then
-    if $PREFIX rm -r /usr/lib/ghul /usr/bin/ghul ; then
+    if $PREFIX rm -r /usr/lib/ghul /usr/bin/ghul /usr/bin/ghul.exe ; then
         echo "✔️ existing ghūl installation removed"
     else
         echo "❌ failed to remove existing ghūl installation: please manually delete /usr/lib/ghul/"
@@ -70,6 +70,15 @@ if [ "$1" == "-L" ] || [ "$1" == "-A" ] ; then
     fi
 fi
 
+if [ "$1" != "-L" ] && [ "$1" != "-D" ] && [ -f usr/bin/ghul.exe ] ; then
+    if mono --aot=full -O=all usr/bin/ghul.exe >aot-log.txt 2>&1 ; then
+        echo "✔️ ghūl compiler AOT compile succeeded"
+    else
+        cat aot-log.txt
+        echo "❌ ghūl compiler AOT compile failed"
+    fi
+fi
+
 if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -a usr / ; then
     if [ "$1" == "-A" ] ; then
         TARGET=".NET and legacy targets"
@@ -85,8 +94,15 @@ else
     exit 1
 fi
 
+echo
 
+echo -n "legacy compiler version: "
 /usr/bin/ghul
+
+if [ "$1" != "-L" ] && [ "$1" != "-D" ] && [ -f /usr/bin/ghul.sh ] ; then
+    echo -n ".NET hosted compiler version: "
+    /usr/bin/ghul.sh
+fi
 
 if [ -x "`which id`" ] ; then
     $PREFIX chown -R `id -u`:`id -g` ./usr
