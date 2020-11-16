@@ -12,12 +12,12 @@
 
 ### Continuous delivery status
 
- [![workflow](https://github.com/degory/ghul/workflows/Release/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ARelease)
+[![workflow](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
 
 
 ## Targets
 
-The compiler can target both .NET and native x86-64 Linux via LLVM, however the native code target is deprecated and I'm concentrating solely on bootstrapping on .NET
+The compiler targets .NET
 
 ## Getting started
 
@@ -26,9 +26,7 @@ The compiler can target both .NET and native x86-64 Linux via LLVM, however the 
 If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl application template](https://github.com/degory/ghul-application-template) repository
 
 ### Required dependencies
-- [Mono](https://www.mono-project.com/) to build .NET executables, and/or
-- [Docker](https://www.docker.com) to build native executables using the legacy LLVM back end
-- Boehm GC (libgc.so.1 libgc1c2)
+- [Mono](https://www.mono-project.com/) to build .NET executables
 - Bash shell
 
 ### Optional dependencies
@@ -55,21 +53,4 @@ There is limited support right now for building ghūl applications other than th
 
 ## Gotchas
 
-### General
-
-This is an incomplete compiler for an experimental programming language. The CD pipeline ensures that a released build will bootstrap and pass the test suite, but nevertheless some features are missing or buggy:
- - Parsing is stable
- - The LLVM based native code target is stable, but is deprecated in favour of the .NET target
- - Semantic analysis is fairly stable
- - The code generator for the .NET target is incomplete and buggy.
-
-### Docker
-
-The LLVM native code target has some dependencies that are difficult to install on recent versions of Linux (including LLVM 2.8 and a specific version of GCC). However, these dependencies are packaged in a container ([ghul/compiler:stable](https://hub.docker.com/r/ghul/compiler)) which the compiler back-end pulls and uses automatically, so you don't typically need to deal with this directly, but Docker does need to be on the PATH.
-
-Compiled binaries can be run directly without Docker, provided the [L language runtime](https://github.com/degory/llc/releases) is installed. Alternatively, compiled binaries can also be run via Docker - dev.sh gets you a suitable shell.
-
-### Transpilation
-
-When compiling for the LLVM native code target, the compiler transpiles ghūl source code to [L](https://github.com/degory/llc) as an intermediate step and then that intermediate L source code is compiled down to LLVM bitcode before actual native code is produced. Most of the semantic analysis is repeated at the L level, which can make for confusing error reporting.
-
+This is an incomplete compiler for an experimental programming language. The CI/CD pipeline ensures that a released build will bootstrap and pass the test suite, but nevertheless some features are missing or buggy.
