@@ -24,11 +24,12 @@ RUN apt-get update \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/* /tmp/common-setup.sh
 
+RUN apt-get update \
+    && apt-get -y install --no-install-recommends mono-devel
+
 COPY installer/ghul.run .
 
-RUN apt-get update \
-    && apt-get -y install --no-install-recommends libgc1c2 mono-devel \
-    && bash ./ghul.run -- -N \
+RUN bash ./ghul.run -- -N \
     && apt-get autoremove -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/* ghul.run

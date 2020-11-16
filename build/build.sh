@@ -1,23 +1,27 @@
 #!/bin/bash
 
-if [ ! -f src/source/build.ghul ] ; then
-    echo "namespace Source is class BUILD is number: System.String static => \"local-`date +'%s'`\"; si si" >src/source/build.ghul
+set -e
+
+if [ -z "$BUILD_NAME" ] ; then
+    export BUILD_NAME="local-`date +'%s'`"
 fi
 
-if [ "$1" != "no-docker" ] ; then
-    WANT_DOCKER="-D"
-fi
-
-if [ ! -z "$DEBUG" ]; then
-    WANT_DEBUG="--debug";
-fi
+echo "namespace Source is class BUILD is number: System.String static => \"$BUILD_NAME\"; si si" >src/source/build.ghul
 
 if [ -z "$GHUL" ]; then
     export PATH=$PATH:`pwd`
-    export GHUL=`which ghul`
+    export GHUL=`which ghul.exe`
 fi
 
-export LFLAGS="-Ws -WM -FC"
+if [ -z "$LIB " ]; then
+    export PREFIX=-p ./lib
+fi
 
-echo "Building with $GHUL (`$GHUL`) for legacy target..."
-find src -name '*.ghul' | xargs $GHUL $WANT_DOCKER $WANT_DEBUG -L -o ghul imports.l -p ./lib
+echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
+
+if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
+cat source-files.txt | xargs mono $GHUL $PREFIX -o ghul-new.exe
+
+mv ghul-new.exe ghul.exe
+
+# if [ -f ghul-new.exe ] ; then mv ghul-new.exe ghul.exe ; mono --aot=full -O=all ghul.exe ; mono ./ghul.exe ; fi

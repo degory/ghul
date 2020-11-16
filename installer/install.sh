@@ -2,35 +2,11 @@
 
 PATH=/sbin:/usr/sbin:$PATH
 
-if ldconfig -p | fgrep -q libgc.so.1 ; then echo
-    echo "✔️ libgc found"
+if [ -x "`which ilasm`" ] ; then
+    echo "✔️ ilasm found"
 else
-    echo "❌ libgc.so.1 not found: please install the Boehm GC development package (e.g. apt install libgc1c2)"
+    echo "❌ ilasm not found: please install the Mono development package (e.g. apt install mono-devel)"
     FAILED=1
-fi
-
-if [ "$1" != "-L" ] && [ "$1" != "-D" ] ; then
-    if [ -x "`which ilasm`" ] ; then
-        echo "✔️ ilasm found"
-    else
-        echo "❌ ilasm not found: please install the Mono development package (e.g. apt install mono-devel)"
-        FAILED=1
-    fi
-else
-    echo "✔️ legacy only install: ilasm not needed"
-fi
-
-if [ "$1" == "-L" ] || [ "$1" == "-A" ] ; then
-    if [ -x "`which docker`" ] ; then
-        echo "✔️ docker found"
-    else
-        echo "❌ docker not found: please install"
-        FAILED=1
-    fi
-elif [ "$1" == "-D" ] ; then
-    echo "✔️ legacy container install: docker not needed"
-else
-    echo "✔️ dotnet only install: docker not needed"
 fi
 
 if [ $FAILED ] ; then
@@ -50,59 +26,41 @@ else
 fi
 
 if [ -d /usr/lib/ghul ] ; then
-    if $PREFIX rm -r /usr/lib/ghul /usr/bin/ghul /usr/bin/ghul.exe ; then
+    TO_DELETE=/usr/lib/ghul
+
+    for f in /usr/bin/ghul /usr/bin/ghul.exe /usr/bin/ghul.sh ; do
+        if [ -f "$f" ] ; then
+            TO_DELETE="$TO_DELETE $f"
+        fi
+    done
+fi
+
+if [ ! -z "$TO_DELETE" ] ; then
+    if $PREFIX rm -r $TO_DELETE ; then
         echo "✔️ existing ghūl installation removed"
     else
-        echo "❌ failed to remove existing ghūl installation: please manually delete /usr/lib/ghul/"
+        echo "❌ failed to remove existing ghūl installation: please manually delete $TO_DELETE"
         exit 1
     fi
 fi
 
-if [ "$1" == "-L" ] || [ "$1" == "-A" ] ; then
-    if [ -x "`which docker`" ] ; then
-        if docker pull --quiet ghul/compiler:stable ; then
-            echo "✔️ pulled latest ghul compiler container"
-        else
-            echo "❌ failed to pull the latest docker container"
-        fi
-    else
-        echo "docker not found: legacy target will not be supported"
-    fi
-fi
-
-if [ "$1" != "-L" ] && [ "$1" != "-D" ] && [ -f usr/bin/ghul.exe ] ; then
-    if mono --aot=full -O=all usr/bin/ghul.exe >aot-log.txt 2>&1 ; then
-        echo "✔️ ghūl compiler AOT compile succeeded"
-    else
-        cat aot-log.txt
-        echo "❌ ghūl compiler AOT compile failed"
-    fi
+if mono --aot=full -O=all usr/bin/ghul.exe >aot-log.txt 2>&1 ; then
+    echo "✔️ ghūl compiler AOT compile succeeded"
+else
+    cat aot-log.txt
+    echo "❌ ghūl compiler AOT compile failed"
 fi
 
 if umask 0022 && $PREFIX chown -R root:root ./usr && $PREFIX cp -a usr / ; then
-    if [ "$1" == "-A" ] ; then
-        TARGET=".NET and legacy targets"
-    elif [ "$1" == "-L" ] || [ "$1" == "-D" ] ; then
-        TARGET="legacy target"
-    else
-        TARGET=".NET target"
-    fi
-
-    echo "✔️ ghūl compiler installed for $TARGET"
+    echo "✔️ ghūl compiler installed"
 else
     echo "❌ installation failed"
     exit 1
 fi
 
 echo
-
-echo -n "legacy compiler version: "
+echo -n "Compiler version: "
 /usr/bin/ghul
-
-if [ "$1" != "-L" ] && [ "$1" != "-D" ] && [ -f /usr/bin/ghul.sh ] ; then
-    echo -n ".NET hosted compiler version: "
-    /usr/bin/ghul.sh
-fi
 
 if [ -x "`which id`" ] ; then
     $PREFIX chown -R `id -u`:`id -g` ./usr
