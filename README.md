@@ -63,13 +63,3 @@ This is an incomplete compiler for an experimental programming language. The CD 
  - Semantic analysis is fairly stable
  - The code generator for the .NET target is incomplete and buggy.
 
-### Docker
-
-The LLVM native code target has some dependencies that are difficult to install on recent versions of Linux (including LLVM 2.8 and a specific version of GCC). However, these dependencies are packaged in a container ([ghul/compiler:stable](https://hub.docker.com/r/ghul/compiler)) which the compiler back-end pulls and uses automatically, so you don't typically need to deal with this directly, but Docker does need to be on the PATH.
-
-Compiled binaries can be run directly without Docker, provided the [L language runtime](https://github.com/degory/llc/releases) is installed. Alternatively, compiled binaries can also be run via Docker - dev.sh gets you a suitable shell.
-
-### Transpilation
-
-When compiling for the LLVM native code target, the compiler transpiles ghūl source code to [L](https://github.com/degory/llc) as an intermediate step and then that intermediate L source code is compiled down to LLVM bitcode before actual native code is produced. Most of the semantic analysis is repeated at the L level, which can make for confusing error reporting.
-
