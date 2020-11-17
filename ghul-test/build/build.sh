@@ -1,3 +1,3 @@
 #!/bin/bash
 
-find src ../src/system -name '*.ghul' | xargs /usr/bin/ghul -p ../lib -o ghul-test.exe
+find src ../src/system -name '*.ghul' | xargs mono /usr/bin/ghul.exe -p ../lib -o ghul-test.exe
