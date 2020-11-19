@@ -13,14 +13,15 @@ if [ -z "$GHUL" ]; then
     export GHUL=`which ghul.exe`
 fi
 
-if [ -z "$LIB " ]; then
-    export PREFIX=-p ./lib
+if [ -z "$LIB" ]; then
+    export LIB=./lib
 fi
 
 echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
-cat source-files.txt | xargs mono $GHUL $PREFIX -o ghul-new.exe
+# cat source-files.txt | xargs mono $GHUL -p $LIB -o ghul-new.exe
+find src -name '*.ghul' | xargs mono $GHUL -p $LIB -o ghul-new.exe
 
 mv ghul-new.exe ghul.exe
 
