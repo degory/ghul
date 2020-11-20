@@ -7,7 +7,7 @@ mkdir root
 pushd root 2>/dev/null
 tar xvzf ../root.tar.gz
 popd 2>/dev/null
-cp -av ../lib/dotnet ../lib/legacy root/usr/lib/ghul
+cp -av ../lib/dotnet root/usr/lib/ghul
 cp ../ghul.exe root/usr/bin
 cp ../ghul root/usr/bin
 cp ../ghul-test/ghul-test.exe root/usr/bin

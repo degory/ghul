@@ -17,12 +17,16 @@ if [ -z "$LIB" ]; then
     export LIB=./lib
 fi
 
+if [ $DEBUG ]; then
+    export DEBUG_OPTION=--debug
+fi
+
 echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
-cat source-files.txt | xargs mono $GHUL -p $LIB -o ghul-new.exe
-# find src -name '*.ghul' | xargs mono $GHUL -p $LIB -o ghul-new.exe
+
+find src -name '*.ghul' | xargs mono $GHUL $DEBUG_OPTION -p $LIB -o ghul-new.exe
 
 mv ghul-new.exe ghul.exe
-
-# if [ -f ghul-new.exe ] ; then mv ghul-new.exe ghul.exe ; mono --aot=full -O=all ghul.exe ; mono ./ghul.exe ; fi
+mv ghul-new.exe.mdb ghul.exe.mdb
+mv ghul-new.runtimeconfig.json ghul.runtimeconfig.json
