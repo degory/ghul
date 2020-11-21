@@ -2,8 +2,20 @@
 
 PATH=/sbin:/usr/sbin:$PATH
 
-if [ -x "`which ilasm`" ] ; then
-    echo "✔️ ilasm found"
+if [ -x "`command -v nuget`" ] && nuget install runtime.linux-x64.Microsoft.NETCore.ILAsm -verbosity quiet -outputdirectory ilasm ; then
+    mkdir -p usr/lib/ghul/ilasm
+    cp `find ilasm -type f -name ilasm` usr/lib/ghul/ilasm
+    chmod 755 usr/lib/ghul/ilasm usr/lib/ghul/ilasm/ilasm
+
+    echo "✔️ .NET Core ilasm downloaded via NuGet"
+elif curl https://share.giantblob.com:5001/sharing/uU4aDcpEk -o ilasm ; then
+    mkdir -p usr/lib/ghul/ilasm
+    cp ilasm usr/lib/ghul/ilasm
+    chmod 755 usr/lib/ghul/ilasm usr/lib/ghul/ilasm/ilasm
+
+    echo "✔️ .NET Core ilasm downloaded giantblob.com"
+elif [ -x /usr/bin/ilasm ] ; then
+    echo "✔️ ilasm found in /usr/bin"
 else
     echo "❌ ilasm not found: please install the Mono development package (e.g. apt install mono-devel)"
     FAILED=1
@@ -17,7 +29,7 @@ fi
 if [ $EUID == 0 ] ; then
     echo "✔️ you are root: sudo not required"
     PREFIX="";
-elif [ -x "`which sudo`" ] ; then
+elif [ -x "`command -v sudo`" ] ; then
     echo "✔️ you are not root, but sudo found: please enter your password if prompted"
     PREFIX="sudo"
 else
@@ -60,10 +72,13 @@ fi
 
 echo
 echo -n "Compiler version: "
-/usr/bin/ghul
 
-if [ -x "`which id`" ] ; then
-    $PREFIX chown -R `id -u`:`id -g` ./usr
-else
-    echo "unable to chown \"`pwd`/usr\": you may need to manually delete it"
+mono /usr/bin/ghul.exe
+
+if [ $EUID != 0 ] ; then
+    if [ -x "`command -v id`" ]; then
+        $PREFIX chown -R `id -u`:`id -g` ./usr
+    else
+        echo "unable to chown \"`pwd`/usr\": you may need to manually delete it"
+    fi
 fi

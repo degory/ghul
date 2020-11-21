@@ -34,5 +34,9 @@ fi
 echo $SOURCE_FILES | xargs mono $GHUL $DEBUG_OPTION -p $LIB -o ghul-new.exe
 
 mv ghul-new.exe ghul.exe
-mv ghul-new.exe.mdb ghul.exe.mdb
+
+if [ -f ghul-new.exe.mdb ] ; then
+    mv ghul-new.exe.mdb ghul.exe.mdb
+fi
+
 mv ghul-new.runtimeconfig.json ghul.runtimeconfig.json
