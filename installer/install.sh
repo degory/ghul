@@ -8,12 +8,12 @@ if [ -x "`command -v nuget`" ] && nuget install runtime.linux-x64.Microsoft.NETC
     chmod 755 usr/lib/ghul/ilasm usr/lib/ghul/ilasm/ilasm
 
     echo "✔️ .NET Core ilasm downloaded via NuGet"
-elif curl https://share.giantblob.com:5001/sharing/uU4aDcpEk -o ilasm ; then
-    mkdir -p usr/lib/ghul/ilasm
+elif curl https://degory.github.io/ilasm -o ilasm ; then
+    mkdir -p usr/lib/ghul/ilasm/
     cp ilasm usr/lib/ghul/ilasm
     chmod 755 usr/lib/ghul/ilasm usr/lib/ghul/ilasm/ilasm
 
-    echo "✔️ .NET Core ilasm downloaded giantblob.com"
+    echo "✔️ .NET Core ilasm downloaded from GitHub"
 elif [ -x /usr/bin/ilasm ] ; then
     echo "✔️ ilasm found in /usr/bin"
 else
