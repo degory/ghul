@@ -25,12 +25,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /tmp/common-setup.sh
 
 RUN apt-get update \
-    && apt-get -y install --no-install-recommends mono-devel
+    && apt-get -y install --no-install-recommends mono-devel nuget \
+    && apt-get clean -y
 
 COPY installer/ghul.run .
 
-RUN bash ./ghul.run -- -N \
-    && apt-get autoremove -y \
-    && apt-get clean -y \
-    && rm -rf /var/lib/apt/lists/* ghul.run
+RUN bash ./ghul.run \
+    && rm ghul.run
 
