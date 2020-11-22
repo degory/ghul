@@ -25,9 +25,7 @@ echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
 
-if [ -f source-files.txt ] ; then
-    export SOURCE_FILES=`cat source-files.txt`
-else
+if [ -z "$SOURCE_FILES" ] ; then
     export SOURCE_FILES=`find src -name '*.ghul'`
 fi
 
