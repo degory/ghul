@@ -8,18 +8,18 @@ fi
 
 echo root is ${ROOT}
 
-read -p "new test name (use-kebab-case): " TEST_NAME
+read -p "new test name (folder/kebab-case-test-name): " TEST_NAME
 
 if [ -z "${TEST_NAME}" ] ; then
     echo "no test name given"
     exit 1
 fi
 
-if [ ! -d ${ROOT}/tests/cases ] ; then
+if [ ! -d ${ROOT}/tests ] ; then
     echo "expected to find tests/cases folder under ${ROOT}"
     exit 1
 fi
 
-cp -r tests/template ${ROOT}/tests/cases/${TEST_NAME}
+cp -r tests/template ${ROOT}/tests/${TEST_NAME}
 
-code ${ROOT}/tests/cases/${TEST_NAME}
+code ${ROOT}/tests/${TEST_NAME}
