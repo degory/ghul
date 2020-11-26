@@ -33,8 +33,6 @@ if [ -d $CASE ] ; then
         echo >$CASE/fail.expected
     fi
 
-    rm $CASE/failed
-
     exit 0
 else
     echo "doesn't seem to be a test case: $CASE"

@@ -21,6 +21,10 @@ if [ $DEBUG ]; then
     export DEBUG_OPTION=--debug
 fi
 
+if [ $CI ]; then
+    export RELEASE_OPTION="--define release"
+fi
+
 echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
@@ -29,7 +33,7 @@ if [ -z "$SOURCE_FILES" ] ; then
     export SOURCE_FILES=`find src -name '*.ghul'`
 fi
 
-echo $SOURCE_FILES | xargs mono $GHUL $DEBUG_OPTION -p $LIB -o ghul-new.exe
+echo $SOURCE_FILES | xargs mono $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o ghul-new.exe
 
 mv ghul-new.exe ghul.exe
 
