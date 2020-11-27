@@ -4,7 +4,7 @@
 
 ### Latest installer
 
-[ghul.run](https://github.com/degory/ghul/releases/latest/downloads/ghul.run)
+[ghul.run](https://github.com/degory/ghul/releases/latest/download/ghul.run)
 
 ### Latest release
 
@@ -15,9 +15,9 @@
 [![workflow](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
 
 
-## Targets
+## Host and target
 
-The compiler targets .NET
+The compiler is hosted on .NET and targets .NET
 
 ## Getting started
 
@@ -25,13 +25,19 @@ The compiler targets .NET
 
 If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl application template](https://github.com/degory/ghul-application-template) repository
 
-### Required dependencies
-- [Mono](https://www.mono-project.com/) to build .NET executables
-- Bash shell
+### Build time dependencies for the compiler itself
+- Linux (native, WSL2, or in a container)
+- Either [.NET 5.0](https://dotnet.microsoft.com/download/dotnet/5.0) or [Mono 6.0](https://www.mono-project.com/)
+- Bash
+
+See the [template application](https://github.com/degory/ghul-application-template) README for detailed instructions on setting up your build environment
 
 ### Optional dependencies
 
 - [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://github.com/degory/ghul-vsce/releases).
+
+### Runtime dependencies for ghūl applications
+- Either [.NET 5.0](https://dotnet.microsoft.com/download/dotnet/5.0) or [Mono 6.0](https://www.mono-project.com/)
 
 ### Building applications with ghūl
 

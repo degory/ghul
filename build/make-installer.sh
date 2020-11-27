@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 cd installer
 wget https://github.com/megastep/makeself/releases/download/release-2.4.2/makeself-2.4.2.run
 bash ./makeself-2.4.2.run
@@ -8,11 +9,12 @@ pushd root 2>/dev/null
 tar xvzf ../root.tar.gz
 popd 2>/dev/null
 cp -av ../lib/dotnet root/usr/lib/ghul
-cp ../ghul.exe root/usr/bin
-cp ../ghul root/usr/bin
-cp ../ghul-test/ghul-test.exe root/usr/bin
-cp ../ghul-test/ghul-test root/usr/bin
+
+cp ../ghul ../ghul.exe ../ghul.runtimeconfig.json root/usr/bin
+cp ../ghul-test/ghul-test ../ghul-test/ghul-test.exe ../ghul-test/ghul-test.runtimeconfig.json root/usr/bin
+
 cp install.sh root
+
 bash ./makeself-2.4.2/makeself.sh root ghul.run "ghūl compiler" ./install.sh
 if [ "$1" != "" ] ; then
     mv ghul.run ghul-v$1.run

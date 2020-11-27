@@ -26,30 +26,36 @@ if [ $CI ]; then
 fi
 
 if [ -z "$HOST" ] ; then
-    if [ -x "`command -v mono`" ] ; then
-        HOST="mono"
-    elif [ -x "`command -v dotnet`" ] ; then
+    if [ -x "`command -v dotnet`" ] ; then
         HOST="dotnet"
+    elif [ -x "`command -v mono`" ] ; then
+        HOST="mono"
     else
         echo "No CLI found"
         exit 1
     fi
 fi
 
-echo "Building with $GHUL (`mono $GHUL`) on $HOST for .NET target..."
-
-if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
+echo "Building with $GHUL (`$HOST $GHUL`) on $HOST for .NET target..."
 
 if [ -z "$SOURCE_FILES" ] ; then
     export SOURCE_FILES=`find src -name '*.ghul'`
 fi
 
-echo $SOURCE_FILES | xargs $HOST $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o ghul-new.exe
+mkdir -p out
 
-mv ghul-new.exe ghul.exe
+echo $HOST $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o out/ghul.exe
 
-if [ -f ghul-new.exe.mdb ] ; then
-    mv ghul-new.exe.mdb ghul.exe.mdb
+echo $SOURCE_FILES | xargs $HOST $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o out/ghul.exe
+
+if [ -f out/ghul.exe ] ; then
+    mv -f out/ghul.exe .
 fi
 
-mv ghul-new.runtimeconfig.json ghul.runtimeconfig.json
+if [ -f out/ghul-new.exe.mdb ] ; then
+    mv -f out/ghul.exe.mdb .
+fi
+
+if [ -f out/ghul.runtimeconfig.json ] ; then
+    mv -f out/ghul.runtimeconfig.json .
+fi
