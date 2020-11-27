@@ -26,17 +26,17 @@ if [ $CI ]; then
 fi
 
 if [ -z "$HOST" ] ; then
-    if [ -x "`command -v mono`" ] ; then
-        HOST="mono"
-    elif [ -x "`command -v dotnet`" ] ; then
+    if [ -x "`command -v dotnet`" ] ; then
         HOST="dotnet"
+    elif [ -x "`command -v mono`" ] ; then
+        HOST="mono"
     else
         echo "No CLI found"
         exit 1
     fi
 fi
 
-echo "Building with $GHUL (`mono $GHUL`) on $HOST for .NET target..."
+echo "Building with $GHUL (`$GHUL`) on $HOST for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
 
