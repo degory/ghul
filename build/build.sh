@@ -25,7 +25,18 @@ if [ $CI ]; then
     export RELEASE_OPTION="--define release"
 fi
 
-echo "Building with $GHUL (`mono $GHUL`) for .NET target..."
+if [ -z "$HOST" ] ; then
+    if [ -x "`command -v mono`" ] ; then
+        HOST="mono"
+    elif [ -x "`command -v dotnet`" ] ; then
+        HOST="dotnet"
+    else
+        echo "No CLI found"
+        exit 1
+    fi
+fi
+
+echo "Building with $GHUL (`mono $GHUL`) on $HOST for .NET target..."
 
 if [ -f ghul-new.exe ] ; then rm ghul-new.exe ; fi
 
@@ -33,7 +44,7 @@ if [ -z "$SOURCE_FILES" ] ; then
     export SOURCE_FILES=`find src -name '*.ghul'`
 fi
 
-echo $SOURCE_FILES | xargs mono $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o ghul-new.exe
+echo $SOURCE_FILES | xargs $HOST $GHUL $DEBUG_OPTION $RELEASE_OPTION -p $LIB -o ghul-new.exe
 
 mv ghul-new.exe ghul.exe
 
