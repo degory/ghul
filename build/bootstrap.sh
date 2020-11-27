@@ -12,5 +12,6 @@ GHUL=./ghul.exe ./build/build.sh
 mv out.il stage-2.il
 GHUL=./ghul.exe ./build/build.sh
 mv out.il stage-3.il
-diff stage-2.il stage-3.il
-# rm stage-2.il stage-3.il
+if diff stage-2.il stage-3.il ; then
+    rm stage-2.il stage-3.il
+fi
