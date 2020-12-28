@@ -177,7 +177,7 @@ if [ -d /usr/lib/ghul ] ; then
             if [ -f "${f}" ] ; then
                 if ! ${PREFIX} rm -f ${f} ; then
                     FAILED=1
-
+  
                     break
                 fi
             fi
