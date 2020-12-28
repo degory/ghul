@@ -5,7 +5,7 @@ PATH=/sbin:/usr/sbin:$PATH
 function install_packages_dotnet {
     echo -n "installing packages"
 
-    if ! mkdir -p project/packages >/dev/null ; then
+    if ! mkdir -p project/packages >log.txt 2>&1 ; then
         echo ; echo "❌ temporary project folder creation failed"
         return 1
     fi
@@ -14,23 +14,23 @@ function install_packages_dotnet {
 
     pushd project >/dev/null
 
-    if ! dotnet new console -verbosity:q >/dev/null ; then
+    if ! dotnet new console -verbosity:q >>log.txt 2>&1 ; then
         echo ; echo "❌ dummy .NET project creation failed"
-        popd ; FAILED=1 ; return
+        cat log.txt ; popd >/dev/null ; FAILED=1 ; return
     fi
 
     echo -n "."
 
-    if ! dotnet add package --package-directory packages runtime.linux-x64.Microsoft.NETCore.ILAsm >/dev/null ; then
+    if ! dotnet add package --package-directory packages runtime.linux-x64.Microsoft.NETCore.ILAsm >>log.txt 2>&1 ; then
         echo ; echo "❌ ILAsm package install failed"
-        popd ; FAILED=1 ; return
+        cat log.txt ; popd >/dev/null ; FAILED=1 ; return
     fi
 
     echo -n "."
 
-    if ! dotnet add package --package-directory packages ghul.runtime >/dev/null ; then
+    if ! dotnet add package --package-directory packages ghul.runtime >>log.txt 2>&1 ; then
         echo ; echo "❌ ghūl runtme package install failed"
-        popd ; FAILED=1 ; return
+        cat log.txt ; popd >/dev/null ; FAILED=1 ; return
     fi
 
     echo "."
@@ -173,11 +173,11 @@ if [ -d /usr/lib/ghul ] ; then
     if ! ${PREFIX} rm -rf /usr/lib/ghul ; then
         FAILED=1
     else
-        for f in /usr/bin/ghul /usr/bin/ghul.exe /usr/bin/ghul.sh ; do
+        for f in /usr/bin/ghul /usr/bin/ghul.exe /usr/bin/ghul.runtimeconfig.json /usr/bin/ghul-test /usr/bin/ghul-test.exe /usr/bin/ghul-test.runtimeconfig.json ; do
             if [ -f "${f}" ] ; then
                 if ! ${PREFIX} rm -f ${f} ; then
                     FAILED=1
-
+  
                     break
                 fi
             fi

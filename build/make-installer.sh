@@ -11,7 +11,6 @@ popd 2>/dev/null
 cp -av ../lib/dotnet ../lib/test.sed root/usr/lib/ghul
 
 cp ../ghul ../ghul.exe ../ghul.runtimeconfig.json root/usr/bin
-cp ../ghul-test/ghul-test ../ghul-test/ghul-test.exe ../ghul-test/ghul-test.runtimeconfig.json root/usr/bin
 
 cp install.sh root
 
