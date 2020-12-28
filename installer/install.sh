@@ -175,7 +175,6 @@ if [ -d /usr/lib/ghul ] ; then
     else
         for f in /usr/bin/ghul /usr/bin/ghul.exe /usr/bin/ghul.sh ; do
             if [ -f "${f}" ] ; then
-                echo "${PREFIX} rm -f ${f}"
                 if ! ${PREFIX} rm -f ${f} ; then
                     FAILED=1
 

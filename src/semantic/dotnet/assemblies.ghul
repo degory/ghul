@@ -5,6 +5,7 @@ namespace Semantic.DotNet is
 
     @IF.not.v3() use TYPE = System.Type2;
     @IF.not.v3() use Path = System.IO2.Path;
+    @IF.not.v3() use File = System.IO2.File;
 
     use System.Reflection.Assembly;
 
@@ -18,34 +19,49 @@ namespace Semantic.DotNet is
     class ASSEMBLIES is
         _is_enabled: bool;
         _timers: TIMERS;
+
+        _flags: Driver.BUILD_FLAGS;
+        _paths: Driver.PATH_CONFIG;
+        _type_details_lookup: TYPE_DETAILS_LOOKUP;
         _ghul_symbol_table: Semantic.SYMBOL_TABLE;
         _namespaces: NAMESPACES;
         _type_name_map: TYPE_NAME_MAP;
 
         _is_started: bool;
 
+        blocked_assemblies: SET[string];
+
         all_assemblies: Iterable[Assembly] => assemblies_by_name.values;
         assemblies_by_name: MAP[string,Assembly];
-        assemblies_by_dotnet_namespace: MAP[string,SET[Assembly]];
         assemblies_by_ghul_namespace: MAP[string,SET[Assembly]];
 
         all_types: SET[TYPE];
-
+        
         init(
             timers: TIMERS,
+            flags: Driver.BUILD_FLAGS,
+            paths: Driver.PATH_CONFIG,
             ghul_symbol_table: Semantic.SYMBOL_TABLE,
-            namespaces: NAMESPACES,
-            type_name_map: TYPE_NAME_MAP
+            namespaces: NAMESPACES,            
+            type_name_map: TYPE_NAME_MAP,
+            type_details_lookup: TYPE_DETAILS_LOOKUP
         ) is
             _timers = timers;
+            _flags = flags;
+            _paths = paths;
             _ghul_symbol_table = ghul_symbol_table;
             _namespaces = namespaces;
             _type_name_map = type_name_map;
 
             _is_enabled = true;
 
+            _type_details_lookup = type_details_lookup;
+
+            blocked_assemblies = new SET[string]();
+
+            block_all_unsupported_assemblies();
+
             assemblies_by_name = new MAP[string,Assembly]();
-            assemblies_by_dotnet_namespace = new MAP[string,SET[Assembly]]();
             assemblies_by_ghul_namespace = new MAP[string,SET[Assembly]]();
 
             all_types = new SET[TYPE]();
@@ -56,84 +72,32 @@ namespace Semantic.DotNet is
         si
 
         start() is
-            if !_is_enabled then
+            if !_is_enabled || _is_started then
                 return;
             fi
 
-            // FIXME: does this need to vary with System.Environment.version?
+            _type_name_map.start();
+
+            @IF.not.release() Std.error.write_line("assemblies starting up...");
+
+            // FIXME: does this need to vary with System.Environment.version? What's the Mono equivalent? Can we get it via config or reflection?
             let sdk_path = "/usr/share/dotnet/packs/Microsoft.NETCore.App.Ref/5.0.0/ref/net5.0/"; 
             
             let default_imports = ["System.Console", "System.Runtime", "System.IO.FileSystem", "System.Collections", "System.Threading"];
 
-            for a in default_imports do
-                import(Path.combine(sdk_path, a + ".dll"));                
-            od
+            if assemblies_by_name.count == 0 then
+                for a in default_imports do
+                    import(sdk_path + a + ".dll");
+                od
+                
+                if !_flags.exclude_runtime_symbols then
+                    import(_paths.get_library_location("dotnet") + "ghul-runtime.dll");                    
+                fi
+            fi
 
-            Std.error.write_line(_timers);
+            _is_started = true;
         si
         
-        reset() is
-            if !_is_enabled then
-                return;
-            fi
-
-            if !_is_started then
-                start();
-                _type_name_map.start();
-                
-                _is_started = true;
-            fi
-
-            create_namespaces();
-        si
-
-        create_namespaces() is
-            let current = new LIST[string]();
-
-            let namespaces = new LIST[string]();
-
-            for ns in assemblies_by_ghul_namespace.keys do
-                namespaces.add(ns);
-            od
-
-            namespaces.sort();
-
-            for a in namespaces do
-                let to_create = new LIST[string](a.split(['.']));
-
-                while current.count > to_create.count do
-                    _namespaces.leave_namespace(null, null);
-                    _ghul_symbol_table.leave_scope();
-                    current.remove_at(current.count - 1);
-                od
-
-                let index = 0;
-
-                while index < current.count && current[index] =~ to_create[index] do
-                    index = index + 1;
-                od
-                
-                while current.count > index do
-                    _namespaces.leave_namespace(null, null);
-                    _ghul_symbol_table.leave_scope();
-                    current.remove_at(current.count - 1);
-                od
-
-                for i in index..to_create.count do
-                    let ns = _namespaces.declare_and_enter_namespace(Source.LOCATION.internal, to_create[i], null);
-                    _ghul_symbol_table.enter_scope(ns);
-                od
-                
-                current = to_create;
-            od
-
-            while current.count > 0 do
-                _namespaces.leave_namespace(null, null);
-                _ghul_symbol_table.leave_scope();
-                current.remove_at(current.count - 1);                
-            od            
-        si        
-
         import(assembly_names: Iterable[string]) is
             for assembly_name in assembly_names do
                 import(assembly_name);
@@ -146,124 +110,129 @@ namespace Semantic.DotNet is
             try
                 let assembly_name = System.IO2.Path.get_file_name_without_extension(path);
 
-                if assemblies_by_name.contains_key(assembly_name) then
+                if assemblies_by_name.contains_key(assembly_name) || blocked_assemblies.contains(assembly_name) then
                     return;
                 fi
 
                 let assembly = Assembly.load_from(path);
-
                 assemblies_by_name.add(assembly_name, assembly);
 
-                import(assembly_name, assembly);
-
-                // @IF.debug() 
-                Std.error.write_line("imported " + assembly);
+                import(assembly, assembly_name);
             catch ex: System.Exception
-                Std.error.write_line("failed to import: " + path + " exception: " + ex.message);
+                Std.error.write_line("failed to import assembly: " + path + " exception: " + ex.to_string().replace('\n', ' '));
             finally
                 _timers.finish("import assembly");
-            yrt            
+            yrt
         si
 
-        import(name: string, assembly: Assembly) is
-            let distinct_namespaces = new SET[string]();
+        import(assembly: Assembly, assembly_name: string) is
+            assert assembly_name? && assembly_name.length > 0;
+
             @IF.debug() Std.error.write_line("start type map...");
 
             _type_name_map.start();
 
+            let types_file = _paths.get_library_location("dotnet/refs") + assembly_name + ".types";
+        
+            // if File.exists(types_file) then
+            //     for type_name in File.read_all_lines(types_file) do
+            //         // Std.error.write_line("try force import type: " + type_name + " from assembly: " + assembly);
+            //         let type = assembly.get_type(type_name);
+
+            //         if type? then
+            //             // Std.error.write_line("successfully force imported type: " + type + " from assembly: " + assembly);
+            //             import_type(type, assembly_name);                        
+            //         fi                    
+            //     od
+            // else
+
+
+            let any_succeeded = false;
+            let exported_ex: System.Exception;
+            let forwarded_ex: System.Exception;
+
             try
-                for type in assembly.get_exported_types() do
-                    all_types.add(type);
+                for type in assembly.get_types() do                        
+                    import_type(type, assembly_name);
 
-                    let namespace_name = _type_name_map.get_ghul_namespace(type);
-
-                    @IF.debug() Std.error.write_line("have type: " + type + " map to ghul namespace: " + namespace_name);
-
-                    distinct_namespaces.add(namespace_name);
+                    any_succeeded = true;
                 od
             catch ex: System.Exception
-                Std.error.write_line("couldn't enumerate exported types in: " + assembly);
-            yrt
+                exported_ex = exported_ex;
+            yrt        
 
             try
                 for type in assembly.get_forwarded_types() do
-                    all_types.add(type);
+                    import_type(type, assembly_name);
 
-                    let namespace_name = _type_name_map.get_ghul_namespace(type);
-
-                    @IF.debug() Std.error.write_line("have type: " + type + " map to ghul namespace: " + namespace_name);
-
-                    distinct_namespaces.add(namespace_name);
+                    any_succeeded = true;
                 od
             catch ex: System.Exception
-                @IF.not.release() Std.error.write_line("couldn't enumerate forwarded types in: " + assembly);
+                forwarded_ex = ex;
             yrt
-                    
-            for namespace_name in distinct_namespaces do
-                let set: SET[Assembly];
-                // Std.error.write_line("assembly " + assembly + " contains types in " + namespace_name + " namespace");
 
-                if !assemblies_by_ghul_namespace.try_get_value(namespace_name, set ref) then
-                    set = new SET[Assembly]();
-                    assemblies_by_ghul_namespace[namespace_name] = set;
-                fi
-                
-                set.add(assembly);
-            od
-        si
-
-        find_all(namespace_name: string) -> Iterable[TYPE] is
-            return all_types;
-        si
-        
-        find(assembly_name: string, namespace_name: string, dotnet_namespace_name: string, type_name: string) -> TYPE is
-            @IF.debug() Std.error.write_line("AAA: search assembly: " + assembly_name + " for namespace: " + namespace_name + " type: " + type_name + " (case X)");
-
-            let assembly: Assembly;            
-        
-            if !assemblies_by_name.try_get_value(assembly_name, assembly ref) then
-                Std.error.write_line("assembly " + assembly_name + " not found looking for " + namespace_name + " " + type_name + " (case X)");
-
-                return null;
-            fi
-
-            let qualified_name = dotnet_namespace_name + "." + type_name;
-
-            // Std.error.write_line("search " + assembly +  " for " + qualified_name);
-            let result = assembly.get_type(qualified_name);
-                
-            if result? then
-                return result;
+            if !any_succeeded then
+                Std.error.write_line("warning: couldn't enumerate any types in " + assembly);
             fi                
 
-            @IF.debug() Std.error.write_line("AAA: namespace: " + namespace_name + " name: " + type_name + " not found (case X)");
+            // fi
         si
-        
-        find(namespace_name: string, dotnet_namespace_name: string, name: string) -> TYPE is
-            @IF.debug() Std.error.write_line("AAA: namespace: ghul namespace: " + namespace_name + " dotnet namespace: " + dotnet_namespace_name +  " name: " + name + " (case Y)");
 
-            let set: SET[Assembly];
+        import_type(type: TYPE, assembly_name: string) is
+            assert assembly_name? else "attempting to import type " + type + " with no assembly name supplied";
 
-            // Std.error.write_line("search for type: " + name + " in namespace: " + namespace_name);
-            
-            if !assemblies_by_ghul_namespace.try_get_value(namespace_name, set ref) then
-                @IF.debug() Std.error.write_line("AAA: namespace " + namespace_name +  " not found in any assembly");
+            try
+                let type_details = _type_name_map.get_type_details(type);
 
-                return null;
-            fi
+                if type_details? then
+                    type_details.merge_assembly_name(type, assembly_name);
 
-            let qualified_name = dotnet_namespace_name + "." + name;
+                    return;
+                elif !type.namespace_? then
+                    return;
+                else
+                    let namespace_details = _type_name_map.get_namespace_details(type);
+                    let namespace_name: string;
+    
+                    if namespace_details? then
+                        namespace_name = namespace_details.ghul_name;
+                    else
+                        namespace_name = type.namespace_;
+                    fi
 
-            for assembly in set do
-                @IF.debug() Std.error.write_line("AAA: search " + assembly +  " for " + qualified_name + " (case Y)");
-                let result = assembly.get_type(qualified_name);
-                
-                if result? then
-                    return result;
-                fi                
-            od
+                    let type_name = type.name;
 
-            @IF.debug() Std.error.write_line("AAA: namespace: " + namespace_name + " name: " + name + " not found (case Y)");
+                    if type.is_nested then
+                        let parts = type.full_name.split(['.']);
+                        
+                        type_name = parts[parts.count-1].replace('+', '_');
+                    fi
+                    
+                    type_details = new TYPE_DETAILS(type, namespace_name, type_name, null, assembly_name);
+                fi
+    
+                assert type_details.assembly_name? && type_details.assembly_name.length > 0 else "invalid assmbly name before add type " + type_details;
+
+                _type_details_lookup.add_type(type_details);
+            catch ex: System.Exception
+                Std.error.write_line("failed to import: " + type + " exception: " + ex.to_string().replace('\n', ' '));
+            yrt
+        si
+ 
+        block_all_unsupported_assemblies() is
+            blocked_assemblies.add("netstandard");
+            blocked_assemblies.add("mscorlib");
+            blocked_assemblies.add("WindowsBase");            
+            blocked_assemblies.add("System.Configuration");
+            blocked_assemblies.add("System.Core");
+            blocked_assemblies.add("System.Data");
+            blocked_assemblies.add("System");
+            blocked_assemblies.add("System.Drawing");
+            blocked_assemblies.add("System.Net");
+            blocked_assemblies.add("System.Security");
+            blocked_assemblies.add("System.ServiceModel.Web");
+            blocked_assemblies.add("System.ServiceProcess");
+            blocked_assemblies.add("System.Transactions");
         si
     si
 si
