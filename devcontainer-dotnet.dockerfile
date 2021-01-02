@@ -25,12 +25,8 @@ RUN apt-get update \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/* /tmp/common-setup.sh
 
-# RUN apt-get update \
-#     && apt-get -y install --no-install-recommends mono-devel nuget \
-#     && apt-get clean -y
+ARG PACKAGE_VERSION="*"
 
-COPY installer/ghul.run .
+COPY nupkg /tmp/nupkg
 
-RUN bash ./ghul.run \
-    && rm ghul.run
-
+RUN dotnet tool install ghul.compiler --tool-path /usr/local/bin --version "${PACKAGE_VERSION}" --add-source /tmp/nupkg
