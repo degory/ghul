@@ -6,7 +6,7 @@ if [ -z "$BUILD_NAME" ] ; then
     export BUILD_NAME="local-`date +'%s'`"
 fi
 
-echo "namespace Source is class BUILD is number: System.String static => \"$BUILD_NAME\"; si si" >src/source/build.ghul
+echo "@IF.not.v3() use string = System.String; namespace Source is class BUILD is number: string static => \"$BUILD_NAME\"; si si" >src/source/build.ghul
 
 if [ -z "$GHUL" ]; then
     export PATH=$PATH:`pwd`
