@@ -8,12 +8,6 @@
 	    ret 
     }
 
-    .method public final virtual hidebysig newslot instance default void Reset ()  cil managed 
-    {
-        .maxstack 8
-        ret 
-    }
-
     .method public final virtual hidebysig newslot instance default void Dispose ()  cil managed 
     {
 	    .maxstack 8
