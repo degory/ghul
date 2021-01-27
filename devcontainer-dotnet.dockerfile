@@ -29,4 +29,6 @@ ARG PACKAGE_VERSION="*"
 
 COPY nupkg /tmp/nupkg
 
-RUN dotnet tool install ghul.compiler --tool-path /usr/local/bin --version "${PACKAGE_VERSION}" --add-source /tmp/nupkg
+RUN \
+    dotnet tool install ghul.compiler --tool-path /usr/local/bin --version "${PACKAGE_VERSION}" --add-source /tmp/nupkg && \
+    chmod +x `find /usr/local/bin/.store/ghul.compiler/ -type f -name ilasm`
