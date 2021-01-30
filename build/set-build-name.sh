@@ -1,4 +1,4 @@
-if [ ! -z "${BUILD_NAME}" ] ; then
+if [ ! -z "${TAG_VERES}" ] ; then
     echo BUILD_NAME overridden to \"${BUILD_NAME}\"
 else
 
