@@ -22,7 +22,7 @@ export CI=1
 
 VERBOSITY="-verbosity:normal"
 
-echo "@IF.not.v3() use string = System.String; namespace Source is class BUILD is number: string static => \"${TAG_VERSION}\"; si si" >src/source/build.ghul
+echo "namespace Source is class BUILD is number: string static => \"${TAG_VERSION}\"; si si" >src/source/build.ghul
 
 for PASS in 1 2 3 ; do
     echo
