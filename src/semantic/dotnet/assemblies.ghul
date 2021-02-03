@@ -1,6 +1,9 @@
 namespace Semantic.DotNet is
     use TYPE = System.Type2;
 
+    use System.Reflection.PathAssemblyResolver;
+    use System.Reflection.MetadataLoadContext;
+    use System.Reflection.MetadataAssemblyResolver;
     use System.Reflection.Assembly;
 
     use IO.Std;
@@ -12,7 +15,7 @@ namespace Semantic.DotNet is
 
     use Logging.TIMERS;
 
-    class ASSEMBLIES is
+    class ASSEMBLIES: TypeSource is
         _timers: TIMERS;
 
         _flags: Driver.BUILD_FLAGS;
@@ -22,10 +25,13 @@ namespace Semantic.DotNet is
         _namespaces: NAMESPACES;
         _type_name_map: TYPE_NAME_MAP;
 
+        _callbacks: LIST[() -> void];
+
+        _metadata_load_context: MetadataLoadContext;
+
         _assemblies_by_name: MAP[string,Assembly];
         _assemblies_by_ghul_namespace: MAP[string,SET[Assembly]];
 
-        _is_enabled: bool;
         _is_started: bool;
         _default_imports_are_needed: bool;
 
@@ -52,98 +58,100 @@ namespace Semantic.DotNet is
             _namespaces = namespaces;
             _type_name_map = type_name_map;
 
-            _is_enabled = true;
             _default_imports_are_needed = true;
 
             _type_details_lookup = type_details_lookup;
 
-            blocked_assemblies = new SET[string]();
-
-            block_all_unsupported_assemblies();
+            _callbacks = new LIST[() -> void]();
 
             _assemblies_by_name = new MAP[string,Assembly]();
             _assemblies_by_ghul_namespace = new MAP[string,SET[Assembly]]();
+
+            blocked_assemblies = new SET[string]();
+            block_all_unsupported_assemblies();
         si
 
-        disable() is
-            _is_enabled = false;
+        on_start(callback: () -> void) is
+            _callbacks.add(callback);
         si
 
-        start() is
-            if !_is_enabled \/ _is_started then
+        get_type(type_name: string) -> TYPE =>
+            get_type("System.Runtime", type_name);
+
+        get_type(assembly_name: string, type_name: string) -> TYPE is
+            if assembly_name == null then
+                assembly_name = "System.Runtime";
+            fi
+
+            // Std.error.write_line("get type [" + assembly_name + "]" + type_name);
+
+            return _assemblies_by_name[assembly_name].get_type(type_name);
+        si        
+
+        get_types(type_names: Iterable[string]) -> Collections.List[TYPE] =>
+            type_names | .map(name => get_type(name)).collect();
+
+        get_types(assembly_and_type_names: Iterable[(assembly_name: string, type_name: string)]) -> Collections.List[TYPE] =>
+            assembly_and_type_names | .map(names => get_type(names.assembly_name, names.type_name)).collect();
+        
+        import(assembly_names: Iterable[string]) is
+            if _is_started then
                 return;
             fi
 
             _is_started = true;
 
-            _type_name_map.start();
-
             @IF.not.release() Std.error.write_line("assemblies starting up...");
-            
-            let default_imports = ["System.Console", "System.Runtime", "System.IO.FileSystem", "System.Collections", "System.Threading"];
 
-            if _default_imports_are_needed then
-                for a in default_imports do
-                    import(_sdk_path + a + ".dll");
-                od
-                
+            if !assembly_names? \/ assembly_names | .count() == 0 then
+                let default_imports = 
+                    ["System.Console", "System.Runtime", "System.IO.FileSystem", "System.Collections", "System.Threading"] |
+                        .map((name: string) -> string => _sdk_path + name + ".dll")
+                        .collect_list();
+
                 if !_flags.exclude_runtime_symbols then
-                    import(_paths.install_folder + "ghul-runtime.dll");                    
+                    default_imports.add(_paths.install_folder + "ghul-runtime.dll");                    
                 fi
+                
+                assembly_names = default_imports;
             fi
-        si
-        
-        import(assembly_names: Iterable[string]) is
-            for assembly_name in assembly_names do
-                import(assembly_name);
-            od            
-        si
 
-        import(path: string) is
-            _default_imports_are_needed = false;
+            let path_resolver = new PathAssemblyResolver(assembly_names);
 
-            start();
+            _metadata_load_context = new MetadataLoadContext(path_resolver, null);
 
-            _timers.start("import assembly");
+            let to_process = new LIST[(assembly: Assembly, name: string, version: string)]();
 
-            try
-                let assembly_name = IO.Path.get_file_name_without_extension(path);
+            for path in assembly_names do
+                let name = IO.Path.get_file_name_without_extension(path);
 
-                if _assemblies_by_name.contains_key(assembly_name) \/ blocked_assemblies.contains(assembly_name) then
-                    return;
-                fi
+                if _assemblies_by_name.contains_key(name) \/ blocked_assemblies.contains(name) then
+                    continue;
+                fi                
 
-                let assembly: Assembly;
+                let assembly = _metadata_load_context.load_from_assembly_path(path);
+                let version = assembly.get_name().version.to_string().replace('.', ':');
 
-                // FIXME: less brittle check:
-                if path.starts_with(_sdk_path) then
-                    assembly = Assembly.load_from(path);
-                else
-                    try
-                        assembly = Assembly.load_file(path);
-                    catch whatever: System.Exception
-                        assembly = Assembly.load_from(path);
-                    yrt
-                fi
+                to_process.add((assembly, name, version));
 
-                _assemblies_by_name.add(assembly_name, assembly);
+                _assemblies_by_name.add(name, assembly);
+            od
 
-                let assembly_version = assembly.get_name().version.to_string().replace('.', ':');
+            _type_name_map.start(self);
 
-                import(assembly, assembly_name, assembly_version);
-            catch ex: System.Exception
-                Std.error.write_line("failed to import assembly: " + path + " exception: " + ex.to_string().replace('\n', ' '));
-            finally
-                _timers.finish("import assembly");
-            yrt
+            for c in _callbacks do
+                c();
+            od
+
+            for a in to_process do
+                import(a.assembly, a.name, a.version);
+            od
         si
 
         import(assembly: Assembly, assembly_name: string, assembly_version: string) is
             assert assembly_name? /\ assembly_name.length > 0;
 
             @IF.debug() Std.error.write_line("start type map...");
-
-            _type_name_map.start();
 
             let types_file = _paths.get_library_location("dotnet/refs") + assembly_name + ".types";
         
@@ -186,7 +194,7 @@ namespace Semantic.DotNet is
                     type_details.merge_assembly_reference(type, assembly_name, assembly_version);
 
                     return;
-                elif !type.`namespace? then
+                elif !type.`namespace? \/ !type.full_name? then
                     return;
                 else
                     let namespace_details = _type_name_map.get_namespace_details(type);
@@ -232,6 +240,7 @@ namespace Semantic.DotNet is
             blocked_assemblies.add("System.ServiceModel.Web");
             blocked_assemblies.add("System.ServiceProcess");
             blocked_assemblies.add("System.Transactions");
+            blocked_assemblies.add("System.Configuration.ConfigurationManager");
         si
     si
 si
