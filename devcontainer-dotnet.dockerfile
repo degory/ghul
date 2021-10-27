@@ -1,5 +1,6 @@
-ARG VARIANT="5.0"
-FROM mcr.microsoft.com/vscode/devcontainers/dotnetcore:0-${VARIANT}
+ARG VARIANT="6.0"
+# FROM mcr.microsoft.com/vscode/devcontainers/dotnetcore:0-${VARIANT}
+FROM mcr.microsoft.com/dotnet/sdk:${VARIANT}
 
 # This Dockerfile adds a non-root user with sudo access. Update the “remoteUser” property in
 # devcontainer.json to use it. More info: https://aka.ms/vscode-remote/containers/non-root-user.
