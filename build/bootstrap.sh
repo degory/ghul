@@ -31,7 +31,7 @@ for PASS in 1 2 3 ; do
     if [ "${PASS}" == "1" ] ; then
         export GHUL="ghul-compiler"
     else
-        export GHUL="./bin/Debug/net5.0/publish/ghul"
+        export GHUL="./bin/Debug/net6.0/publish/ghul"
     fi
 
     RUN="dotnet publish -nologo ${VERBOSITY} -p:GhulCompiler=\"${GHUL}\" -p:Version=${PACKAGE_VERSION} -consoleloggerparameters:NoSummary"
@@ -55,4 +55,4 @@ done
 diff stage-2.il stage-3.il
 
 echo
-echo "Bootstrapped `./bin/Debug/net5.0/publish/ghul`"
+echo "Bootstrapped `./bin/Debug/net6.0/publish/ghul`"
