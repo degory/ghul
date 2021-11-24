@@ -27,7 +27,7 @@ If you only want to use the compiler to build an application, as opposed to cont
 
 ### Build time dependencies for the compiler itself
 - Linux (native, WSL2, or in a container)
-- Either [.NET 5.0](https://dotnet.microsoft.com/download/dotnet/5.0) or [Mono 6.0](https://www.mono-project.com/)
+- The [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) SDK
 - Bash
 
 See the [template application](https://github.com/degory/ghul-application-template) README for detailed instructions on setting up your build environment
@@ -37,7 +37,7 @@ See the [template application](https://github.com/degory/ghul-application-templa
 - [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://github.com/degory/ghul-vsce/releases).
 
 ### Runtime dependencies for ghūl applications
-- Either [.NET 5.0](https://dotnet.microsoft.com/download/dotnet/5.0) or [Mono 6.0](https://www.mono-project.com/)
+- [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0)
 
 ### Building applications with ghūl
 
@@ -46,14 +46,14 @@ There is limited support right now for building ghūl applications other than th
 ### To build the compiler from Visual Studio Code
 
 - Build the compiler: `<Ctrl>+<Shift>+B`
-- Run all the tests: `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Run all tests`
+- Run all the integration tests: `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Run all integration tests`
 
 ### To build and test the compiler from the command line
 
 - Build the compiler: `./build/build.sh`
-- Run all tests: `./tests/test.sh`
-- Run a specific test: `./tests/test.sh test-case-folder-name`
-- Capture a failed test's output as its new expected output: `./tests/capture.sh test-case-folder-name`
+- Run all integration tests: `./integration-tests/test.sh`
+- Run a specific test: `./integration-tests/test.sh test-case-folder-name`
+- Capture a failed test's output as its new expected output: `./integration-tests/capture.sh test-case-folder-name`
 - Bootstrap the compiler: `./build/bootstrap.sh`
 - Start an interactive shell in the development container: `./build/dev.sh`
 
