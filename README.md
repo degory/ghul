@@ -1,10 +1,10 @@
 # ghūl compiler
 
-## Compiler for the [ghūl programming language](https://www.ghul.io)
+## Compiler for the [ghūl programming language](https://ghul.io)
 
-### Latest installer
+### Latest compiler .NET tool package
 
-[ghul.run](https://github.com/degory/ghul/releases/latest/download/ghul.run)
+[ghul.compiler](https://www.nuget.org/packages/ghul.compiler/)
 
 ### Latest release
 
@@ -14,7 +14,6 @@
 
 [![workflow](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
 
-
 ## Host and target
 
 The compiler is hosted on .NET and targets .NET
@@ -23,25 +22,25 @@ The compiler is hosted on .NET and targets .NET
 
 ### Template ghūl application project
 
-If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl application template](https://github.com/degory/ghul-application-template) repository
+If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl console template](https://github.com/degory/ghul-console-template) repository
 
 ### Build time dependencies for the compiler itself
 - Linux (native, WSL2, or in a container)
 - The [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) SDK
 - Bash
 
-See the [template application](https://github.com/degory/ghul-application-template) README for detailed instructions on setting up your build environment
+See the [template application](https://github.com/degory/ghul-console-template) README for detailed instructions on setting up your build environment
 
 ### Optional dependencies
 
-- [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://github.com/degory/ghul-vsce/releases).
+- [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
 
 ### Runtime dependencies for ghūl applications
 - [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0)
 
 ### Building applications with ghūl
 
-There is limited support right now for building ghūl applications other than the compiler itself. The [hello-world](https://github.com/degory/hello-world) project shows a small example ghūl program, with VSCode config and an example GitHub build workflow
+The [hello-world](https://github.com/degory/hello-world) project shows a small example ghūl program, with VSCode config and an example GitHub build workflow
 
 ### To build the compiler from Visual Studio Code
 
@@ -50,10 +49,11 @@ There is limited support right now for building ghūl applications other than th
 
 ### To build and test the compiler from the command line
 
-- Build the compiler: `./build/build.sh`
+- Build the compiler: `./build/build.sh
+- Run all unit tests: `dotnet test unit-tests`
 - Run all integration tests: `./integration-tests/test.sh`
-- Run a specific test: `./integration-tests/test.sh test-case-folder-name`
-- Capture a failed test's output as its new expected output: `./integration-tests/capture.sh test-case-folder-name`
+- Run a specific integration test: `./integration-tests/test.sh test-case-folder-name`
+- Capture a failed integration test's output as its new expected output: `./integration-tests/capture.sh test-case-folder-name`
 - Bootstrap the compiler: `./build/bootstrap.sh`
 - Start an interactive shell in the development container: `./build/dev.sh`
 
