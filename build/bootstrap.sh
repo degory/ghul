@@ -22,8 +22,6 @@ export CI=1
 
 VERBOSITY="-verbosity:normal"
 
-echo "namespace Source is class BUILD is number: string static => \"${TAG_VERSION}\"; si si" >src/source/build.ghul
-
 for PASS in 1 2 3 ; do
     echo
     echo "Start pass ${PASS}..."
