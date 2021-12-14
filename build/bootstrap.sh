@@ -52,10 +52,12 @@ for PASS in 1 2 3 4 ; do
     dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -consoleloggerparameters:NoSummary
 
     echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
+    echo
 
     dotnet tool uninstall --local ghul.compiler # >/dev/null 2>&1
     dotnet tool install --local ghul.compiler --add-source nupkg --version ${VERSION} # >/dev/null 2>&1
 
+    echo
     echo "Installed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
     dotnet ghul-compiler
@@ -70,6 +72,9 @@ for PASS in 1 2 3 4 ; do
     echo " Finished pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 done
 
+echo
+echo "Verify IL matches for last two passes..."
+
 # there should be no differences between pass 3 IL and pass 4 IL except
 # for the version info, which is in a custom attribute ('.custom : ....')
 diff \
@@ -77,4 +82,4 @@ diff \
     <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-4.il)
 
 echo
-echo "Bootstrapped `dotnet ghul-compiler`"
+echo "Successfully Bootstrapped `dotnet ghul-compiler`"
