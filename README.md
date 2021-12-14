@@ -1,7 +1,7 @@
 # ghūl compiler
 
 [![CI/CD](https://img.shields.io/github/workflow/status/degory/ghul/CI)](https://github.com/degory/ghul/actions?query=workflow%3ACICD)
-[![NuGet version (ghul.targets)](https://img.shields.io/nuget/v/ghul.targets.svg)](https://www.nuget.org/packages/ghul.targets/)
+[![NuGet version (ghul)](https://img.shields.io/nuget/v/ghul.svg)](https://www.nuget.org/packages/ghul/)
 [![Release](https://img.shields.io/github/v/release/degory/ghul?label=release)](https://github.com/degory/ghul/releases)
 [![Release Date](https://img.shields.io/github/release-date/degory/ghul)](https://github.com/degory/ghul/releases)
 [![Issues](https://img.shields.io/github/issues/degory/ghul)](https://github.com/degory/ghul/issues) 
@@ -43,7 +43,7 @@ You can manually install the compiler from the [ghūl compiler .NET tool package
 ### Project file
 
 The compiler expects to be driven by MSBuild using a `.ghulproj` project file.
-See the [ghūl targets](https://www.nuget.org/packages/ghul.targets/) package for
+See the [ghūl targets](https://www.nuget.org/packages/ghul/) package for
 a minimal example, or use one of the project templates to get started.
 
 ### Source files
