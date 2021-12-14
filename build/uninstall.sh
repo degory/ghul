@@ -1,3 +1,3 @@
 #!/bin/bash
-dotnet tool uninstall -g ghul.compiler
+dotnet tool uninstall --local ghul.compiler >/dev/null 2>&1
 exit 0
