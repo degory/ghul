@@ -5,4 +5,4 @@ for f in `find integration-tests -name failed`; do
     if [ ! -f "$DIR/disabled" ] ; then
         echo $DIR
     fi
-done | xargs ghul-test
+done | xargs dotnet ghul-test
