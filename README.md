@@ -49,10 +49,10 @@ The [hello-world](https://github.com/degory/hello-world) project shows a small e
 
 ### To build and test the compiler from the command line
 
-- Build the compiler: `./build/build.sh
+- Build the compiler: `dotnet build`
 - Run all unit tests: `dotnet test unit-tests`
-- Run all integration tests: `./integration-tests/test.sh`
-- Run a specific integration test: `./integration-tests/test.sh test-case-folder-name`
+- Run all integration tests: `dotnet tool run ghul-test integration-tests`
+- Run a specific integration test: `dotnet tool run ghul-test integration-tests/<path-to-test-folder>`
 - Capture a failed integration test's output as its new expected output: `./integration-tests/capture.sh test-case-folder-name`
 - Bootstrap the compiler: `./build/bootstrap.sh`
 - Start an interactive shell in the development container: `./build/dev.sh`
