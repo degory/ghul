@@ -53,7 +53,7 @@ for PASS in 1 2 3 4 ; do
 
     echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
-    dotnet tool update --local ghul.compiler --add-source nupkg --version ${VERSION} >/dev/nul 2>&1
+    dotnet tool update --local ghul.compiler --add-source nupkg --version ${VERSION} >/dev/null 2>&1
 
     echo "Installed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
@@ -69,7 +69,7 @@ for PASS in 1 2 3 4 ; do
     echo " Finished pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 done
 
-# there should be no differences between pass 3 output and pass 4 output except
+# there should be no differences between pass 3 IL and pass 4 IL except
 # for the version info, which is in a custom attribute ('.custom : ....')
 diff \
     <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-3.il) \

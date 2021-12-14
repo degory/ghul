@@ -1,62 +1,81 @@
 # ghūl compiler
 
-## Compiler for the [ghūl programming language](https://ghul.io)
+[![CI/CD](https://img.shields.io/github/workflow/status/degory/ghul/CI)](https://github.com/degory/ghul/actions?query=workflow%3ACICD)
+[![NuGet version (ghul.targets)](https://img.shields.io/nuget/v/ghul.targets.svg)](https://www.nuget.org/packages/ghul.targets/)
+[![Release](https://img.shields.io/github/v/release/degory/ghul?label=release)](https://github.com/degory/ghul/releases)
+[![Release Date](https://img.shields.io/github/release-date/degory/ghul)](https://github.com/degory/ghul/releases)
+[![Issues](https://img.shields.io/github/issues/degory/ghul)](https://github.com/degory/ghul/issues) 
+[![License](https://img.shields.io/github/license/degory/ghul)](https://github.com/degory/ghul/blob/main/LICENSE)
+[![ghūl](https://img.shields.io/badge/gh%C5%ABl-100%25!-information)](https://ghul.io)
 
-### Latest compiler .NET tool package
+This is the compiler for the [ghūl programming language](https://ghul.io). It is a [self-hosting compiler](https://en.wikipedia.org/wiki/Self-hosting_(compilers)): the compiler itself is written entirely in ghūl.
 
-[ghul.compiler](https://www.nuget.org/packages/ghul.compiler/)
+## Prerequisites
 
-### Latest release
+The compiler requires the [.NET 6.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/6.0)
 
-[Release](https://github.com/degory/ghul/releases/latest)
+## Target
 
-### Continuous delivery status
+The compiler produces standard .NET assemblies and packages targeting .NET 6.0
 
-[![workflow](https://github.com/degory/ghul/workflows/CI/badge.svg?branch=master)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
+## Getting the compiler
 
-## Host and target
+There are a few different ways to get the compiler
 
-The compiler is hosted on .NET and targets .NET
+### Use a ghūl .NET project template
 
-## Getting started
+If you initialize your project using one of the [ghūl .NET project templates](https://www.nuget.org/packages/ghul.templates/), the template will add the compiler to your project folder as a local .NET tool - just run `dotnet tool restore` to restore it. 
 
-### Template ghūl application project
+### Clone the ghūl GitHub repository template
 
-If you only want to use the compiler to build an application, as opposed to contributing to the development of the compiler itself, then take a look at the [ghūl console template](https://github.com/degory/ghul-console-template) repository
+If you create a new GitHub repo from the [ghūl repository template](https://github.com/degory/ghul-repository-template), then the compiler will be pre-configured as a local .NET tool in your project folder - run `dotnet tool restore` to restore it.
 
-### Build time dependencies for the compiler itself
-- Linux (native, WSL2, or in a container)
-- The [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) SDK
-- Bash
+### Use the ghūl development container image
 
-See the [template application](https://github.com/degory/ghul-console-template) README for detailed instructions on setting up your build environment
+The compiler is pre-installed globally in the [ghūl development container](https://hub.docker.com/r/ghul/devcontainer)
 
-### Optional dependencies
+### Install the compiler as a local or global .NET tool
 
-- [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
+You can manually install the compiler from the [ghūl compiler .NET tool package](https://www.nuget.org/packages/ghul.compiler/)
+
+## Using the compiler
+
+### Project file
+
+The compiler expects to be driven by MSBuild using a `.ghulproj` project file.
+See the [ghūl targets](https://www.nuget.org/packages/ghul.targets/) package for
+a minimal example, or use one of the project templates to get started.
+
+### Source files
+
+You'll need some ghūl source files. By convention ghūl source files have the extension `.ghul`, and the standard MSBuild targets will include `**/*.ghul` when building.
+
+### Building and running
+
+Once you have a project file and some ghūl source files, you can use the normal
+.NET SDK commands to build, pack, and run your project:
+
+```sh
+dotnet build
+```
+
+```sh
+dotnet pack
+```
+
+```sh
+dotnet run
+```
 
 ### Runtime dependencies for ghūl applications
-- [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0)
 
-### Building applications with ghūl
+Applications written in ghūl require the [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) runtime
 
-The [hello-world](https://github.com/degory/hello-world) project shows a small example ghūl program, with VSCode config and an example GitHub build workflow
+## Development environment
 
-### To build the compiler from Visual Studio Code
+[Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
 
-- Build the compiler: `<Ctrl>+<Shift>+B`
-- Run all the integration tests: `<Ctrl>+<Shift>+P` | `Tasks: Run task` | `Run all integration tests`
-
-### To build and test the compiler from the command line
-
-- Build the compiler: `dotnet build`
-- Run all unit tests: `dotnet test unit-tests`
-- Run all integration tests: `dotnet tool run ghul-test integration-tests`
-- Run a specific integration test: `dotnet tool run ghul-test integration-tests/<path-to-test-folder>`
-- Capture a failed integration test's output as its new expected output: `./integration-tests/capture.sh test-case-folder-name`
-- Bootstrap the compiler: `./build/bootstrap.sh`
-- Start an interactive shell in the development container: `./build/dev.sh`
 
 ## Gotchas
 
-This is an incomplete compiler for an experimental programming language. The CI/CD pipeline ensures that a released build will bootstrap and pass the test suite, but nevertheless some features are missing or buggy.
+The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. However, this is an _incomplete compiler_ for an _experimental programming language_: there will be [compiler bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug)!
