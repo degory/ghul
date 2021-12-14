@@ -18,41 +18,62 @@ fi
 
 echo "Bootstrapping tag version ${TAG_VERSION} to produce package version ${PACKAGE_VERSION}"
 
-export CI=1 
+VALID_VERSION_PREFIX_REGEX="^([0-9]+\.[0-9]+\.[0-9]+)"
 
-VERBOSITY="-verbosity:normal"
+if [[ ${PACKAGE_VERSION} =~ ${VALID_VERSION_PREFIX_REGEX} ]] ; then
 
-echo "namespace Source is class BUILD is number: string static => \"${TAG_VERSION}\"; si si" >src/source/build.ghul
+    VERSION_PREFIX=${BASH_REMATCH[1]}
 
-for PASS in 1 2 3 ; do
+    echo ${VERSION_PREFIX}
+else
+    exit 1
+fi
+
+if [ "${CI}" == "" ] ; then
+    LOCAL=true
+fi
+
+VERBOSITY="-verbosity:quiet"
+
+for PASS in 1 2 3 4 ; do
+    PREVIOUS=$(dotnet ghul-compiler)
+
+    if [[ ( "${PASS}" == "3" || "${PASS}" == "4" ) && "${LOCAL}" == "" ]] ; then
+        VERSION="${PACKAGE_VERSION}"
+    else
+        VERSION="${VERSION_PREFIX}-bootstrap.$(($(date +%s%N)/1000))"
+    fi
+
     echo
-    echo "Start pass ${PASS}..."
+    echo "    Start pass ${PASS}: ${PREVIOUS} -> ${VERSION}..."
 
-    if [ "${PASS}" == "1" ] ; then
-        export GHUL="ghul-compiler"
-    else
-        export GHUL="./bin/Debug/net6.0/publish/ghul"
-    fi
+    rm -rf nupkg ; mkdir nupkg
 
-    RUN="dotnet publish -nologo ${VERBOSITY} -p:GhulCompiler=\"${GHUL}\" -p:Version=${PACKAGE_VERSION} -consoleloggerparameters:NoSummary"
-    echo ${RUN} ; ${RUN}    
+    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -consoleloggerparameters:NoSummary
 
-    if [ "${PASS}" == "3" ] ; then
-        RUN="dotnet pack -nologo ${VERBOSITY} -p:GhulCompiler=\"${GHUL}\" -p:Version=${PACKAGE_VERSION} -consoleloggerparameters:NoSummary"
-        echo ${RUN} ; ${RUN}
-    else
-        dotnet clean -nologo -verbosity:quiet
-    fi
+    echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
-    if [ "${PASS}" != "1" ] ; then
+    dotnet tool update --local ghul.compiler --add-source nupkg --version ${VERSION} >/dev/null 2>&1
+
+    echo "Installed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
+
+    dotnet ghul-compiler
+
+    if [ "${PASS}" != "1" ] && [ "${PASS}" != "2" ] ; then
         mv out.il stage-${PASS}.il
     fi
 
+    dotnet clean -nologo -verbosity:quiet
+
     echo
-    echo "Finished pass ${PASS}..."
+    echo " Finished pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 done
 
-diff stage-2.il stage-3.il
+# there should be no differences between pass 3 IL and pass 4 IL except
+# for the version info, which is in a custom attribute ('.custom : ....')
+diff \
+    <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-3.il) \
+    <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-4.il)
 
 echo
-echo "Bootstrapped `./bin/Debug/net6.0/publish/ghul`"
+echo "Bootstrapped `dotnet ghul-compiler`"
