@@ -34,4 +34,5 @@ COPY nupkg /tmp/nupkg
 
 RUN \
     dotnet tool install ghul.compiler --tool-path /usr/local/bin --version "${PACKAGE_VERSION}" --add-source /tmp/nupkg && \
-    chmod +x `find /usr/local/bin/.store/ghul.compiler/ -type f -name ilasm`
+    chmod +x `find /usr/local/bin/.store/ghul.compiler/ -type f -name ilasm` && \
+    ln -s /usr/local/bin/ghul-compiler /usr/local/bin/dotnet-ghul-compiler
