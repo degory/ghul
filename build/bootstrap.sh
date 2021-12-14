@@ -38,7 +38,7 @@ VERBOSITY="-verbosity:quiet"
 for PASS in 1 2 3 4 ; do
     PREVIOUS=$(dotnet ghul-compiler)
 
-    if [[ ( "${PASS}" == "3" || "${PASS}" == "4" ) && "${LOCAL}" == "" ]] ; then
+    if [[ ( "${PASS}" == "3" || "${PASS}" == "4" ) ]] ; then
         VERSION="${PACKAGE_VERSION}"
     else
         VERSION="${VERSION_PREFIX}-bootstrap.$(($(date +%s%N)/1000))"
@@ -53,7 +53,8 @@ for PASS in 1 2 3 4 ; do
 
     echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
-    dotnet tool update --local ghul.compiler --add-source nupkg --version ${VERSION} >/dev/null 2>&1
+    dotnet tool uninstall --local ghul.compiler # >/dev/null 2>&1
+    dotnet tool install --local ghul.compiler --add-source nupkg --version ${VERSION} # >/dev/null 2>&1
 
     echo "Installed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
 
