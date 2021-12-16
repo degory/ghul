@@ -31,6 +31,14 @@ fi
 
 if [ "${CI}" == "" ] ; then
     LOCAL=true
+
+    cleanup() {
+        echo "Cleaning up..."
+        dotnet tool uninstall --local ghul.compiler
+        dotnet tool install --local ghul.compiler
+    }
+
+    trap cleanup EXIT
 fi
 
 VERBOSITY="-verbosity:quiet"
@@ -83,3 +91,4 @@ diff \
 
 echo
 echo "Successfully Bootstrapped `dotnet ghul-compiler`"
+
