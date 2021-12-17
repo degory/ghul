@@ -31,6 +31,14 @@ fi
 
 if [ "${CI}" == "" ] ; then
     LOCAL=true
+
+    cleanup() {
+        echo "Cleaning up..."
+        dotnet tool uninstall --local ghul.compiler
+        dotnet tool install --local ghul.compiler
+    }
+
+    trap cleanup EXIT
 fi
 
 VERBOSITY="-verbosity:quiet"
@@ -38,7 +46,7 @@ VERBOSITY="-verbosity:quiet"
 for PASS in 1 2 3 4 ; do
     PREVIOUS=$(dotnet ghul-compiler)
 
-    if [[ ( "${PASS}" == "3" || "${PASS}" == "4" ) ]] ; then
+    if [[ "${LOCAL}" == "" &&  ( "${PASS}" == "3" || "${PASS}" == "4" ) ]] ; then
         VERSION="${PACKAGE_VERSION}"
     else
         VERSION="${VERSION_PREFIX}-bootstrap.$(($(date +%s%N)/1000))"
