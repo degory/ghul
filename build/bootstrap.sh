@@ -57,7 +57,7 @@ for PASS in 1 2 3 4 ; do
 
     rm -rf nupkg ; mkdir nupkg
 
-    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -consoleloggerparameters:NoSummary
+    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -p:GhulOptions=--keep-out-il -consoleloggerparameters:NoSummary
 
     echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
     echo
