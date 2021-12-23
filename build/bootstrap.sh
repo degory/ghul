@@ -41,7 +41,7 @@ if [ "${CI}" == "" ] ; then
     trap cleanup EXIT
 fi
 
-VERBOSITY="-verbosity:quiet"
+# VERBOSITY="-verbosity:quiet"
 
 for PASS in 1 2 3 4 ; do
     PREVIOUS=$(dotnet ghul-compiler)
