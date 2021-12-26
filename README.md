@@ -1,6 +1,6 @@
 # ghūl compiler
 
-[![CI/CD](https://img.shields.io/github/workflow/status/degory/ghul/CI)](https://github.com/degory/ghul/actions?query=workflow%3ACICD)
+[![CI/CD](https://img.shields.io/github/workflow/status/degory/ghul/CI)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
 [![NuGet version (ghul)](https://img.shields.io/nuget/v/ghul.compiler.svg)](https://www.nuget.org/packages/ghul.compiler/)
 [![Release](https://img.shields.io/github/v/release/degory/ghul?label=release)](https://github.com/degory/ghul/releases)
 [![Release Date](https://img.shields.io/github/release-date/degory/ghul)](https://github.com/degory/ghul/releases)
