@@ -21,7 +21,6 @@ echo "Bootstrapping tag version ${TAG_VERSION} to produce package version ${PACK
 VALID_VERSION_PREFIX_REGEX="^([0-9]+\.[0-9]+\.[0-9]+)"
 
 if [[ ${PACKAGE_VERSION} =~ ${VALID_VERSION_PREFIX_REGEX} ]] ; then
-
     VERSION_PREFIX=${BASH_REMATCH[1]}
 
     echo ${VERSION_PREFIX}
@@ -57,7 +56,7 @@ for PASS in 1 2 3 4 ; do
 
     rm -rf nupkg ; mkdir nupkg
 
-    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -p:GhulOptions=--keep-out-il -consoleloggerparameters:NoSummary
+    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -p:GhulOptions="--keep-out-il" -consoleloggerparameters:NoSummary
 
     echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
     echo
