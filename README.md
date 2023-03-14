@@ -32,7 +32,7 @@ If you create a new GitHub repo from the [ghūl repository template](https://git
 
 ### Use the ghūl development container image
 
-The compiler is pre-installed globally in the [ghūl development container](https://hub.docker.com/r/ghul/devcontainer)
+The compiler is pre-installed globally in the [ghūl development container](https://github.com/users/degory/packages/container/package/ghul%2Fdevcontainer)
 
 ### Install the compiler as a local or global .NET tool
 
