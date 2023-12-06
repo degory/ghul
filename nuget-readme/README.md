@@ -12,11 +12,11 @@ This package contains the [ghūl programming language](https://ghul.io) [compile
 
 ## Prerequisites
 
-The compiler requires the [.NET 6.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/6.0)
+The compiler requires the [.NET 8.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
 
 ## Target
 
-The compiler produces standard .NET assemblies and packages targeting .NET 6.0
+The compiler produces standard .NET assemblies and packages targeting .NET 8.0
 
 ## Getting the compiler
 
@@ -69,7 +69,7 @@ dotnet run
 
 ### Runtime dependencies for ghūl applications
 
-Applications written in ghūl require the [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) runtime
+Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.com/download/dotnet/8.0) runtime
 
 ## Development environment
 
