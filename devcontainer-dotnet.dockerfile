@@ -1,4 +1,4 @@
-ARG VARIANT="6.0"
+ARG VARIANT="8.0"
 # FROM mcr.microsoft.com/vscode/devcontainers/dotnetcore:0-${VARIANT}
 FROM mcr.microsoft.com/dotnet/sdk:${VARIANT}
 
