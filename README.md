@@ -43,8 +43,8 @@ You can manually install the compiler from the [ghūl compiler .NET tool package
 ### Project file
 
 The compiler expects to be driven by MSBuild using a `.ghulproj` project file.
-See the [ghūl targets](https://www.nuget.org/packages/ghul/) package for
-a minimal example, or use one of the project templates to get started.
+See the [ghūl test](https://github.com/degory/ghul-test) project for
+a real-world example, or use one of the project templates to get started.
 
 ### Source files
 
