@@ -6,17 +6,17 @@
 [![Release Date](https://img.shields.io/github/release-date/degory/ghul)](https://github.com/degory/ghul/releases)
 [![Issues](https://img.shields.io/github/issues/degory/ghul)](https://github.com/degory/ghul/issues) 
 [![License](https://img.shields.io/github/license/degory/ghul)](https://github.com/degory/ghul/blob/main/LICENSE)
-[![ghūl](https://img.shields.io/badge/gh%C5%ABl-100%25!-information)](https://ghul.io)
+[![ghūl](https://img.shields.io/badge/gh%C5%ABl-100%25!-information)](https://ghul.dev)
 
-This package contains the [ghūl programming language](https://ghul.io) [compiler](https://github.com/degory/ghul) packaged as a [.NET tool](https://docs.microsoft.com/en-us/dotnet/core/tools/global-tools)
+This package contains the [ghūl programming language](https://ghul.dev) [compiler](https://github.com/degory/ghul) packaged as a [.NET tool](https://docs.microsoft.com/en-us/dotnet/core/tools/global-tools)
 
 ## Prerequisites
 
-The compiler requires the [.NET 6.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/6.0)
+The compiler requires the [.NET 8.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
 
 ## Target
 
-The compiler produces standard .NET assemblies and packages targeting .NET 6.0
+The compiler produces standard .NET assemblies and packages targeting .NET 8.0
 
 ## Getting the compiler
 
@@ -43,8 +43,8 @@ If none of the above options suits, you can manually install the compiler from t
 ### Project file
 
 The compiler expects to be driven by MSBuild using a `.ghulproj` project file.
-See the [ghūl targets](https://www.nuget.org/packages/ghul.targets/) package for
-a minimal example, or use one of the project templates to get started.
+See the [ghūl test](https://github.com/degory/ghul-test) package for
+a real-world example, or use one of the project templates to get started.
 
 ### Source files
 
@@ -69,7 +69,7 @@ dotnet run
 
 ### Runtime dependencies for ghūl applications
 
-Applications written in ghūl require the [.NET 6.0](https://dotnet.microsoft.com/download/dotnet/6.0) runtime
+Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.com/download/dotnet/8.0) runtime
 
 ## Development environment
 
