@@ -6,7 +6,7 @@ if [ -z "${ROOT}" ] ; then
     ROOT=`pwd`
 fi
 
-echo root is ${ROOT}
+echo will create test under "${ROOT}/integration-tests"
 
 read -p "new test name (folder/kebab-case-test-name): " TEST_NAME
 
