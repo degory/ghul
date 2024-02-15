@@ -7,10 +7,4 @@
 	    ldnull 
 	    ret 
     }
-
-    .method public final virtual hidebysig newslot instance default void Dispose ()  cil managed 
-    {
-	    .maxstack 8
-	    ret 
-    }
     // end IEnumerator boilerplate
