@@ -294,6 +294,28 @@ namespace Syntax.Process is
             expression.value = expression.expression.value;
         si
 
+        pre(r: Trees.Statements.RETURN) -> bool is
+            super.pre(r);
+
+            if !r.expression? then
+                return false;
+            fi
+
+            let function = current_function;
+
+            if
+                !function.return_type? \/ 
+                function.return_type.is_any \/ 
+                function.return_type =~ _innate_symbol_lookup.get_void_type()
+            then
+                return false;
+            fi
+
+            r.expression.try_set_constraint(function.return_type, "cannot return value of type {0} from function of type {1}");
+
+            return false;
+        si
+
         visit(r: Trees.Statements.RETURN) is
             super.visit(r);
 
@@ -353,6 +375,9 @@ namespace Syntax.Process is
             if !exception_type.is_assignable_from(`throw.expression.value.type) then
                 _logger.warn(`throw.expression.location, "thrown value is not derived from System.Exception");
             fi
+
+            // FIXME: need to signal to any enclosing expression if statement that this is a throw so
+            // if all branches are throws, an error can be reported
         si
 
         visit(`assert: Trees.Statements.ASSERT) is
@@ -451,9 +476,27 @@ namespace Syntax.Process is
             super.visit(`if);
         si
 
-
         pre(expression: Trees.Bodies.EXPRESSION) -> bool is
             super.pre(expression);
+
+            if !expression.expression? then
+                return false;
+            fi
+
+            let function = current_function;
+
+            if 
+                !function.return_type? \/ 
+                function.return_type.is_any \/ 
+                function.return_type =~ _innate_symbol_lookup.get_void_type()
+            then
+                return false;
+            fi
+
+            expression.expression.try_set_constraint(function.return_type, "cannot return value of type {0} from function of type {1}");
+
+            return false;
+
         si
 
         visit(expression: Trees.Bodies.EXPRESSION) is
@@ -1510,6 +1553,17 @@ namespace Syntax.Process is
             fi
         si
 
+        pre(variable: Trees.Variables.Variable) -> bool is
+            if variable.initializer? /\ variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
+                // if we have both an explicit type and an initializer, we
+                // can push a type constraint down into the initializer
+            
+                variable.initializer.try_set_constraint(variable.type_expression.type, "{0} is not assignable to {1}");
+            fi
+
+            return false;
+        si
+
         visit(variable: Trees.Variables.Variable) is
             let symbol = find(variable.name);
 
@@ -2025,7 +2079,12 @@ namespace Syntax.Process is
         si
 
         visit(list: Trees.Statements.LIST) is
-            if !list? \/ !list.want_value then
+            if !list.want_value then
+                return;
+            fi
+
+            if list.is_empty then
+                _logger.error(list.location, "expected a value");
                 return;
             fi
 
@@ -2036,20 +2095,15 @@ namespace Syntax.Process is
             fi
 
             if !last.provides_value then
-                _logger.error(last.location, "not a value");
+                _logger.error(last.location, "expected a value");
+                return;
             fi
 
-            // TODO needs to be checked exactly once, somewhere
-
-            /*
             if !last.value? then
-                _logger.info(last.location, "no value provided by " + last.get_type());
-            elif !last.value.type? then
-                _logger.error(last.location, "provided value has no type");
+                return;
             fi
-            */
 
-            list.value = last.value;
+            list.value = new IR.Values.BLOCK(last.value.type);
         si
 
         pre(`if: Trees.Statements.IF) -> bool is
@@ -2067,49 +2121,71 @@ namespace Syntax.Process is
 
         visit(`if: Trees.Statements.IF) is
             if !`if.want_value then
-                // _logger.info(`if.location, "no value wanted from if statement");
                 return;
             fi
 
-            let seen_any = false;
-            let type: Type;
+            if `if.is_poisoned then
+                // if the if is syntactically incomplete don't bother reporting any
+                // semantic errors:
+                `if.value = new DUMMY_BLOCK(new Semantic.Types.ERROR(), `if.location, "if is poisoned");
+
+                _logger.info(`if.location, "poisoned");
+                return;
+            fi
+
+            if !`if.branches | .has(b => b? /\ !b.condition?) then
+                // if the if has no else branch, then don't bother reporting any
+                // semantic errors:
+                _logger.error(`if.location, "expected else in if expression");
+                `if.value = new DUMMY_BLOCK(new Semantic.Types.ERROR(), `if.location, "no else");
+                return;
+            fi
+
+            let type = `if.constraint;
+
+            let seen_any_values = false;
 
             for i in `if.branches do
                 let branch = i.body;
 
                 if !branch.value? then
-                    // _logger.info(branch.location, "no value in if branch");
                     continue;
                 fi
 
                 if !branch.value.type? then
-                    // _logger.info(branch.location, "value has no type in if branch");
                     continue;
                 fi
 
-                seen_any = true;
+                if !branch.value.check_is_consumable(_logger, branch.location) then
+                    continue;
+                fi
 
-                branch.value.check_is_consumable(_logger, branch.location);
-
-                if !type? then
+                if `if.constraint? then
+                    if !`if.constraint.is_assignable_from(branch.value.type) then
+                        _logger.error(branch.location, string.format(`if.constraint_error_message, branch.value.type, type));
+                    fi
+                elif !type? then
                     type = branch.value.type;
                 elif branch.value.type.is_assignable_from(type) then
                     type = branch.value.type;
                 elif !type.is_assignable_from(branch.value.type) then
                     _logger.error(branch.location, "incompatible types in if branches: " + type + " and " + branch.value.type);
 
-                    `if.value = null;
-                    break;
+                    `if.value = new DUMMY_BLOCK(new Semantic.Types.ERROR(), `if.location, "incompatible types");
+                    return;
                 fi
+
+                seen_any_values = true;
             od
 
             if type? then
-                // FIXME: this needs to go into a temporary variable because
-                // we can't guarantee nothing will be above it on the stack
-                // when it's consumed:
-                `if.value = new IR.Values.POP(type);
+                `if.value = new IR.Values.BLOCK(type);
             else
-                _logger.error(`if.location, "no type infered for if branches");
+                if seen_any_values then
+                    _logger.error(`if.location, "no type infered for if expression");
+                fi
+
+                `if.value = new DUMMY_BLOCK(new Semantic.Types.ERROR(), `if.location, "no type infered");
             fi
         si
 
