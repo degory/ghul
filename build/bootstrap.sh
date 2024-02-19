@@ -1,6 +1,20 @@
 #!/bin/bash
 set -e
 
+START_MILLISECONDS=$(date +%s%N)
+
+if [ "${CI}" == "" ] ; then
+    LOCAL=true
+
+    cleanup() {
+        echo "Cleaning up..."
+        dotnet tool uninstall --local ghul.compiler
+        dotnet tool install --local ghul.compiler
+    }
+
+    trap cleanup EXIT
+fi
+
 if [ -z "${TAG_VERSION}" ] ; then
     TAG_VERSION=v0.0.0
 fi
@@ -28,17 +42,6 @@ else
     exit 1
 fi
 
-if [ "${CI}" == "" ] ; then
-    LOCAL=true
-
-    cleanup() {
-        echo "Cleaning up..."
-        dotnet tool uninstall --local ghul.compiler
-        dotnet tool install --local ghul.compiler
-    }
-
-    trap cleanup EXIT
-fi
 
 VERBOSITY="-verbosity:quiet"
 
@@ -89,4 +92,9 @@ diff \
     <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-4.il)
 
 echo
-echo "Successfully Bootstrapped `dotnet ghul-compiler`"
+
+END_MILLISECONDS=$(date +%s%N)
+
+ELAPSED_SECONDS=$(awk -v start="$START_MILLISECONDS" -v end="$END_MILLISECONDS" 'BEGIN { printf "%.2f", (end - start) / 1000000000 }')
+
+echo "Successfully Bootsstrapped $(dotnet ghul-compiler) in ${ELAPSED_SECONDS} seconds"
