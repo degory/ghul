@@ -3,6 +3,8 @@ namespace Syntax.Parsers.Expressions is
 
     use Source;
 
+    use Logging;
+
     class PRIMARY: Base[Trees.Expressions.Expression] is
         identifier_parser: Parser[Trees.Identifiers.Identifier];
         type_parser: Parser[Trees.TypeExpressions.TypeExpression];
@@ -211,7 +213,7 @@ namespace Syntax.Parsers.Expressions is
             );
 
             add_parser(
-                (context: CONTEXT) => parse_string_interpolation(context),
+                (context: CONTEXT) => parse_string_with_interpolations(context),
                 Lexical.TOKEN.ENTER_STRING
             );
 
@@ -260,79 +262,227 @@ namespace Syntax.Parsers.Expressions is
             );
         si
 
-        parse_string_interpolation(context: CONTEXT) -> Trees.Expressions.Expression is
+        parse_string_with_interpolations(context: CONTEXT) -> Trees.Expressions.Expression is
+            // ENTER_STRING expression (':' FORMAT_STRING)? (CONTINUE_STRING expression (':' FORMAT_STRING)? )* (EXIT_STRING | CANCEL_STRING)
+            //            ^ we're here
+
             let start = context.location;
 
-            let expressions = new Collections.LIST[Trees.Expressions.Expression]();
+            let fragments = new Collections.LIST[Trees.Expressions.INTERPOLATION_FRAGMENT]();
 
-            let fragment = new Trees.Expressions.Literals.STRING(context.location, context.current_string);
+            let is_first = true;
+            let success = false;
+            let line = start.start_line;
 
-            let total_fragment_length = context.current_string.length;
+            while
+                context.current_token != Lexical.TOKEN.EXIT_STRING
+            do
+                // a newline in the string part will result in a CANCEL_STRING token
+                // we should stop parsing the string and return immediately
+                // TODO: return the interpolation that we've assembled so far
+
+                if context.current_token == Lexical.TOKEN.CANCEL_STRING then
+                    // TODO might want to skip to end of line, as the input could be garbled
+                    context.next_token();
+                    return new Trees.Expressions.Literals.STRING(start::context.location, "");
+                fi
+
+                // we've either just entered a string interpolation, or we've just passed a closing curly bracket
+                // either way we're expecting a string fragment
+
+                line = context.location.start_line;
+
+                let success_line = parse_single_interpolated_string_fragment(context, is_first, fragments);
+                success = success_line.success;
+                line = success_line.line;
+
+                if !success then
+                    skip_to_end_of_string_with_interpolations(context, line);
+    
+                    return new Trees.Expressions.Literals.STRING(start::context.location, "");
+                fi
+    
+                if context.current_token == Lexical.TOKEN.CANCEL_STRING then
+                    // TODO might want to skip to end of line, as the input could be garbled
+                    context.next_token();
+                    return new Trees.Expressions.Literals.STRING(start::context.location, "");
+                fi
+    
+                success_line = parse_single_interpolated_expression(context, fragments);
+                success = success_line.success;
+                line = success_line.line;
+
+                if !success then
+                    skip_to_end_of_string_with_interpolations(context, line);
+    
+                    return new Trees.Expressions.Literals.STRING(start::context.location, "");
+                fi
+
+                is_first = false;
+            od
+
+            if context.current_token == Lexical.TOKEN.CANCEL_STRING then
+                context.next_token();
+            elif context.current_token != Lexical.TOKEN.EXIT_STRING then
+                context.error(context.location, "unexpected token in string interpolation");
+
+                if context.location.start_line == start.start_line then
+                    skip_to_end_of_string_with_interpolations(context, line);
+                fi
+            else
+                parse_single_interpolated_string_fragment(context, is_first, fragments);
+            fi
+
+            let end = context.location;
+
             let expression_count = 0;
+            let should_poison = false;
+            let total_fragment_length = 0;
 
-            expressions.add(fragment);
+            for e in fragments do
+                if e.is_expression then
+                    expression_count = expression_count + 1;
+                    if e.expression.is_poisoned then
+                        should_poison = true;
+                    fi
+                else
+                    let fragment = cast Trees.Expressions.Literals.STRING(e.expression);
+                    let fragment_length = fragment.value_string.length;
+
+                    total_fragment_length = total_fragment_length + fragment_length;
+                fi
+            od
+            
+            let result = new Trees.Expressions.STRING_INTERPOLATION(start::end, fragments, total_fragment_length, expression_count);
+
+            return result;    
+        si
+
+        skip_to_end_of_string_with_interpolations(context: CONTEXT, line: int) is
+            let retries = 50;
+
+            while 
+                context.current_token != Lexical.TOKEN.EXIT_STRING /\ 
+                context.current_token != Lexical.TOKEN.CANCEL_STRING /\ 
+                context.location.start_line == line /\
+                !context.is_end_of_file /\
+                retries > 0
+            do
+                context.next_token();
+                retries = retries - 1;
+            od
+        si
+        
+        parse_single_interpolated_string_fragment(
+            context: CONTEXT,
+            is_first: bool,
+            into: Collections.MutableList[Trees.Expressions.INTERPOLATION_FRAGMENT]
+        ) -> 
+            (success: bool, line: int)
+        is
+            // ENTER_STRING expression (':' FORMAT_STRING)? (CONTINUE_STRING expression (':' FORMAT_STRING)? )* (EXIT_STRING | CANCEL_STRING)
+            // ^ we're here                                 ^ or here                                           ^ or here
+
+            // we've either just entered a string interpolation, or we've just passed a closing curly bracket
+            // either way we're expecting a string fragment
+
+            if is_first then                
+                if !context.expect_token(Lexical.TOKEN.ENTER_STRING) then
+                    return (false, 0);
+                fi
+            else
+                if 
+                    context.current_token != Lexical.TOKEN.CONTINUE_STRING /\
+                    context.current_token != Lexical.TOKEN.EXIT_STRING
+                then
+                    context.logger.error(context.location, "syntax error: expected }} but found {context.current_token_name}");
+
+                    return (false, 0);
+                fi
+            fi
+
+            into.add(
+                new Trees.Expressions.INTERPOLATION_FRAGMENT(
+                    false, 
+                    new Trees.Expressions.Literals.STRING(context.location, context.current_string),
+                    null,
+                    null
+                )
+            );
+
+            let line = context.location.start_line;
 
             context.next_token();
 
-            let end = context.location;
-                        
-            let expression = expression_parser.parse(context);
+            return (true, line);
+        si
+
+        parse_single_interpolated_expression(context: CONTEXT, into: Collections.MutableList[Trees.Expressions.INTERPOLATION_FRAGMENT]) -> (success: bool, line: int) is
+            // ENTER_STRING expression (':' FORMAT_STRING)? (CONTINUE_STRING expression (':' FORMAT_STRING)? )* (EXIT_STRING | CANCEL_STRING)
+            //              ^ we're here                                     ^ or here
+
+            let start = context.location;
+
+            let expression: Trees.Expressions.Expression;
+
+            if context.current_token != Lexical.TOKEN.CONTINUE_STRING then
+                expression = expression_parser.parse(context);
+            else
+                expression = new Trees.Expressions.Literals.STRING(context.location, "");
+                context.logger.error(context.location, "expected an expression");
+                context.next_token();
+            fi
 
             if !expression? \/ expression.is_poisoned then
-                // even if the expression is garbled, we expect the tokenizer to
-                // provide the EXIT_STRING token
-                if context.current_token == Lexical.TOKEN.EXIT_STRING then
+                if 
+                    context.current_token != Lexical.TOKEN.COMMA /\
+                    context.current_token != Lexical.TOKEN.COLON /\
+                    context.current_token != Lexical.TOKEN.CONTINUE_STRING /\
+                    context.current_token != Lexical.TOKEN.EXIT_STRING
+                then
+                    return (false, 0);
+                fi
+            fi
+
+            let alignment: Trees.Expressions.Expression = null;
+            let format: string = null;
+
+            let line = 0;
+
+            if context.current_token == Lexical.TOKEN.COMMA then
+                context.next_token();
+
+                alignment = expression_parser.parse(context);
+
+                if !alignment? \/ alignment.is_poisoned then
+                    if 
+                        context.current_token != Lexical.TOKEN.COLON /\
+                        context.current_token != Lexical.TOKEN.CONTINUE_STRING /\
+                        context.current_token != Lexical.TOKEN.EXIT_STRING
+                    then
+                        return (false, 0);
+                    fi
+                fi
+
+                line = alignment.location.end_line;
+            fi
+
+            if context.current_token == Lexical.TOKEN.COLON then
+                context.expect_format_specifier();
+
+                context.next_token();
+
+                if context.expect_token(Lexical.TOKEN.FORMAT_STRING) then
+                    format = context.current_string;
+                    line = context.location.end_line;
+
                     context.next_token();
                 fi
-
-                return fragment;
             fi
 
-            expressions.add(expression);
-            expression_count = expression_count + 1;
+            into.add(new Trees.Expressions.INTERPOLATION_FRAGMENT(true, expression, alignment, format));
 
-            while context.current.token == Lexical.TOKEN.CONTINUE_STRING do
-                fragment = new Trees.Expressions.Literals.STRING(context.location, context.current_string);
-                total_fragment_length = total_fragment_length + context.current_string.length;
-                expressions.add(fragment);
-
-                context.next_token();
-
-                expression = expression_parser.parse(context);
-
-                if !expression? \/ expression.is_poisoned then
-                    end = context.location;
-                    // even if the expression is garbled, we expect the tokenizer to
-                    // provide the EXIT_STRING token
-                    if context.current_token == Lexical.TOKEN.EXIT_STRING then
-                        context.next_token();
-                    fi
-
-                    return new Trees.Expressions.STRING_INTERPOLATION(start::end, expressions, total_fragment_length, expression_count);
-                fi
-
-                expressions.add(expression);
-                expression_count = expression_count + 1;
-
-                end = expression.location;
-            od
-
-            if context.current_token == Lexical.TOKEN.EXIT_STRING then
-                end = context.location;
-                fragment = new Trees.Expressions.Literals.STRING(context.location, context.current_string);
-                total_fragment_length = total_fragment_length + context.current_string.length;
-                expressions.add(fragment);
-
-                context.next_token();
-            elif context.current_token == Lexical.TOKEN.CANCEL_STRING then
-                context.next_token();
-            else
-                context.error(context.location, "unexpected token in string interpolation");
-            fi
-            
-            let result = new Trees.Expressions.STRING_INTERPOLATION(start::end, expressions, total_fragment_length, expression_count);
-
-            return result;
+            return (true, line);
         si
 
         other_token(context: CONTEXT) -> Trees.Expressions.Expression is
