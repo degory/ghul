@@ -42,6 +42,7 @@ namespace Syntax.Process is
         _append_formatted_generic_format: Semantic.Symbols.Function;
         _append_formatted_generic_alignment_format: Semantic.Symbols.Function;
         _to_string_and_clear: Semantic.Symbols.Function;
+        _dispose: Semantic.Symbols.Function;
 
         init(
             logger: Logger,
@@ -75,7 +76,7 @@ namespace Syntax.Process is
             _loops = new LOOP_LABEL_STACK();
         si
 
-        ensure_interpolate_symbols_are_materialized() is
+        ensure_runtime_symbols_are_materialized() is
             if _interpolation_handler? then
                 return;
             fi
@@ -83,9 +84,16 @@ namespace Syntax.Process is
             let string_type = _innate_symbol_lookup.get_string_type();
             let int_type = _innate_symbol_lookup.get_int_type();
 
-            _interpolation_handler = _innate_symbol_lookup.get_interpolated_string_handler_type();
 
-            // FIXME: proper overload resolution for these calls:
+            // Materialize IDisposable.Dispose()
+            let idisposable_type = _innate_symbol_lookup.get_idisposable_type();
+ 
+            // there is only one overload of dispose:
+            _dispose = cast Semantic.Symbols.FUNCTION_GROUP(idisposable_type.find_member("dispose")).functions[0];
+
+
+            // Materialize the various methods of the string interpolation handler:
+            _interpolation_handler = _innate_symbol_lookup.get_interpolated_string_handler_type();
             
             // the constructor overload we want is the only one with 2 arguments:
             _constructor = cast Semantic.Symbols.FUNCTION_GROUP(_interpolation_handler.find_member("init")).functions |
@@ -576,6 +584,12 @@ namespace Syntax.Process is
                 return false;
             fi
 
+            if v.want_dispose then
+                // variable will be declared outside the enclosing .try
+                // so don't declare it here
+                return false;
+            fi
+            
             let buffer = new System.Text.StringBuilder();
             symbol.gen_definition_header(buffer);
 
@@ -703,22 +717,115 @@ namespace Syntax.Process is
 
         pre(list: Statements.LIST) -> bool is
             super.pre(list);
+            return true;
+        si
 
+        visit(list: Statements.LIST) is
             if list.value? then
                 _context.enter_buffer(true);
                 _context.write_comment_line("statement list expression {{");
                 _context.indent();
             fi
 
-            return false;
-        si
+            let return_type = current_function.return_type;
 
-        visit(list: Statements.LIST) is
+            let return_needed: TEMP;
+            let return_value: TEMP;
+            let label: LOOP_LABELS;
+
+            if list.want_dispose then
+                return_needed = new TEMP(_context, 1, _innate_symbol_lookup.get_bool_type());
+
+                if return_type? /\ return_type !~ _innate_symbol_lookup.get_void_type() then
+                    return_value = new TEMP(_context, return_type);                
+                fi
+
+                for v in list.variables_to_dispose do
+                    let buffer = new System.Text.StringBuilder();
+                    v.gen_definition_header(buffer);
+
+                    _context.write_line(buffer.to_string());
+                od
+
+                label = _loops.enter_try(return_needed, return_value);
+
+                _context.write_line(".try {{ // RAII ");
+                _context.indent();
+            fi
+
+            for s in list.statements do
+                s.walk(self);
+            od
+
             if list.value? then
                 if list.last? /\ list.last.value? then
                     gen(list.last.value);
                 fi
+            fi
 
+            if list.want_dispose then
+                ensure_runtime_symbols_are_materialized();
+
+                label.is_in_finally = true;
+
+                _brancher.leave(label.end);
+
+                _context.outdent();
+                _context.write_line("}}");
+                _context.write_line("finally {{");
+                _context.indent();
+
+                let to_dispose = list.variables_to_dispose;
+
+                let i = to_dispose.count - 1;
+
+                while i >= 0 do
+                    let v = to_dispose[i];
+
+                    let skip_label: LABEL;
+
+                    if !v.type.is_value_type then
+                        skip_label = new LABEL();
+ 
+                        _brancher.branch(BRANCH.Z, _symbol_loader.load_local_variable(list.location, v), skip_label);
+                    fi
+
+                    let variable_value = _symbol_loader.load_local_variable(list.location, v);
+                    let dispose_call = _dispose.call(list.location, variable_value, System.Array.empty`[Value](), null, _function_caller);
+
+                    gen(dispose_call);
+
+                    if skip_label? then
+                        _brancher.label(skip_label);
+                    fi
+
+                    i = i - 1;
+                od
+
+                // TODO probably not needed
+                _brancher.label(label.middle);
+
+                _context.write_line("endfinally");
+                _context.outdent();
+
+                _context.write_line("}}");
+
+                _loops.leave_loop();
+
+                _brancher.branch(BRANCH.Z, label.return_needed.load(), label.end);
+    
+                _brancher.label(label.start);
+
+                if return_value? then
+                    return_value.load().gen(_context);                    
+                fi                
+
+                _context.write_line("ret");                
+
+                _brancher.label(label.end);
+            fi
+
+            if list.value? then
                 _context.outdent();
                 _context.write_comment_line("}}");
     
@@ -840,11 +947,8 @@ namespace Syntax.Process is
                         _brancher.label(match);
                     fi
                 fi
-                pre(m);
                 
-                m.statements.walk(self);
-
-                visit(m);
+                m.walk(self);
 
                 _brancher.branch(_loops.get_current_loop().end);
 
@@ -1160,7 +1264,7 @@ namespace Syntax.Process is
         si
 
         visit(interpolation: Expressions.STRING_INTERPOLATION) is
-            ensure_interpolate_symbols_are_materialized();
+            ensure_runtime_symbols_are_materialized();
 
             _context.enter_buffer(true);
 
