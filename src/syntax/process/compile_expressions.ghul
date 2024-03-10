@@ -23,6 +23,7 @@ namespace Syntax.Process is
         _function_caller: Semantic.FUNCTION_CALLER;
         _overload_resolver: Semantic.OVERLOAD_RESOLVER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _ir_context: IR.CONTEXT;
         _value_converter: VALUE_CONVERTER;
         _value_boxer: VALUE_BOXER;
 
@@ -45,6 +46,7 @@ namespace Syntax.Process is
             function_caller: Semantic.FUNCTION_CALLER,
             overload_resolver: Semantic.OVERLOAD_RESOLVER,
             symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
+            context: IR.CONTEXT,
             value_converter: VALUE_CONVERTER,
             value_boxer: VALUE_BOXER
         )
@@ -58,6 +60,7 @@ namespace Syntax.Process is
             _function_caller = function_caller;
             _overload_resolver = overload_resolver;
             _symbol_use_locations = symbol_use_locations;
+            _ir_context = context;
             _value_converter = value_converter;
             _value_boxer = value_boxer;
         si
@@ -202,20 +205,22 @@ namespace Syntax.Process is
                 let idisposable = _innate_symbol_lookup.get_idisposable_type();
 
                 for v in `let.variables do
-                    let symbol = find(v.name);
+                    for name in v.names do
+                        let symbol = find(v.name);
 
-                    if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                        let variable = cast Semantic.Symbols.Variable(symbol); 
-                        variable.is_disposed = true;
+                        if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
+                            let variable = cast Semantic.Symbols.Variable(symbol); 
+                            variable.is_disposed = true;
 
-                        let type = variable.type;
+                            let type = variable.type;
 
-                        if !idisposable.is_assignable_from(type) then
-                            _logger.error(v.name.location, "not disposable");
+                            if !idisposable.is_assignable_from(type) then
+                                _logger.error(v.name.location, "not disposable");
+                            fi
+
+                            current_statement_list.add_variable_to_dispose(variable);
                         fi
-
-                        current_statement_list.add_variable_to_dispose(variable);
-                    fi
+                    od
                 od
             fi
         si
@@ -235,75 +240,147 @@ namespace Syntax.Process is
         _pre(`for: Trees.Statements.FOR) -> bool is
             let symbol: Semantic.Symbols.Symbol;
 
-            if `for.variable? /\ !`for.variable.is_poisoned /\ `for.variable.name? then
-                symbol = find(`for.variable.name);
-
-                if symbol? then
-                    symbol.define();
-                else
-                    _logger.poison(`for.variable.name.location, "couldn't find typed symbol for variable {`for.variable.name}");    
-                fi
-            fi
-
-            if `for.expression? then
+            let type: Type = new Semantic.Types.ERROR();
+    
+            if `for.expression? /\ !`for.expression.is_poisoned then
                 `for.expression.walk(self);
-            fi
-
-            if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
-                let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
-
-                let type: Type;
 
                 if 
-                    `for.expression? /\ !`for.expression.is_poisoned /\ `for.expression.value? /\ 
-                    set_iterator_for(`for, `for.expression.value.type, false)
+                    `for.expression.value? /\ set_iterator_for(`for, `for.expression.value.type, false)
                 then
                     if `for.variable.type_expression? /\ !isa Trees.TypeExpressions.INFER(`for.variable.type_expression) then
-                        if !`for.variable.type_expression.type.is_assignable_from(`for.read_current.return_type) then
+                        if `for.variable.type_expression.type.is_assignable_from(`for.read_current.return_type) then
+                            type = `for.variable.type_expression.type;
+                        else
                             _logger.error(`for.variable.location, "type mismatch");
                         fi
-
                     else
-                        typed_symbol.set_type(`for.read_current.return_type);
+                        type = `for.read_current.return_type;
                     fi
                 fi
+            fi
+
+            if `for.variable? /\ !`for.variable.is_poisoned then
+                set_symbol_type(`for.variable.left, type);
             fi
 
             if `for.body? then
                 `for.body.walk(self);
             fi
         si
+
+        pre(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) -> bool is
+            super.pre(left);
+
+            if !left.value? then
+                return false;
+            fi
+
+            if !left.value.is_consumable then
+                _logger.error(left.location, "cannot use this here");
+                return false;
+            fi
+
+            left.expression.value = new Need.STORE(left.value);
+            return false;
+        si
+
+        visit(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) is
+            super.visit(left);
+
+            if !left.value? \/ !left.value.type? \/ !left.expression.value? \/ !left.expression.value.type? then
+                return;
+            fi
+
+            if !left.expression.value.is_consumable then
+                _logger.error(left.location, "cannot assign to this");
+                return;
+            fi
+
+            if !left.expression.value.type.is_assignable_from(left.value.type) then
+                _logger.error(left.assign_location, "{left.value.type} is not assignable to {left.expression.value.type}");
+                return;
+            fi
+
+            left.value = left.expression.value;
+        si
+        
+        pre(left: Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION) -> bool is
+            super.pre(left);
+
+            let from = left.value;
+
+            if !from? then
+                return true;
+            fi
+            
+            let from_type = from.type;
+
+            if !from_type? then
+                return true;
+            fi
+
+            if !from_type.is_destructurable then
+                _logger.error(left.location, "cannot destructure {from_type}");
+                return true;
+            fi
+
+            // TODO deconstruct(...) support
+            let from_types = from_type.arguments;
+            let elements = left.elements;
+
+            let count = elements.count;
+
+            if elements.count != from_types.count then
+                _logger.error(left.location, "expected {elements.count} destructuring elements but found {from_types.count}");
+
+                if elements.count > from_types.count then
+                    count = from_types.count;
+                fi
+            fi
+
+            let block = _ir_context.enter_block();
+            let get_from = from.get_temp_copier(_ir_context, "destructure");
+
+            for i in 0..count do
+                let element = elements[i];
+
+                let member = from_type.find_member("`{i}");
+
+                element.value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                element.walk(self);
+
+                if element.value? then
+                    element.value.gen(_ir_context);
+                fi
+            od
+
+            left.value = block.close();
+
+            return true;
+        si                
         
         pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
             assignment.right.walk(self);
 
-            if assignment.right.value? then
-                if !assignment.right.value.is_consumable then
-                    _logger.error(assignment.right.location, "cannot use this here");
-                    assignment.left.value = new Need.STORE(new IR.Values.DUMMY(assignment.right.value.type, assignment.right.location));
-                else
-                    assignment.left.value = new Need.STORE(assignment.right.value);
-                fi
-                
-                assignment.left.walk(self);
+            if !assignment.right.value? then
+                return true;
+            fi
+            
+            if !assignment.right.value.is_consumable then
+                _logger.error(assignment.right.location, "cannot use this here");
+
+                assignment.left.value = new IR.Values.DUMMY(assignment.right.value.type, assignment.right.location);
             else
-                assignment.left.value = null;
-                return true;
+                assignment.left.value = assignment.right.value;
             fi
 
-            if !assignment.left.value? \/ !assignment.left.value.type? \/ !assignment.right.value.type? then
-                return true;
-            fi
+            assignment.left.assign_location = assignment.location;
 
-            if !assignment.left.value.is_consumable then
-                _logger.error(assignment.left.location, "cannot assign to this");
-                return true;
-            fi
+            assignment.left.walk(self);
 
-            if !assignment.left.value.type.is_assignable_from(assignment.right.value.type) then
-                _logger.error(assignment.location, "{assignment.right.value.type} is not assignable to {assignment.left.value.type}");
-                return true;
-            fi
+            assignment.value = assignment.left.value;
 
             return true;
         si
@@ -611,6 +688,7 @@ namespace Syntax.Process is
             for index in 0..arguments.count do
                 let a = arguments[index];
                 
+                // TODO: destructure
                 if isa Trees.Expressions.VARIABLE(a) then
                     let argument = cast Trees.Expressions.VARIABLE(a);
 
@@ -684,12 +762,17 @@ namespace Syntax.Process is
             if _will_generate_code /\ function.value? then
                 // FIXME: have to update in place, otherwise the parent IR value tree node that
                 // references this will continue to point at the stale value:
-                function.value.copy_from(value);
+                function.value.update_from(value);
             else
                 function.value = value;
             fi
 
             super.visit(function);
+        si
+
+
+        pre(tuple: Trees.Expressions.TUPLE) -> bool is
+            return false;
         si
 
         visit(tuple: Trees.Expressions.TUPLE) is
@@ -699,6 +782,11 @@ namespace Syntax.Process is
 
             if tuple.elements.expressions.count == 1 then
                 tuple.value = tuple.elements.expressions[0].value;
+                return;
+            elif tuple.elements.expressions.count == 0 then
+                tuple.value = new IR.Values.DUMMY(new Semantic.Types.ERROR(), tuple.location);
+
+                _logger.error(tuple.location, "empty tuple");
                 return;
             fi
 
@@ -757,7 +845,6 @@ namespace Syntax.Process is
             fi
 
             let type = _innate_symbol_lookup.get_tuple_type(types, names);
-                        
             tuple.value = new TUPLE(type, values);
         si
 
@@ -1304,7 +1391,7 @@ namespace Syntax.Process is
         si
 
         _visit(index: Trees.Expressions.INDEX) is
-            let need_store = index.value? /\ isa Need.STORE(index.value);
+            let need_store = index.value? /\ index.value.is_need_store;
 
             if index.left.value? /\ index.index.value? then
                 let type = index.left.value.type;
@@ -1465,7 +1552,7 @@ namespace Syntax.Process is
 
                 let symbol = named_type.scope.find_member(member.identifier.name);
 
-                if symbol == null then
+                if !symbol? then
                     _logger.error(member.identifier.location, "member {member.identifier.name} not found in {named_type}");
 
                     member.value = null;
@@ -1587,60 +1674,263 @@ namespace Syntax.Process is
             fi
         si
 
-        pre(variable: Trees.Variables.Variable) -> bool is
-            if variable.initializer? /\ variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
-                // if we have both an explicit type and an initializer, we
-                // can push a type constraint down into the initializer
-            
-                variable.initializer.try_set_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
-            fi
-
+        pre(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) -> bool is
             return false;
         si
 
-        visit(variable: Trees.Variables.Variable) is
-            let symbol = find(variable.name);
-
+        visit(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) is
+            let symbol = find(left.name);
+    
             if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
                 let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
 
                 symbol.define();
 
+                let right_location =
+                    if left.right_location? then
+                        left.right_location;
+                    else
+                        left.location;
+                    fi;
+
                 if typed_symbol.type == null then
-                    if variable.type_expression? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
-                        _logger.poison(variable.location, "explicitly typed variable should already have a type");
+                    if left.explicit_type? then
+                        // _logger.poison(left.location, "explicitly typed variable should already have a type");
 
-                        if variable.initializer? /\ Value.check_is_consumable(_logger, variable.initializer.location, variable.initializer.value) then
-                            typed_symbol.set_type(variable.initializer.value.type);
+                        typed_symbol.set_type(left.explicit_type);
+                    elif left.right_value? then
+                        if Value.check_is_consumable(_logger, right_location, left.right_value) then
+                            typed_symbol.set_type(left.right_value.type);
                         else
                             typed_symbol.set_type(new Semantic.Types.ERROR());                            
                         fi
-
-                    elif variable.initializer? then
-                        if Value.check_is_consumable(_logger, variable.initializer.location, variable.initializer.value) then
-                            typed_symbol.set_type(variable.initializer.value.type);
-                        else
-                            typed_symbol.set_type(new Semantic.Types.ERROR());                            
-                        fi
-                    elif !variable.is_poisoned then
-                        _logger.error(variable.location, "variable must have explict type or initializer");
                     fi
                 elif
-                    !isa Trees.TypeExpressions.INFER(variable.type_expression) /\
-                    variable.initializer? /\
-                    Value.check_is_consumable(_logger, variable.initializer.location, variable.initializer.value)
+                    left.explicit_type? /\
+                    left.right_value? /\
+                    Value.check_is_consumable(_logger, right_location, left.right_value)
                 then
                     if
-                        !variable.type_expression.type.is_assignable_from(variable.initializer.value.type)
+                        !left.explicit_type.is_assignable_from(left.right_value.type)
                     then
                         _logger.error(
-                            variable.location, 
-                            "{variable.initializer.value.type} is not assignable to {variable.type_expression.type}");
+                            left.variable_location, 
+                            "{left.right_value.type} is not assignable to {left.explicit_type}");
                     fi
                 fi
+
+                if left.right_value? then
+                    left.value = symbol.store(left.location, null, left.right_value, _symbol_loader, true);
+                fi
             else
-                _logger.error(variable.name.location, "couldn't find typed symbol for variable {variable.name}");
-            fi        
+                _logger.error(left.name.location, "couldn't find typed symbol for variable {left.name}");
+            fi
+        si
+
+        pre(left: Trees.Variables.DESTRUCTURING_VARIABLE_LEFT) -> bool is
+            let from = left.right_value;
+
+            if !from? then
+                _logger.error(left.location, "cannot destructure without initializer");
+                return true;
+            fi
+
+            let from_type =
+                if left.explicit_type? then
+                    left.explicit_type;
+                else
+                    from.type;
+                fi;
+
+            if !from_type? then
+                _logger.error(left.location, "oops: null type");
+            fi
+
+            if !from_type.is_destructurable then
+                _logger.error(left.location, "cannot destructure {from_type}");
+                return true;
+            fi
+
+            // TODO deconstruct(...) support
+            let from_types = from_type.arguments;
+            let elements = left.elements;
+
+            let count = elements.count;
+
+            if left.elements.count != from_types.count then
+                _logger.error(left.location, "expected {elements.count} destructuring elements but found {from_types.count}");
+
+                if elements.count > from_types.count then
+                    count = from_types.count;
+                fi
+            fi
+
+            let use block = _ir_context.enter_block();
+            let get_from = from.get_temp_copier(_ir_context, "destructure");
+
+            for i in 0..count do
+                let element = elements[i];
+
+                let member = from_type.find_member("`{i}");
+
+                element.right_value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+                element.variable_location = left.variable_location;
+                element.right_location = left.right_location;
+
+                element.walk(self);
+
+                if element.value? then
+                    element.value.gen(_ir_context);
+                fi
+            od
+
+            left.value = block.close();
+
+            return true;
+        si
+
+        visit(destructure_left: Trees.Variables.DESTRUCTURING_VARIABLE_LEFT) is
+
+        si
+
+        pre(variable: Trees.Variables.VARIABLE) -> bool is
+            if variable.type_expression? then
+                variable.type_expression.walk(self);
+
+                // push explicit type down into the variable left
+                if variable.is_explicit_type /\ variable.type_expression.type? then
+                    variable.left.explicit_type = variable.type_expression.type;
+                fi
+            fi
+
+            if variable.initializer? then
+                if variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
+                    // if we have both an explicit type and an initializer, we
+                    // can push a type constraint down into the initializer
+                    variable.initializer.try_set_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
+                fi
+
+                variable.initializer.walk(self);
+
+                // push the initializer value down into the variable left
+                if variable.initializer.value? then
+                    variable.left.right_value = variable.initializer.value;
+                else
+                    variable.left.right_value = new IR.Values.DUMMY(new Semantic.Types.ERROR(), variable.initializer.location);
+                fi
+
+                variable.left.variable_location = variable.location;
+                variable.left.right_location = variable.initializer.location;
+            fi
+
+            if 
+                !variable.is_poisoned /\ 
+                (!variable.type_expression? \/ isa Trees.TypeExpressions.INFER(variable.type_expression))
+                /\ !variable.initializer?
+            then
+                _logger.error(variable.location, "variable must have explict type or initializer");
+            fi
+
+            variable.left.walk(self);
+
+            return true;
+        si
+
+        visit(variable: Trees.Variables.VARIABLE) is
+        si
+
+        // TODO used by for loop - needs removing
+        set_symbol_type(left: Trees.Variables.VariableLeft, type: Type) is
+            if !left? then
+                return;
+            fi
+
+            if left.is_simple_name then
+                let symbol = find(left.name);
+
+                if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                    let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                    symbol.define();
+
+                    typed_symbol.set_type(type);
+                else
+                    _logger.error(left.location, "couldn't find typed symbol for variable {left.name}");
+                fi
+            else
+                set_symbol_destructure_types(left, type);
+            fi
+        si
+
+        set_symbol_destructure_types(left: Trees.Variables.VariableLeft, type: Type) is
+            if !type? \/ !type.is_destructurable then
+                _logger.error(left.location, "cannot destructure {type}");
+                return;
+            fi
+
+            // TODO this is safe while we only support tuples
+            let types = type.arguments;
+
+            let elements = left.elements;
+
+            let count = elements.count;
+
+            if elements.count != types.count then
+                _logger.error(left.location, "expected {elements.count} destructuring elements but found {types.count}");
+
+                if elements.count > types.count then
+                    count = types.count;
+                fi
+            fi
+
+            for i in 0..count do
+                let element = elements[i];
+                let type = types[i];
+
+                if !element? then
+                    return;
+                elif element? /\ element.is_simple_name then
+                    let symbol = find(element.name);
+
+                    if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                        let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                        symbol.define();
+
+                        typed_symbol.set_type(type);
+                    else
+                        _logger.error(element.location, "couldn't find typed symbol for destructuring element {element.name}");
+                    fi
+                else
+                    set_symbol_destructure_types(element, type);
+                fi
+            od
+        si
+        
+        get_destructure_types(type: Type) -> Collections.List[Type] is
+            let result = new Collections.LIST[Type]();
+
+            if !type? \/ !type.is_destructurable then
+                debug_always("## get_destructure_types: not destructurable {type}");
+
+                return result;                
+            fi
+
+            get_destructure_types_into(type, result);
+
+            return result;
+        si
+        
+        get_destructure_types_into(type: Type, into: Collections.MutableList[Type]) is
+            let result = new Collections.LIST[Type]();
+
+            for t in type.arguments do
+                if t.is_destructurable then
+                    get_destructure_types_into(t, into);
+                else
+                    into.add(t);
+                fi
+            od
         si
 
         visit(integer: Trees.Expressions.Literals.INTEGER) is
