@@ -44,6 +44,7 @@ fi
 
 
 VERBOSITY="-verbosity:quiet"
+# VERBOSITY="-verbosity:detailed"
 
 for PASS in 1 2 3 4 ; do
     PREVIOUS=$(dotnet ghul-compiler)
