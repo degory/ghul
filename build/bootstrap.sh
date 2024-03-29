@@ -72,9 +72,9 @@ for PASS in 1 2 3 4 ; do
 
     dotnet ghul-compiler
 
-    if [ "${PASS}" != "1" ] && [ "${PASS}" != "2" ] ; then
+    # if [ "${PASS}" != "1" ] && [ "${PASS}" != "2" ] ; then
         mv out.il stage-${PASS}.il
-    fi
+    # fi
 
     dotnet clean -nologo -verbosity:quiet
 
