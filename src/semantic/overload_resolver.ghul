@@ -47,13 +47,14 @@ namespace Semantic is
             group: Symbols.FUNCTION_GROUP,
             arguments: Collections.List[Type],
             want_infer: bool,
-            want_instance: bool
+            want_instance: bool,
+            is_constructor_call: bool
         ) -> OVERLOAD_RESOLVE_RESULT
         is
             let mark = _logger.mark();
 
             try
-                return _resolve(location, group, arguments, want_infer, want_instance);
+                return _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call);
             catch e: Exception
                 _logger.release(mark);
 
@@ -90,7 +91,8 @@ namespace Semantic is
             group: Symbols.FUNCTION_GROUP,
             arguments: Collections.List[Type],
             want_infer: bool,
-            want_instance: bool
+            want_instance: bool,
+            is_constructor_call: bool
         ) -> OVERLOAD_RESOLVE_RESULT
         is
             if group == null \/ group.functions == null \/ arguments == null then
@@ -98,7 +100,7 @@ namespace Semantic is
             fi
 
             // FIXME: this could just as well be applied to any parameters of generic type, not just anon functions
-            let needs_second_call = want_infer /\ arguments | .any(a => a? /\ a.is_function_with_any_implicit_argument_types);
+            let needs_second_call = arguments | .any(a => a? /\ a.is_function_with_any_implicit_argument_types);
 
             let is_ambiguous = false;
 
@@ -109,6 +111,11 @@ namespace Semantic is
 
             let functions_to_search = group.functions | .filter(f => want_instance \/ !f.is_instance);
 
+            // We need to return PARTIAL if any actual argument types are wild. 'PARTIAL' provides
+            // the caller with the best match we can find, and the caller is expected to use that
+            // to bind any unknown types in the actual arguments and then try overload resolution
+            // again
+
             for f in functions_to_search do
                 let actual = f;
 
@@ -117,7 +124,27 @@ namespace Semantic is
                 elif f.arguments.count == 0 /\ arguments.count == 0 then
                     return OVERLOAD_RESOLVE_RESULT(f, Types.MATCH.SAME);
                 elif f.arguments.count == arguments.count then
+                    let want_try_bind_owner_generic_arguments = false;
+                    let want_try_bind_function_generic_arguments = false;
+
+                    if is_constructor_call then
+                        want_try_bind_owner_generic_arguments = true;
+                        want_try_bind_function_generic_arguments = false;                    
+                    elif f.is_instance then
+                        want_try_bind_owner_generic_arguments = false;
+                        want_try_bind_function_generic_arguments = true;                    
+                    elif f.is_generic then
+                        want_try_bind_owner_generic_arguments = true;
+                        want_try_bind_function_generic_arguments = true;
+                    else
+                        want_try_bind_owner_generic_arguments = true;
+                        want_try_bind_function_generic_arguments = false;
+                    fi
+
+                    let try_bind_generic_arguments = false;
                     let score = cast int(Types.MATCH.SAME);
+
+                    let owner_symbol = cast Symbols.Classy(f.owner);
 
                     for i in 0..f.arguments.count do
                         let match: Types.MATCH;
@@ -129,32 +156,148 @@ namespace Semantic is
                             match = f_arg.compare(arg);
 
                             if match == Types.MATCH.DIFFERENT then
+                                // if any argument type compare returns DIFFERENT then
+                                // this overload cannot match the supplied arguments
+                                // even allowing for type argument inference of any
+                                // type arguments in the formal arguments or of
+                                // unknown types in the actual arguments, so
+                                // bail on this overload immediately:
                                 score = cast int(Types.MATCH.DIFFERENT);
                                 break;
-                            fi
+                            elif match == Types.MATCH.WILD then
+                                // either or both of the following has occurred:
+                                // 1. the formal argument type is 'wild', i.e. its type expression
+                                //    includes at least one generic type argument that could be free
+                                //    to be bound to the type in corresponding position in the actual
+                                //    argument type. The type argument could be appear inside the type
+                                //    expression at any depth, for example `List[T]` or `int -> T`
+                                // 2. the actual argument type is 'any', i.e. its type expression
+                                //    includes at least one unknown type where the actual type can
+                                //    potentially be infered based on the formal argument type
+                               
+                                // we need first to figure out which it is. If it's both then type
+                                // inference probably isn't possible, but we will still attempt it
 
-                            if match == Types.MATCH.WILD then
-                                match = Types.MATCH.SAME;
+                                if f_arg.is_wild then
+                                    // this formal argument is wild, we need to figure out if any
+                                    // type arguments in it could be free in this context
+
+                                    // if the overload is an instance method we then can't supply
+                                    // actual type parameters to its owning class/struct either explicitly
+                                    // or via inference - they're already applied to the instance we're
+                                    // calling the method on
+
+                                    // if the overload is a static method, we can potentially supply
+                                    // actual type arguments for its owning class
+
+                                    // and in either case we can supply actual type arguments for the
+                                    // method itself
+
+                                    // if the function is a global function then we can supply actual
+                                    // type arguments for it
+
+                                    // if the function is a constructor, and we're calling it for a
+                                    // constructor expression, it cannot have generic arguments but
+                                    // its owning type can, and we do want to supply them if we
+                                    // can infer them from this overload
+
+                                    match = Types.MATCH.SAME;
+
+
+                                    // FIXME: not convinced this is needed - bootstraps and tests pass
+                                    // without it. The intention is to block from trying to bind generic
+                                    // arguments that are not actually free in the current context
+
+                                    let generic_arguments = f_arg.get_type_arguments();
+                                    
+                                    for ga in generic_arguments do
+                                        if ga.is_function_generic_argument /\ !want_try_bind_function_generic_arguments then
+                                            score = cast int(Types.MATCH.DIFFERENT);
+                                            break;
+
+                                        elif ga.is_classy_generic_argument /\ !want_try_bind_owner_generic_arguments then
+                                            score = cast int(Types.MATCH.DIFFERENT);
+                                            break;
+
+                                        else
+                                            match = Types.MATCH.SAME;
+                                        fi
+                                    od
+
+                                    if score == cast int(Types.MATCH.DIFFERENT) then
+                                        break;
+                                    fi
+
+                                    try_bind_generic_arguments = true;
+                                fi
+                            elif arg.is_any_any then
+                                // The actual argument is any, or is constructed from any. Treat this argument as if it
+                                // matches and see if that results in an unambiguous overload result. If so, the caller
+                                // can use the argument type from that result to try to infer the actual type of this
+                                // argument
+                                
+                                // FIXME not sure it makes sense to be setting score here - should be match
+                                score = cast int(Types.MATCH.PARTIAL);                                                                
                             fi
                         else
+                            // something wrong with the argument - treat it as a moderate quality match
                             match = Types.MATCH.ASSIGNABLE;
                         fi
 
                         score = cast int(score) + cast int(match);
                     od
 
-                    if f.is_generic /\ score <= best_score /\ score != cast int(Types.MATCH.DIFFERENT) then
-                        let bindings = f.try_bind_generic_arguments(location, arguments);
+                    if try_bind_generic_arguments /\ score <= best_score /\ score < cast int(Types.MATCH.DIFFERENT) then
+                        // if we saw any generic argument types in any of the function formal argument types
+                        // then we need to try to bind them to concrete types from the corresponding actual
+                        // argument types
 
-                        if !bindings? then
-                            score = cast int(Types.MATCH.DIFFERENT);
-                        elif bindings.is_bound then
-                            actual = f.specialize_function(bindings.map, null);
-                        elif want_infer then
-                            actual = f.specialize_function(bindings.map, null);
-                            score = cast int(Types.MATCH.PARTIAL);
+                        let function_generic_argument_bindings = 
+                            if want_try_bind_function_generic_arguments then
+                                f.try_bind_generic_arguments(location, arguments);
+                            else
+                                null;
+                            fi;
+
+                        let owner_generic_argument_bindings =
+                            if want_try_bind_owner_generic_arguments then
+                                f.try_bind_owner_generic_arguments(location, arguments);
+                            else
+                                null
+                            fi;
+
+                        if function_generic_argument_bindings? then
+                            if function_generic_argument_bindings.is_bound then
+                                actual = f.specialize_function(function_generic_argument_bindings.map, null);
+                            elif needs_second_call then
+                                actual = f.specialize_function(function_generic_argument_bindings.map, null);
+                                score = cast int(Types.MATCH.PARTIAL);
+                            else
+                                score = cast int(Types.MATCH.DIFFERENT);
+                            fi
+                        elif owner_generic_argument_bindings? then
+                            if owner_generic_argument_bindings.is_bound then
+                                let specialized_owner = Symbols.GENERIC.try_create_from(location, owner_symbol, owner_generic_argument_bindings.map);
+
+                                if specialized_owner? then
+                                    actual = specialized_owner.find_specialized_function(f);
+                                else
+                                    score = cast int(Types.MATCH.DIFFERENT);
+                                fi
+                            elif needs_second_call then
+                                let specialized_owner = Symbols.GENERIC.try_create_from(location, owner_symbol, owner_generic_argument_bindings.map);
+
+                                if specialized_owner? then
+                                    actual = specialized_owner.find_specialized_function(f);
+                                    score = cast int(Types.MATCH.PARTIAL);
+                                else
+                                    score = cast int(Types.MATCH.DIFFERENT);
+                                fi
+                            else
+                                score = cast int(Types.MATCH.DIFFERENT);
+                            fi
                         else
-                            score = cast int(Types.MATCH.DIFFERENT);
+                            score = cast int(Types.MATCH.DIFFERENT);                        
                         fi
                     fi
 
@@ -168,6 +311,7 @@ namespace Semantic is
                         fi
 
                         ambiguous_matches.add(actual);
+
                         is_ambiguous = true;
                     elif score < best_score then
                         if ambiguous_matches? then
