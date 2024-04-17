@@ -467,7 +467,7 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            r.expression.try_set_constraint(function.return_type, "cannot return value of type {{0}} from function of type {{1}}");
+            r.expression.set_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
 
             return false;
         si
@@ -500,7 +500,7 @@ namespace Syntax.Process is
                         _logger
                             .error(
                                 r.expression.location,
-                                "cannot return value of type {r.expression.value.type} from function of type {function.return_type}"
+                                "cannot return value of type {r.expression.value.type} where {function.return_type} expected"
                             );
                     fi
 
@@ -648,7 +648,7 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            expression.expression.try_set_constraint(function.return_type, "cannot return value of type {{0}} from function of type {{1}}");
+            expression.expression.set_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
 
             return false;
 
@@ -695,7 +695,7 @@ namespace Syntax.Process is
                 _logger
                     .error(
                         expression.location,
-                        "cannot return value of type {expression.expression.value.type} from function of type {function.return_type}"
+                        "cannot return value of type {expression.expression.value.type} where {function.return_type} expected"
                     );
             else
                 Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
@@ -705,17 +705,26 @@ namespace Syntax.Process is
         si
         
         pre(function: Trees.Expressions.FUNCTION) -> bool is
-            super.pre(function);
-
             return true;
         si
 
         visit(function: Trees.Expressions.FUNCTION) is
+            let mark = _logger.mark();
+
             try
+                _logger.speculate();
+
+                super.pre(function);
+
                 _visit(function);
-            catch ex: Exception
-                _logger.exception(function.location, ex, "exception walking lambda");
-            yrt            
+
+                _logger.commit();
+            catch e: Exception
+                function.value = DUMMY(Semantic.Types.ERROR(), function.location);
+                _logger.release(mark);
+ 
+                _logger.exception(function.location, e, "exception compiling function literal");
+            yrt
         si
 
         _visit(function: Trees.Expressions.FUNCTION) is
@@ -746,6 +755,7 @@ namespace Syntax.Process is
 
             let arguments = function.arguments.expressions;
 
+            // we are walking the arguments here while speculating
             for index in 0..arguments.count do
                 let a = arguments[index];
                 
@@ -801,23 +811,24 @@ namespace Syntax.Process is
                 closure.set_return_type(return_type);
             fi
 
-            let use logger_snapshot = _logger.speculate_then_commit();
+            _logger.commit();
+            _logger.speculate();
 
             function.body.walk(self);
 
             let reported_inference_failure = false;
 
             if closure.is_recursive then
-                logger_snapshot.backtrack();
+                _logger.roll_back();
+                _logger.speculate();
 
                 function.body.walk(self);
-            else
-                any_errors = any_errors \/ logger_snapshot.any_errors;
-                
-                logger_snapshot.commit();
             fi
 
             if _will_generate_code /\ !any_errors /\ closure.could_be_delegate then
+                _logger.roll_back();
+                _logger.speculate();
+
                 closure.convert_to_delegate();
 
                 function.body.walk(self);
@@ -857,6 +868,16 @@ namespace Syntax.Process is
         si
 
         pre(tuple: Trees.Expressions.TUPLE) -> bool is
+            if tuple.constraint? /\ tuple.constraint.is_value_tuple then
+                for (element, type) in tuple.elements | .zip(tuple.constraint.arguments) do
+                    element.set_constraint(type, tuple.constraint_error_message);
+                od
+            else
+                for element in tuple.elements do
+                    element.clear_constraint();
+                od
+            fi
+
             return false;
         si
 
@@ -864,6 +885,14 @@ namespace Syntax.Process is
             let names = Collections.LIST[string]();
             let values = Collections.LIST[Value]();
             let types = Collections.LIST[Type]();
+
+            let element_constraints: Collections.List[Type] = null;
+            let constraint_error_message: string = null;
+
+            if tuple.constraint? /\ tuple.constraint.is_value_tuple then
+                element_constraints = tuple.constraint.arguments;
+                constraint_error_message = tuple.constraint_error_message;
+            fi;
 
             if tuple.elements.expressions.count == 1 then
                 tuple.value = tuple.elements.expressions[0].value;
@@ -878,6 +907,13 @@ namespace Syntax.Process is
             let seen_any_named = false;
 
             for (index, v) in tuple.elements | .index() do
+                let element_type_constraint =
+                    if element_constraints? then
+                        element_constraints[index];
+                    else
+                        null;
+                    fi;
+
                 if isa Trees.Expressions.TUPLE_ELEMENT(v) then
                     let element = cast Trees.Expressions.TUPLE_ELEMENT(v);
 
@@ -887,15 +923,35 @@ namespace Syntax.Process is
                     if element.initializer? then
                         if Value.check_is_consumable(_logger, element.initializer.location, element.initializer.value) then
                             if element.type_expression? /\ element.type_expression.type? then
+                                let type =
+                                    if element_type_constraint? then
+                                        element_type_constraint
+                                    else
+                                        element.type_expression.type
+                                    fi;
+
                                 if element.type_expression.check_is_not_reference(_logger, "tuple element cannot be a reference") then
-                                    if !element.type_expression.type.is_assignable_from(element.initializer.value.type) then
-                                        _logger.error(element.location, "{element.initializer.value.type} is not assignable to {element.type_expression.type}");
+                                    if !type.is_assignable_from(element.initializer.value.type) then
+                                        _logger.error(element.location, "{element.initializer.value.type} is not assignable to {type}");
+                                    elif element_type_constraint? /\ !element_type_constraint.is_assignable_from(element.type_expression.type) then
+                                        _logger.error(
+                                            element.type_expression.location,
+                                            string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
                                     fi
                                 fi
 
-                                let type = element.type_expression.type;
+                                types.add(type);
+                                values.add(_value_boxer.box_if_needed(element.initializer.value, type));
 
-                                types.add(element.type_expression.type);
+                            elif element_type_constraint? then
+                                let type = element_type_constraint;
+
+                                if !type.is_assignable_from(element.initializer.value.type) then
+                                    _logger.error(
+                                        element.type_expression.location,
+                                        string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
+                                fi
+
                                 values.add(_value_boxer.box_if_needed(element.initializer.value, type));
                             else
                                 types.add(element.initializer.value.type);
@@ -912,14 +968,29 @@ namespace Syntax.Process is
                     types.add(Semantic.Types.ERROR());
 
                 elif Value.check_is_consumable(_logger, v.location, v.value) then
-                    names.add("`{index}");
+                    names.add(null);
 
-                    values.add(v.value);
-                    types.add(v.value.type);
+                    if element_type_constraint? then
+                        let type = element_type_constraint;
+
+                        if !type.is_assignable_from(v.value.type) then
+                            _logger.error(
+                                v.location,
+                                string.format(constraint_error_message, [v.value.type, type]:object));
+                        fi
+
+                        types.add(type);
+                        values.add(_value_boxer.box_if_needed(v.value, type));
+                    else
+                        types.add(v.value.type);
+                        values.add(v.value);
+                    fi
                 else
                     values.add(IR.Values.DUMMY(Semantic.Types.ERROR(), v.location));
                     types.add(Semantic.Types.ERROR());
                 fi
+
+                debug_unindent();
             od
 
             if !seen_any_named then
@@ -930,7 +1001,38 @@ namespace Syntax.Process is
             tuple.value = TUPLE(type, values);
         si
 
+        pre(sequence: Trees.Expressions.SEQUENCE) -> bool is
+            return true;
+        si
+
         visit(sequence: Trees.Expressions.SEQUENCE) is
+            let mark = _logger.mark();
+
+            try
+                _logger.speculate();
+
+                super.pre(sequence);
+
+                sequence.type_expression.walk(self);
+
+                for e in sequence.elements do
+                    e.clear_constraint();
+                od
+
+                sequence.elements.walk(self);
+
+                _visit(sequence);
+
+                _logger.commit();
+            catch e: Exception
+                sequence.value = DUMMY(Semantic.Types.ERROR(), sequence.location);
+                _logger.release(mark);
+ 
+                _logger.exception(sequence.location, e, "exception compiling call");
+            yrt
+        si
+
+        _visit(sequence: Trees.Expressions.SEQUENCE) is
             let type: Type;
             let have_explicit_type: bool;
 
@@ -942,42 +1044,119 @@ namespace Syntax.Process is
 
                     have_explicit_type = true;
                 else
+                    // FIXME probably not needed - type pass will have given an error
                     _logger.error(sequence.type_expression.location, "bad explicit type expression");
                     return;
                 fi
+            elif sequence.constraint? then
+                type = sequence.constraint.get_element_type();
+
+                have_explicit_type = type?;            
             elif elements.count == 0 then
                 _logger.error(sequence.location, "cannot infer type of list literal with no elements");
 
                 return; 
             else
-                // FIXME: this is assuming the type of the sequence is the type of its first element
-                // should be the most specific type that is assignable from all element types
-
                 let seen_any = false;
+                let seen_error = false;
+                let all_tuple_literals = elements.count > 0; // assume all tuples until proved otherwise
+                let tuples_element_count = -1;
+                let lub = LEAST_UPPER_BOUND_MAP();
 
                 for v in elements do
+                    if !v.is_tuple_literal then
+                        all_tuple_literals = false;
+                    fi
+
                     if v.value? /\ v.value.type? then
-                        seen_any = true;
+                        if v.value.check_is_consumable(_logger, v.location) then
+                            if !v.value.type.is_null then
+                                seen_any = true;
+                                lub.add(v.value.type);
+                            elif v.value.type.is_error then
+                                seen_error = true;
+                            else
+                                _logger.warn(v.location, "is null {v.value.type.is_null}");
+                            fi
 
-                        v.value.check_is_consumable(_logger, v.location);
-
-                        if !type? then
-                            type = v.value.type;
-                        elif v.value.type.is_assignable_from(type) then
-                            type = v.value.type;
-                        elif !type.is_assignable_from(v.value.type) then
-                            type = _innate_symbol_lookup.get_object_type();
-                            break;
+                            if v.is_tuple_literal then
+                                if tuples_element_count == -1 then
+                                    tuples_element_count = v.value.type.arguments.count;
+                                elif v.value.type.arguments.count != tuples_element_count then
+                                    all_tuple_literals = false;
+                                fi
+                            fi
+                        else
+                            seen_error = true;
                         fi
+                    else
+                        seen_error = true;
                     fi
                 od
 
-                if type == null then
-                    if seen_any then
-                        _logger.error(sequence.location, "cannot infer type of list literal with only null elements");
+                if !type? then
+                    type = lub.get_result();
+
+                    // FIXME factor this out - it's duplicated between here and if branches
+                    if all_tuple_literals /\ (!type? \/ !type.is_value_tuple) then
+                        let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
+    
+                        for element in elements do
+                            if !element.value? \/ !element.value.type? then
+                                continue;
+                            fi
+    
+                            for (index, e) in element.value.type.arguments | .index() do
+                                if index >= lubs.count then
+                                    lubs.add(LEAST_UPPER_BOUND_MAP());
+                                fi
+    
+                                lubs[index].add(e);
+                            od
+                        od
+   
+                        type = 
+                            _innate_symbol_lookup.get_tuple_type(
+                                lubs |
+                                    .map(l => 
+                                        let r: Type = l.get_result() in if r? then r else _innate_symbol_lookup.get_object_type() fi) 
+                                    .collect(),
+                                lub.element_names
+                            );
+
+                        // going to walk the elements again, so roll back
+                        // and re-speculate to avoid duplicate / misleading
+                        // error messages
+                        _logger.roll_back();
+                        _logger.speculate();
+
+                        // re-walk the type expression if present, to avoid
+                        // hiding any error message it may generate
+
+                        if sequence.type_expression? then
+                            sequence.type_expression.walk(self);
+                        fi
+
+                        for e in sequence.elements do
+                            e.set_constraint(type, "element type {{0}} not compatible with inferred list type {{1}}");
+                            e.walk(self);
+                        od
                     fi
-                    
-                    return;
+                fi
+
+                if !type? then
+                    if seen_error then
+                        sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
+                        return;
+                    elif seen_any then
+                        _logger.hint(sequence.location, "specify explicit list literal type to avoid infering object type here");
+                        type = _innate_symbol_lookup.get_object_type();
+                    else
+                        _logger.error(sequence.location, "cannot infer type of list literal with only null elements");
+   
+                        sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
+                        return;
+                    fi
                 fi
             fi
 
@@ -986,6 +1165,8 @@ namespace Syntax.Process is
             for v in sequence.elements do
                 if v.value? /\ v.value.type? then
                     let u = v.value.type;
+
+                    // FIXME should push explicit type into element as constraint and retry
                     if have_explicit_type /\ !type.is_assignable_from(v.value.type) then
                         _logger.error(v.location, "element not compatible with explicit type");
                     fi
@@ -2214,7 +2395,7 @@ namespace Syntax.Process is
                 if variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
                     // if we have both an explicit type and an initializer, we
                     // can push a type constraint down into the initializer
-                    variable.initializer.try_set_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
+                    variable.initializer.set_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
                 fi
 
                 variable.initializer.walk(self);
@@ -3005,11 +3186,14 @@ namespace Syntax.Process is
             let seen_any_values = false;
             let seen_non_null_values = false;
             let seen_null_values = false;
+            let all_tuple_literals = true;
+
+            let lub = LEAST_UPPER_BOUND_MAP();
 
             for i in `if.branches do
                 let branch = i.body;
 
-                if !branch.value? then
+                if !branch.value? then                    
                     continue;
                 fi
 
@@ -3027,37 +3211,75 @@ namespace Syntax.Process is
                     fi
                 fi
 
+                debug_indent();
+
                 if `if.constraint? then
                     if !`if.constraint.is_void /\ !`if.constraint.is_assignable_from(branch.value.type) then
                         _logger.error(branch.location, string.format(`if.constraint_error_message, branch.value.type, type));
                     fi
-                    seen_non_null_values = true;
                 elif branch.value.type.is_null then
+                    // could also be error
                     seen_null_values = true;
-                    if type? /\ type.is_value_type then
-                        _logger.error(branch.location, "incompatible types in if branches: {type} and {branch.value.type}");                        
-                    fi
                 else
                     seen_non_null_values = true;
 
-                    if !type? \/ type.is_any then
-                        type = branch.value.type;
-
-                        if seen_null_values /\ type.is_value_type then
-                            _logger.error(branch.location, "incompatible types in if branches: null and {branch.value.type}");
-                        fi
-                    elif branch.value.type.is_assignable_from(type) /\ !branch.value.type.is_any then
-                        type = branch.value.type;
-                    elif !type.is_assignable_from(branch.value.type) then
-                        _logger.error(branch.location, "incompatible types in if branches: {type} and {branch.value.type}");
-
-                        `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "incompatible types");
-                        return;
+                    if !branch.is_tuple_literal then
+                        all_tuple_literals = false;
                     fi
+        
+                    lub.add(branch.value.type);
                 fi
 
                 seen_any_values = true;
             od
+
+            if !`if.constraint? then
+                type = lub.get_result();
+
+                // FIXME factor this out - it's duplicated between here and list literal elements
+                if all_tuple_literals /\ seen_non_null_values /\ (!type? \/ !type.is_value_tuple) then
+                    let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
+
+                    for i in `if.branches do
+                        let branch = i.body;
+
+                        if !branch.value? \/ !branch.value.type? then
+                            continue;
+                        fi
+
+                        for (index, e) in branch.value.type.arguments | .index() do
+                            if index >= lubs.count then
+                                lubs.add(LEAST_UPPER_BOUND_MAP());
+                            fi
+
+                            lubs[index].add(e);
+                        od
+                    od
+
+                    type = 
+                        _innate_symbol_lookup.get_tuple_type(
+                            lubs |
+                                .map(l => 
+                                    let r: Type = l.get_result() in if r? then r else _innate_symbol_lookup.get_object_type() fi) 
+                                .collect(),
+                            lub.element_names
+                        );
+                fi
+
+                if type? /\ type.is_value_type /\ seen_null_values then
+                    for i in `if.branches do
+                        let branch = i.body;
+        
+                        if !branch.value? \/ !branch.value.type? then
+                            continue;
+                        fi
+        
+                        if branch.value.type.is_null then
+                            _logger.error(branch.location, "incompatible types in if branches: {branch.value.type} and {type}");                                                    
+                        fi
+                    od
+                fi
+            fi
 
             if !type? then
                 if seen_any_values then
@@ -3069,7 +3291,7 @@ namespace Syntax.Process is
                 fi
 
                 `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no type inferred");
-        
+                return;
             else
                 `if.value = IR.Values.BLOCK(type);
             fi
