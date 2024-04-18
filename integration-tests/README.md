@@ -16,7 +16,7 @@ Test cases are named based on the directory they sit in under `integration-tests
 
 ### Test runner
 
-The test runner is a ghul application (`tester`) which executes one or more test cases and collects and reports the results. Because the test runner needs to be run in a Docker container, you don't generally run it directly - see below for how to execute tests from Visual Studio Code and from the command line
+The test runner is a ghul application (`ghul-test`) which executes one or more test cases and collects and reports the results.
 
 ### Test case execution
 
