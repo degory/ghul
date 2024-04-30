@@ -10,6 +10,7 @@ namespace Syntax.Process is
     use IR.VALUE_CONVERTER;
     use IR.VALUE_BOXER;
 
+    use Semantic.LEAST_UPPER_BOUND_MAP;
     use Semantic.Types.Type;
 
     use Syntax.Trees.Definitions.PRAGMA;
@@ -25,8 +26,6 @@ namespace Syntax.Process is
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _value_converter: VALUE_CONVERTER;
         _value_boxer: VALUE_BOXER;
-
-        _partial_argument_function_type: Type;
 
         _will_generate_code: bool;
 
@@ -191,6 +190,78 @@ namespace Syntax.Process is
             return should_skip(`struct);            
         si
 
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            return true;
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            let use debug_dispose = debug_enter();
+            debug("enter function {function.name}");
+
+            let mark = _logger.mark();
+
+            super.pre(function);
+
+            try
+                _logger.speculate();
+
+                _visit(function);
+
+                debug("logger commit");
+                _logger.commit();
+            catch ex: Exception
+                _logger.release(mark);
+
+                debug("function {function.name} exception {ex}");
+    
+                _logger.exception(function.location, ex, "exception compiling function");
+            finally
+                debug("exit function {function.name}");
+
+                super.visit(function);
+            yrt
+        si
+    
+        _visit(function: Trees.Definitions.FUNCTION) is
+            let use debug_dispose = debug_enter();
+
+            let symbol = symbol_for(function);
+
+            debug("visit function {symbol}");
+
+            function.name.walk(self);
+            function.type_expression.walk(self);
+            function.arguments.walk(self);
+
+            let retries = 10;
+
+            for i in 1::retries do
+                let use debug_dispose = debug_enter();
+                debug("inference attempt #{i} for {symbol}");
+                
+                debug("consumed any {_logger.has_consumed_any} consumed error {_logger.has_consumed_error}");
+
+                function.body.walk(self);
+
+                debug("consumed any {_logger.has_consumed_any} consumed error {_logger.has_consumed_error}");
+
+                if _logger.is_clean then
+                    debug("no errors");
+                    IO.Std.error.write_line("clean:\n{IoC.CONTAINER.instance.inference_info_printer.print(function)}");
+                    break;
+                fi
+                
+                if i < retries then
+                    _logger.roll_back();
+                    _logger.speculate();
+                else
+                    debug("failed after {retries} attempts");
+                fi
+
+                IO.Std.error.write_line("dirty\n{IoC.CONTAINER.instance.inference_info_printer.print(function)}");
+            od
+        si
+
         pre(`let: Trees.Statements.LET) -> bool is
             super.pre(`let);
             return false;
@@ -291,7 +362,6 @@ namespace Syntax.Process is
             fi
 
             if !left.expression.value.is_consumable then
-                // debug_always("cannot assign to {left} at {left.location} from AAA {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
                 _logger.error(left.location, "cannot assign to this");
                 return;
             fi
@@ -406,6 +476,13 @@ namespace Syntax.Process is
         si
         
         pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
+            let use debug_dispose = debug_enter();
+            debug("assign {assignment.to_string().replace_line_endings(" ")}");
+
+            if assignment.right.constraint? then 
+                debug("assign right constraint is {assignment.right.constraint}");
+            fi  
+
             assignment.right.walk(self);
 
             if !assignment.right.value? then
@@ -417,8 +494,17 @@ namespace Syntax.Process is
                 assignment.left.value = IR.Values.DUMMY(Semantic.Types.ERROR(), assignment.right.location);
             else
                 assignment.left.value = assignment.right.value;
+
+                debug("assign right value is {assignment.right.value}");
+                debug("assign right type is {assignment.right.value.type}");
             fi
 
+            debug_always("assign upgrade right constraint from {assignment.right.constraint} to {assignment.right.value.type}");
+
+            assignment.right.upgrade_constraint(assignment.right.value.type, "{{0}} burble {{1}}");
+
+            assignment.left.upgrade_constraint(assignment.right.value.type, "{{0}} burble {{1}}");
+            
             assignment.left.assign_location = assignment.location;
 
             assignment.left.walk(self);
@@ -467,7 +553,7 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            r.expression.set_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
+            r.expression.upgrade_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
 
             return false;
         si
@@ -712,22 +798,31 @@ namespace Syntax.Process is
             let mark = _logger.mark();
 
             try
-                _logger.speculate();
+                // _logger.speculate();
 
                 super.pre(function);
 
                 _visit(function);
 
-                _logger.commit();
+                // _logger.commit();
             catch e: Exception
+                debug_always("oops caught exception in lambda {e}");
+
                 function.value = DUMMY(Semantic.Types.ERROR(), function.location);
                 _logger.release(mark);
  
                 _logger.exception(function.location, e, "exception compiling function literal");
+
+            finally
+                super.visit(function);
             yrt
         si
 
         _visit(function: Trees.Expressions.FUNCTION) is
+            let use debug_dispose = debug_enter();
+
+            debug("compile function literal {function.to_string().replace_line_endings(" ")}");
+
             if !function.value? then
                 function.value = IR.Values.WRAPPER();
             fi
@@ -737,13 +832,30 @@ namespace Syntax.Process is
             closure.map_type_arguments();
 
             let implied_type: Type;
-            let implied_argument_types: Collections.List[Type];
+            let constraint_argument_types: Collections.List[Type];
+            let constraint_return_type: Type;
 
             // have we been passed expected arguments types? If so we'll use them
             // to argument types of any anonymous function literal arguments
-            if _partial_argument_function_type? then
-                implied_argument_types = _partial_argument_function_type.arguments;
-                _partial_argument_function_type = null;
+            if function.constraint? then
+                constraint_argument_types = function.constraint.arguments;
+
+                debug("have function constraint {function.constraint} args and return type {constraint_argument_types|}");
+
+                if function.constraint.is_function /\ constraint_argument_types.count > 0 then
+                    debug("expect return type from {constraint_argument_types|} count {constraint_argument_types.count}");
+
+                    let rt = constraint_argument_types[constraint_argument_types.count-1];
+
+                    if rt.any_count == 0 then
+                        debug("concrete return type {rt}");
+                        constraint_return_type = rt;
+                    else
+                        debug("ignore wild return type {rt}");
+                    fi
+                fi
+            else
+                debug("no constraint or unusable constraint");
             fi
 
             _symbol_table.current_closure_context.add_closure(closure);
@@ -755,9 +867,13 @@ namespace Syntax.Process is
 
             let arguments = function.arguments.expressions;
 
+            debug("compile function {function.compile_count} {function.to_string().replace_line_endings(" ")}");
+            function.compile_count = function.compile_count + 1;
+
             // we are walking the arguments here while speculating
             for index in 0..arguments.count do
                 let a = arguments[index];
+                debug("function argument #{index} {a}");
                 
                 // TODO: destructure
                 if isa Trees.Expressions.VARIABLE(a) then
@@ -768,24 +884,41 @@ namespace Syntax.Process is
                     let symbol = cast Semantic.Symbols.Variable(closure.find_direct(argument.name.name));
 
                     if !isa Trees.TypeExpressions.INFER(argument.type_expression) then
+                        debug("explicit type {argument.type_expression.type}");
                         argument_types.add(argument.type_expression.type);
-                    elif implied_argument_types? then
-                        let implied_argument_type = implied_argument_types[index];
+                    elif constraint_argument_types? then
+                        let constraint_argument_type = constraint_argument_types[index];
 
-                        if implied_argument_type? /\ !implied_argument_type.is_type_variable then
-                            argument_types.add(implied_argument_type);
+                        debug("constrained argument type {constraint_argument_type} {constraint_argument_type.get_type()} inferred: {constraint_argument_type.is_inferred}");
 
-                            symbol.set_type(implied_argument_type);
+                        if constraint_argument_type? /\ !constraint_argument_type.is_type_variable /\ !constraint_argument_type.is_inferred then
+                            debug("apply constraint {constraint_argument_type}");
+                            argument_types.add(constraint_argument_type);
+
+                            symbol.set_type(constraint_argument_type);
                         else
-                            _logger.error(a.location, "cannot infer type here");
+                            let best_guess = symbol.try_get_inferred_type(symbol.location, _logger);
 
-                            symbol.set_type(Semantic.Types.ERROR());
-                            argument_types.add(Semantic.Types.ERROR());
+                            debug("lambda arg #{index} {a} LUB result {best_guess}");
+    
+                            if !best_guess? then
+                                best_guess = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol.location);
+                            fi
+                            
+                            symbol.set_type(best_guess);
+                            argument_types.add(best_guess);
                         fi
                     else
-                        _logger.error(a.location, "cannot infer type here");
-                        symbol.set_type(Semantic.Types.ERROR());
-                        argument_types.add(Semantic.Types.ERROR());
+                        let best_guess = symbol.try_get_inferred_type(symbol.location, _logger);
+
+                        debug("lambda arg #{index} {a} LUB result {best_guess}");
+
+                        if !best_guess? then
+                            best_guess = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol.location);
+                        fi
+                        
+                        symbol.set_type(best_guess);
+                        argument_types.add(best_guess);
                     fi
                 else
                     _logger.error(a.location, "unexpected kind of argument ({a.get_type()})");
@@ -795,26 +928,42 @@ namespace Syntax.Process is
                 index = index + 1;
             od
 
-            if !any_errors then
+            // if !any_errors then
                 closure.arguments = Collections.LIST[Type](argument_types);
 
                 let return_type: Type;
 
                 if function.type_expression.type? then
                     return_type = function.type_expression.type;
+                    debug("explicit return type {return_type}");
+                elif constraint_return_type? then
+                    return_type = constraint_return_type;
+                    debug("constrained return type {return_type}");
                 else
-                    return_type = Semantic.Types.INFERED_RETURN_TYPE();
-                fi                
+                    return_type = Semantic.Types.INFERRED_RETURN_TYPE(function.location);
+                    debug("infer return type {return_type}");
+                fi
 
                 closure.argument_names = argument_names;
 
+                // TODO only set if it's an improvement?
                 closure.set_return_type(return_type);
+
+                debug("set return type {return_type}");
+            // fi
+
+            // _logger.commit();
+            // _logger.speculate();
+
+            debug("walk function A {function.compile_count} {function.to_string().replace_line_endings(" ")}");
+            function.body.walk(self);
+
+            if closure.is_recursive /\ closure.is_recurse_capture_type_any then
+                debug("recurse is any type");
+                _logger.error(function.body.location, "no type inferred for recursive capture");
             fi
 
-            _logger.commit();
-            _logger.speculate();
-
-            function.body.walk(self);
+            /*            
 
             let reported_inference_failure = false;
 
@@ -822,29 +971,77 @@ namespace Syntax.Process is
                 _logger.roll_back();
                 _logger.speculate();
 
+                debug("walk function B {function.compile_count} {function.to_string().replace_line_endings(" ")}");
                 function.body.walk(self);
             fi
 
-            if _will_generate_code /\ !any_errors /\ closure.could_be_delegate then
+            */
+
+            if _will_generate_code /\ !any_errors then
+                debug("generating IL ensure return type is applied");
+
+                // FIXME should roll back here, speculate again
+
                 _logger.roll_back();
                 _logger.speculate();
 
-                closure.convert_to_delegate();
+                // let mark = _logger.mark();
+                // _logger.speculate();
 
-                function.body.walk(self);
+                // try
+                    if closure.could_be_delegate then
+                        closure.convert_to_delegate();
+                    fi
+
+                    debug("walk function C {function.compile_count} {function.to_string().replace_line_endings(" ")}");
+                    function.body.walk(self);
+   
+                    /*
+                    if !_logger.is_clean then
+                        let errors = _logger.roll_back();
+
+                        debug("final walk failed");
+
+                        errors.write_all_diagnostics(IO.Std.error, new Logging.HUMAN_READABLE_DIAGNOSTIC_FORMATTER());
+
+                        if closure.could_be_delegate then
+                            _logger.error(function.location, "failed to convert anonymous function to delegate");
+                        else
+                            _logger.error(function.location, "unexpected error generating code for anonymous function");
+                        fi
+                    else
+                        debug("final walk succeeded");
+                    fi
+                    */
+                // finally
+                //     _logger.release(mark);
+                // yrt
+
+                debug("final walk completed");
             fi
             
             if closure.return_type.is_inferred /\ ! closure.arguments | .any(a => a.is_error) then
+                debug("set void return type");
                 closure.set_return_type(_innate_symbol_lookup.get_void_type());
             fi
+            
+            debug("finishing up function {function.compile_count} {function.to_string().replace_line_endings(" ")}");
 
             closure.unmap_type_arguments();
 
             let value = closure.load(function.location, _symbol_loader).freeze();
 
+            debug("lambda result type {value.type} closure return type {closure.return_type} closure type {closure.type}");
+
+            if closure.is_recursive then
+                debug("recurse capture is {closure.find_or_add_recurse()}");
+            fi
+
             cast IR.Values.WRAPPER(function.value).value = value;
 
-            super.visit(function);
+            debug("value is {function.value} (inner should be {value})");
+
+            debug("done function {function.compile_count} {function.to_string().replace_line_endings(" ")}");
         si
 
         visit(recurse: Trees.Expressions.RECURSE) is
@@ -868,11 +1065,16 @@ namespace Syntax.Process is
         si
 
         pre(tuple: Trees.Expressions.TUPLE) -> bool is
+            // if we've been given a tuple typed constraint then
+            // apply the corresponding element types from it to the
+            // tuple elements: 
             if tuple.constraint? /\ tuple.constraint.is_value_tuple then
                 for (element, type) in tuple.elements | .zip(tuple.constraint.arguments) do
-                    element.set_constraint(type, tuple.constraint_error_message);
+                    element.upgrade_constraint(type, tuple.constraint_error_message);
                 od
             else
+                // TODO we may not want to do this - there's a chance that
+                // removing a constraint will cause us to go backwards
                 for element in tuple.elements do
                     element.clear_constraint();
                 od
@@ -888,6 +1090,7 @@ namespace Syntax.Process is
 
             let element_constraints: Collections.List[Type] = null;
             let constraint_error_message: string = null;
+
 
             if tuple.constraint? /\ tuple.constraint.is_value_tuple then
                 element_constraints = tuple.constraint.arguments;
@@ -908,7 +1111,7 @@ namespace Syntax.Process is
 
             for (index, v) in tuple.elements | .index() do
                 let element_type_constraint =
-                    if element_constraints? then
+                    if element_constraints? /\ index < element_constraints.count then
                         element_constraints[index];
                     else
                         null;
@@ -934,9 +1137,10 @@ namespace Syntax.Process is
                                     if !type.is_assignable_from(element.initializer.value.type) then
                                         _logger.error(element.location, "{element.initializer.value.type} is not assignable to {type}");
                                     elif element_type_constraint? /\ !element_type_constraint.is_assignable_from(element.type_expression.type) then
+                                        debug("error {element.type_expression.location} {string.format(constraint_error_message, [element.type_expression.type, element_type_constraint])}");
                                         _logger.error(
                                             element.type_expression.location,
-                                            string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
+                                            string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]));
                                     fi
                                 fi
 
@@ -947,11 +1151,13 @@ namespace Syntax.Process is
                                 let type = element_type_constraint;
 
                                 if !type.is_assignable_from(element.initializer.value.type) then
+                                    debug("error {element.type_expression.location} {string.format(constraint_error_message, [element.type_expression.type, element_type_constraint])}");
                                     _logger.error(
                                         element.type_expression.location,
-                                        string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
+                                        string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]));
                                 fi
 
+                                types.add(type);
                                 values.add(_value_boxer.box_if_needed(element.initializer.value, type));
                             else
                                 types.add(element.initializer.value.type);
@@ -974,9 +1180,10 @@ namespace Syntax.Process is
                         let type = element_type_constraint;
 
                         if !type.is_assignable_from(v.value.type) then
+                            debug("error {v.location} {string.format(constraint_error_message, [v.value.type, type])}");
                             _logger.error(
                                 v.location,
-                                string.format(constraint_error_message, [v.value.type, type]:object));
+                                string.format(constraint_error_message, [v.value.type, type]));
                         fi
 
                         types.add(type);
@@ -989,8 +1196,6 @@ namespace Syntax.Process is
                     values.add(IR.Values.DUMMY(Semantic.Types.ERROR(), v.location));
                     types.add(Semantic.Types.ERROR());
                 fi
-
-                debug_unindent();
             od
 
             if !seen_any_named then
@@ -1006,39 +1211,69 @@ namespace Syntax.Process is
         si
 
         visit(sequence: Trees.Expressions.SEQUENCE) is
-            let mark = _logger.mark();
+            // let mark = _logger.mark();
 
             try
-                _logger.speculate();
+                // _logger.speculate();
 
                 super.pre(sequence);
 
                 sequence.type_expression.walk(self);
 
-                for e in sequence.elements do
-                    e.clear_constraint();
-                od
+                // have we been given a type constraint? if so the
+                // constraint will be some kind of list type. We need
+                // to extract the element type and then push that
+                // type as a constraint down into each of the elements
+
+                let element_constraint = 
+                    if sequence.constraint? then
+                        sequence.constraint.get_element_type();
+                    else
+                        null;
+                    fi;
+
+                
+                if element_constraint? then
+                    for e in sequence.elements do
+                        e.upgrade_constraint(element_constraint, "element type {{0}} not compatible with expected type {{1}}");
+                    od
+                else
+                    // TODO may not want to do this
+                    // removing an existing constraint might 
+                    // take us backwards
+                    for e in sequence.elements do
+                        e.clear_constraint();
+                    od                        
+                fi
 
                 sequence.elements.walk(self);
 
                 _visit(sequence);
 
-                _logger.commit();
+                // _logger.commit();
             catch e: Exception
                 sequence.value = DUMMY(Semantic.Types.ERROR(), sequence.location);
-                _logger.release(mark);
+                // _logger.release(mark);
  
-                _logger.exception(sequence.location, e, "exception compiling call");
+                _logger.exception(sequence.location, e, "exception compiling list literal");
             yrt
         si
 
         _visit(sequence: Trees.Expressions.SEQUENCE) is
+            let use debug_dispose = debug_enter();
+            debug("sequence {sequence} {sequence.compile_count} constraint {sequence.constraint}");
+
+            sequence.compile_count = sequence.compile_count + 1;
+
             let type: Type;
             let have_explicit_type: bool;
 
             let elements = Collections.LIST[Trees.Expressions.Expression](sequence.elements);
 
+            let concrete_constraint = sequence.concrete_constraint;
+
             if sequence.type_expression? /\ !isa Trees.TypeExpressions.INFER(sequence.type_expression) then
+                // explicit element type overrides all other sources of element type
                 if sequence.type_expression.type? then
                     type = sequence.type_expression.type;
 
@@ -1048,15 +1283,27 @@ namespace Syntax.Process is
                     _logger.error(sequence.type_expression.location, "bad explicit type expression");
                     return;
                 fi
-            elif sequence.constraint? then
-                type = sequence.constraint.get_element_type();
+            elif concrete_constraint? then
+                // next preference is a concrete type constraint
+                type = concrete_constraint.get_element_type();
 
-                have_explicit_type = type?;            
+                assert type? else "list literal has been given a type constraint {concrete_constraint} that has no element type";
+
+                have_explicit_type = true;
             elif elements.count == 0 then
+                // if we've not been given an explicit type or a type constraint and we have no
+                // elements then we can't infer a type
+
                 _logger.error(sequence.location, "cannot infer type of list literal with no elements");
+
+                sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
 
                 return; 
             else
+                // we have no explicit type or concrete type constraint but we do have
+                // elements. attempt to infer a common element type from the element types
+                // using our least upper bound heuristic
+
                 let seen_any = false;
                 let seen_error = false;
                 let all_tuple_literals = elements.count > 0; // assume all tuples until proved otherwise
@@ -1069,6 +1316,7 @@ namespace Syntax.Process is
                     fi
 
                     if v.value? /\ v.value.type? then
+                        debug("value {v.value} of type {v.value.type}");
                         if v.value.check_is_consumable(_logger, v.location) then
                             if !v.value.type.is_null then
                                 seen_any = true;
@@ -1094,11 +1342,34 @@ namespace Syntax.Process is
                     fi
                 od
 
-                if !type? then
+                if type? then
+                    debug("before LUB type any count is {type.any_count}");
+                fi
+
+                if !type? \/ type.any_count > 0 then
+                    debug("no type: get LUB result...");
+
                     type = lub.get_result();
+
+                    debug("type now {type}");
 
                     // FIXME factor this out - it's duplicated between here and if branches
                     if all_tuple_literals /\ (!type? \/ !type.is_value_tuple) then
+                        // all the elements were tuple literals but LUB did not infer
+                        // a tuple type. this means that at least some of the tuples
+                        // have different element types. .NET value tuples are not
+                        // naturally covariant but we can get the effect of covariance
+                        // by coercing the tuple element types to the best common type
+
+                        // we need to re-do the LUB heuristic for each tuple element type
+                        // separately
+
+                        // TODO this only handles one level of tuple-in-list nesting, which
+                        // is useful as far as it goes, but ideally we'd somehow do this
+                        // recursively all the way down into arbitrary nestings of tuple
+                        // and list literals
+
+                        // one LUB map per tuple element
                         let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
     
                         for element in elements do
@@ -1124,22 +1395,22 @@ namespace Syntax.Process is
                                 lub.element_names
                             );
 
-                        // going to walk the elements again, so roll back
-                        // and re-speculate to avoid duplicate / misleading
-                        // error messages
-                        _logger.roll_back();
-                        _logger.speculate();
+                        let constraint_error_message =
+                            if sequence.constraint_error_message? then
+                                sequence.constraint_error_message
+                            else
+                                // TODO maybe we should always push a contraint message
+                                // down the tree even if no constraint is ever set
+                                // at the moment at least the messages are always the same
+                                // for a given constraint source
+                                "element type {{0}} not compatible with expected type {{1}}"
+                            fi;
 
-                        // re-walk the type expression if present, to avoid
-                        // hiding any error message it may generate
+                        sequence.upgrade_constraint(type, constraint_error_message);
 
-                        if sequence.type_expression? then
-                            sequence.type_expression.walk(self);
-                        fi
-
+                        // now push the hopefully narrower type constraint down into the sequence elements:
                         for e in sequence.elements do
-                            e.set_constraint(type, "element type {{0}} not compatible with inferred list type {{1}}");
-                            e.walk(self);
+                            e.upgrade_constraint(type, "element type {{0}} not compatible with inferred list type {{1}}");
                         od
                     fi
                 fi
@@ -1164,11 +1435,19 @@ namespace Syntax.Process is
             
             for v in sequence.elements do
                 if v.value? /\ v.value.type? then
-                    let u = v.value.type;
+                    debug("apply type {type} to {v} of type {v.value}");
 
                     // FIXME should push explicit type into element as constraint and retry
                     if have_explicit_type /\ !type.is_assignable_from(v.value.type) then
-                        _logger.error(v.location, "element not compatible with explicit type");
+
+                        debug("not assignable {type} from {v.value}");
+                        if sequence.constraint_error_message? then
+                            debug("error {v.location} {string.format(sequence.constraint_error_message, [v.value.type, type])}");
+
+                            _logger.error(v.location, string.format(sequence.constraint_error_message, [v.value.type, type]));                            
+                        else
+                            _logger.error(v.location, "element type {v.value.type} not compatible with explicit type {type}");
+                        fi
                     fi
 
                     values.add(v.value);
@@ -1179,6 +1458,8 @@ namespace Syntax.Process is
                         
             sequence.value = 
                 SEQUENCE(_innate_symbol_lookup.get_array_type(type), type, values);
+
+            debug("sequence result {type} {sequence.value}");
         si        
 
         visit(`self: Trees.Expressions.SELF) is
@@ -1465,8 +1746,8 @@ namespace Syntax.Process is
                 );
         si
 
-        // should be called with logger speculating
-        resolve_constructor(location: LOCATION, right_location: LOCATION, type: Semantic.Types.Type, argument_expressions: Trees.Expressions.LIST) -> (Value, Value) is
+        // must be called with logger speculating
+        resolve_constructor(location: LOCATION, left_location: LOCATION, right_location: LOCATION, type: Semantic.Types.Type, argument_expressions: Trees.Expressions.LIST) -> (Value, Value) is
             let result: Value;
 
             let named_type = cast Semantic.Types.NAMED(type);
@@ -1502,45 +1783,44 @@ namespace Syntax.Process is
                 return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
             fi
 
-            let overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
+            let overload_result = _overload_resolver.resolve(location, function_group, argument_types, true, true, true);
 
             if overload_result == null then
                 return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
             fi
 
             if overload_result.score == Semantic.Types.MATCH.PARTIAL then
-                _logger.roll_back();
-                _logger.speculate();
+                // _logger.roll_back();
+                // _logger.speculate();
 
                 for (index, a) in argument_expressions | .index() do
                     // let use debug_despose = debug_enter();
                     if !a? then
                         continue;
-                    elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                        let f = overload_result.function.arguments[index];
+                    elif a.value? /\ a.value.check_is_consumable(_logger, a.location) then
+                        let required_argument_type = overload_result.function.arguments[index];
 
-                        try
-                            _partial_argument_function_type = f;
+                        a.upgrade_constraint(required_argument_type, "actual argument type {{0}} not compatible with expected type {{1}}");
 
-                            a.walk(self);
-                        finally
-                            _partial_argument_function_type = null;
-                        yrt
+                        // FIXME shouldn't rewalk
+                        a.walk(self);
                         
                         argument_types[index] = a.value.type;
                     else
                         // ensure any error messages are committed
+                        a.clear_constraint();
+                        // FIXME shouldn't rewalk
                         a.walk(self);
                     fi
 
                     arguments[index] = a.value;
                 od
 
-                overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
+                // overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
 
-                if !overload_result? then
-                    return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
-                fi
+                // if !overload_result? then
+                //     return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
+                // fi
             fi
 
             let function = overload_result.function;
@@ -1560,6 +1840,12 @@ namespace Syntax.Process is
             
             if !is_directly_owned then
                 _logger.error(location, "cannot call superclass constructor {function}");
+            fi
+
+            if type.is_unsafe_constraints then
+                // TODO this could result in a duplicate message if the left hand
+                // side is an explicit generic specialization
+                _logger.warn(left_location, "type {type} has unchecked constraints");
             fi
             
             _symbol_use_locations.add_symbol_use(right_location, function);
@@ -1610,6 +1896,8 @@ namespace Syntax.Process is
                 _symbol_use_locations.add_symbol_use(unary.operation.location, function);
 
                 let value = function.call(unary.location, null, Collections.LIST[Value]([unary.right.value]), null, _function_caller);
+
+                unary.right.upgrade_constraint(function.arguments[0], "{{0}} blurb {{1}}");
 
                 unary.value = value;
             fi
@@ -1758,6 +2046,9 @@ namespace Syntax.Process is
                 if want_not then
                     value = NOT(value);
                 fi
+
+                binary.left.upgrade_constraint(function.arguments[0], "{{0}} blurb {{1}}");
+                binary.right.upgrade_constraint(function.arguments[0], "{{0}} blurb {{1}}");
                 
                 binary.value = value;
             else
@@ -2271,10 +2562,11 @@ namespace Syntax.Process is
                         left.location;
                     fi;
 
-                if typed_symbol.type == null then
+                if typed_symbol.type == null \/ typed_symbol.type.is_inferred then
                     if left.explicit_type? then
                         // _logger.poison(left.location, "explicitly typed variable should already have a type");
 
+                        // TODO should narrow type not set it 
                         typed_symbol.set_type(left.explicit_type);
                     elif left.right_value? then
                         if Value.check_is_consumable(_logger, right_location, left.right_value) then
@@ -2282,6 +2574,8 @@ namespace Syntax.Process is
                         else
                             typed_symbol.set_type(Semantic.Types.ERROR());                            
                         fi
+                    else
+                        typed_symbol.set_type(symbol.try_get_inferred_type(symbol.location, _logger));
                     fi
                 elif
                     left.explicit_type? /\
@@ -2392,10 +2686,14 @@ namespace Syntax.Process is
             fi
 
             if variable.initializer? then
+                let want_upgrade_constraint_from_value_type = true;
+
                 if variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
                     // if we have both an explicit type and an initializer, we
                     // can push a type constraint down into the initializer
-                    variable.initializer.set_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
+
+                    want_upgrade_constraint_from_value_type = false;
+                    variable.initializer.upgrade_constraint(variable.type_expression.type, "{{0}} is not assignable to {{1}}");
                 fi
 
                 variable.initializer.walk(self);
@@ -2403,6 +2701,10 @@ namespace Syntax.Process is
                 // push the initializer value down into the variable left
                 if variable.initializer.value? then
                     variable.left.right_value = variable.initializer.value;
+
+                    if want_upgrade_constraint_from_value_type then
+                        variable.initializer.upgrade_constraint(variable.initializer.value.type, "{{0}} is not assignable to {{1}}");
+                    fi
                 else
                     variable.left.right_value = IR.Values.DUMMY(Semantic.Types.ERROR(), variable.initializer.location);
                 fi
@@ -2416,7 +2718,7 @@ namespace Syntax.Process is
                 (!variable.type_expression? \/ isa Trees.TypeExpressions.INFER(variable.type_expression))
                 /\ !variable.initializer?
             then
-                _logger.error(variable.location, "variable must have explict type or initializer");
+                // _logger.error(variable.location, "variable must have explict type or initializer");
             fi
 
             variable.left.walk(self);
@@ -2723,7 +3025,7 @@ namespace Syntax.Process is
             let mark = _logger.mark();
 
             try
-                _logger.speculate();
+                // _logger.speculate();
 
                 super.pre(call);
 
@@ -2732,7 +3034,7 @@ namespace Syntax.Process is
 
                 _visit(call);
 
-                _logger.commit();
+                // _logger.commit();
             catch e: Exception
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                 _logger.release(mark);
@@ -2747,8 +3049,13 @@ namespace Syntax.Process is
                 return;
             fi
 
+            let use debug_dispose = debug_enter();
+            debug("compile call {call.to_string().replace_line_endings(" ")}");
+            
+            let location = call.arguments.location;
+
             if call.function.value.is_type_expression then
-                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments);
+                (call.function.value, call.value) = resolve_constructor(location, call.function.location, call.right_location, call.function.value.type, call.arguments);
 
                 return;
             fi
@@ -2760,10 +3067,27 @@ namespace Syntax.Process is
 
             let outer_state: (writer: IO.TextWriter, error_count: int);
 
-            for a in call.arguments do
+            for (index, a) in call.arguments | .index() do
+                if a? then
+                    debug("arg #{index} {a.to_string().replace_line_endings(" ")}");
+                fi
+
                 if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                    a.upgrade_constraint(a.value.type, "{{0}} blah {{1}}");
+
                     arguments.add(a.value);
                     argument_types.add(a.value.type);
+                    debug("arg #{index} value has type {a.value.type} (from {a.value})");
+
+                elif a? /\ a.constraint? /\ a.constraint.any_count == 0 then
+                    // FIXME need to check type compatibility 
+                    arguments.add(a.value);
+                    argument_types.add(a.constraint);
+                    debug("arg #{index} already constrained to {a.constraint}");
+                elif a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                    arguments.add(a.value);
+                    argument_types.add(a.value.type);
+                    debug("arg #{index} value has type {a.value.type} (from {a.value})");
                 else
                     let t = Semantic.Types.ERROR();
 
@@ -2777,14 +3101,11 @@ namespace Syntax.Process is
                 fi
             od
 
-            // TODO handle if left is actually a type not a function or method
-            // in which case we should treat this as a constructor call
-
-            // we could also treat consuming a bare type as a constructor call
-            // this would be done in the symbol loader
+            debug("have argument types {argument_types|}");
 
             let load_symbol: Semantic.Symbols.Symbol;
 
+            // TODO factor out common parts from this and resolve constructor
             if isa Load.SYMBOL(call.function.value) then
                 let load = cast Load.SYMBOL(call.function.value);
                 load_symbol = load.symbol;
@@ -2798,49 +3119,66 @@ namespace Syntax.Process is
                         else 
                             _symbol_table.current_instance_context?
                         fi;
+
                     
                     let function_group = cast Semantic.Symbols.FUNCTION_GROUP(load_symbol);
-                    let overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
+                    let overload_result = _overload_resolver.resolve(location, function_group, argument_types, true, want_instance, false);
 
                     if overload_result == null then
                         call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                         return;
                     fi
 
+                    debug("overload result {overload_result}");
+
                     if overload_result.score == Semantic.Types.MATCH.PARTIAL then
-                        _logger.roll_back();
-                        _logger.speculate();
+                        debug("partial result {overload_result} try again");
+
+                        // _logger.roll_back();
+                        // _logger.speculate();                            
 
                         for (index, a) in call.arguments | .index() do
+                            debug("arg #{index} {a}...");
+
                             if !a? then
+                                debug("bad arg");
                                 continue;
-                            elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                                let f = overload_result.function.arguments[index];
+                            elif a.value? /\ a.value.check_is_consumable(_logger, a.location) then
+                                debug("have a consumable arg value");
 
-                                try
-                                    _partial_argument_function_type = f;
+                                let required_argument_type = overload_result.function.arguments[index];
 
-                                    a.walk(self);
-                                finally
-                                    _partial_argument_function_type = null;
-                                yrt
+                                debug("arg #{index} {a.to_string().replace_line_endings(" ")} set constraint {required_argument_type}");
+
+                                a.upgrade_constraint(required_argument_type, "actual argument type {{0}} not compatible with expected type {{1}}");
+
+                                // TODO need to ensure a is walked again but not yet
+                                // a.walk(self);
                                 
-                                argument_types[index] = a.value.type;
+                                // assume that when we re-walk the argument, the constraint will be applied
+                                // argument_types[index] = argument_constraint;
                             else
-                                // ensure any error messages are committed
-                                a.walk(self);
+                                a.clear_constraint();
+                                // a.walk(self);
                             fi
 
                             arguments[index] = a.value;
                         od
 
-                        overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, false, want_instance, false);
+                        
+//                        return;
+
+/*
+
+                        overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, want_instance, false);
 
                         if !overload_result? then
+                            debug("no overload result - give up");
                             call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                             // caller will commit any error messages
                             return;
                         fi    
+*/
                     fi
 
                     if !overload_result? then
@@ -2895,7 +3233,7 @@ namespace Syntax.Process is
                 fi
             else
                 if load_symbol? /\ load_symbol.is_type then                    
-                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments);
+                    (call.function.value, call.value) = resolve_constructor(location, call.function.location, call.right_location, load_symbol.type, call.arguments);
                 else
                     _logger.error(call.function.location, "cannot call value of non-function type {call.function.value.type}");
                     call.value = DUMMY(Semantic.Types.ERROR(), call.location);
@@ -2943,6 +3281,7 @@ namespace Syntax.Process is
                 _visit(identifier);
 
             catch ex: Exception
+                _logger.release(mark);
                 _logger.exception(identifier.location, ex, "something went wrong with identifier");
 
             finally 
@@ -2955,16 +3294,15 @@ namespace Syntax.Process is
         
             let symbol = find(identifier.identifier);
 
+            if symbol.is_local_variable /\ identifier.concrete_constraint? then
+                symbol.add_constraint(identifier.constraint);
+            fi
+
             if symbol? then
                 _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
 
                 if symbol.is_type then
                     identifier.value = TYPE_EXPRESSION(symbol.type, identifier.location);
-
-                    // if need_store then
-                    //     debug_always("cannot assign to {identifier} at {identifier.location} from BBB {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
-                    //     _logger.error(identifier.location, "cannot assign to this");                        
-                    // fi
                 else
                     _symbol_loader.find_symbol = (name: string) => find(name);
 
@@ -3143,9 +3481,17 @@ namespace Syntax.Process is
             super.pre(`if);
 
             if `if.want_value then
-                for i in `if.branches do
-                    i.body.want_value = true;
-                od
+                if `if.constraint? then
+                    for i in `if.branches do
+                        i.body.want_value = true;
+                        i.body.upgrade_constraint(`if.constraint, `if.constraint_error_message);
+                    od
+                else
+                    for i in `if.branches do
+                        i.body.want_value = true;
+                        i.body.clear_constraint();
+                    od
+                fi    
             fi
 
             return false;
@@ -3172,7 +3518,7 @@ namespace Syntax.Process is
 
             if 
                 !`if.branches | .any(b => b? /\ !b.condition?) /\
-                (!`if.constraint? \/ !`if.constraint.is_void)
+                !(`if.constraint? /\ `if.constraint.is_void)
             then
                 // if the if has no else branch, then don't bother reporting any
                 // semantic errors:
@@ -3181,7 +3527,7 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let type = `if.constraint;
+            let type = if `if.constraint? /\ `if.constraint.any_count == 0 then `if.constraint else null fi;
 
             let seen_any_values = false;
             let seen_non_null_values = false;
@@ -3190,7 +3536,15 @@ namespace Syntax.Process is
 
             let lub = LEAST_UPPER_BOUND_MAP();
 
+            let use debug_dispose = debug_enter();
+
+            debug("expression if {`if.compile_count} {`if.to_string().replace_line_endings(" ")}");
+
+            `if.compile_count = `if.compile_count + 1;
+
             for i in `if.branches do
+                let use debug_dispose = debug_enter();
+                debug("if branch {i}");
                 let branch = i.body;
 
                 if !branch.value? then                    
@@ -3211,11 +3565,11 @@ namespace Syntax.Process is
                     fi
                 fi
 
-                debug_indent();
-
-                if `if.constraint? then
-                    if !`if.constraint.is_void /\ !`if.constraint.is_assignable_from(branch.value.type) then
-                        _logger.error(branch.location, string.format(`if.constraint_error_message, branch.value.type, type));
+                if type? then
+                    debug("enforce constraint {type}");
+                    if !type.is_void /\ !type.is_assignable_from(branch.value.type) then
+                        debug("error {branch.location} {string.format(`if.constraint_error_message, [branch.value.type, type])}");
+                        _logger.error(branch.location, string.format(`if.constraint_error_message, [branch.value.type, type]));
                     fi
                 elif branch.value.type.is_null then
                     // could also be error
@@ -3226,15 +3580,18 @@ namespace Syntax.Process is
                     if !branch.is_tuple_literal then
                         all_tuple_literals = false;
                     fi
-        
+                    debug("add type {branch.value.type} to LUB");
+
                     lub.add(branch.value.type);
                 fi
 
                 seen_any_values = true;
             od
 
-            if !`if.constraint? then
+            if !`if.constraint? \/ `if.constraint.any_count > 0 then
                 type = lub.get_result();
+
+                debug("no constraint lub result {type}");
 
                 // FIXME factor this out - it's duplicated between here and list literal elements
                 if all_tuple_literals /\ seen_non_null_values /\ (!type? \/ !type.is_value_tuple) then
@@ -3267,6 +3624,10 @@ namespace Syntax.Process is
                 fi
 
                 if type? /\ type.is_value_type /\ seen_null_values then
+                    debug("apply type {type} to branches");
+
+                    let use debug_dispose = debug_enter();
+
                     for i in `if.branches do
                         let branch = i.body;
         
@@ -3281,7 +3642,10 @@ namespace Syntax.Process is
                 fi
             fi
 
+            debug("after maybe apply constraint");
+
             if !type? then
+                debug("still no type");
                 if seen_any_values then
                     if seen_non_null_values then
                         _logger.error(`if.location, "no type inferred for if expression");
@@ -3293,6 +3657,7 @@ namespace Syntax.Process is
                 `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no type inferred");
                 return;
             else
+                debug("create value of type {type}");
                 `if.value = IR.Values.BLOCK(type);
             fi
         si

@@ -1,3 +1,3 @@
-# Compiler source
+# Compiler Source
 
-Compiler source code proper lives in subfolders of `src/`
+The ghūl source code for the compiler. See README files in sub-folders for more detail
