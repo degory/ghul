@@ -40,10 +40,13 @@ namespace Semantic.DotNet is
         _object_type: TYPE;
         _value_type: TYPE;
         _tuple_types: List[TYPE];
+        _extension_attribute_type: TYPE;
 
         _type_source: TypeSource;
 
         _ambiguous_method_checker: AMBIGUOUS_METHOD_CHECKER;
+
+        _extension_methods_for_types: EXTENSION_METHOD_TYPE_MAP;
 
         init(
             namespaces: NAMESPACES,
@@ -51,6 +54,7 @@ namespace Semantic.DotNet is
             type_mapper: TYPE_MAPPER,
             referenced_assemblies: REFERENCED_ASSEMBLIES,
             type_source: TypeSource,
+            extension_methods_for_types: EXTENSION_METHOD_TYPE_MAP,
             logger: Logging.Logger
         ) is
             _namespaces = namespaces;
@@ -62,6 +66,7 @@ namespace Semantic.DotNet is
             _type_source = type_source;
 
             _ambiguous_method_checker = AMBIGUOUS_METHOD_CHECKER(logger);
+            _extension_methods_for_types = extension_methods_for_types;
 
             _type_source.on_start(() -> void is start(); si);
         si
@@ -84,6 +89,8 @@ namespace Semantic.DotNet is
                 "System.ValueTuple`7"
             ]);
 
+            _extension_attribute_type = _type_source.get_type("System.Runtime.CompilerServices.ExtensionAttribute");
+
             // TODO handle more than 7-tuple types by
             // nesting them
         si
@@ -104,7 +111,6 @@ namespace Semantic.DotNet is
 
                 throw ex;
             yrt
-            
         si
 
         create_class(type_details: TYPE_DETAILS) -> Symbols.Scoped is
@@ -230,6 +236,10 @@ namespace Semantic.DotNet is
         si
         
         add_members(result: Symbols.Scoped, type: TYPE) is
+            let extension_methods = _extension_methods_for_types.get_extensions_for_type(type);
+
+            let use debug_dispose = debug_enter(extension_methods?);
+
             let properties = MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS]();
             let indexers = SET[System.Reflection.MethodInfo]();
             let methods = LIST[(symbol: Symbols.Function, method_info: MethodInfo)]();
@@ -241,6 +251,15 @@ namespace Semantic.DotNet is
             for t in type.get_members(cast BindingFlags(64 + 4 + 32 + 16 + 8)) do
                 add_member(result, type, properties, indexers, methods, t);                    
             od
+
+            if extension_methods? then
+                debug("have extension methods for {type}: {extension_methods|}");
+
+                for method in extension_methods do
+                    debug("add extension method to {type}: {method}");
+                    add_method(result, type, properties, indexers, methods, method, true);
+                od    
+            fi
 
             if methods.count > 0 then
                 _ambiguous_method_checker.check(result, methods);
@@ -267,7 +286,7 @@ namespace Semantic.DotNet is
             elif member_type == MemberTypes.FIELD then
                 add_field(owner, type, cast FieldInfo(member));
             elif member_type == MemberTypes.METHOD then
-                add_method(owner, type, properties, indexers, methods, cast MethodInfo(member));
+                add_method(owner, type, properties, indexers, methods, cast MethodInfo(member), false);
             fi            
         si
 
@@ -428,7 +447,7 @@ namespace Semantic.DotNet is
             let property_details = PROPERTY_DETAILS(result, property.get_get_method(), property.get_set_method());
 
             if getter? then
-                properties[getter] = property_details;
+                properties[getter] = property_details;/////////////////////////
             fi
 
             if setter? then
@@ -442,17 +461,14 @@ namespace Semantic.DotNet is
             properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS], 
             indexers: SET[System.Reflection.MethodInfo],
             methods: LIST[(symbol: Symbols.Function, method_info: MethodInfo)],
-            method: MethodInfo
+            method: MethodInfo,
+            want_extension_method: bool
         ) is
             if method.is_private then
                 return;
             fi
 
-            let result: Symbols.Function;
-            let location = Source.LOCATION.reflected;
-
             let name: string;
-
             let property_details: PROPERTY_DETAILS;
 
             if properties.try_get_value(method, property_details ref) then
@@ -478,15 +494,43 @@ namespace Semantic.DotNet is
                 name = _type_name_map.get_member_name(owner.qualified_name, method.name, method.is_private, method.is_special_name /\ !indexers.contains(method));
             fi
 
-            let declaring_symbol: Symbols.Symbol = owner;
+            let result = create_method(owner, type, method, name, want_extension_method);
 
-            if method.declaring_type != type then
+            if property_details? then
+                let accessor_method_name = method.name;
+
+                if method.equals(property_details.dotnet_get_method) then
+                    property_details.ghul_property.read_function = result;
+                    property_details.ghul_property.read_function_il_name_override = method.name;
+                elif method.equals(property_details.dotnet_set_method) then
+                    property_details.ghul_property.assign_function = result;
+                    property_details.ghul_property.assign_function_il_name_override = method.name;
+                fi
+            fi
+            
+            methods.add((result, method));
+        si
+
+        create_method(
+            owner: Symbols.Scoped,            
+            type: TYPE,
+            method: MethodInfo,
+            name: string,
+            want_extension_method: bool
+        ) -> Symbols.Function is
+            let result: Symbols.Function;
+            let declaring_symbol: Symbols.Symbol = owner;
+            let location = Source.LOCATION.reflected;
+
+            if !want_extension_method /\ method.declaring_type != type then
                 let dt = _type_mapper.get_type(method.declaring_type);
 
                 declaring_symbol = dt.symbol;
             fi
-
-            if method.is_static then
+            
+            if want_extension_method then
+                result = Symbols.EXTENSION_METHOD(location, location, owner, name, owner)
+            elif method.is_static then
                 result = Symbols.STATIC_METHOD(location, location, declaring_symbol, name, owner);
             elif method.declaring_type.is_value_type then
                 result = Symbols.STRUCT_METHOD(location, location, declaring_symbol, name, owner);
@@ -522,9 +566,18 @@ namespace Semantic.DotNet is
             let argument_names = LIST[string]();
             let argument_types = LIST[Type]();
 
+            let skip_first = want_extension_method;
+
             for a in method.get_parameters() do
+                if skip_first then
+                    skip_first = false;
+                    continue;
+                fi
+
+                let argument_type = _type_mapper.get_type(a.parameter_type);
+
                 argument_names.add(a.name);
-                argument_types.add(_type_mapper.get_type(a.parameter_type));
+                argument_types.add(argument_type);
             od
 
             result.argument_names = argument_names;
@@ -532,20 +585,16 @@ namespace Semantic.DotNet is
 
             result.return_type = _type_mapper.get_type(method.return_type);
 
-            if property_details? then
-                let accessor_method_name = method.name;
-
-                if method.equals(property_details.dotnet_get_method) then
-                    property_details.ghul_property.read_function = result;
-                    property_details.ghul_property.read_function_il_name_override = method.name;
-                elif method.equals(property_details.dotnet_set_method) then
-                    property_details.ghul_property.assign_function = result;
-                    property_details.ghul_property.assign_function_il_name_override = method.name;
-                fi
+            if want_extension_method then
+                debug_always("XXXX created extension method {result.description} for {method}");
             fi
-            
-            methods.add((result, method));
+
+            return result;
         si
+
+        is_extension_method(method: MethodInfo) -> bool =>
+            method.get_custom_attributes_data() |
+                .any(attr => attr.attribute_type == _extension_attribute_type);
 
         get_assembly_name(type: TYPE) -> string is
             let assembly = type.assembly;
