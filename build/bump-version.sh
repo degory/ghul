@@ -8,5 +8,5 @@ if [[ ${CURRENT_VERSION} =~ ${VERSION_REGEX} ]] ; then
 
     NEXT_VERSION=${CURRENT_PREFIX}$((${CURRENT_SUFFIX} + 1))
 
-    sed -i s/${CURRENT_VERSION}/${NEXT_VERSION}/ Directory.Build.props
+    sed -i "s/${CURRENT_VERSION}/${NEXT_VERSION}/" Directory.Build.props
 fi
