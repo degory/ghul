@@ -97,4 +97,4 @@ END_MILLISECONDS=$(date +%s%N)
 
 ELAPSED_SECONDS=$(awk -v start="$START_MILLISECONDS" -v end="$END_MILLISECONDS" 'BEGIN { printf "%.2f", (end - start) / 1000000000 }')
 
-echo "Successfully Bootsstrapped $(dotnet ghul-compiler) in ${ELAPSED_SECONDS} seconds"
+echo "Successfully Bootstrapped $(dotnet ghul-compiler) in ${ELAPSED_SECONDS} seconds"
