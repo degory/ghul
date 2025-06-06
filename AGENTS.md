@@ -16,4 +16,15 @@ The integration tests are roughly grouped in four subfolders:
  integration-tests/il - for tests that produce IL assembly language and assert it matches expected IL
  integration-tests/parse - for tests that parse various syntax constructs, often asserting specific syntax errors or warnings are produced
  integration-tests/semantic - for tests that compile various constructs and either assert they compile without errors, or assert they result in specific semantic errors
-New or changed functionality should be verified by new or updated integration tests. Place new tests in the appropriate sub-folder
+New or changed functionality should be verified by new or updated integration tests. Place new tests in the appropriate sub-folder.
+
+To create a new integration test run `./integration-tests/create.sh` and supply a
+new test folder name. Edit the generated `.ghul` sources and `ghulflags` then run
+`dotnet ghul-test integration-tests/<new-test>` to generate output files. Capture
+those outputs as expectations with `./tasks/capture.sh integration-tests/<new-test>`
+(from the repository root). The expectation files `err.expected`, `warn.expected`,
+`run.expected` and `il.expected` are compared on subsequent test runs.
+
+Use `@IL.output("il.out")` to write IL for the following statement or block. The
+captured `il.out` file will be stored as `il.expected` when expectations are
+captured. Files named `out.il` may also appear but are not used by the tests.
