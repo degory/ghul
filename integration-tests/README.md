@@ -65,6 +65,17 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 | `ghul.json` | Configuration file pointing at the compiler (created from the template). |
 | `disabled*` | Any file beginning with `disabled` causes the test to be skipped. |
 
+### Capturing IL output
+
+To assert that specific IL is generated, decorate the definition or statement you
+want IL for with `@IL.output("il.out")`. The pragma captures the IL produced for
+the following statement or block and writes it to `il.out`. When you capture test
+expectations this file will be copied to `il.expected` so the test can compare the
+generated IL on subsequent runs.
+
+`out.il` files may appear if the compiler is run with `--keep-out-il`, but these
+files are not used by the test runner.
+
 ## Expectation comparison workflow
 
 1. The runner invokes the compiler using the arguments in `ghulflags` and the test sources. Compiler output goes to `compiler.out`.
