@@ -1,19 +1,45 @@
-All the tests should pass before raising a PR
-The tests comprise:
-1. unit tests `dotnet test unit-tests`
-The unit tests are driven by MSTest.
-The unit tests are minimal, have very poor coverage and are brittle. The existing tests need to pass, and may need to be fixed if impacted by code changes, but I wouldn't advise trying to add new ones. Coding unit tests in ghūl is awkward at best because ghūl has limited support for language features that frameworks like Moq take for granted.
+# AI Agent Guide for ghūl Compiler
 
-2. bootstrap `./build/bootstrap.sh`
-Bootstraps the compiler by compiling it with itself four times, and verifies that the IL for the third and fourth passes matches. The bootstrap step
-typically takes a little over one minute on the Codex test environment.
+## Purpose
 
-3. integration tests `dotnet publish && dotnet ghul-test integration-tests`
-The integration tests are snapshot based - expected errors, warnings, IL and/or compiled binary output are compared against canned expectation files. See integration-tests/README.md for more details. The compiler
-publishing and test run usually finish in about a minute and a quarter in Codex.
-The integration tests are roughly grouped in four subfolders:
- integration-tests/execution - for tests that compile a binary and assert it produces specific output
- integration-tests/il - for tests that produce IL assembly language and assert it matches expected IL
- integration-tests/parse - for tests that parse various syntax constructs, often asserting specific syntax errors or warnings are produced
- integration-tests/semantic - for tests that compile various constructs and either assert they compile without errors, or assert they result in specific semantic errors
-New or changed functionality should be verified by new or updated integration tests. Place new tests in the appropriate sub-folder
+This guide is primarily for AI agents (and automated contributors) working on the ghūl programming language compiler. Human contributors may also find it useful. Please follow these instructions to ensure changes are made safely and tested thoroughly.
+
+## Background
+
+The ghūl compiler is written in ghūl. Before making changes:
+- Consult the ghūl language quick tutorial and reference ([GHUL.md](./GHUL.md))
+- Optionally review the [ghūl programming language website](https://ghul.dev/)
+- The compiler source code in this repository is the largest ghūl codebase and serves as a key reference
+- The language and compiler are a work in progress; actual behavior may differ from documentation, and bugs are expected
+
+## Test Requirements
+
+All tests must pass before submitting a pull request. The test suite includes:
+
+| Test Type      | How to Run                                   | Typical Duration (agent environment)         | Notes                                                                 |
+|----------------|----------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
+| Unit Tests     | `dotnet test unit-tests`                     | Seconds                                | Minimal coverage; only fix/add if affected by your changes. Don't waste time trying to add new unit tests if you run into issues           |
+| Bootstrap      | `./build/bootstrap.sh`                       | ~1 minute                              | Verifies compiler self-hosting. May appear to pause during builds; produces little output until each build completes. Can take longer on less powerful machines or in agent environments. |
+| Integration    | `dotnet publish --output publish/ && dotnet ghul-test integration-tests` | ~3 minutes | Snapshot-based; see [integration-tests/README.md](integration-tests/README.md) for details. Produces continuous output. Requires compiler to be published to `./publish/` first. May take longer in agent/dev environments. |
+
+### Integration Test Groups
+
+- `integration-tests/execution`: Asserts a binary is created, runs, and specific text output is produced.
+- `integration-tests/il`: Asserts IL output.
+- `integration-tests/parse`: Asserts parsing errors/warnings.
+- `integration-tests/semantic`: Asserts semantic correctness/errors.
+
+**For new or changed functionality, add or update integration tests in the appropriate subfolder.**
+
+## Additional Notes
+
+- If unrelated tests fail, report or flag them for human review.
+- If you encounter flaky or brittle tests, note them in your PR or commit message.
+- Use imperative instructions and keep changes minimal and well-documented.
+- Be aware that test durations may be significantly longer in AI agent/dev environments with limited resources.
+
+## See Also
+- [GHUL.md](./GHUL.md) – Language reference
+- [integration-tests/README.md](integration-tests/README.md) – Integration test details
+- [README.md](./README.md) – Project overview
+
