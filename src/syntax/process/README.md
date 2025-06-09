@@ -1,6 +1,10 @@
-# Syntax tree visitors implementing different passes and processes
+# AST passes
 
-Some of these are phases/passes. Others are used by the analyser to service requests from Visual Studio Code.
+The files in this directory implement visitors over the syntax tree.  Many are
+true compilation phases (declaration, type checking, code generation) while
+others provide features for the editor such as completions and signature help.
 
-**Note** some of these were experimental and are now dead code - check the compiler driver and the analyser to see which are actually in use
+Older experimental visitors remain for reference; unused ones are marked in the
+source.  Check `Driver.Main` and `Analysis.ANALYSER` to see which passes are
+currently invoked.
 
