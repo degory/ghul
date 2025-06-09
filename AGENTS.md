@@ -24,7 +24,7 @@ All tests must pass before submitting a pull request. The test suite includes:
 
 ### Integration Test Groups
 
-- `integration-tests/execution`: Asserts binary output.
+- `integration-tests/execution`: Asserts a binary is created, runs, and specific text output is produced.
 - `integration-tests/il`: Asserts IL output.
 - `integration-tests/parse`: Asserts parsing errors/warnings.
 - `integration-tests/semantic`: Asserts semantic correctness/errors.
