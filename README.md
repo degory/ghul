@@ -77,6 +77,9 @@ Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.co
 
 [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
 
+## Basic ghūl language tutorial
+
+For a short ghūl programming language tutorial and reference, see [GHUL.md](./GHUL.md) in this repository. For more ghūl language details, see the [the ghūl programming language website](https://ghul.dev)
 
 ## Gotchas
 
