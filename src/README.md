@@ -21,4 +21,4 @@ quick orientation, so here is a brief guide to the contents:
 - **syntax** – Abstract syntax tree (AST) definitions, parsers and passes.
 
 When updating or adding new modules place them in the most appropriate
-subfolder.  Tests and build scripts expect this layout to remain stable.
+subfolder.

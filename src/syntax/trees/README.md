@@ -8,4 +8,4 @@ All concrete AST nodes live here. Each file declares a small class or struct tha
 - `type_expressions/` – parse-time type syntax used before semantic resolution.
 - `bodies/`, `pragmas/`, `modifiers/` and `identifiers/` – supporting structures.
 
-Every node stores a `Source.LOCATION` for diagnostics. New syntax should define a new node here and update the visitors under `process/` to handle it.
+Every node stores a `Source.LOCATION` for diagnostics. New syntax should define a new node here, add or update a parser in `parsers/` to recognize it, and update the visitors under `process/` to handle it.

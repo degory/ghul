@@ -10,4 +10,4 @@ Key pieces:
 - `unwind_exception.ghul` – used to abort nested parsing when error recovery needs to unwind to a safe point.
 - Subfolders like `definitions`, `expressions`, `statements` and `type_expressions` group the actual parser classes by grammar area.
 
-Parsers are instantiated by `ioc/container.ghul` so other compiler modules can fetch them on demand. When adding new syntax features remember to update the corresponding parser and the AST node in `trees/`.
+Parsers are instantiated by `ioc/container.ghul` so other compiler modules can fetch them on demand. When adding new syntax features remember to update the corresponding parser and the AST node in `syntax/trees/`, and it may also be necessary to update AST visitors in `syntax/process/`

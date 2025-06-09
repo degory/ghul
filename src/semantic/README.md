@@ -12,5 +12,4 @@ concepts include:
 - **dotnet/** – helpers for emitting .NET metadata such as attributes and
   assembly info.
 
-Most passes under `syntax/process` rely on these APIs.  When making changes be
-mindful of the bootstrap test, which ensures the compiler can compile itself.
+Most passes under `syntax/process` rely on these APIs.

@@ -27,4 +27,4 @@ The `COMPILER` class (see `src/compiler/compiler.ghul`) runs these in order:
 - **signature_help.ghul** – determines overload information for function calls.
 - **printer/** – visitors that pretty-print trees for debugging.
 
-Support code like `least_upper_bound_map.ghul` and the visitor base classes are used by multiple passes. Not every pass runs in every scenario; the driver selects them based on build flags and whether analysis mode is active.
+Support code like the visitor base classes are used by multiple passes. Not every pass runs in every scenario; the driver selects them based on build flags and whether analysis mode is active.

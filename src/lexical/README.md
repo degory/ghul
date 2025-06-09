@@ -11,6 +11,3 @@ Other notable files:
 - `token_lookahead.ghul` and `token_queue.ghul` – utilities for peeking ahead in
   the token stream.
 
-Unit tests rely heavily on stable token names, so changes here often require
-updates to snapshot tests under `integration-tests`.
-

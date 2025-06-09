@@ -16,5 +16,4 @@ Key files:
 
 The driver is intentionally thin; most heavy lifting happens in the
 `COMPILER` class found under `src/compiler`.  If you extend the command line
-options or need to trigger additional compiler passes, update the logic here and
-write integration tests under `integration-tests` to lock behaviour down.
+options or need to trigger additional compiler passes, update the logic here
