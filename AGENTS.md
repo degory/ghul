@@ -38,6 +38,17 @@ All tests must pass before submitting a pull request. The test suite includes:
 - Use imperative instructions and keep changes minimal and well-documented.
 - Be aware that test durations may be significantly longer in AI agent/dev environments with limited resources.
 
+## Documentation hygiene
+
+When preparing a pull request, verify the accuracy and clarity of documentation:
+
+- Any `AGENTS.md` file
+- Any `README.md` file
+- `GHUL.md`
+- The explanatory comment at the top of any source file
+
+If you discover information in these files that is incorrect, fix it. If wording is confusing, clarify it. When you spend time working out something that should be documented but is missing, add that information. Avoid removing explicit instructions from these files unless you have confirmation from the user.
+
 ## See Also
 - [GHUL.md](./GHUL.md) – Language reference
 - [integration-tests/README.md](integration-tests/README.md) – Integration test details
