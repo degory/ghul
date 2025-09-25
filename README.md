@@ -77,6 +77,16 @@ Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.co
 
 [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
 
+## Bootstrap verification
+
+The ghūl compiler is self-hosting and can compile itself. To verify that the compiler successfully bootstraps:
+
+```sh
+./verify-bootstrap.sh
+```
+
+This runs a 4-pass compilation process where the compiler compiles itself multiple times and verifies that the final passes produce identical output, proving the compiler is stable and self-hosting.
+
 ## Basic ghūl language tutorial
 
 For a short ghūl programming language tutorial and reference, see [GHUL.md](./GHUL.md) in this repository. For more ghūl language details, see the [the ghūl programming language website](https://ghul.dev)
