@@ -1681,6 +1681,112 @@ namespace Syntax.Process is
             return specialized;
         si
 
+        // Find the single arity- and instance-matching candidate in a
+        // function group, or null if there are zero or multiple. Used
+        // by `_visit(call)`'s constraint-push retry: when the first
+        // overload resolution fails, having exactly one candidate to
+        // push formal arg types from disambiguates the constraint
+        // direction. Multi-candidate disambiguation under constraint
+        // push is bigger work tracked under #1174.
+        _try_find_single_arity_candidate(
+            group: Semantic.Symbols.FUNCTION_GROUP,
+            arg_count: int,
+            want_instance: bool
+        ) -> Semantic.Symbols.Function is
+            let result: Semantic.Symbols.Function;
+            let count = 0;
+
+            for f in group.functions do
+                if !want_instance /\ f.is_instance then
+                    continue;
+                fi
+
+                if !f.arguments? then
+                    continue;
+                fi
+
+                if f.arguments.count != arg_count then
+                    continue;
+                fi
+
+                result = f;
+                count = count + 1;
+            od
+
+            if count == 1 then
+                return result;
+            fi
+
+            return null;
+        si
+
+        // Predicate: pushing `formal` as a constraint to `arg_value_type`
+        // could plausibly resolve under-determined owner-generic args.
+        // True when the actual arg type is a NAMED type wrapping a
+        // generic Classy (i.e. unspecialised — `Box` from `Box()` with
+        // no T-binding from args) AND the formal type is a GENERIC for
+        // the same Classy (`Box[int]`). Only this shape benefits from
+        // the constraint-push retry; pushing to an already-specialised
+        // SEQUENCE / TUPLE / function-type arg risks introducing new
+        // element-mismatch errors that aren't an improvement on the
+        // original "no overload found" error.
+        _arg_under_determined_for_formal(
+            formal: Semantic.Types.Type,
+            arg_value_type: Semantic.Types.Type
+        ) -> bool is
+            if !formal? \/ !arg_value_type? then
+                return false;
+            fi
+
+            let formal_generic = cast Semantic.Types.GENERIC(formal);
+
+            if !formal_generic? then
+                return false;
+            fi
+
+            if isa Semantic.Types.GENERIC(arg_value_type) then
+                return false;
+            fi
+
+            let arg_named = cast Semantic.Types.NAMED(arg_value_type);
+
+            if !arg_named? then
+                return false;
+            fi
+
+            let arg_classy = cast Semantic.Symbols.Classy(arg_named.symbol);
+
+            if !arg_classy? \/ !arg_classy.is_generic then
+                return false;
+            fi
+
+            let formal_symbol_generic = cast Semantic.Symbols.GENERIC(formal_generic.symbol);
+
+            if !formal_symbol_generic? then
+                return false;
+            fi
+
+            return arg_classy =~ formal_symbol_generic.symbol;
+        si
+
+        // Returns true when at least one argument's first-walk type is
+        // under-determined for the corresponding formal type — i.e. the
+        // constraint-push retry might recover. Cheap pre-check: avoids
+        // the expensive logger roll-back / re-walk loop when there's
+        // no plausible benefit.
+        _any_arg_under_determined(
+            candidate: Semantic.Symbols.Function,
+            argument_types: Collections.List[Semantic.Types.Type]
+        ) -> bool is
+            for i in 0..argument_types.count do
+                if _arg_under_determined_for_formal(candidate.arguments[i], argument_types[i]) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
         // should be called with logger speculating
         resolve_constructor(
             location: LOCATION,
@@ -3025,6 +3131,55 @@ namespace Syntax.Process is
                     
                     let function_group = cast Semantic.Symbols.FUNCTION_GROUP(load_symbol);
                     let overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
+
+                    // Constraint-push retry: when the first resolve fails AND
+                    // there's exactly one arity-matching candidate AND at least
+                    // one argument's first-walk type is under-determined for
+                    // its corresponding formal type, push that candidate's
+                    // formal arg types as constraints to each call argument
+                    // and re-walk. This catches `apply(Box())` cases where a
+                    // constructor argument's owner generic args were
+                    // under-determined the first time round but become
+                    // resolvable from the formal argument's type. The
+                    // candidate's signature is the only signal we have for
+                    // what the under-determined arg should resolve to —
+                    // multi-candidate disambiguation under constraint push
+                    // is left to a more general overload-as-constraint
+                    // pass under #1174.
+                    if !overload_result? then
+                        let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
+
+                        if candidate? /\ _any_arg_under_determined(candidate, argument_types) then
+                            _logger.roll_back();
+                            _logger.speculate();
+
+                            for (index, a) in call.arguments | .index() do
+                                if !a? then
+                                    continue;
+                                fi
+
+                                let f = candidate.arguments[index];
+
+                                if f? then
+                                    a.set_constraint(f, "{{0}} is not assignable to {{1}}");
+                                fi
+
+                                a.walk(self);
+
+                                if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                                    arguments[index] = a.value;
+                                    argument_types[index] = a.value.type;
+                                else
+                                    let t = Semantic.Types.ERROR();
+
+                                    arguments[index] = DUMMY(t, a.location);
+                                    argument_types[index] = t;
+                                fi
+                            od
+
+                            overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
+                        fi
+                    fi
 
                     if overload_result == null then
                         call.value = DUMMY(Semantic.Types.ERROR(), call.location);
