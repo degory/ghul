@@ -465,12 +465,26 @@ namespace Syntax.Process is
         si
         
         pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
+            // Push the LHS type down to the RHS as a constraint. The
+            // RHS expression node is responsible for either consuming
+            // it (FUNCTION uses it for argument-type inference,
+            // SEQUENCE / TUPLE forward to their elements) or ignoring
+            // it (literals, identifiers — Expression's default
+            // set_constraint is a no-op). The post-walk assignability
+            // check still verifies type correctness for the cases
+            // where the RHS doesn't act on the constraint.
+            let lhs_type = _try_get_assignment_left_type(assignment.left);
+
+            if lhs_type? then
+                assignment.right.set_constraint(lhs_type, "{{0}} is not assignable to {{1}}");
+            fi
+
             assignment.right.walk(self);
 
             if !assignment.right.value? then
                 return true;
             fi
-            
+
             if !assignment.right.value.is_consumable then
                 _logger.error(assignment.right.location, "cannot use this here");
                 assignment.left.value = IR.Values.DUMMY(Semantic.Types.ERROR(), assignment.right.location);
@@ -485,6 +499,44 @@ namespace Syntax.Process is
             assignment.value = assignment.left.value;
 
             return true;
+        si
+
+        // Speculatively walk a SIMPLE_LEFT_EXPRESSION's inner expression
+        // as a regular load, read its type, and roll back the logger so
+        // the probe is invisible to later passes. Destructuring lefts
+        // are skipped — extracting their effective type is a follow-up
+        // that needs a tuple-shape construction we don't have yet.
+        // The probe walks the live expression rather than a copy: the
+        // subsequent normal walk through pre(SIMPLE_LEFT_EXPRESSION)
+        // overwrites the inner expression's value with the STORE form
+        // anyway, so the probe's read-form value never escapes.
+        _try_get_assignment_left_type(left: Trees.Expressions.AssignmentLeftExpression) -> Type is
+            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
+
+            if !simple? \/ !simple.expression? then
+                return null;
+            fi
+
+            let mark = _logger.mark();
+            let type: Type;
+
+            try
+                _logger.speculate();
+
+                simple.expression.walk(self);
+
+                if simple.expression.value? /\ simple.expression.value.type? /\ !simple.expression.value.type.is_error then
+                    type = simple.expression.value.type;
+                fi
+
+                _logger.roll_back();
+                _logger.release(mark);
+            catch e: Exception
+                _logger.release(mark);
+                return null;
+            yrt
+
+            return type;
         si
 
         pre(expression: Trees.Statements.EXPRESSION) -> bool is
@@ -548,19 +600,45 @@ namespace Syntax.Process is
                     r.expression.value.check_is_consumable(_logger, r.expression.location)
                 then
                     if function.return_type.is_any then
-                        function.set_return_type(r.expression.value.type);                
+                        function.set_return_type(r.expression.value.type);
                     elif function.return_type =~ _innate_symbol_lookup.get_void_type() /\ !function.return_type.is_type_variable then
                         _logger
                             .error(
                                 r.expression.location,
                                 "cannot return value from function of void type"
-                            );                        
-                    elif !function.return_type.is_assignable_from(r.expression.value.type) then
-                        _logger
-                            .error(
-                                r.expression.location,
-                                "cannot return value of type {r.expression.value.type} where {function.return_type} expected"
                             );
+                    elif !function.return_type.is_assignable_from(r.expression.value.type) then
+                        // Originally-inferred return type with a later
+                        // return that doesn't conform to the current
+                        // binding — widen via LUB rather than erroring
+                        // (#1173 checkbox "Inferring the return type
+                        // of function literals with multiple return
+                        // statements"). Covers both the narrower-first
+                        // / wider-second case and the siblings case.
+                        // For a declared return type the existing
+                        // error is correct.
+                        if function.return_type_was_inferred then
+                            let lub = Semantic.LEAST_UPPER_BOUND_MAP();
+                            lub.add(function.return_type);
+                            lub.add(r.expression.value.type);
+                            let widened = lub.get_result();
+
+                            if widened? then
+                                function.set_return_type(widened);
+                            else
+                                _logger
+                                    .error(
+                                        r.expression.location,
+                                        "cannot widen return type to common ancestor of {function.return_type} and {r.expression.value.type}"
+                                    );
+                            fi
+                        else
+                            _logger
+                                .error(
+                                    r.expression.location,
+                                    "cannot return value of type {r.expression.value.type} where {function.return_type} expected"
+                                );
+                        fi
                     fi
 
                     return;
@@ -799,10 +877,19 @@ namespace Syntax.Process is
             let implied_argument_types: Collections.List[Type];
 
             // have we been passed expected arguments types? If so we'll use them
-            // to argument types of any anonymous function literal arguments
+            // to argument types of any anonymous function literal arguments.
+            // Two channels feed this: the older _partial_argument_function_type
+            // implication (set by overload resolution while retrying with
+            // function-literal args), and the newer set_constraint pathway
+            // used by the parent context (LHS of an assignment, typed variable
+            // initializer). Prefer the implication when both are set — it
+            // reflects the most-recent overload-resolution decision and is
+            // already specialised for the call site.
             if _partial_argument_function_type? then
                 implied_argument_types = _partial_argument_function_type.arguments;
                 _partial_argument_function_type = null;
+            elif function.constraint? /\ function.constraint.is_function then
+                implied_argument_types = function.constraint.arguments;
             fi
 
             _symbol_table.current_closure_context.add_closure(closure);
@@ -863,7 +950,8 @@ namespace Syntax.Process is
                     return_type = function.type_expression.type;
                 else
                     return_type = Semantic.Types.INFERED_RETURN_TYPE();
-                fi                
+                    closure.return_type_was_inferred = true;
+                fi
 
                 closure.argument_names = argument_names;
 
@@ -1007,10 +1095,11 @@ namespace Syntax.Process is
 
                                 if !type.is_assignable_from(element.initializer.value.type) then
                                     _logger.error(
-                                        element.type_expression.location,
-                                        string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
+                                        element.location,
+                                        string.format(constraint_error_message, [element.initializer.value.type, type]:object));
                                 fi
 
+                                types.add(type);
                                 values.add(_value_boxer.box_if_needed(element.initializer.value, type));
                             else
                                 types.add(element.initializer.value.type);
@@ -1074,8 +1163,29 @@ namespace Syntax.Process is
 
                 sequence.type_expression.walk(self);
 
+                // If the sequence is going to compile against a known
+                // list/array type — either an inline type annotation
+                // (`[1, 2, 3]: int[]`) or a constraint pushed by the
+                // surrounding context (typed initializer / list-of-
+                // lambdas) — push the corresponding element type down
+                // to each element as its own constraint. Constraint-
+                // aware element types (notably function literals) use
+                // it to infer their argument types; element types that
+                // ignore constraint (most literals) are unaffected.
+                let element_constraint: Type;
+
+                if sequence.type_expression? /\ !isa Trees.TypeExpressions.INFER(sequence.type_expression) /\ sequence.type_expression.type? then
+                    element_constraint = sequence.type_expression.type.get_element_type();
+                elif sequence.constraint? then
+                    element_constraint = sequence.constraint.get_element_type();
+                fi
+
                 for e in sequence.elements do
-                    e.clear_constraint();
+                    if element_constraint? then
+                        e.set_constraint(element_constraint, "element type {{0}} not compatible with inferred list type {{1}}");
+                    else
+                        e.clear_constraint();
+                    fi
                 od
 
                 sequence.elements.walk(self);
@@ -1086,7 +1196,7 @@ namespace Syntax.Process is
             catch e: Exception
                 sequence.value = DUMMY(Semantic.Types.ERROR(), sequence.location);
                 _logger.release(mark);
- 
+
                 _logger.exception(sequence.location, e, "exception compiling call");
             yrt
         si
@@ -1096,6 +1206,11 @@ namespace Syntax.Process is
             let have_explicit_type: bool;
 
             let elements = Collections.LIST[Trees.Expressions.Expression](sequence.elements);
+
+            let constraint_type: Type;
+            if sequence.constraint? then
+                constraint_type = sequence.constraint.get_element_type();
+            fi
 
             if sequence.type_expression? /\ !isa Trees.TypeExpressions.INFER(sequence.type_expression) then
                 if sequence.type_expression.type? then
@@ -1107,14 +1222,15 @@ namespace Syntax.Process is
                     _logger.error(sequence.type_expression.location, "bad explicit type expression");
                     return;
                 fi
-            elif sequence.constraint? then
-                type = sequence.constraint.get_element_type();
-
-                have_explicit_type = type?;            
             elif elements.count == 0 then
-                _logger.error(sequence.location, "cannot infer type of list literal with no elements");
+                if constraint_type? then
+                    type = constraint_type;
+                    have_explicit_type = true;
+                else
+                    _logger.error(sequence.location, "cannot infer type of list literal with no elements");
 
-                return; 
+                    return;
+                fi
             else
                 let seen_any = false;
                 let seen_error = false;
@@ -1203,6 +1319,24 @@ namespace Syntax.Process is
                     fi
                 fi
 
+                // Reconcile bottom-up LUB with any constraint pushed
+                // by the parent context. Prefer the more-specific
+                // bottom-up type when it satisfies the constraint —
+                // that preserves the runtime allocation precision the
+                // covariance idiom relies on (e.g. `let ao: object[]
+                // = ["a", "b"];` should produce a string[] at run
+                // time, even though the variable is declared
+                // object[]). When the LUB doesn't satisfy the
+                // constraint, fall back to the constraint's element
+                // type and drive per-element mismatch errors via the
+                // post-walk assignability check.
+                if constraint_type? then
+                    if !type? \/ !constraint_type.is_assignable_from(type) then
+                        type = constraint_type;
+                        have_explicit_type = true;
+                    fi
+                fi
+
                 if !type? then
                     if seen_error then
                         sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
@@ -1212,7 +1346,7 @@ namespace Syntax.Process is
                         type = _innate_symbol_lookup.get_object_type();
                     else
                         _logger.error(sequence.location, "cannot infer type of list literal with only null elements");
-   
+
                         sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
                         return;
                     fi
@@ -1459,6 +1593,13 @@ namespace Syntax.Process is
 
             let function = overload_result.function;
 
+            function = _try_specialize_owner_from_constraint(`new.location, function, `new.constraint);
+
+            if isa Semantic.Symbols.GENERIC(function.owner) then
+                type_symbol = cast Semantic.Symbols.Symbol(function.owner);
+                type = function.owner.type;
+            fi;
+
             let is_directly_owned = false;
 
             if isa Semantic.Symbols.GENERIC(type_symbol) /\ isa Semantic.Symbols.Symbol(function.owner) then
@@ -1466,11 +1607,11 @@ namespace Syntax.Process is
             else
                 is_directly_owned = type_symbol == function.owner;
             fi
-            
+
             if !is_directly_owned then
                 _logger.error(`new.location, "cannot call superclass constructor {function}");
             fi
-            
+
             _symbol_use_locations.add_symbol_use(`new.type_expression.right_location, function);
             _symbol_use_locations.add_symbol_use(`new.type_expression.right_location, type_symbol.root_unspecialized_symbol);
 
@@ -1482,8 +1623,97 @@ namespace Syntax.Process is
                 );
         si
 
+        // When the call site couldn't bind every owner-generic argument
+        // from the constructor arguments alone but the surrounding
+        // context has a constraint of the same generic class (e.g.
+        // `let b: Box[int] = Box();` — zero-arg init), use the
+        // constraint's type-argument map to specialize the owner and
+        // re-resolve the function via the specialized owner. Returns
+        // the original function unchanged when the constraint doesn't
+        // apply.
+        //
+        // Implementation lives on Semantic.Types.TYPE_OPERATIONS so the
+        // cast pattern can be shared (and is the seam for the broader
+        // type/symbol rationalisation tracked in
+        // docs/claude/type-symbol-rationalisation.md).
+        _try_specialize_owner_from_constraint(
+            location: LOCATION,
+            function: Semantic.Symbols.Function,
+            constraint: Semantic.Types.Type
+        ) -> Semantic.Symbols.Function =>
+            Semantic.Types.TYPE_OPERATIONS.try_specialize_owner_function_from_constraint(
+                location, function, constraint);
+
+        // Find the single arity- and instance-matching candidate in a
+        // function group, or null if there are zero or multiple. Used
+        // by `_visit(call)`'s constraint-push retry: when the first
+        // overload resolution fails, having exactly one candidate to
+        // push formal arg types from disambiguates the constraint
+        // direction. Multi-candidate disambiguation under constraint
+        // push is bigger work tracked under #1174.
+        _try_find_single_arity_candidate(
+            group: Semantic.Symbols.FUNCTION_GROUP,
+            arg_count: int,
+            want_instance: bool
+        ) -> Semantic.Symbols.Function is
+            let result: Semantic.Symbols.Function;
+            let count = 0;
+
+            for f in group.functions do
+                if !want_instance /\ f.is_instance then
+                    continue;
+                fi
+
+                if !f.arguments? then
+                    continue;
+                fi
+
+                if f.arguments.count != arg_count then
+                    continue;
+                fi
+
+                result = f;
+                count = count + 1;
+            od
+
+            if count == 1 then
+                return result;
+            fi
+
+            return null;
+        si
+
+        // Returns true when at least one argument's first-walk type is
+        // under-determined for the corresponding formal type — i.e. the
+        // constraint-push retry might recover. Cheap pre-check: avoids
+        // the expensive logger roll-back / re-walk loop when there's
+        // no plausible benefit.
+        //
+        // Per-arg predicate lives on Semantic.Types.TYPE_OPERATIONS as
+        // is_arg_under_determined_for_formal.
+        _any_arg_under_determined(
+            candidate: Semantic.Symbols.Function,
+            argument_types: Collections.List[Semantic.Types.Type]
+        ) -> bool is
+            for i in 0..argument_types.count do
+                if Semantic.Types.TYPE_OPERATIONS.is_arg_under_determined_for_formal(
+                    candidate.arguments[i], argument_types[i]
+                ) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
         // should be called with logger speculating
-        resolve_constructor(location: LOCATION, right_location: LOCATION, type: Semantic.Types.Type, argument_expressions: Trees.Expressions.LIST) -> (Value, Value) is
+        resolve_constructor(
+            location: LOCATION,
+            right_location: LOCATION,
+            type: Semantic.Types.Type,
+            argument_expressions: Trees.Expressions.LIST,
+            constraint: Semantic.Types.Type
+        ) -> (Value, Value) is
             let result: Value;
 
             let named_type = cast Semantic.Types.NAMED(type);
@@ -1562,6 +1792,8 @@ namespace Syntax.Process is
 
             let function = overload_result.function;
 
+            function = _try_specialize_owner_from_constraint(location, function, constraint);
+
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
                 type = function.owner.type;
@@ -1574,11 +1806,11 @@ namespace Syntax.Process is
             else
                 is_directly_owned = type_symbol == function.owner;
             fi
-            
+
             if !is_directly_owned then
                 _logger.error(location, "cannot call superclass constructor {function}");
             fi
-            
+
             _symbol_use_locations.add_symbol_use(right_location, function);
             _symbol_use_locations.add_symbol_use(right_location, type_symbol.root_unspecialized_symbol);
 
@@ -1855,10 +2087,6 @@ namespace Syntax.Process is
                         fi
                     else
                         _logger.error(index.location, "no indexer found in {type}");
-                    fi
-                    
-                    if isa Semantic.Symbols.GENERIC(named_type.scope) then
-                        let g = cast Semantic.Symbols.GENERIC(named_type.scope);
                     fi
                     
                     index.value = DUMMY(Semantic.Types.ERROR(), index.location);
@@ -2765,7 +2993,7 @@ namespace Syntax.Process is
             fi
 
             if call.function.value.is_type_expression then
-                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments);
+                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments, call.constraint);
 
                 return;
             fi
@@ -2818,6 +3046,55 @@ namespace Syntax.Process is
                     
                     let function_group = cast Semantic.Symbols.FUNCTION_GROUP(load_symbol);
                     let overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
+
+                    // Constraint-push retry: when the first resolve fails AND
+                    // there's exactly one arity-matching candidate AND at least
+                    // one argument's first-walk type is under-determined for
+                    // its corresponding formal type, push that candidate's
+                    // formal arg types as constraints to each call argument
+                    // and re-walk. This catches `apply(Box())` cases where a
+                    // constructor argument's owner generic args were
+                    // under-determined the first time round but become
+                    // resolvable from the formal argument's type. The
+                    // candidate's signature is the only signal we have for
+                    // what the under-determined arg should resolve to —
+                    // multi-candidate disambiguation under constraint push
+                    // is left to a more general overload-as-constraint
+                    // pass under #1174.
+                    if !overload_result? then
+                        let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
+
+                        if candidate? /\ _any_arg_under_determined(candidate, argument_types) then
+                            _logger.roll_back();
+                            _logger.speculate();
+
+                            for (index, a) in call.arguments | .index() do
+                                if !a? then
+                                    continue;
+                                fi
+
+                                let f = candidate.arguments[index];
+
+                                if f? then
+                                    a.set_constraint(f, "{{0}} is not assignable to {{1}}");
+                                fi
+
+                                a.walk(self);
+
+                                if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                                    arguments[index] = a.value;
+                                    argument_types[index] = a.value.type;
+                                else
+                                    let t = Semantic.Types.ERROR();
+
+                                    arguments[index] = DUMMY(t, a.location);
+                                    argument_types[index] = t;
+                                fi
+                            od
+
+                            overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
+                        fi
+                    fi
 
                     if overload_result == null then
                         call.value = DUMMY(Semantic.Types.ERROR(), call.location);
@@ -2911,8 +3188,8 @@ namespace Syntax.Process is
                     return;
                 fi
             else
-                if load_symbol? /\ load_symbol.is_type then                    
-                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments);
+                if load_symbol? /\ load_symbol.is_type then
+                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments, call.constraint);
                 else
                     _logger.error(call.function.location, "cannot call value of non-function type {call.function.value.type}");
                     call.value = DUMMY(Semantic.Types.ERROR(), call.location);

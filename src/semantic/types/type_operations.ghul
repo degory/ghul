@@ -1,0 +1,220 @@
+namespace Semantic.Types is
+    use Source.LOCATION;
+
+    // Static utility for the recurring "is this type an application of
+    // that class declaration, and if so, get its arguments / specialise
+    // it / etc." pattern.
+    //
+    // Two type shapes are recognised:
+    //   - closed: Types.GENERIC, which owns its classy + arguments
+    //     directly (since β-5 of the rationalisation).
+    //   - open:   Types.NAMED whose symbol is a generic Classy directly
+    //     (a reference to a generic class without explicit type args).
+    //
+    // Downstream inference code asks high-level questions ("is this an
+    // application of Box?", "what are its type arguments?") rather than
+    // doing cast/test inline. See
+    // docs/claude/type-symbol-rationalisation.md.
+    class TYPE_OPERATIONS is
+
+        // True if `type` represents an application of the given class
+        // declaration `classy`, whether open (no arguments at the type
+        // level) or closed (with concrete arguments).
+        is_application_of(type: Type, classy: Symbols.Classy) -> bool static is
+            let extracted = try_get_classy(type);
+
+            return extracted? /\ extracted =~ classy;
+        si
+
+        // If `type` represents an application of some class declaration,
+        // return that Classy. Returns null otherwise (function types,
+        // tuple types, generic-argument references, error types, etc.).
+        // Recognises:
+        //   - closed: Types.GENERIC owns its `classy` directly.
+        //   - open:   Types.NAMED whose symbol is the classy directly.
+        try_get_classy(type: Type) -> Symbols.Classy static is
+            if !type? then
+                return null;
+            fi
+
+            let generic_type = cast Types.GENERIC(type);
+
+            if generic_type? then
+                return generic_type.classy;
+            fi
+
+            let named = cast Types.NAMED(type);
+
+            if named? then
+                return cast Symbols.Classy(named.symbol);
+            fi
+
+            return null;
+        si
+
+        // True if `type` carries explicit type arguments at the type
+        // level. For an open generic (Types.NAMED(generic-classy)
+        // shape) this returns false even though the classy has
+        // type-parameter slots; you'd need an explicit application
+        // before this is true.
+        is_closed_application(type: Type) -> bool static is
+            return type? /\ isa Types.GENERIC(type);
+        si
+
+        // True if `type` is an *open* application — a reference to a
+        // generic class without explicit type arguments at the type
+        // level (Types.NAMED whose symbol is a generic Classy, and
+        // which is not itself a Types.GENERIC).
+        is_open_application(type: Type) -> bool static is
+            if !type? \/ is_closed_application(type) then
+                return false;
+            fi
+
+            let named = cast Types.NAMED(type);
+
+            if !named? then
+                return false;
+            fi
+
+            let classy = cast Symbols.Classy(named.symbol);
+
+            return classy? /\ classy.is_generic;
+        si
+
+        // If `type` is a closed application (carries explicit type
+        // arguments at the type level), return them. Returns null for
+        // open applications, error types, and non-applications.
+        try_get_arguments(type: Type) -> Collections.List[Type] static is
+            if !type? then
+                return null;
+            fi
+
+            let generic_type = cast Types.GENERIC(type);
+
+            if generic_type? then
+                return generic_type.arguments;
+            fi
+
+            return null;
+        si
+
+        // If `type` is a closed application of `classy`, return its
+        // type-argument map (keyed by the classy's argument names).
+        // Returns null otherwise — including for open applications,
+        // applications of a different classy, and non-application
+        // types.
+        try_get_type_map(type: Type, classy: Symbols.Classy) -> Collections.Map[string, Type] static is
+            if !type? \/ !classy? \/ !classy.is_generic then
+                return null;
+            fi
+
+            let generic_type = cast Types.GENERIC(type);
+
+            if !generic_type? \/ !(generic_type.classy =~ classy) then
+                return null;
+            fi
+
+            return generic_type.type_map;
+        si
+
+        // Construct a specialised generic symbol for `classy` from a
+        // type-argument map. Returns null if `classy` isn't generic or
+        // if the map doesn't cover all of its argument slots.
+        specialize_classy(
+            location: LOCATION,
+            classy: Symbols.Classy,
+            type_map: Collections.Map[string, Type]
+        ) -> Symbols.GENERIC static is
+            if !classy? \/ !classy.is_generic then
+                return null;
+            fi
+
+            return Symbols.GENERIC.try_create_from(location, classy, type_map);
+        si
+
+        // Combined helper for the constructor-as-constrained-RHS case:
+        // given a function whose owner is an *open* generic Classy and
+        // a constraint type, if the constraint is a closed application
+        // of the same Classy, return the function specialised against
+        // the constraint's type-argument map. Otherwise return the
+        // function unchanged.
+        //
+        // Encapsulates the logic previously inlined as
+        // `_try_specialize_owner_from_constraint` in
+        // compile_expressions.ghul.
+        try_specialize_owner_function_from_constraint(
+            location: LOCATION,
+            function: Symbols.Function,
+            constraint: Type
+        ) -> Symbols.Function static is
+            if !function? \/ !constraint? then
+                return function;
+            fi
+
+            // Owner is already specialised — nothing to do.
+            if isa Symbols.GENERIC(function.owner) then
+                return function;
+            fi
+
+            let owner_classy = cast Symbols.Classy(function.owner);
+
+            if !owner_classy? \/ !owner_classy.is_generic then
+                return function;
+            fi
+
+            let type_map = try_get_type_map(constraint, owner_classy);
+
+            if !type_map? then
+                return function;
+            fi
+
+            let specialized_owner = specialize_classy(location, owner_classy, type_map);
+
+            if !specialized_owner? then
+                return function;
+            fi
+
+            let specialized = specialized_owner.find_specialized_function(function);
+
+            if !specialized? then
+                return function;
+            fi
+
+            return specialized;
+        si
+
+        // Predicate for the call-arg-as-constraint case: the actual
+        // argument's value type is an *open* application of a generic
+        // Classy AND the formal parameter is a *closed* application of
+        // the same Classy. In that situation, pushing the formal as a
+        // constraint to the argument expression will plausibly resolve
+        // the open application's owner generic arguments.
+        //
+        // Encapsulates the logic previously inlined as
+        // `_arg_under_determined_for_formal` in compile_expressions.ghul.
+        is_arg_under_determined_for_formal(
+            formal: Type,
+            arg_value_type: Type
+        ) -> bool static is
+            if !formal? \/ !arg_value_type? then
+                return false;
+            fi
+
+            // Formal must be a closed application.
+            if !is_closed_application(formal) then
+                return false;
+            fi
+
+            // Arg must be an open application — i.e. a reference to a
+            // generic class without arguments.
+            if !is_open_application(arg_value_type) then
+                return false;
+            fi
+
+            let formal_classy = try_get_classy(formal);
+            let arg_classy = try_get_classy(arg_value_type);
+
+            return formal_classy? /\ arg_classy? /\ formal_classy =~ arg_classy;
+        si
+    si
+si
