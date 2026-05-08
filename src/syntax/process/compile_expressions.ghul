@@ -247,7 +247,71 @@ namespace Syntax.Process is
 
         pre(`struct: Trees.Definitions.STRUCT) -> bool is
             super.pre(`struct);
-            return should_skip(`struct);            
+            return should_skip(`struct);
+        si
+
+        // Iterative body walk. Returning true here suppresses the
+        // walk framework's default child traversal so visit() can walk
+        // arguments once and the body up to N times. Constraints set
+        // on AST nodes during a walk persist across iterations
+        // (TypeConstrained.upgrade_constraint is narrowing-only), so
+        // each pass either narrows the constraint set or stays put;
+        // convergence is _logger.is_clean (no errors and no flagged
+        // wild/inferred type consumption). See PENDING-PRS.md
+        // "Long-running local branches" — port of the body-retry
+        // mechanism from origin/degory/iterative-type-inference-2.
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            super.pre(function);
+            return true;
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            if function.name? then
+                function.name.walk(self);
+            fi
+
+            if function.type_expression? then
+                function.type_expression.walk(self);
+            fi
+
+            if function.arguments? then
+                function.arguments.walk(self);
+            fi
+
+            if function.body? then
+                _logger.speculate();
+
+                let retries = 20;
+
+                for i in 1::retries do
+                    function.body.walk(self);
+
+                    // Convergence: clean or no progress signal raised.
+                    // Without a `has_consumed_any` flag from somewhere
+                    // in the walk, errors that did fire are real and
+                    // persistent — re-walking won't change them, and
+                    // re-walking AST nodes that hold partial state
+                    // produces *different* (often worse) error sets
+                    // because the second walk sees state left over
+                    // from the first. So retry only when something
+                    // explicitly flagged "I consumed an unresolved
+                    // type" — that's the case where iteration N+1
+                    // might find narrower constraints and make
+                    // progress.
+                    if _logger.is_clean \/ !_logger.has_consumed_any then
+                        break;
+                    fi
+
+                    if i < retries then
+                        _logger.roll_back();
+                        _logger.speculate();
+                    fi
+                od
+
+                _logger.commit();
+            fi
+
+            super.visit(function);
         si
 
         pre(`let: Trees.Statements.LET) -> bool is
@@ -599,7 +663,18 @@ namespace Syntax.Process is
                     r.expression.value.type? /\
                     r.expression.value.check_is_consumable(_logger, r.expression.location)
                 then
-                    if function.return_type.is_any then
+                    if function.return_type.is_inferred then
+                        // Filling in a previously-undeclared return
+                        // type from this return statement. is_inferred
+                        // (today only INFERED_RETURN_TYPE) rather than
+                        // is_any: a function whose return type was
+                        // already set to ERROR by an earlier failing
+                        // return shouldn't get silently overwritten
+                        // with a concrete type by a later (validly-
+                        // typed) return — the original error should
+                        // remain reported and the return-type contract
+                        // should stay ERROR until the user fixes the
+                        // source.
                         function.set_return_type(r.expression.value.type);
                     elif function.return_type =~ _innate_symbol_lookup.get_void_type() /\ !function.return_type.is_type_variable then
                         _logger
@@ -913,7 +988,15 @@ namespace Syntax.Process is
                     let partial_argument_type: Type;
                     let symbol = cast Semantic.Symbols.Variable(closure.find_direct(argument.name.name));
 
-                    if !isa Trees.TypeExpressions.INFER(argument.type_expression) then
+                    if symbol.type? /\ !symbol.type.is_inferred /\ !symbol.type.is_error then
+                        // Argument symbol already carries a usable type
+                        // from a previous walk (call-site second-pass
+                        // set it from the formal, or a function-level
+                        // retry is re-walking the body). Don't
+                        // overwrite — the existing narrower type is
+                        // correct.
+                        argument_types.add(symbol.type);
+                    elif !isa Trees.TypeExpressions.INFER(argument.type_expression) then
                         argument_types.add(argument.type_expression.type);
                     elif implied_argument_types? then
                         let implied_argument_type = implied_argument_types[index];
@@ -923,15 +1006,40 @@ namespace Syntax.Process is
 
                             symbol.set_type(implied_argument_type);
                         else
-                            _logger.error(a.location, "cannot infer type here");
+                            // Iterative-inference path: previous
+                            // iteration's body walk may have
+                            // accumulated constraints on the symbol
+                            // via overload-resolver back-feed (e.g.
+                            // `x` in `x + 1` constrained to int when
+                            // `+`'s int+int overload won). Try
+                            // resolving the LUB before falling back
+                            // to a fresh placeholder.
+                            let inferred = symbol.try_get_inferred_type();
 
-                            symbol.set_type(Semantic.Types.ERROR());
-                            argument_types.add(Semantic.Types.ERROR());
+                            if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
+                                symbol.set_type(inferred);
+                                argument_types.add(inferred);
+                            else
+                                _logger.error(a.location, "cannot infer type here");
+
+                                let placeholder = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol);
+                                symbol.set_type(placeholder);
+                                argument_types.add(placeholder);
+                            fi
                         fi
                     else
-                        _logger.error(a.location, "cannot infer type here");
-                        symbol.set_type(Semantic.Types.ERROR());
-                        argument_types.add(Semantic.Types.ERROR());
+                        let inferred = symbol.try_get_inferred_type();
+
+                        if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
+                            symbol.set_type(inferred);
+                            argument_types.add(inferred);
+                        else
+                            _logger.error(a.location, "cannot infer type here");
+
+                            let placeholder = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol);
+                            symbol.set_type(placeholder);
+                            argument_types.add(placeholder);
+                        fi
                     fi
                 else
                     _logger.error(a.location, "unexpected kind of argument ({a.get_type()})");
@@ -2263,10 +2371,19 @@ namespace Syntax.Process is
                 fi
 
                 if !isa Semantic.Types.NAMED(type) then
-                    if !isa Semantic.Types.ERROR(type) then
+                    if !isa Semantic.Types.ERROR(type) /\ !type.is_inferred then
+                        // Suppress for ERROR (existing — error already
+                        // reported, the contract says don't pile on)
+                        // and for is_inferred placeholders (deferred-
+                        // inference: the lambda's arg type is awaiting
+                        // the call-site second-pass to fill it in,
+                        // and emitting a fatal "type has no members"
+                        // here breaks that flow). Both share the
+                        // intent of "don't surface a member-resolution
+                        // failure on a stand-in type".
                         _logger.poison(member.left.location, "type has no members: {type}");
                     fi
-                    
+
                     member.value = DUMMY(Semantic.Types.ERROR(), member.location);
                     return;
                 fi
@@ -2601,7 +2718,24 @@ namespace Syntax.Process is
                         left.location;
                     fi;
 
-                if typed_symbol.type == null then
+                // Iterative-inference re-narrowing: if the current
+                // type still carries an INFERRED_VARIABLE_TYPE
+                // placeholder somewhere in its tree (e.g.
+                // Function[placeholder, int] from iter 1 of the
+                // body retry loop), allow re-set from the
+                // initializer's now-narrower type. Same applies if
+                // the current type is ERROR — that's iter 1's
+                // attempt that propagated through (e.g. from the
+                // function-typed-value branch's is_error early-
+                // return on a placeholder-armed lambda whose body
+                // failed). Iter N+1 with constraints in hand may
+                // produce a real type.
+                let needs_set =
+                    typed_symbol.type == null \/
+                    typed_symbol.type.contains_inferred \/
+                    typed_symbol.type.is_error;
+
+                if needs_set then
                     if left.explicit_type? then
                         // _logger.poison(left.location, "explicitly typed variable should already have a type");
 
@@ -2610,7 +2744,7 @@ namespace Syntax.Process is
                         if Value.check_is_consumable(_logger, right_location, left.right_value) then
                             typed_symbol.set_type(left.right_value.type);
                         else
-                            typed_symbol.set_type(Semantic.Types.ERROR());                            
+                            typed_symbol.set_type(Semantic.Types.ERROR());
                         fi
                     fi
                 elif
@@ -3242,6 +3376,44 @@ namespace Syntax.Process is
             fi
 
             let function_type = call.function.value.type;
+
+            // Iterative-inference back-feed: if the function being
+            // called has a placeholder formal arg (e.g. f's type is
+            // Function[INFERRED_VARIABLE_TYPE, ?] from a let-bound
+            // lambda whose argument types weren't inferable from
+            // the body alone), push the actual arg's type onto the
+            // placeholder's origin symbol. Done *before* the
+            // is_error early-return because the return-type slot
+            // may legitimately be ERROR while the arg slot is a
+            // back-feedable placeholder (e.g. `x => x.length`'s
+            // body errors with ERROR-typed member access on
+            // unresolved receiver, propagating through the function
+            // type's is_error). The next iteration resolves x and
+            // x.length cleanly.
+            if isa Semantic.Types.NAMED(function_type) then
+                let ft_named = cast Semantic.Types.NAMED(function_type);
+                let ft_args = ft_named.arguments;
+                let formal_count =
+                    if function_type.is_function then
+                        ft_args.count - 1;
+                    else
+                        ft_args.count;
+                    fi;
+
+                if formal_count == arguments.count then
+                    for i in 0..arguments.count do
+                        let formal = ft_args[i];
+                        let actual = argument_types[i];
+
+                        if formal? /\ actual? /\ isa Semantic.Types.INFERRED_VARIABLE_TYPE(formal) then
+                            let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(formal);
+                            if placeholder.origin.add_constraint(actual) then
+                                _logger.mark_consumed_any();
+                            fi
+                        fi
+                    od
+                fi
+            fi
 
             if function_type? /\ function_type.is_error then
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
