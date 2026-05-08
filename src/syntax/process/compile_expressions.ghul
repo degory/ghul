@@ -535,9 +535,18 @@ namespace Syntax.Process is
             // set_constraint is a no-op). The post-walk assignability
             // check still verifies type correctness for the cases
             // where the RHS doesn't act on the constraint.
+            //
+            // When the LHS is itself a not-yet-resolved placeholder
+            // (`let l; ...; l = X` shape), the LHS type is not
+            // useful as a constraint to push *down*. Instead, after
+            // walking the RHS, push the RHS's type back to the
+            // LHS variable's symbol via add_constraint — the
+            // existing iterative-inference machinery will collapse
+            // the LUB across all assignments on the next retry-
+            // loop iteration.
             let lhs_type = _try_get_assignment_left_type(assignment.left);
 
-            if lhs_type? then
+            if lhs_type? /\ !lhs_type.is_inferred then
                 assignment.right.set_constraint(lhs_type, "{{0}} is not assignable to {{1}}");
             fi
 
@@ -554,6 +563,21 @@ namespace Syntax.Process is
                 assignment.left.value = assignment.right.value;
             fi
 
+            // Back-feed the RHS type as a constraint onto a
+            // placeholder-typed LHS variable (`let l; l = X` etc.).
+            // The next retry-loop iteration of the enclosing
+            // function-body walk picks up the LUB via
+            // try_get_inferred_type at visit(SIMPLE_VARIABLE_LEFT).
+            if
+                lhs_type? /\
+                lhs_type.is_inferred /\
+                assignment.right.value? /\
+                assignment.right.value.type? /\
+                _try_back_feed_assignment_lhs(assignment.left, assignment.right.value.type)
+            then
+                _logger.mark_consumed_any();
+            fi
+
             assignment.left.assign_location = assignment.location;
 
             assignment.left.walk(self);
@@ -561,6 +585,39 @@ namespace Syntax.Process is
             assignment.value = assignment.left.value;
 
             return true;
+        si
+
+        // If the assignment's LHS is a simple identifier referring
+        // to a Variable whose current type is an inference
+        // placeholder, push the supplied RHS type onto the
+        // variable's LUB accumulator. Returns true when a real
+        // constraint actually landed (so the caller can signal
+        // progress to the retry loop).
+        _try_back_feed_assignment_lhs(
+            left: Trees.Expressions.AssignmentLeftExpression,
+            rhs_type: Semantic.Types.Type
+        ) -> bool is
+            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
+
+            if !simple? \/ !simple.expression? then
+                return false;
+            fi
+
+            let identifier = cast Trees.Expressions.IDENTIFIER(simple.expression);
+
+            if !identifier? \/ !identifier.identifier? then
+                return false;
+            fi
+
+            let symbol = find(identifier.identifier);
+
+            if !symbol? \/ !isa Semantic.Symbols.Variable(symbol) then
+                return false;
+            fi
+
+            let variable = cast Semantic.Symbols.Variable(symbol);
+
+            return variable.add_constraint(rhs_type);
         si
 
         // Speculatively walk a SIMPLE_LEFT_EXPRESSION's inner expression
@@ -797,10 +854,21 @@ namespace Syntax.Process is
         visit(`catch: Trees.Statements.CATCH) is
             super.visit(`catch);
 
-            if !`catch.variable? \/ !`catch.variable.type_expression? then
+            if !`catch.variable? then
                 return;
             fi
-            
+
+            // Catch parameters must always have an explicit type —
+            // their whole purpose is to identify which exception
+            // shape the clause handles. Type inference (placeholder
+            // + LUB across writes) does not apply here, so the
+            // generalised let-without-type relaxation in
+            // pre(VARIABLE) doesn't extend to catch.
+            if !`catch.variable.type_expression? \/ isa Trees.TypeExpressions.INFER(`catch.variable.type_expression) then
+                _logger.error(`catch.variable.location, "catch variable must have an explicit type");
+                return;
+            fi
+
             let type = `catch.variable.type_expression.type;
 
             if !type? then
@@ -2733,6 +2801,24 @@ namespace Syntax.Process is
                         else
                             typed_symbol.set_type(Semantic.Types.ERROR());
                         fi
+                    else
+                        // No explicit type and no initializer
+                        // (`let l;`). Try the LUB accumulated from
+                        // later assignments; otherwise stand-in with
+                        // an INFERRED_VARIABLE_TYPE placeholder so
+                        // subsequent assignments can attach
+                        // constraints and the body retry loop
+                        // resolves on iteration N+1.
+                        if isa Semantic.Symbols.Variable(symbol) then
+                            let variable = cast Semantic.Symbols.Variable(symbol);
+                            let inferred = variable.try_get_inferred_type();
+
+                            if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
+                                typed_symbol.set_type(inferred);
+                            else
+                                typed_symbol.set_type(Semantic.Types.INFERRED_VARIABLE_TYPE(variable));
+                            fi
+                        fi
                     fi
                 elif
                     left.explicit_type? /\
@@ -2862,13 +2948,13 @@ namespace Syntax.Process is
                 variable.left.right_location = variable.initializer.location;
             fi
 
-            if 
-                !variable.is_poisoned /\ 
-                (!variable.type_expression? \/ isa Trees.TypeExpressions.INFER(variable.type_expression))
-                /\ !variable.initializer?
-            then
-                _logger.error(variable.location, "variable must have explict type or initializer");
-            fi
+            // No-type, no-initializer is now allowed: the variable's
+            // type is inferred from later assignments via the
+            // INFERRED_VARIABLE_TYPE placeholder + LUB accumulator
+            // (#1174 — see visit(SIMPLE_VARIABLE_LEFT) below). If
+            // no assignment ever fires, the placeholder remains
+            // and the variable's first use will produce a
+            // "cannot infer" error.
 
             variable.left.walk(self);
 
