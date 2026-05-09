@@ -16,6 +16,17 @@ namespace Analysis.Protocol is
     // response frame and to terminate file content in EDIT requests.
     FORM_FEED: char static => cast char(12);
 
+    // One file's worth of payload for a multi-file EDIT request.
+    class EDIT_FILE is
+        path: string;
+        source: string;
+
+        init(path: string, source: string) is
+            self.path = path;
+            self.source = source;
+        si
+    si
+
     // Long-lived wrapper around a `dotnet ghul-compiler --analyse @...` subprocess.
     // Each test should construct one in [@test_initialize] and dispose() it in
     // [@test_cleanup] — see project_analysis_protocol_locked memory for why we
@@ -123,18 +134,21 @@ namespace Analysis.Protocol is
         is_compiler_own_dll(path: string) -> bool static =>
             Path.get_file_name(path).to_lower_invariant() =~ "ghul.dll";
 
-        // Resolve the compiler-under-test invocation. Default is the freshly-
-        // built ghul.dll copied into our bin/ via ProjectReference — this
-        // exercises the PR-branch compiler. For release validation set
-        // ANALYSIS_TESTS_USE_INSTALLED_TOOL=1, which switches to
-        // `dotnet ghul-compiler` (resolved via `.config/dotnet-tools.json`)
-        // so the bootstrapped artifact, installed as the local tool, is the
-        // compiler-under-test.
-        resolve_compiler_invocation(project_directory: string) -> (file: string, prefix_args: string) static is
-            let use_installed = System.Environment.get_environment_variable("ANALYSIS_TESTS_USE_INSTALLED_TOOL");
+        // Resolve the path of the ghul.dll the harness will spawn as the
+        // compiler-under-test. ANALYSIS_TESTS_COMPILER_DLL=<path> overrides
+        // (CI uses this to point at the dll extracted from the bootstrapped
+        // ghul.compiler nupkg). Default is bin/.../ghul.dll, copied into
+        // our bin/ via the ProjectReference in analysis-tests.ghulproj —
+        // suitable for local dev where we want to test PR-source changes.
+        resolve_compiler_dll() -> string static is
+            let override_path = System.Environment.get_environment_variable("ANALYSIS_TESTS_COMPILER_DLL");
 
-            if use_installed? /\ use_installed =~ "1" then
-                return ("dotnet", "ghul-compiler");
+            if !string.is_null_or_white_space(override_path) then
+                if !File.exists(override_path) then
+                    throw Exception("ANALYSIS_TESTS_COMPILER_DLL='{override_path}' does not exist");
+                fi
+
+                return override_path;
             fi
 
             let assembly_path = System.Reflection.Assembly.get_executing_assembly().location;
@@ -142,10 +156,10 @@ namespace Analysis.Protocol is
             let compiler_dll = Path.combine(bin_dir, "ghul.dll");
 
             if !File.exists(compiler_dll) then
-                throw Exception("compiler ghul.dll not found at {compiler_dll} — is the ProjectReference to ghul.ghulproj wired up? Or set ANALYSIS_TESTS_USE_INSTALLED_TOOL=1 to spawn the installed local tool instead.");
+                throw Exception("compiler ghul.dll not found at {compiler_dll} — is the ProjectReference to ghul.ghulproj wired up? Or set ANALYSIS_TESTS_COMPILER_DLL=<path> to spawn a specific dll.");
             fi
 
-            return ("dotnet", "\"{compiler_dll}\"");
+            return compiler_dll;
         si
 
         // Compose a response file (`.analyser.rsp`) in the project directory and
@@ -168,12 +182,12 @@ namespace Analysis.Protocol is
             let arguments = build_analyser_arguments(project_directory);
             let response_file = write_response_file(project_directory, arguments);
 
-            let invocation = resolve_compiler_invocation(project_directory);
+            let compiler_dll = resolve_compiler_dll();
 
             let start_info = ProcessStartInfo();
 
-            start_info.file_name = invocation.file;
-            start_info.arguments = "{invocation.prefix_args} @\"{response_file}\"";
+            start_info.file_name = "dotnet";
+            start_info.arguments = "\"{compiler_dll}\" @\"{response_file}\"";
             start_info.working_directory = project_directory;
 
             start_info.use_shell_execute = false;
@@ -229,6 +243,24 @@ namespace Analysis.Protocol is
                 dispose();
                 throw ex;
             yrt
+        si
+
+        // Read a response that may be preceded by an unsolicited DIAGNOSTICS
+        // frame. HOVER / DEFINITION / etc. fall through to FULL_COMPILER
+        // .compile_all when the symbol-use-locations don't have the queried
+        // position cached — that path writes a DIAGNOSTICS frame to the
+        // same stdout *before* the handler writes its actual response.
+        // Tests asserting on a query response should use this helper rather
+        // than read_response, so the optional DIAGNOSTICS is drained
+        // transparently.
+        read_query_response() -> RESPONSE is
+            let response = read_response();
+
+            if response.header =~ "DIAGNOSTICS" then
+                response = read_response();
+            fi
+
+            return response;
         si
 
         // Read characters from stdout until we hit the form-feed terminator,
@@ -290,16 +322,32 @@ namespace Analysis.Protocol is
             _process.standard_input.flush();
         si
 
-        // Send `#EDIT#` for a single file. The analyser also accepts EDIT for
-        // multiple files (see requester.ts:sendDocuments) — we'll add that when
-        // we have a multi-file test that needs it.
-        send_edit(path: string, source: string) is
+        // Send `#EDIT#` for one or more files. The wire format mirrors
+        // ghul-vsce's requester.ts:sendDocuments — path list, blank-line
+        // terminator, then form-feed-terminated source per file.
+        //
+        // The IDE sends a *multi-file* EDIT once at startup with every
+        // discovered source file in the project (see
+        // project_analysis_mode_workflow memory). After startup, edits are
+        // single-file and other files' ASTs are retained. Tests that want
+        // to exercise the realistic startup path or the retained-AST
+        // condition use this multi-file form.
+        send_edit_files(files: Collections.Iterable[EDIT_FILE]) is
             write("#EDIT#\n");
-            write("{path}\n");
+            for f in files do
+                write("{f.path}\n");
+            od
             write("\n");           // empty line ends path list
-            write(source);
-            write("{FORM_FEED}");  // form-feed terminates source content
+            for f in files do
+                write(f.source);
+                write("{FORM_FEED}");  // form-feed terminates each source
+            od
             flush();
+        si
+
+        // Convenience for single-file EDIT — the common case.
+        send_edit(path: string, source: string) is
+            send_edit_files([EDIT_FILE(path, source)]);
         si
 
         send_compile() is
@@ -320,6 +368,61 @@ namespace Analysis.Protocol is
             write("{path}\n");
             write("{line}\n");
             write("{column}\n");
+            flush();
+        si
+
+        send_declaration(path: string, line: int, column: int) is
+            write("#DECLARATION#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_references(path: string, line: int, column: int) is
+            write("#REFERENCES#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_implementation(path: string, line: int, column: int) is
+            write("#IMPLEMENTATION#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_completion(path: string, line: int, column: int) is
+            write("#COMPLETE#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_signature(path: string, line: int, column: int) is
+            write("#SIGNATURE#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_symbols(path: string) is
+            write("#SYMBOLS#\n");
+            write("{path}\n");
+            flush();
+        si
+
+        send_rename_request(path: string, line: int, column: int, new_name: string) is
+            write("#RENAMEREQUEST#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            write("{new_name}\n");
             flush();
         si
 
