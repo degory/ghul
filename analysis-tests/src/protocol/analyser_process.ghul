@@ -52,6 +52,11 @@ namespace Analysis.Protocol is
         // Read .assemblies.json (produced by the GenerateAssembliesJson MSBuild
         // target) and return the list of "-a <path>" args plus a trailing "-A".
         // Format is exactly { "assemblies": ["path1", "path2", ...] }.
+        // The compiler's own ghul.dll is filtered out — it lands in our bin via
+        // the ProjectReference (so the analyser tests can spawn it as the
+        // compiler-under-test) but exposing it to the analyser as an `-a`
+        // reference would have it load its own type metadata into the symbol
+        // table, polluting test fixtures.
         build_analyser_arguments(project_directory: string) -> Iterable[string] static is
             let assemblies_json_path = Path.combine(project_directory, ".assemblies.json");
 
@@ -89,8 +94,14 @@ namespace Analysis.Protocol is
                     if in_string then
                         let captured = current.to_string();
 
-                        // Skip the literal "assemblies" key and empty strings.
-                        if captured !~ "assemblies" /\ captured.length > 0 then
+                        // Skip: (a) the literal "assemblies" key, (b) empty
+                        // strings, and (c) the compiler's own ghul.dll (case-
+                        // insensitive on basename).
+                        if
+                            captured !~ "assemblies" /\
+                            captured.length > 0 /\
+                            !is_compiler_own_dll(captured)
+                        then
                             result.add("-a");
                             result.add(captured);
                         fi
@@ -107,6 +118,34 @@ namespace Analysis.Protocol is
             result.add("-A");
 
             return result;
+        si
+
+        is_compiler_own_dll(path: string) -> bool static =>
+            Path.get_file_name(path).to_lower_invariant() =~ "ghul.dll";
+
+        // Resolve the compiler-under-test invocation. Default is the freshly-
+        // built ghul.dll copied into our bin/ via ProjectReference — this
+        // exercises the PR-branch compiler. For release validation set
+        // ANALYSIS_TESTS_USE_INSTALLED_TOOL=1, which switches to
+        // `dotnet ghul-compiler` (resolved via `.config/dotnet-tools.json`)
+        // so the bootstrapped artifact, installed as the local tool, is the
+        // compiler-under-test.
+        resolve_compiler_invocation(project_directory: string) -> (file: string, prefix_args: string) static is
+            let use_installed = System.Environment.get_environment_variable("ANALYSIS_TESTS_USE_INSTALLED_TOOL");
+
+            if use_installed? /\ use_installed =~ "1" then
+                return ("dotnet", "ghul-compiler");
+            fi
+
+            let assembly_path = System.Reflection.Assembly.get_executing_assembly().location;
+            let bin_dir = Path.get_directory_name(assembly_path);
+            let compiler_dll = Path.combine(bin_dir, "ghul.dll");
+
+            if !File.exists(compiler_dll) then
+                throw Exception("compiler ghul.dll not found at {compiler_dll} — is the ProjectReference to ghul.ghulproj wired up? Or set ANALYSIS_TESTS_USE_INSTALLED_TOOL=1 to spawn the installed local tool instead.");
+            fi
+
+            return ("dotnet", "\"{compiler_dll}\"");
         si
 
         // Compose a response file (`.analyser.rsp`) in the project directory and
@@ -129,10 +168,12 @@ namespace Analysis.Protocol is
             let arguments = build_analyser_arguments(project_directory);
             let response_file = write_response_file(project_directory, arguments);
 
+            let invocation = resolve_compiler_invocation(project_directory);
+
             let start_info = ProcessStartInfo();
 
-            start_info.file_name = "dotnet";
-            start_info.arguments = "ghul-compiler @{response_file}";
+            start_info.file_name = invocation.file;
+            start_info.arguments = "{invocation.prefix_args} @\"{response_file}\"";
             start_info.working_directory = project_directory;
 
             start_info.use_shell_execute = false;
@@ -285,6 +326,9 @@ namespace Analysis.Protocol is
         // Drain stdout for any lingering frames, then close stdin and wait for
         // exit. Kill the subprocess if it overruns the wait timeout — a runaway
         // analyser shouldn't leak across tests.
+        // Drain stdout for any lingering frames, then close stdin and wait for
+        // exit. Kill the subprocess if it overruns the wait timeout — a runaway
+        // analyser shouldn't leak across tests.
         dispose() is
             try
                 _process.standard_input.close();
@@ -300,5 +344,52 @@ namespace Analysis.Protocol is
         si
 
         stderr_capture: string => _stderr_capture.to_string();
+
+        // Wait until the compiler's startup banner appears in captured stderr
+        // and return the version string from it. The analyser writes
+        //   "ghūl compiler {version}: serving analysis requests"
+        // to stderr immediately before entering the request-handling loop
+        // (see driver/main.ghul) so this should land within milliseconds of
+        // the LISTEN frame arriving on stdout.
+        await_compiler_version(timeout_ms: int) -> string is
+            let deadline_ticks = System.DateTime.now.add_milliseconds(cast double(timeout_ms)).ticks;
+
+            do
+                let captured = _stderr_capture.to_string();
+                let version = parse_version_from_banner(captured);
+
+                if version? then
+                    return version;
+                fi
+
+                if System.DateTime.now.ticks > deadline_ticks then
+                    throw Exception("timed out waiting for compiler version banner.\nstderr captured so far:\n{captured}");
+                fi
+
+                System.Threading.Thread.sleep(10);
+            od
+        si
+
+        await_compiler_version() -> string => await_compiler_version(2000);
+
+        BANNER_PREFIX: string static => "ghūl compiler ";
+        BANNER_SUFFIX: string static => ": serving analysis requests";
+
+        parse_version_from_banner(captured: string) -> string static is
+            let prefix_index = captured.index_of(BANNER_PREFIX);
+
+            if prefix_index < 0 then
+                return null;
+            fi
+
+            let after_prefix = prefix_index + BANNER_PREFIX.length;
+            let suffix_index = captured.index_of(BANNER_SUFFIX, after_prefix);
+
+            if suffix_index < 0 then
+                return null;
+            fi
+
+            return captured.substring(after_prefix, suffix_index - after_prefix);
+        si
     si
 si
