@@ -33,6 +33,16 @@ namespace Syntax.Process is
         _stub_depth: int;
         _keep_depth: int;
 
+        // Per-AST-node cache of placeholder origin symbols for unbound
+        // owner type-args at constructor expressions. Each constructor
+        // call AST node gets one phantom Variable per type-arg slot;
+        // the phantom carries the `_lub_map` accumulator that overload
+        // back-feed pushes constraints into. Cached on the visitor (not
+        // the AST node) so the AST stays simple — the visitor instance
+        // is the body retry loop's lifecycle, so origins persist across
+        // iterations (constraint accumulation needs that stability).
+        _type_arg_placeholder_origins: Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]];
+
         current_statement_list: Trees.Statements.LIST;
 
         init(
@@ -63,6 +73,8 @@ namespace Syntax.Process is
             _symbol_use_locations = symbol_use_locations;
             _value_converter = value_converter;
             _value_boxer = value_boxer;
+
+            _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
         si
 
         apply(root: Trees.Node) is
@@ -306,10 +318,49 @@ namespace Syntax.Process is
                     fi
                 od
 
+                // Fall-back: any constructor-type-arg placeholders that
+                // didn't acquire a concrete constraint from any usage
+                // default to `object`. Without this, a construction
+                // whose owner type-args are never pinned by downstream
+                // usage (e.g. `let m = Box(); Std.write_line("hi")`)
+                // would emit malformed IL with the placeholder's
+                // gen_type comment string in the type-arg position,
+                // which ilasm rejects.
+                if _fill_in_default_typearg_placeholders() then
+                    _logger.roll_back();
+                    _logger.speculate();
+
+                    function.body.walk(self);
+                fi
+
                 _logger.commit();
             fi
 
             super.visit(function);
+        si
+
+        // Walk all phantom origins cached during this body retry; for
+        // each that's still unresolved, default to object via
+        // add_constraint. Returns true when at least one default was
+        // injected — the caller does one more body walk so the AST
+        // values pick up the resolved type.
+        _fill_in_default_typearg_placeholders() -> bool is
+            let added_any = false;
+            let object_type = _innate_symbol_lookup.get_object_type();
+
+            for kv in _type_arg_placeholder_origins do
+                for origin in kv.value do
+                    let resolved = origin.try_get_inferred_type();
+
+                    if !resolved? \/ resolved.is_inferred \/ resolved.is_error then
+                        if origin.add_constraint(object_type) then
+                            added_any = true;
+                        fi
+                    fi
+                od
+            od
+
+            return added_any;
         si
 
         pre(`let: Trees.Statements.LET) -> bool is
@@ -1825,6 +1876,98 @@ namespace Syntax.Process is
         // up). The returned function's .owner is a Symbols.GENERIC, so
         // the caller's existing `isa GENERIC(function.owner)` branch
         // picks up the type/type_symbol update naturally.
+        // Look up (or lazily create) the per-AST-node phantom Variables
+        // that act as origins for unbound owner type-arg placeholders.
+        // The same call expression on a later body-retry iteration
+        // reuses the same phantoms, so any constraints accumulated by
+        // overload back-feed in iter N persist into iter N+1's lub_map
+        // resolution.
+        _get_or_create_type_arg_placeholder_origins(
+            cache_key: Trees.Node,
+            location: LOCATION,
+            type_symbol: Semantic.Symbols.Classy
+        ) -> Collections.LIST[Semantic.Symbols.Variable] is
+            if _type_arg_placeholder_origins.contains_key(cache_key) then
+                return _type_arg_placeholder_origins[cache_key];
+            fi
+
+            let result = Collections.LIST[Semantic.Symbols.Variable]();
+            let owner = _symbol_table.current_function;
+
+            for i in 0..type_symbol.argument_names.count do
+                let arg_name = type_symbol.argument_names[i];
+                let phantom_name = "${type_symbol.name}.{arg_name}@{location.start_line}:{location.start_column}";
+                let phantom = Semantic.Symbols.INFERRED_TYPE_ARG_ORIGIN(location, owner, phantom_name);
+                result.add(phantom);
+            od
+
+            _type_arg_placeholder_origins[cache_key] = result;
+
+            return result;
+        si
+
+        // Iterative-inference: when a generic class is constructed
+        // with no constraint and no constructor args binding T (e.g.
+        // `let m = Box()`), produce a specialized owner where each
+        // type-arg slot carries an INFERRED_VARIABLE_TYPE pointing at
+        // a phantom Variable cached on the AST node. Overload back-
+        // feed in OVERLOAD_RESOLVER pushes downstream-discovered
+        // concrete types onto the phantom's `_lub_map`, and the body
+        // retry loop's next iteration resolves the type-arg by
+        // calling try_get_inferred_type() on the phantom.
+        _try_specialize_owner_with_placeholders(
+            location: LOCATION,
+            function: Semantic.Symbols.Function,
+            cache_key: Trees.Node
+        ) -> Semantic.Symbols.Function is
+            if !cache_key? then
+                return function;
+            fi
+
+            if isa Semantic.Symbols.GENERIC(function.owner) then
+                return function;
+            fi
+
+            let owner_classy = cast Semantic.Symbols.Classy(function.owner);
+
+            if !owner_classy? \/ !owner_classy.is_generic then
+                return function;
+            fi
+
+            let origins = _get_or_create_type_arg_placeholder_origins(cache_key, location, owner_classy);
+
+            let type_map = Collections.MAP[string, Semantic.Types.Type]();
+
+            for i in 0..owner_classy.argument_names.count do
+                let arg_name = owner_classy.argument_names[i];
+                let origin = origins[i];
+                let resolved = origin.try_get_inferred_type();
+                let arg_type: Semantic.Types.Type;
+
+                if resolved? /\ !resolved.is_inferred /\ !resolved.is_error then
+                    arg_type = resolved;
+                else
+                    arg_type = Semantic.Types.INFERRED_VARIABLE_TYPE(origin);
+                fi
+
+                type_map[arg_name] = arg_type;
+            od
+
+            let specialized_owner = Semantic.Symbols.GENERIC.try_create_from(location, owner_classy, type_map);
+
+            if !specialized_owner? then
+                return function;
+            fi
+
+            let specialized = specialized_owner.find_specialized_function(function);
+
+            if !specialized? then
+                return function;
+            fi
+
+            return specialized;
+        si
+
         _try_specialize_owner_from_constraint(
             location: LOCATION,
             function: Semantic.Symbols.Function,
@@ -1983,7 +2126,8 @@ namespace Syntax.Process is
             right_location: LOCATION,
             type: Semantic.Types.Type,
             argument_expressions: Trees.Expressions.LIST,
-            constraint: Semantic.Types.Type
+            constraint: Semantic.Types.Type,
+            cache_key: Trees.Node
         ) -> (Value, Value) is
             let result: Value;
 
@@ -2059,6 +2203,7 @@ namespace Syntax.Process is
             let function = overload_result.function;
 
             function = _try_specialize_owner_from_constraint(location, function, constraint);
+            function = _try_specialize_owner_with_placeholders(location, function, cache_key);
 
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
@@ -3307,7 +3452,7 @@ namespace Syntax.Process is
             fi
 
             if call.function.value.is_type_expression then
-                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments, call.constraint);
+                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments, call.constraint, call);
 
                 return;
             fi
@@ -3536,7 +3681,7 @@ namespace Syntax.Process is
                 fi
             else
                 if load_symbol? /\ load_symbol.is_type then
-                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments, call.constraint);
+                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments, call.constraint, call);
                 else
                     _logger.error(call.function.location, "cannot call value of non-function type {call.function.value.type}");
                     call.value = DUMMY(Semantic.Types.ERROR(), call.location);
