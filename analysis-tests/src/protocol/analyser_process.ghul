@@ -1,0 +1,304 @@
+namespace Analysis.Protocol is
+    use System.Exception;
+    use System.Diagnostics.Process;
+    use System.Diagnostics.ProcessStartInfo;
+    use System.Text.StringBuilder;
+    use System.Text.UTF8Encoding;
+
+    use Collections.Iterable;
+    use Collections.MutableList;
+    use Collections.LIST;
+
+    use IO.File;
+    use IO.Path;
+
+    // Form-feed character (ASCII 12). The analyser uses this to terminate every
+    // response frame and to terminate file content in EDIT requests.
+    FORM_FEED: char static => cast char(12);
+
+    // Long-lived wrapper around a `dotnet ghul-compiler --analyse @...` subprocess.
+    // Each test should construct one in [@test_initialize] and dispose() it in
+    // [@test_cleanup] — see project_analysis_protocol_locked memory for why we
+    // can't share processes across tests (the compiler has substantial persistent
+    // global state that the analyser's `clear_symbols` doesn't fully scrub).
+    class ANALYSER_PROCESS: Disposable is
+        _process: Process;
+        _stderr_capture: StringBuilder;
+
+        // Walk up from the running test assembly to find analysis-tests/ — that's
+        // where .config/dotnet-tools.json (via ghul/) and .assemblies.json live.
+        find_project_directory() -> string static is
+            let assembly_path = System.Reflection.Assembly.get_executing_assembly().location;
+            let dir = Path.get_directory_name(assembly_path);
+
+            // bin/Debug/net8.0/<dll> -> walk up three to project root
+            do
+                if dir? /\ File.exists(Path.combine(dir, "analysis-tests.ghulproj")) then
+                    return dir;
+                fi
+
+                let parent = Path.get_directory_name(dir);
+
+                if parent? /\ parent !~ dir then
+                    dir = parent;
+                else
+                    break;
+                fi
+            od
+
+            throw Exception("could not find analysis-tests project directory from assembly path: {assembly_path}");
+        si
+
+        // Read .assemblies.json (produced by the GenerateAssembliesJson MSBuild
+        // target) and return the list of "-a <path>" args plus a trailing "-A".
+        // Format is exactly { "assemblies": ["path1", "path2", ...] }.
+        build_analyser_arguments(project_directory: string) -> Iterable[string] static is
+            let assemblies_json_path = Path.combine(project_directory, ".assemblies.json");
+
+            if !File.exists(assemblies_json_path) then
+                throw Exception(".assemblies.json not found at {assemblies_json_path} — is the GenerateAssembliesJson target wired into Build?");
+            fi
+
+            let content = File.read_all_text(assemblies_json_path);
+
+            // Plain-line parse: split on '"', take every odd-indexed element after
+            // the "assemblies" key. We don't need a real JSON parser — the file is
+            // produced by MSBuild with a fixed shape.
+            let result = LIST[string]();
+            let in_string = false;
+            let current = StringBuilder();
+            let escape_next = false;
+
+            for c in content do
+                if escape_next then
+                    if c == 'n' then
+                        current.append('\n');
+                    elif c == 't' then
+                        current.append('\t');
+                    elif c == '"' then
+                        current.append('"');
+                    elif c == '\\' then
+                        current.append('\\');
+                    else
+                        current.append(c);
+                    fi
+                    escape_next = false;
+                elif c == '\\' /\ in_string then
+                    escape_next = true;
+                elif c == '"' then
+                    if in_string then
+                        let captured = current.to_string();
+
+                        // Skip the literal "assemblies" key and empty strings.
+                        if captured !~ "assemblies" /\ captured.length > 0 then
+                            result.add("-a");
+                            result.add(captured);
+                        fi
+
+                        current.clear();
+                    fi
+
+                    in_string = !in_string;
+                elif in_string then
+                    current.append(c);
+                fi
+            od
+
+            result.add("-A");
+
+            return result;
+        si
+
+        // Compose a response file (`.analyser.rsp`) in the project directory and
+        // spawn `dotnet ghul-compiler @<rsp>`. Mirrors what the VS Code server
+        // does in server-manager.ts.
+        write_response_file(project_directory: string, arguments: Iterable[string]) -> string static is
+            let path = Path.combine(project_directory, ".analyser.rsp");
+
+            let line = arguments
+                | .map(a -> string => "\"{a}\"")
+                .to_string(" ");
+
+            File.write_all_text(path, line);
+
+            return path;
+        si
+
+        init() is
+            let project_directory = find_project_directory();
+            let arguments = build_analyser_arguments(project_directory);
+            let response_file = write_response_file(project_directory, arguments);
+
+            let start_info = ProcessStartInfo();
+
+            start_info.file_name = "dotnet";
+            start_info.arguments = "ghul-compiler @{response_file}";
+            start_info.working_directory = project_directory;
+
+            start_info.use_shell_execute = false;
+            start_info.redirect_standard_input = true;
+            start_info.redirect_standard_output = true;
+            start_info.redirect_standard_error = true;
+
+            // The compiler's stdin/stdout are byte-oriented framing (form-feed
+            // delimiter mid-stream). UTF-8 keeps the multi-byte semantics stable.
+            start_info.standard_input_encoding = UTF8Encoding();
+            start_info.standard_output_encoding = UTF8Encoding();
+            start_info.standard_error_encoding = UTF8Encoding();
+
+            _process = Process.start(start_info);
+
+            if !_process? then
+                throw Exception("failed to start ghul-compiler analyser process");
+            fi
+
+            _stderr_capture = StringBuilder();
+
+            // Drain stderr in the background so a chatty analyser doesn't fill
+            // its stderr pipe and block. Stash text for inclusion in failure
+            // messages.
+            System.Threading.Tasks.Task.run(
+                () is
+                    try
+                        do
+                            let line = _process.standard_error.read_line();
+
+                            if !line? then
+                                break;
+                            fi
+
+                            _stderr_capture.append(line);
+                            _stderr_capture.append('\n');
+                        od
+                    catch ex: Exception
+                    yrt
+                si
+            );
+
+            // Block until the analyser writes its initial LISTEN frame, then
+            // we know it's ready. If anything fails between Process.start and
+            // here, dispose the subprocess so it doesn't leak.
+            try
+                let listen = read_response();
+
+                if listen.header !~ "LISTEN" then
+                    throw Exception("expected LISTEN as first response, got '{listen.header}'.\nstderr so far:\n{_stderr_capture}");
+                fi
+            catch ex: Exception
+                dispose();
+                throw ex;
+            yrt
+        si
+
+        // Read characters from stdout until we hit the form-feed terminator,
+        // then split into header (first line) + body lines (remaining lines,
+        // excluding the empty trailing line that comes from "\n\f").
+        read_response() -> RESPONSE is
+            let buffer = StringBuilder();
+
+            do
+                let c = _process.standard_output.read();
+
+                if c < 0 then
+                    throw Exception(
+                        "analyser stdout closed before form-feed.\n" +
+                        "buffer so far:\n{buffer}\n" +
+                        "stderr so far:\n{_stderr_capture}"
+                    );
+                fi
+
+                if c == 12 then
+                    break;
+                fi
+
+                if c != 13 then
+                    buffer.append(cast char(c));
+                fi
+            od
+
+            let raw = buffer.to_string();
+            let lines = LIST[string](raw.split(['\n']));
+
+            if lines.count == 0 then
+                throw Exception("empty response frame");
+            fi
+
+            let header = lines[0];
+
+            // Drop header and trailing empty entry (from the "\n\f" tail).
+            let body = LIST[string]();
+
+            for i in 1..lines.count do
+                let line = lines[i];
+
+                if i == lines.count - 1 /\ line.length == 0 then
+                    continue;
+                fi
+
+                body.add(line);
+            od
+
+            return RESPONSE(header, body);
+        si
+
+        write(text: string) is
+            _process.standard_input.write(text);
+        si
+
+        flush() is
+            _process.standard_input.flush();
+        si
+
+        // Send `#EDIT#` for a single file. The analyser also accepts EDIT for
+        // multiple files (see requester.ts:sendDocuments) — we'll add that when
+        // we have a multi-file test that needs it.
+        send_edit(path: string, source: string) is
+            write("#EDIT#\n");
+            write("{path}\n");
+            write("\n");           // empty line ends path list
+            write(source);
+            write("{FORM_FEED}");  // form-feed terminates source content
+            flush();
+        si
+
+        send_compile() is
+            write("#COMPILE#\n");
+            flush();
+        si
+
+        send_hover(path: string, line: int, column: int) is
+            write("#HOVER#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        send_definition(path: string, line: int, column: int) is
+            write("#DEFINITION#\n");
+            write("{path}\n");
+            write("{line}\n");
+            write("{column}\n");
+            flush();
+        si
+
+        // Drain stdout for any lingering frames, then close stdin and wait for
+        // exit. Kill the subprocess if it overruns the wait timeout — a runaway
+        // analyser shouldn't leak across tests.
+        dispose() is
+            try
+                _process.standard_input.close();
+            catch ex: Exception
+            yrt
+
+            if !_process.wait_for_exit(2000) then
+                try
+                    _process.kill();
+                catch ex: Exception
+                yrt
+            fi
+        si
+
+        stderr_capture: string => _stderr_capture.to_string();
+    si
+si
