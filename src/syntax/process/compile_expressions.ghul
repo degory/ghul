@@ -15,6 +15,28 @@ namespace Syntax.Process is
 
     use Syntax.Trees.Definitions.PRAGMA;
 
+    // Per-IF bookkeeping for else-branch complement narrowing on
+    // 2-variant unions. An IF "qualifies" when it has exactly
+    // 2 branches with the second being an `else` — in
+    // `if cond then ... else ... fi`, a 2-variant union narrowed
+    // by `cond` of the form `<simple-id>.is_<variant>` lets the
+    // else body see the variable narrowed to the other variant.
+    // Multi-variant complements need an internal sum type — see
+    // issue #1265.
+    //
+    // pre(IF) pushes a frame; visit(IF) pops it. visit(IF_BRANCH)
+    // for the if-branch fills in (target, complement_type) when
+    // the qualifying cond shape matches; pre(IF_BRANCH) for the
+    // else-branch reads them and pushes the narrowing.
+    class ELSE_COMPLEMENT_FRAME is
+        is_two_branch_if_else: bool public;
+        target: Semantic.Symbols.Variable public;
+        complement_type: Type public;
+
+        init() is
+        si
+    si
+
     class COMPILE_EXPRESSIONS: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -50,6 +72,12 @@ namespace Syntax.Process is
         // delegate here. See `narrowing.ghul` for the mechanism.
         _narrowing: NARROWING;
 
+        // Stack of frames, one per IF currently being walked.
+        // pre/visit(IF) push and pop; visit(IF_BRANCH) for the
+        // if-branch of a qualifying frame stashes the complement
+        // narrowing for pre(IF_BRANCH) of the else-branch to push.
+        _else_complement_stack: Collections.LIST[ELSE_COMPLEMENT_FRAME];
+
         current_statement_list: Trees.Statements.LIST;
 
         init(
@@ -84,6 +112,8 @@ namespace Syntax.Process is
             _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
 
             _narrowing = NARROWING();
+
+            _else_complement_stack = Collections.LIST[ELSE_COMPLEMENT_FRAME]();
         si
 
         // True if `name` looks like a synthesized variant accessor
@@ -179,6 +209,68 @@ namespace Syntax.Process is
             return null;
         si
 
+        // For an `is_<variant>` access on a 2-variant union, return
+        // the type of the OTHER variant carrying the receiver's
+        // generic args. Null if the receiver isn't a union, has more
+        // or fewer than 2 variants, or no variant matches the suffix.
+        // Multi-variant complements need a sum-type representation
+        // — see issue #1265.
+        try_get_two_variant_complement(
+            receiver_type: Type,
+            member_name: string
+        ) -> Type is
+            if !is_variant_accessor_name(member_name) then
+                return null;
+            fi
+
+            let classy = get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return null;
+            fi
+
+            let suffix = member_name.substring(3);
+
+            let variants = Collections.LIST[Semantic.Symbols.Classy]();
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant then
+                    variants.add(cast Semantic.Symbols.Classy(s));
+                fi
+            od
+
+            if variants.count != 2 then
+                return null;
+            fi
+
+            let other: Semantic.Symbols.Classy;
+            let saw_match = false;
+
+            for v in variants do
+                if v.name? /\ v.name.to_lower_invariant() =~ suffix then
+                    saw_match = true;
+                else
+                    other = v;
+                fi
+            od
+
+            if !saw_match \/ !other? then
+                return null;
+            fi
+
+            if isa Semantic.Types.GENERIC(receiver_type) then
+                let generic_receiver = cast Semantic.Types.GENERIC(receiver_type);
+
+                return Semantic.Types.GENERIC(
+                    other.location,
+                    other,
+                    generic_receiver.arguments
+                );
+            else
+                return Semantic.Types.NAMED(other);
+            fi
+        si
+
         apply(root: Trees.Node) is
             assert _keep_depth == 0;
             assert _stub_depth == 0;
@@ -212,6 +304,12 @@ namespace Syntax.Process is
             // it goes, not just clears the stacks.
             _narrowing.unwind_all();
 
+            // Defensive — same rationale as _narrowing.unwind_all above.
+            // Frames are pushed in pre(IF) and popped in visit(IF); a
+            // leak from an aborted earlier walk would let stale frames
+            // misroute else-complement narrowings on later compiles.
+            _else_complement_stack.clear();
+
             root.walk(self);
 
             assert _keep_depth == 0;
@@ -220,6 +318,8 @@ namespace Syntax.Process is
                 else "narrowing saves stack leaked: {_narrowing.saves_count} unreleased";
             assert _narrowing.marks_count == 0
                 else "narrowing marks stack leaked: {_narrowing.marks_count} unreleased";
+            assert _else_complement_stack.count == 0
+                else "else-complement frame stack leaked: {_else_complement_stack.count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
@@ -1113,10 +1213,52 @@ namespace Syntax.Process is
             // saves into this branch's frame; the matching release
             // in visit() pops them once the body has been walked.
             _narrowing.mark_scope();
+
+            // Else-complement narrowing: if this is the else
+            // branch of a qualifying IF and the if-branch's visit
+            // already stashed a (target, complement_type) pair on
+            // the frame, push it onto the just-marked scope so
+            // the body sees the variable narrowed to the other
+            // variant.
+            if !`if.condition? /\ _else_complement_stack.count > 0 then
+                let frame = _else_complement_stack[_else_complement_stack.count - 1];
+
+                if frame.is_two_branch_if_else /\ frame.target? /\ frame.complement_type? then
+                    _narrowing.try_push(frame.target, frame.complement_type);
+                fi
+            fi
         si
 
         visit(`if: Trees.Statements.IF_BRANCH) is
             _narrowing.release_scope();
+
+            // Else-complement narrowing: if the just-finished
+            // branch is the if-branch of a qualifying IF and its
+            // condition is `<simple-id>.is_<variant>` on a 2-variant
+            // union, stash the complement variant type on the frame
+            // for pre(IF_BRANCH) of the else-branch to consume.
+            if
+                _else_complement_stack.count > 0 /\
+                `if? /\
+                `if.condition? /\
+                isa Trees.Expressions.MEMBER(`if.condition)
+            then
+                let frame = _else_complement_stack[_else_complement_stack.count - 1];
+
+                if frame.is_two_branch_if_else /\ !frame.target? then
+                    let member = cast Trees.Expressions.MEMBER(`if.condition);
+
+                    if member.left? /\ member.left.value? /\ member.left.value.type? /\ member.identifier? then
+                        let target = try_get_narrowing_target(member.left);
+                        let complement = try_get_two_variant_complement(member.left.value.type, member.identifier.name);
+
+                        if target? /\ complement? then
+                            frame.target = target;
+                            frame.complement_type = complement;
+                        fi
+                    fi
+                fi
+            fi
 
             if
                 `if? /\
@@ -4386,10 +4528,37 @@ namespace Syntax.Process is
                 od
             fi
 
+            // Push an else-complement frame for this IF. Structural
+            // qualification check: exactly 2 branches, branch 0 has a
+            // condition, branch 1 is `else` (null condition). The
+            // type-dependent variant-count check is deferred until
+            // visit(IF_BRANCH) for branch 0 — we only know the
+            // receiver's resolved type after the cond walk.
+            let frame = ELSE_COMPLEMENT_FRAME();
+
+            let count = 0;
+            let first_has_condition = false;
+            let second_is_else = false;
+
+            for b in `if.branches do
+                count = count + 1;
+                if count == 1 then
+                    first_has_condition = b? /\ b.condition?;
+                elif count == 2 then
+                    second_is_else = b? /\ !b.condition?;
+                fi
+            od
+
+            frame.is_two_branch_if_else = count == 2 /\ first_has_condition /\ second_is_else;
+
+            _else_complement_stack.add(frame);
+
             return false;
         si
 
         visit(`if: Trees.Statements.IF) is
+            _else_complement_stack.remove_at(_else_complement_stack.count - 1);
+
             for i in `if.branches do
                 if i.condition? then
                     IR.Values.Value.check_is_consumable(_logger, i.condition.location, i.condition.value);
