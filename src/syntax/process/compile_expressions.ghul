@@ -15,19 +15,6 @@ namespace Syntax.Process is
 
     use Syntax.Trees.Definitions.PRAGMA;
 
-    // One save record per `push_narrowing` call. The symbol's
-    // declared type is saved here so the matching
-    // `release_narrowing_scope` can restore it.
-    class NARROWING_SAVE is
-        symbol: Semantic.Symbols.Variable public;
-        saved_type: Type public;
-
-        init(symbol: Semantic.Symbols.Variable, saved_type: Type) is
-            self.symbol = symbol;
-            self.saved_type = saved_type;
-        si
-    si
-
     class COMPILE_EXPRESSIONS: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -56,14 +43,12 @@ namespace Syntax.Process is
         // iterations (constraint accumulation needs that stability).
         _type_arg_placeholder_origins: Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]];
 
-        // Type narrowing — `(symbol, saved_type)` saves pushed at the
-        // point a narrowing predicate is observed during AST walk. The
-        // owning AST (IF_BRANCH body, CASE arm, WHILE body, etc.)
-        // marks the stack on entry and releases (pops + restores) on
-        // exit. Top-of-stack wins for symbol type lookups, so chained
-        // narrowings and reassignments compose naturally.
-        _narrowing_saves: Collections.LIST[NARROWING_SAVE];
-        _narrowing_marks: Collections.LIST[int];
+        // Type-narrowing stack — owns scope marks and per-symbol
+        // saves. Visit hooks (IF_BRANCH for marking, BINARY/UNARY
+        // for `\/`/`!` cancellation, ISA/MEMBER for predicate
+        // pushes, SIMPLE_LEFT_EXPRESSION for assignment cancel)
+        // delegate here. See `narrowing.ghul` for the mechanism.
+        _narrowing: NARROWING;
 
         current_statement_list: Trees.Statements.LIST;
 
@@ -98,61 +83,7 @@ namespace Syntax.Process is
 
             _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
 
-            _narrowing_saves = Collections.LIST[NARROWING_SAVE]();
-            _narrowing_marks = Collections.LIST[int]();
-        si
-
-        // Mark the current narrowing stack depth — paired with
-        // `release_narrowing_scope` on the same owning AST.
-        mark_narrowing_scope() is
-            _narrowing_marks.add(_narrowing_saves.count);
-        si
-
-        // Pop the most recent mark, restoring every save pushed since.
-        // Restoration walks the stack top-down so reassignments
-        // (which push a new save over an existing one) unwind to the
-        // declared type, not an intermediate narrowed type.
-        release_narrowing_scope() is
-            assert _narrowing_marks.count > 0 else "release_narrowing_scope without matching mark";
-
-            let mark = _narrowing_marks[_narrowing_marks.count - 1];
-            _narrowing_marks.remove_at(_narrowing_marks.count - 1);
-
-            while _narrowing_saves.count > mark do
-                let last = _narrowing_saves.count - 1;
-                let save = _narrowing_saves[last];
-
-                save.symbol.set_type(save.saved_type);
-                _narrowing_saves.remove_at(last);
-            od
-        si
-
-        // Push a single narrowing — saves the symbol's current type,
-        // then mutates `symbol.type` to the narrowed type. The save
-        // is popped (and the original type restored) by the next
-        // matching `release_narrowing_scope`.
-        push_narrowing(symbol: Semantic.Symbols.Variable, narrowed_type: Type) is
-            _narrowing_saves.add(NARROWING_SAVE(symbol, symbol.type));
-            symbol.set_type(narrowed_type);
-        si
-
-        // Defensive recovery — restore every outstanding save and
-        // empty both stacks. Called at apply() boundaries so a
-        // leaked narrowing from a previous walk (e.g. one that
-        // exception'd through a missing release) doesn't poison the
-        // next compile. Walk top-down so the most recent save (which
-        // may itself overwrite an earlier save's symbol) restores to
-        // the value beneath it correctly.
-        unwind_all_narrowings() is
-            while _narrowing_saves.count > 0 do
-                let last = _narrowing_saves.count - 1;
-                let save = _narrowing_saves[last];
-
-                save.symbol.set_type(save.saved_type);
-                _narrowing_saves.remove_at(last);
-            od
-
-            _narrowing_marks.clear();
+            _narrowing = NARROWING();
         si
 
         // True if `name` looks like a synthesized variant accessor
@@ -248,103 +179,6 @@ namespace Syntax.Process is
             return null;
         si
 
-        // Push only when `narrowed` is strictly assignable-narrower
-        // than the target's current type. Skips no-ops and refuses
-        // accidental widening. Also gated on an enclosing
-        // narrowing scope being open — predicates outside any
-        // owning AST (e.g. a top-level `assert isa T(x)`) have no
-        // body that would consume the narrowing, and an unmarked
-        // push would leak past apply()'s leak asserts.
-        try_push_narrowing(target: Semantic.Symbols.Variable, narrowed: Type) is
-            if _narrowing_marks.count == 0 then
-                return;
-            fi
-
-            if !target? \/ !narrowed? \/ !target.type? then
-                return;
-            fi
-
-            if narrowed.is_error \/ narrowed.is_inferred then
-                return;
-            fi
-
-            if target.type =~ narrowed then
-                return;
-            fi
-
-            if !target.type.is_assignable_from(narrowed) then
-                return;
-            fi
-
-            push_narrowing(target, narrowed);
-        si
-
-        // Bottommost narrowing save for `target` carries its type
-        // before any narrowing pushed — i.e. its declared type.
-        // Returns the declared type for an actively narrowed
-        // variable; falls back to `target.type` when no save exists.
-        // Used to bypass narrowing for assignment LHS checks: a
-        // user reassignment inside a narrowing branch must
-        // typecheck against the variable's declared type, not the
-        // narrowed view, or `if isa T(x) then x = wider_value`
-        // patterns (idiomatic across the codebase) would fail.
-        get_declared_type_of(target: Semantic.Symbols.Variable) -> Type is
-            if !target? then
-                return null;
-            fi
-
-            for save in _narrowing_saves do
-                if save.symbol == target then
-                    return save.saved_type;
-                fi
-            od
-
-            return target.type;
-        si
-
-        // Drop every narrowing save covering `target` and restore
-        // its type to the declared type. Called after a successful
-        // reassignment to a narrowed variable: the narrow may no
-        // longer hold, so subsequent reads in the same scope must
-        // observe the declared type. Saves higher up the stack for
-        // *other* symbols are preserved; only `target`'s saves are
-        // collapsed — release_narrowing_scope's mark/depth book-
-        // keeping copes with a sparser saves list.
-        cancel_narrowing_for(target: Semantic.Symbols.Variable) is
-            if !target? then
-                return;
-            fi
-
-            let declared = get_declared_type_of(target);
-
-            // Walk top-down: removing index-i shifts later indices,
-            // and we want to keep the marks list stable. Decrement
-            // each mark by the number of saves removed below it.
-            let i = _narrowing_saves.count - 1;
-
-            while i >= 0 do
-                let save = _narrowing_saves[i];
-
-                if save.symbol == target then
-                    _narrowing_saves.remove_at(i);
-
-                    let m = 0;
-                    while m < _narrowing_marks.count do
-                        if _narrowing_marks[m] > i then
-                            _narrowing_marks[m] = _narrowing_marks[m] - 1;
-                        fi
-                        m = m + 1;
-                    od
-                fi
-
-                i = i - 1;
-            od
-
-            if declared? then
-                target.set_type(declared);
-            fi
-        si
-
         apply(root: Trees.Node) is
             assert _keep_depth == 0;
             assert _stub_depth == 0;
@@ -376,16 +210,16 @@ namespace Syntax.Process is
             // so a leaked narrowing doesn't poison subsequent runs of
             // the same compiler instance — restores symbol types as
             // it goes, not just clears the stacks.
-            unwind_all_narrowings();
+            _narrowing.unwind_all();
 
             root.walk(self);
 
             assert _keep_depth == 0;
             assert _stub_depth == 0;
-            assert _narrowing_saves.count == 0
-                else "narrowing saves stack leaked: {_narrowing_saves.count} unreleased";
-            assert _narrowing_marks.count == 0
-                else "narrowing marks stack leaked: {_narrowing_marks.count} unreleased";
+            assert _narrowing.saves_count == 0
+                else "narrowing saves stack leaked: {_narrowing.saves_count} unreleased";
+            assert _narrowing.marks_count == 0
+                else "narrowing marks stack leaked: {_narrowing.marks_count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
@@ -772,7 +606,7 @@ namespace Syntax.Process is
             let target_variable = try_get_narrowing_target(left.expression);
             let lhs_type =
                 if target_variable? then
-                    get_declared_type_of(target_variable)
+                    _narrowing.declared_type_of(target_variable)
                 else
                     left.expression.value.type
                 fi;
@@ -789,7 +623,7 @@ namespace Syntax.Process is
             // reads in the same scope should observe the declared
             // type. Saves for *other* symbols stay in place.
             if target_variable? then
-                cancel_narrowing_for(target_variable);
+                _narrowing.cancel_for(target_variable);
             fi
         si
         
@@ -1017,7 +851,7 @@ namespace Syntax.Process is
 
                     type =
                         if target_variable? then
-                            get_declared_type_of(target_variable)
+                            _narrowing.declared_type_of(target_variable)
                         else
                             simple.expression.value.type
                         fi;
@@ -1278,11 +1112,11 @@ namespace Syntax.Process is
             // condition so any predicates the cond observes push
             // saves into this branch's frame; the matching release
             // in visit() pops them once the body has been walked.
-            mark_narrowing_scope();
+            _narrowing.mark_scope();
         si
 
         visit(`if: Trees.Statements.IF_BRANCH) is
-            release_narrowing_scope();
+            _narrowing.release_scope();
 
             if
                 `if? /\
@@ -2073,7 +1907,7 @@ namespace Syntax.Process is
                     `isa.right.value
                 );
 
-            try_push_narrowing(
+            _narrowing.try_push(
                 try_get_narrowing_target(`isa.right),
                 isa_type
             );
@@ -2611,12 +2445,12 @@ namespace Syntax.Process is
             // smart-merge LUB machinery deferred to v2.
             if unary.operation? /\ unary.operation.name =~ "!" then
                 if unary.right? then
-                    mark_narrowing_scope();
+                    _narrowing.mark_scope();
 
                     try
                         unary.right.walk(self);
                     finally
-                        release_narrowing_scope();
+                        _narrowing.release_scope();
                     yrt
                 fi
 
@@ -2682,22 +2516,22 @@ namespace Syntax.Process is
             // and generic-args axes.
             if binary.operation? /\ binary.operation.name =~ "\\/" then
                 if binary.left? then
-                    mark_narrowing_scope();
+                    _narrowing.mark_scope();
 
                     try
                         binary.left.walk(self);
                     finally
-                        release_narrowing_scope();
+                        _narrowing.release_scope();
                     yrt
                 fi
 
                 if binary.right? then
-                    mark_narrowing_scope();
+                    _narrowing.mark_scope();
 
                     try
                         binary.right.walk(self);
                     finally
-                        release_narrowing_scope();
+                        _narrowing.release_scope();
                     yrt
                 fi
 
@@ -3091,7 +2925,7 @@ namespace Syntax.Process is
                 member.value = value;
 
                 if !need_store /\ is_variant_accessor_name(member.identifier.name) then
-                    try_push_narrowing(
+                    _narrowing.try_push(
                         try_get_narrowing_target(member.left),
                         try_get_variant_type_for_is_accessor(named_type, member.identifier.name)
                     );
