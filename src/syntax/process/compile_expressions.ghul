@@ -43,6 +43,13 @@ namespace Syntax.Process is
         // iterations (constraint accumulation needs that stability).
         _type_arg_placeholder_origins: Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]];
 
+        // Type-narrowing stack — owns scope marks and per-symbol
+        // saves. Visit hooks (IF_BRANCH for marking, BINARY/UNARY
+        // for `\/`/`!` cancellation, ISA/MEMBER for predicate
+        // pushes, SIMPLE_LEFT_EXPRESSION for assignment cancel)
+        // delegate here. See `narrowing.ghul` for the mechanism.
+        _narrowing: NARROWING;
+
         current_statement_list: Trees.Statements.LIST;
 
         init(
@@ -75,6 +82,101 @@ namespace Syntax.Process is
             _value_boxer = value_boxer;
 
             _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
+
+            _narrowing = NARROWING();
+        si
+
+        // True if `name` looks like a synthesized variant accessor
+        // (`is_<lowercased_variant_name>`) — i.e. starts with `is_`
+        // and has at least one suffix character.
+        is_variant_accessor_name(name: string) -> bool =>
+            name? /\ name.length > 3 /\ name.starts_with("is_");
+
+        // If `expr` is an unqualified identifier resolving (in the
+        // current scope) to a Variable, return that Variable; null
+        // otherwise. Caller-bounded to predicates whose narrowing
+        // target must be a simple-identifier — qualified or
+        // member-access targets are v1-deferred.
+        try_get_narrowing_target(expr: Trees.Expressions.Expression) -> Semantic.Symbols.Variable is
+            if !expr? \/ !isa Trees.Expressions.IDENTIFIER(expr) then
+                return null;
+            fi
+
+            let identifier_expr = cast Trees.Expressions.IDENTIFIER(expr);
+
+            if !identifier_expr.identifier? \/ identifier_expr.identifier.is_qualified then
+                return null;
+            fi
+
+            let symbol = find(identifier_expr.identifier);
+
+            if !symbol? \/ !isa Semantic.Symbols.Variable(symbol) then
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Variable(symbol);
+        si
+
+        // Drill `type` to the underlying Classy (peeling Symbols.GENERIC
+        // wrapping for specialized generics). Null if `type` isn't a
+        // NAMED of a Classy.
+        get_classy_for_narrowing(type: Type) -> Semantic.Symbols.Classy is
+            if !type? \/ !isa Semantic.Types.NAMED(type) then
+                return null;
+            fi
+
+            let symbol = (cast Semantic.Types.NAMED(type)).symbol;
+
+            if isa Semantic.Symbols.GENERIC(symbol) then
+                symbol = (cast Semantic.Symbols.GENERIC(symbol)).symbol;
+            fi
+
+            if !isa Semantic.Symbols.Classy(symbol) then
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Classy(symbol);
+        si
+
+        // For an `is_<variant>` access on a value of union type,
+        // return the variant type with the same generic args as the
+        // receiver. Null if the receiver isn't a union, or no variant
+        // matches the suffix.
+        try_get_variant_type_for_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> Type is
+            if !is_variant_accessor_name(member_name) then
+                return null;
+            fi
+
+            let classy = get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return null;
+            fi
+
+            let suffix = member_name.substring(3);
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    if isa Semantic.Types.GENERIC(receiver_type) then
+                        let generic_receiver = cast Semantic.Types.GENERIC(receiver_type);
+
+                        return Semantic.Types.GENERIC(
+                            variant.location,
+                            variant,
+                            generic_receiver.arguments
+                        );
+                    else
+                        return Semantic.Types.NAMED(variant);
+                    fi
+                fi
+            od
+
+            return null;
         si
 
         apply(root: Trees.Node) is
@@ -99,10 +201,25 @@ namespace Syntax.Process is
             // the start of apply is safe.
             _type_arg_placeholder_origins.clear();
 
+            // Narrowing stack must be empty at apply() boundaries —
+            // every push has to be balanced by a release before its
+            // owning AST exits. A leak here means a `pre`/`visit` pair
+            // got out of step (likely an early return / exception that
+            // skipped a release) and would surface as confusing
+            // type-mismatch errors on later walks. Unwind defensively
+            // so a leaked narrowing doesn't poison subsequent runs of
+            // the same compiler instance — restores symbol types as
+            // it goes, not just clears the stacks.
+            _narrowing.unwind_all();
+
             root.walk(self);
 
             assert _keep_depth == 0;
             assert _stub_depth == 0;
+            assert _narrowing.saves_count == 0
+                else "narrowing saves stack leaked: {_narrowing.saves_count} unreleased";
+            assert _narrowing.marks_count == 0
+                else "narrowing marks stack leaked: {_narrowing.marks_count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
@@ -481,12 +598,33 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if !left.expression.value.type.is_assignable_from(left.value.type) then
-                _logger.error(left.assign_location, "{left.value.type} is not assignable to {left.expression.value.type}");
+            // Bypass narrowing for assignability — the LHS value's
+            // type may be a narrowed view, but assignment must
+            // typecheck against the variable's declared type, or
+            // `if isa T(x) then x = wider_value` (idiomatic across
+            // the codebase) would fail at the narrow.
+            let target_variable = try_get_narrowing_target(left.expression);
+            let lhs_type =
+                if target_variable? then
+                    _narrowing.declared_type_of(target_variable)
+                else
+                    left.expression.value.type
+                fi;
+
+            if !lhs_type.is_assignable_from(left.value.type) then
+                _logger.error(left.assign_location, "{left.value.type} is not assignable to {lhs_type}");
                 return;
             fi
 
             left.value = left.expression.value;
+
+            // Reassignment cancels narrowing for the target — the
+            // new value may not satisfy the narrow, so subsequent
+            // reads in the same scope should observe the declared
+            // type. Saves for *other* symbols stay in place.
+            if target_variable? then
+                _narrowing.cancel_for(target_variable);
+            fi
         si
         
         get_conventionally_named_destructure_member_types(type: Type) -> Collections.List[Type] is
@@ -709,7 +847,14 @@ namespace Syntax.Process is
                 simple.expression.walk(self);
 
                 if simple.expression.value? /\ simple.expression.value.type? /\ !simple.expression.value.type.is_error then
-                    type = simple.expression.value.type;
+                    let target_variable = try_get_narrowing_target(simple.expression);
+
+                    type =
+                        if target_variable? then
+                            _narrowing.declared_type_of(target_variable)
+                        else
+                            simple.expression.value.type
+                        fi;
                 fi
 
                 _logger.roll_back();
@@ -960,7 +1105,19 @@ namespace Syntax.Process is
             super.visit(`do);
         si
 
+        pre(`if: Trees.Statements.IF_BRANCH) -> bool is
+            super.pre(`if);
+
+            // Mark the narrowing scope before walking the
+            // condition so any predicates the cond observes push
+            // saves into this branch's frame; the matching release
+            // in visit() pops them once the body has been walked.
+            _narrowing.mark_scope();
+        si
+
         visit(`if: Trees.Statements.IF_BRANCH) is
+            _narrowing.release_scope();
+
             if
                 `if? /\
                 `if.condition? /\
@@ -1746,9 +1903,14 @@ namespace Syntax.Process is
             `isa.value =
                 ISA(
                     bool_type,
-                    isa_type,                     
+                    isa_type,
                     `isa.right.value
                 );
+
+            _narrowing.try_push(
+                try_get_narrowing_target(`isa.right),
+                isa_type
+            );
         si
 
         visit(`typeof: Trees.Expressions.TYPEOF) is
@@ -2276,6 +2438,28 @@ namespace Syntax.Process is
             return (cast Value(Load.SYMBOL(null, function_group)), cast Value(NEW(type, function, arguments)));
         si
 
+        pre(unary: Trees.Expressions.UNARY) -> bool is
+            // `!` cancels narrowings observed in its operand —
+            // a v1 conservative choice, since the negation form
+            // (e.g. `!x.is_some` ⇒ `x` is `NONE`) would need the
+            // smart-merge LUB machinery deferred to v2.
+            if unary.operation? /\ unary.operation.name =~ "!" then
+                if unary.right? then
+                    _narrowing.mark_scope();
+
+                    try
+                        unary.right.walk(self);
+                    finally
+                        _narrowing.release_scope();
+                    yrt
+                fi
+
+                return true;
+            fi
+
+            return false;
+        si
+
         visit(unary: Trees.Expressions.UNARY) is
             unary.value = null;
 
@@ -2323,12 +2507,46 @@ namespace Syntax.Process is
             fi
         si        
 
+        pre(binary: Trees.Expressions.BINARY) -> bool is
+            // `\/` (OR) — cancel each side's narrowings during
+            // walk so the right operand evaluates as if the left
+            // was false, and so neither side leaks predicates into
+            // the surrounding (post-OR) context. v2 will replace
+            // this with a smart-merge along the variant-identity
+            // and generic-args axes.
+            if binary.operation? /\ binary.operation.name =~ "\\/" then
+                if binary.left? then
+                    _narrowing.mark_scope();
+
+                    try
+                        binary.left.walk(self);
+                    finally
+                        _narrowing.release_scope();
+                    yrt
+                fi
+
+                if binary.right? then
+                    _narrowing.mark_scope();
+
+                    try
+                        binary.right.walk(self);
+                    finally
+                        _narrowing.release_scope();
+                    yrt
+                fi
+
+                return true;
+            fi
+
+            return false;
+        si
+
         visit(binary: Trees.Expressions.BINARY) is
             try
                 _visit(binary);
             catch ex: Exception
                 _logger.exception(binary.location, ex, "exception compiling binary operator (called from {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")})");
-            yrt            
+            yrt
         si
 
         _visit(binary: Trees.Expressions.BINARY) is
@@ -2705,6 +2923,13 @@ namespace Syntax.Process is
                 fi
 
                 member.value = value;
+
+                if !need_store /\ is_variant_accessor_name(member.identifier.name) then
+                    _narrowing.try_push(
+                        try_get_narrowing_target(member.left),
+                        try_get_variant_type_for_is_accessor(named_type, member.identifier.name)
+                    );
+                fi
             fi
         si
 
