@@ -15,6 +15,19 @@ namespace Syntax.Process is
 
     use Syntax.Trees.Definitions.PRAGMA;
 
+    // One save record per `push_narrowing` call. The symbol's
+    // declared type is saved here so the matching
+    // `release_narrowing_scope` can restore it.
+    class NARROWING_SAVE is
+        symbol: Semantic.Symbols.Variable public;
+        saved_type: Type public;
+
+        init(symbol: Semantic.Symbols.Variable, saved_type: Type) is
+            self.symbol = symbol;
+            self.saved_type = saved_type;
+        si
+    si
+
     class COMPILE_EXPRESSIONS: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -42,6 +55,15 @@ namespace Syntax.Process is
         // is the body retry loop's lifecycle, so origins persist across
         // iterations (constraint accumulation needs that stability).
         _type_arg_placeholder_origins: Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]];
+
+        // Type narrowing — `(symbol, saved_type)` saves pushed at the
+        // point a narrowing predicate is observed during AST walk. The
+        // owning AST (IF_BRANCH body, CASE arm, WHILE body, etc.)
+        // marks the stack on entry and releases (pops + restores) on
+        // exit. Top-of-stack wins for symbol type lookups, so chained
+        // narrowings and reassignments compose naturally.
+        _narrowing_saves: Collections.LIST[NARROWING_SAVE];
+        _narrowing_marks: Collections.LIST[int];
 
         current_statement_list: Trees.Statements.LIST;
 
@@ -75,6 +97,62 @@ namespace Syntax.Process is
             _value_boxer = value_boxer;
 
             _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
+
+            _narrowing_saves = Collections.LIST[NARROWING_SAVE]();
+            _narrowing_marks = Collections.LIST[int]();
+        si
+
+        // Mark the current narrowing stack depth — paired with
+        // `release_narrowing_scope` on the same owning AST.
+        mark_narrowing_scope() is
+            _narrowing_marks.add(_narrowing_saves.count);
+        si
+
+        // Pop the most recent mark, restoring every save pushed since.
+        // Restoration walks the stack top-down so reassignments
+        // (which push a new save over an existing one) unwind to the
+        // declared type, not an intermediate narrowed type.
+        release_narrowing_scope() is
+            assert _narrowing_marks.count > 0 else "release_narrowing_scope without matching mark";
+
+            let mark = _narrowing_marks[_narrowing_marks.count - 1];
+            _narrowing_marks.remove_at(_narrowing_marks.count - 1);
+
+            while _narrowing_saves.count > mark do
+                let last = _narrowing_saves.count - 1;
+                let save = _narrowing_saves[last];
+
+                save.symbol.set_type(save.saved_type);
+                _narrowing_saves.remove_at(last);
+            od
+        si
+
+        // Push a single narrowing — saves the symbol's current type,
+        // then mutates `symbol.type` to the narrowed type. The save
+        // is popped (and the original type restored) by the next
+        // matching `release_narrowing_scope`.
+        push_narrowing(symbol: Semantic.Symbols.Variable, narrowed_type: Type) is
+            _narrowing_saves.add(NARROWING_SAVE(symbol, symbol.type));
+            symbol.set_type(narrowed_type);
+        si
+
+        // Defensive recovery — restore every outstanding save and
+        // empty both stacks. Called at apply() boundaries so a
+        // leaked narrowing from a previous walk (e.g. one that
+        // exception'd through a missing release) doesn't poison the
+        // next compile. Walk top-down so the most recent save (which
+        // may itself overwrite an earlier save's symbol) restores to
+        // the value beneath it correctly.
+        unwind_all_narrowings() is
+            while _narrowing_saves.count > 0 do
+                let last = _narrowing_saves.count - 1;
+                let save = _narrowing_saves[last];
+
+                save.symbol.set_type(save.saved_type);
+                _narrowing_saves.remove_at(last);
+            od
+
+            _narrowing_marks.clear();
         si
 
         apply(root: Trees.Node) is
@@ -99,10 +177,25 @@ namespace Syntax.Process is
             // the start of apply is safe.
             _type_arg_placeholder_origins.clear();
 
+            // Narrowing stack must be empty at apply() boundaries —
+            // every push has to be balanced by a release before its
+            // owning AST exits. A leak here means a `pre`/`visit` pair
+            // got out of step (likely an early return / exception that
+            // skipped a release) and would surface as confusing
+            // type-mismatch errors on later walks. Unwind defensively
+            // so a leaked narrowing doesn't poison subsequent runs of
+            // the same compiler instance — restores symbol types as
+            // it goes, not just clears the stacks.
+            unwind_all_narrowings();
+
             root.walk(self);
 
             assert _keep_depth == 0;
             assert _stub_depth == 0;
+            assert _narrowing_saves.count == 0
+                else "narrowing saves stack leaked: {_narrowing_saves.count} unreleased";
+            assert _narrowing_marks.count == 0
+                else "narrowing marks stack leaked: {_narrowing_marks.count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
