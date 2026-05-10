@@ -1,0 +1,191 @@
+namespace Syntax.Process is
+    use Semantic.Types.Type;
+
+    // One save record per `NARROWING.push` call. Captures the
+    // symbol's type before narrowing so the matching scope
+    // release can restore it.
+    class NARROWING_SAVE is
+        symbol: Semantic.Symbols.Variable public;
+        saved_type: Type public;
+
+        init(symbol: Semantic.Symbols.Variable, saved_type: Type) is
+            self.symbol = symbol;
+            self.saved_type = saved_type;
+        si
+    si
+
+    // Type-narrowing stack: a list of save records and a parallel
+    // list of marks. An owning AST (IF_BRANCH body, BINARY's `\/`
+    // operands, UNARY's `!` operand) calls `mark_scope` on entry
+    // and `release_scope` on exit — release pops every save above
+    // the most recent mark, restoring the affected symbols' types
+    // top-down so reassignments unwind through any narrowed
+    // shadows correctly.
+    //
+    // Predicates (HAS_VALUE, ISA, MEMBER for `is_xxx`) call
+    // `try_push` at observation. AND chains compose because each
+    // leaf push lands on the same scope; OR/NOT shape what
+    // survives by bracketing each operand walk in its own scope.
+    //
+    // Direct symbol-type mutation is the lookup mechanism — the
+    // narrowed type is what the variable's `Variable.type` reads
+    // until release. `Load.SYMBOL` snapshots that type at
+    // construction so reads compiled inside a narrowing scope
+    // carry through to IL gen unchanged after release.
+    class NARROWING is
+        _saves: Collections.LIST[NARROWING_SAVE];
+        _marks: Collections.LIST[int];
+
+        has_open_scope: bool => _marks.count > 0;
+        is_empty: bool => _saves.count == 0 /\ _marks.count == 0;
+        saves_count: int => _saves.count;
+        marks_count: int => _marks.count;
+
+        init() is
+            _saves = Collections.LIST[NARROWING_SAVE]();
+            _marks = Collections.LIST[int]();
+        si
+
+        // Mark the current stack depth — paired with `release_scope`
+        // on the same owning AST.
+        mark_scope() is
+            _marks.add(_saves.count);
+        si
+
+        // Pop the most recent mark, restoring every save pushed since.
+        // Walks top-down so reassignments (which push fresh saves
+        // over an existing one) unwind to the declared type, not
+        // an intermediate narrowed type.
+        release_scope() is
+            assert _marks.count > 0 else "NARROWING.release_scope without matching mark";
+
+            let mark = _marks[_marks.count - 1];
+            _marks.remove_at(_marks.count - 1);
+
+            while _saves.count > mark do
+                let last = _saves.count - 1;
+                let save = _saves[last];
+
+                save.symbol.set_type(save.saved_type);
+                _saves.remove_at(last);
+            od
+        si
+
+        // Push a fresh save and mutate the target's type. The save
+        // is popped — and the original type restored — by the next
+        // `release_scope` whose mark sits below this push.
+        push(target: Semantic.Symbols.Variable, narrowed_type: Type) is
+            _saves.add(NARROWING_SAVE(target, target.type));
+            target.set_type(narrowed_type);
+        si
+
+        // Push only when `narrowed_type` is strictly assignable-
+        // narrower than the target's current type, and an enclosing
+        // narrowing scope is open. The scope gate prevents leaks
+        // past the visitor's apply()-level invariant — predicates
+        // observed outside any owning AST have no body that would
+        // consume the narrow.
+        try_push(target: Semantic.Symbols.Variable, narrowed_type: Type) is
+            if _marks.count == 0 then
+                return;
+            fi
+
+            if !target? \/ !narrowed_type? \/ !target.type? then
+                return;
+            fi
+
+            if narrowed_type.is_error \/ narrowed_type.is_inferred then
+                return;
+            fi
+
+            if target.type =~ narrowed_type then
+                return;
+            fi
+
+            if !target.type.is_assignable_from(narrowed_type) then
+                return;
+            fi
+
+            push(target, narrowed_type);
+        si
+
+        // Defensive recovery — restore every outstanding save and
+        // empty both stacks. Walks top-down so the most recent save
+        // (which may itself overwrite an earlier save's symbol)
+        // restores to the value beneath it correctly. Called at
+        // visitor apply() boundaries so a leak from a previous walk
+        // doesn't poison the next compile.
+        unwind_all() is
+            while _saves.count > 0 do
+                let last = _saves.count - 1;
+                let save = _saves[last];
+
+                save.symbol.set_type(save.saved_type);
+                _saves.remove_at(last);
+            od
+
+            _marks.clear();
+        si
+
+        // Bottommost save for `target` carries the type before any
+        // narrowing pushed for that variable — i.e. its declared
+        // type at the point narrowing first kicked in. Falls back
+        // to `target.type` when no save exists. Used to bypass
+        // narrowing for assignment LHS checks: a user reassignment
+        // inside a narrowing branch must typecheck against the
+        // variable's declared type, not the narrowed view, or
+        // `if isa T(x) then x = wider_value` (idiomatic across the
+        // codebase) would fail.
+        declared_type_of(target: Semantic.Symbols.Variable) -> Type is
+            if !target? then
+                return null;
+            fi
+
+            for save in _saves do
+                if save.symbol == target then
+                    return save.saved_type;
+                fi
+            od
+
+            return target.type;
+        si
+
+        // Drop every save covering `target` and restore its type to
+        // the declared type. Called after a successful reassignment
+        // to a narrowed variable: the narrow may no longer hold, so
+        // subsequent reads in the same scope must observe the
+        // declared type. Saves for *other* symbols stay in place;
+        // mark depths shift down to match the sparser saves list.
+        cancel_for(target: Semantic.Symbols.Variable) is
+            if !target? then
+                return;
+            fi
+
+            let declared = declared_type_of(target);
+
+            let i = _saves.count - 1;
+
+            while i >= 0 do
+                let save = _saves[i];
+
+                if save.symbol == target then
+                    _saves.remove_at(i);
+
+                    let m = 0;
+                    while m < _marks.count do
+                        if _marks[m] > i then
+                            _marks[m] = _marks[m] - 1;
+                        fi
+                        m = m + 1;
+                    od
+                fi
+
+                i = i - 1;
+            od
+
+            if declared? then
+                target.set_type(declared);
+            fi
+        si
+    si
+si
