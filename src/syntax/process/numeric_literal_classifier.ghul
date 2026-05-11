@@ -1,0 +1,236 @@
+namespace Syntax.Process is
+    use Logging;
+    use Source.LOCATION;
+
+    use Semantic.Lookups.InnateSymbolLookup;
+    use Semantic.Types.Type;
+
+    use IR.Values;
+
+    // Classify a parsed integer literal: pick the target type from
+    // any trailing type-suffix (`b`/`s`/`i`/`l`/`w`/`c`, optionally
+    // prefixed by `u` for unsigned or `s` for sign-without-width),
+    // strip the suffix from the value string, and range-check the
+    // result against the chosen type. The lexer accepts arbitrarily
+    // long digit strings and any suffix combination; this is where
+    // suffix → type and value → fits-in-type get decided.
+    //
+    // Bounds errors and "character literals cannot be unsigned"
+    // structural errors are logged via the constructor-supplied
+    // logger. Callers receive a non-null `Literal.NUMBER` on success
+    // and null on either kind of failure.
+    //
+    // The `fits` / `parse_hex` / `max_unsigned_for` helpers are
+    // exposed for unit testing in isolation from the suffix path.
+    class NUMERIC_LITERAL_CLASSIFIER is
+        _logger: Logger;
+        _innate_symbol_lookup: InnateSymbolLookup;
+
+        init(logger: Logger, innate_symbol_lookup: InnateSymbolLookup) is
+            super.init();
+
+            _logger = logger;
+            _innate_symbol_lookup = innate_symbol_lookup;
+        si
+
+        classify_integer(location: LOCATION, value_string: string) -> Literal.NUMBER is
+            let type: Type;
+            let suffix = "i4";
+            let conv: string;
+            let working = value_string;
+
+            let last_char = working.get_chars(working.length - 1);
+
+            if "bBcCsSiIlLwWuU".contains(last_char) then
+                let is_unsigned = false;
+                let cutoff = working.length;
+
+                if last_char == 'u' \/ last_char == 'U' then
+                    is_unsigned = true;
+                    cutoff = cutoff - 1;
+                elif working.length > 2 then
+                    let sign_char = working.get_chars(working.length - 2);
+
+                    if sign_char == 'u' \/ sign_char == 'U' then
+                        is_unsigned = true;
+                        cutoff = cutoff - 1;
+                    elif sign_char == 's' \/ sign_char == 'S' then
+                        cutoff = cutoff - 1;
+                    fi
+                fi
+
+                case last_char
+                when 'b', 'B':
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_ubyte_type();
+                    else
+                        type = _innate_symbol_lookup.get_byte_type();
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                when 'c', 'C':
+                    if is_unsigned then
+                        _logger.error(location, "numeric character literal cannot be unsigned");
+                    else
+                        type = _innate_symbol_lookup.get_char_type();
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                when 's', 'S':
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_ushort_type();
+                    else
+                        type = _innate_symbol_lookup.get_short_type();
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                when 'i', 'I':
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_uint_type();
+                    else
+                        type = _innate_symbol_lookup.get_int_type();
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                when 'l', 'L':
+                    suffix = "i8";
+
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_ulong_type();
+                    else
+                        type = _innate_symbol_lookup.get_long_type();
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                when 'w', 'W':
+                    suffix = "i8";
+
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_uword_type();
+                        conv = "conv.u";
+                    else
+                        type = _innate_symbol_lookup.get_word_type();
+                        conv = "conv.i";
+                    fi
+
+                    cutoff = cutoff - 1;
+
+                default
+                    if is_unsigned then
+                        type = _innate_symbol_lookup.get_uint_type();
+                    else
+                        type = _innate_symbol_lookup.get_int_type();
+                    fi
+                esac
+
+                working = working.substring(0, cutoff);
+            else
+                type = _innate_symbol_lookup.get_int_type();
+            fi
+
+            if !type? then
+                return null;
+            fi
+
+            if !fits(location, working, type) then
+                return null;
+            fi
+
+            return Literal.NUMBER(working, type, suffix, conv);
+        si
+
+        // Range-check a parsed integer literal against its target
+        // type. Comparing as a ulong using each type's unsigned max
+        // preserves the standard "literal fits in N unsigned bits,
+        // unary minus negates separately" convention. Without this,
+        // oversize literals reach IL emission and ilasm rejects the
+        // `ldc.i4 <bignum>` with an opaque syntax error (issue #580).
+        fits(location: LOCATION, value_string: string, type: Type) -> bool is
+            let (ok, parsed) =
+                if value_string.starts_with("0x") \/ value_string.starts_with("0X") then
+                    parse_hex(value_string.substring(2, value_string.length - 2));
+                else
+                    let v: ulong;
+                    let parsed_ok = ulong.try_parse(value_string, v ref);
+                    (parsed_ok, v);
+                fi;
+
+            if !ok then
+                _logger.error(location, "numeric literal {value_string} does not fit in {type}");
+                return false;
+            fi
+
+            let max_value = max_unsigned_for(type);
+
+            if max_value > 0UL /\ parsed > max_value then
+                _logger.error(location, "numeric literal {value_string} does not fit in {type}");
+                return false;
+            fi
+
+            return true;
+        si
+
+        // Parse a hex digit string (no `0x` prefix) into a ulong.
+        // Returns (false, 0) for empty, > 16 digits, or any non-hex
+        // character.
+        parse_hex(s: string) -> (ok: bool, value: ulong) is
+            if s.length == 0 \/ s.length > 16 then
+                return (false, 0UL);
+            fi
+
+            let value: ulong = 0UL;
+
+            for c in s do
+                let digit: int;
+
+                if c >= '0' /\ c <= '9' then
+                    digit = cast int(c) - cast int('0');
+                elif c >= 'a' /\ c <= 'f' then
+                    digit = cast int(c) - cast int('a') + 10;
+                elif c >= 'A' /\ c <= 'F' then
+                    digit = cast int(c) - cast int('A') + 10;
+                else
+                    return (false, 0UL);
+                fi
+
+                value = (value << 4UL) + cast ulong(digit);
+            od
+
+            return (true, value);
+        si
+
+        // Largest non-negative literal value the type accepts, or 0
+        // to signal "no narrower bound than the ulong-parse range"
+        // (used for ulong / uword: ulong.try_parse already enforces
+        // the 64-bit ceiling). 0 makes `fits` skip the narrower-
+        // bound check.
+        max_unsigned_for(type: Type) -> ulong is
+            if type =~ _innate_symbol_lookup.get_byte_type() then
+                return 127UL;
+            elif type =~ _innate_symbol_lookup.get_ubyte_type() then
+                return 255UL;
+            elif type =~ _innate_symbol_lookup.get_short_type() then
+                return 32767UL;
+            elif type =~ _innate_symbol_lookup.get_ushort_type() then
+                return 65535UL;
+            elif type =~ _innate_symbol_lookup.get_char_type() then
+                return 65535UL;
+            elif type =~ _innate_symbol_lookup.get_int_type() then
+                return 2147483647UL;
+            elif type =~ _innate_symbol_lookup.get_uint_type() then
+                return 4294967295UL;
+            elif type =~ _innate_symbol_lookup.get_long_type() then
+                return 9223372036854775807UL;
+            elif type =~ _innate_symbol_lookup.get_word_type() then
+                return 9223372036854775807UL;
+            fi
+
+            return 0UL;
+        si
+    si
+si

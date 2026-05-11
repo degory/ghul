@@ -1,0 +1,241 @@
+namespace Semantic is
+    use System.Text.StringBuilder;
+
+    use Semantic.Types.Type;
+
+    // A "demand" recorded against an INFERRED_VARIABLE_TYPE
+    // placeholder's origin during the body-retry walk. Each demand
+    // captures one operation site that consumed a placeholder-typed
+    // value and that needs to be satisfied by the eventual resolved
+    // type. The constraint-aware LUB uses demands to filter
+    // candidate types: a type is only a valid resolution for the
+    // placeholder if every accumulated demand discharges against it.
+    //
+    // This sits alongside `Symbols.Variable._lub_map` (which holds
+    // type-bound constraints). The two together — types we know the
+    // placeholder must be *compatible with*, and operations the
+    // resolved type must *support* — give the solver the full
+    // picture of how the placeholder is used across the function
+    // body without needing a separate dataflow pass.
+    //
+    // Subclasses MUST override `equals` and `get_hash_code` so that
+    // two demands emitted from semantically equivalent operation
+    // sites collapse into a single set entry. The Variable-side
+    // accumulator stores demands in a `Collections.SET` which uses
+    // .NET's `Object.Equals` / `Object.GetHashCode` contract; ghūl
+    // exposes these as `equals(other: object) -> bool` and
+    // `get_hash_code() -> int`.
+    class Demand is
+        init() is
+            super.init();
+        si
+
+        // Returns true iff `candidate` carries the operation this
+        // demand requires. Conservative by contract: subclasses
+        // MUST return false rather than risk a false positive,
+        // because a false positive lets the LUB pick a candidate
+        // that subsequently emits broken IL or fails member lookup
+        // in generated code.
+        try_discharge(candidate: Type) -> bool is
+            return false;
+        si
+
+        // Base class disagrees with everything. Subclasses override
+        // and return true only for same-subclass + same-field
+        // matches. `equals` on Demand is the operator the SET
+        // accumulator uses for dedup; `get_hash_code` must agree.
+        equals(other: object) -> bool is
+            return false;
+        si
+
+        get_hash_code() -> int => 0;
+
+        to_string() -> string => "<demand>";
+    si
+
+    // Demand: the placeholder must resolve to a type that has a
+    // member named `member_name`. Emitted at MEMBER-expression
+    // visit sites when the receiver is an INFERRED_VARIABLE_TYPE.
+    //
+    // Discharge is intentionally name-only — it doesn't (yet) check
+    // the member's signature against any expected call-shape. That
+    // refinement belongs to a later CALL_DEMAND that captures the
+    // argument types as well. Member-name presence is enough to
+    // distinguish (say) `Box[T]` from a bare `int` when the call
+    // site is `m.set(42)`.
+    class MEMBER_DEMAND: Demand is
+        member_name: string;
+
+        init(member_name: string) is
+            super.init();
+            self.member_name = member_name;
+        si
+
+        try_discharge(candidate: Type) -> bool is
+            if !candidate? \/ candidate.is_inferred \/ candidate.is_error then
+                return false;
+            fi
+
+            return candidate.find_member(member_name)?;
+        si
+
+        // Two member demands collide iff they share a member name.
+        // The discharge logic is name-only today, so this is the
+        // right granularity for set-based dedup.
+        equals(other: object) -> bool is
+            if !other? \/ !isa MEMBER_DEMAND(other) then
+                return false;
+            fi
+
+            let m = cast MEMBER_DEMAND(other);
+            return member_name == m.member_name;
+        si
+
+        get_hash_code() -> int => member_name.get_hash_code();
+
+        to_string() -> string => "member {member_name}";
+    si
+
+    // Demand: the placeholder must resolve to a type that is callable
+    // with the captured argument types. Emitted at `_visit(call)`
+    // when the receiver is itself an INFERRED_VARIABLE_TYPE — i.e.,
+    // a local lambda or local-bound function is invoked before its
+    // type is pinned, including self-applied shapes like
+    // `(f, x) => f(f(x))`.
+    //
+    // Discharge is "is this a Function/Action type whose argument
+    // count matches and whose arg-types accept the captured actuals".
+    // The shape-side check is strict (heads must be Function/Action)
+    // — we don't accept arbitrary types with an `invoke` member.
+    //
+    // The captured argument types may themselves contain placeholders
+    // (the inner `f(x)` above supplies `x`'s placeholder as its
+    // single arg). The discharge conservatively returns false when
+    // any captured arg contains an inferred placeholder — the LUB
+    // gets to filter against demands repeatedly as iteration
+    // progresses, so a discharge that says "not yet" on iteration N
+    // can flip to true on iteration N+1 once the arg placeholders
+    // resolve.
+    class CALL_DEMAND: Demand is
+        argument_types: Collections.List[Type] public;
+
+        init(argument_types: Collections.List[Type]) is
+            super.init();
+            self.argument_types = argument_types;
+        si
+
+        try_discharge(candidate: Type) -> bool is
+            if !candidate? \/ candidate.is_inferred \/ candidate.is_error then
+                return false;
+            fi
+
+            if !argument_types? then
+                return false;
+            fi
+
+            // Captured args containing placeholders — defer.
+            for a in argument_types do
+                if !a? \/ a.is_error \/ a.contains_inferred then
+                    return false;
+                fi
+            od
+
+            if !candidate.is_function /\ !candidate.is_action then
+                return false;
+            fi
+
+            // Function carries one extra slot for the return type;
+            // Action carries arg-slots only. Compare just the
+            // argument prefix.
+            let candidate_args =
+                if isa Types.NAMED(candidate) then
+                    (cast Types.NAMED(candidate)).arguments
+                else
+                    null
+                fi;
+
+            if !candidate_args? then
+                return false;
+            fi
+
+            let expected_arg_count =
+                if candidate.is_function then
+                    candidate_args.count - 1
+                else
+                    candidate_args.count
+                fi;
+
+            if expected_arg_count != argument_types.count then
+                return false;
+            fi
+
+            for i in 0..argument_types.count do
+                let formal = candidate_args[i];
+                let actual = argument_types[i];
+
+                if cast int(formal.compare(actual)) > cast int(Types.MATCH.CONVERTABLE) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        equals(other: object) -> bool is
+            if !other? \/ !isa CALL_DEMAND(other) then
+                return false;
+            fi
+
+            let c = cast CALL_DEMAND(other);
+
+            if !argument_types? /\ !c.argument_types? then return true; fi
+            if !argument_types? \/ !c.argument_types? then return false; fi
+            if argument_types.count != c.argument_types.count then return false; fi
+
+            for i in 0..argument_types.count do
+                let a = argument_types[i];
+                let b = c.argument_types[i];
+
+                if !a? /\ !b? then continue; fi
+                if !a? \/ !b? then return false; fi
+                if !(a =~ b) then return false; fi
+            od
+
+            return true;
+        si
+
+        // Hash on arity + each arg's hash. Arg `=~` returns true for
+        // INFERRED_VARIABLE_TYPE against anything, so two demands
+        // with placeholder args still collide structurally even
+        // when their placeholders differ — that matches the
+        // de-duplication policy for re-walks of the same call site.
+        get_hash_code() -> int is
+            let h = 17;
+
+            if argument_types? then
+                h = h * 31 + argument_types.count;
+
+                for a in argument_types do
+                    h = h * 31 + (if a? then a.get_hash_code() else 0 fi);
+                od
+            fi
+
+            return h;
+        si
+
+        to_string() -> string is
+            let buffer = StringBuilder();
+            buffer.append("call(");
+            if argument_types? then
+                let first = true;
+                for a in argument_types do
+                    if !first then buffer.append(", "); fi
+                    first = false;
+                    buffer.append(if a? then a.to_string() else "<null>" fi);
+                od
+            fi
+            buffer.append(")");
+            return buffer.to_string();
+        si
+    si
+si

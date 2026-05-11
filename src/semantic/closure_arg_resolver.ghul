@@ -1,0 +1,199 @@
+namespace Semantic is
+    use Logging;
+    use Types.Type;
+
+    // Resolve closure argument types from the lambda's AST argument
+    // expressions, mutating each argument symbol's `.type` and
+    // recording any captured type-variables on the closure. Picks
+    // among four resolution branches in priority order:
+    //
+    //   1. Symbol already carries a usable (non-inferred / non-
+    //      error) type — keep it. This is set by a previous walk
+    //      (overload resolution's second pass set the symbol's
+    //      type from the chosen formal, or a function-level retry
+    //      is re-walking the body).
+    //
+    //   2. Argument has a written type expression that isn't INFER
+    //      — use it directly.
+    //
+    //   3. An implied type from the enclosing context
+    //      (function.constraint.arguments) is available and
+    //      "usable" — install it on the symbol. "Usable" means the
+    //      type is concrete OR an in-scope type-variable. Foreign
+    //      type-variables (carried over from an overload-resolution
+    //      constraint where the candidate is a different generic
+    //      function) are rejected — see #1210 commentary. Any
+    //      in-scope type-variables embedded in the implied type are
+    //      recorded via `closure.add_type_argument_reference` so IL
+    //      emission generates a generic closure method with
+    //      matching `!!N` slots.
+    //
+    //   4. Fall back to the iterative-inference path: try the
+    //      argument variable's accumulated LUB. On success install
+    //      that as the resolved type. On failure (still inferred /
+    //      error) emit "cannot infer type here" and install a
+    //      fresh INFERRED_VARIABLE_TYPE placeholder, leaving the
+    //      outer body-retry loop to resolve from body operations.
+    //
+    // `resolve(...)` returns true when the loop completed and the
+    // closure's `arguments` / `argument_names` were populated.
+    // Returns false on an unexpected argument shape (anything other
+    // than a `Syntax.Trees.Expressions.VARIABLE` — destructuring isn't
+    // supported in lambda parameter lists yet) without writing
+    // anything back to the closure.
+    class CLOSURE_ARG_RESOLVER is
+        _logger: Logger;
+
+        init(logger: Logger) is
+            super.init();
+
+            _logger = logger;
+        si
+
+        resolve(
+            arguments: Collections.List[Syntax.Trees.Expressions.Expression],
+            closure: Symbols.Closure,
+            implied_argument_types: Collections.List[Type]
+        ) -> bool is
+            let argument_names = Collections.LIST[string]();
+            let argument_types = Collections.LIST[Type]();
+
+            for index in 0..arguments.count do
+                let a = arguments[index];
+
+                // TODO: destructure
+                if !isa Syntax.Trees.Expressions.VARIABLE(a) then
+                    _logger.error(a.location, "unexpected kind of argument ({a.get_type()})");
+                    return false;
+                fi
+
+                let argument = cast Syntax.Trees.Expressions.VARIABLE(a);
+
+                argument_names.add(argument.name.name);
+
+                let symbol = cast Symbols.Variable(closure.find_direct(argument.name.name));
+
+                argument_types.add(_resolve_one(a, argument, symbol, index, implied_argument_types, closure));
+            od
+
+            closure.arguments = Collections.LIST[Type](argument_types);
+            closure.argument_names = argument_names;
+
+            return true;
+        si
+
+        _resolve_one(
+            a: Syntax.Trees.Expressions.Expression,
+            argument: Syntax.Trees.Expressions.VARIABLE,
+            symbol: Symbols.Variable,
+            index: int,
+            implied_argument_types: Collections.List[Type],
+            closure: Symbols.Closure
+        ) -> Type is
+            if symbol.type? /\ !symbol.type.is_inferred /\ !symbol.type.is_error then
+                return symbol.type;
+            fi
+
+            if !isa Syntax.Trees.TypeExpressions.INFER(argument.type_expression) then
+                return argument.type_expression.type;
+            fi
+
+            if implied_argument_types? then
+                let implied_argument_type = implied_argument_types[index];
+
+                if implied_argument_type? /\ _is_implied_type_usable(implied_argument_type, closure) then
+                    symbol.set_type(implied_argument_type);
+
+                    // Record function-generic type variables embedded
+                    // in the implied arg type as captures of this
+                    // closure, so IL emission generates a generic
+                    // closure method with matching `!!N` slots. The
+                    // `RECORD_TYPE_ARGUMENT_USES` pass picks up
+                    // type-vars in WRITTEN type expressions, but a
+                    // type set here via implied_argument_type has no
+                    // AST node — record explicitly.
+                    //
+                    // Class-level type variables (the T in `Box[T]`'s
+                    // members) are reachable via `self` and must NOT
+                    // be recorded as captured type-args, because a
+                    // delegate-converted closure asserts no captured
+                    // type-args at IL emission (see Closure._load_
+                    // delegate). Class-level T flows in through the
+                    // closure's enclosing-class instance; method-
+                    // level T has to be captured explicitly.
+                    implied_argument_type.walk((t: Type) is
+                        if t.is_type_variable /\ !t.is_classy_generic_argument then
+                            closure.add_type_argument_reference(t.symbol);
+                        fi
+                    si);
+
+                    return implied_argument_type;
+                fi
+            fi
+
+            return _resolve_from_inference_or_placeholder(a, symbol);
+        si
+
+        _resolve_from_inference_or_placeholder(
+            a: Syntax.Trees.Expressions.Expression,
+            symbol: Symbols.Variable
+        ) -> Type is
+            let inferred = symbol.try_get_inferred_type();
+
+            if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
+                symbol.set_type(inferred);
+                return inferred;
+            fi
+
+            _logger.error(a.location, "cannot infer type here");
+
+            let placeholder = Types.INFERRED_VARIABLE_TYPE(symbol);
+            symbol.set_type(placeholder);
+            return placeholder;
+        si
+
+        // True when the implied type for a closure argument is safe
+        // to install as the symbol's type. Concrete types are always
+        // usable. Type-variable-containing types are usable only when
+        // every embedded type-variable is declared by a lexical
+        // ancestor of the closure — i.e. it's in scope. Foreign type
+        // variables (from overload-resolution constraints carrying
+        // the *candidate* function's type vars) are rejected so the
+        // iterative-inference fallback runs and resolves the arg
+        // from body operations.
+        _is_implied_type_usable(t: Type, closure: Symbols.Closure) -> bool is
+            // ghūl closures capture locals by value, so the inner
+            // lambda can't assign to a primitive local in this
+            // scope. BOX[bool] gives us a mutable holder the lambda
+            // can write to via property assignment.
+            let any_foreign = Ghul.BOX[bool](false);
+
+            t.walk((u: Type) is
+                if u.is_type_variable /\ !_is_type_variable_in_scope(u.symbol, closure) then
+                    any_foreign.value = true;
+                fi
+            si);
+
+            return !any_foreign.value;
+        si
+
+        // Look up the type variable's name from the closure's scope.
+        // If `find_enclosing(name)` resolves to the same symbol,
+        // the type variable is lexically in scope at the lambda.
+        // For foreign type variables (the candidate function's type
+        // vars in an overload-resolution constraint), the lookup
+        // either returns null or returns a DIFFERENT same-named
+        // symbol — either way, not-in-scope, so we return false and
+        // let the iterative-inference path resolve from body
+        // operations.
+        _is_type_variable_in_scope(type_variable: Symbols.Symbol, closure: Symbols.Closure) -> bool is
+            if !type_variable? \/ !type_variable.name? \/ !closure? then
+                return false;
+            fi
+
+            let found = closure.find_enclosing(type_variable.name);
+
+            return found? /\ found == type_variable;
+        si
+    si
+si
