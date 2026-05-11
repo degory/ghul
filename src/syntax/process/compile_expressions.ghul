@@ -45,6 +45,12 @@ namespace Syntax.Process is
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
         _function_caller: Semantic.FUNCTION_CALLER;
         _overload_resolver: Semantic.OVERLOAD_RESOLVER;
+        _owner_type_arg_specializer: Semantic.OWNER_TYPE_ARG_SPECIALIZER;
+        _owner_constraint_specializer: Semantic.OWNER_CONSTRAINT_SPECIALIZER;
+        _under_determination_detector: Semantic.UNDER_DETERMINATION_DETECTOR;
+        _type_arg_placeholder_registry: Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY;
+        _closure_arg_resolver: Semantic.CLOSURE_ARG_RESOLVER;
+        _numeric_literal_classifier: NUMERIC_LITERAL_CLASSIFIER;
         _type_caster: Semantic.TYPE_CASTER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _value_converter: VALUE_CONVERTER;
@@ -54,16 +60,6 @@ namespace Syntax.Process is
 
         _stub_depth: int;
         _keep_depth: int;
-
-        // Per-AST-node cache of placeholder origin symbols for unbound
-        // owner type-args at constructor expressions. Each constructor
-        // call AST node gets one phantom Variable per type-arg slot;
-        // the phantom carries the `_lub_map` accumulator that overload
-        // back-feed pushes constraints into. Cached on the visitor (not
-        // the AST node) so the AST stays simple — the visitor instance
-        // is the body retry loop's lifecycle, so origins persist across
-        // iterations (constraint accumulation needs that stability).
-        _type_arg_placeholder_origins: Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]];
 
         // Type-narrowing stack — owns scope marks and per-symbol
         // saves. Visit hooks (IF_BRANCH for marking, BINARY/UNARY
@@ -105,11 +101,15 @@ namespace Syntax.Process is
             _function_caller = function_caller;
             _type_caster = type_caster;
             _overload_resolver = overload_resolver;
+            _owner_type_arg_specializer = Semantic.OWNER_TYPE_ARG_SPECIALIZER();
+            _owner_constraint_specializer = Semantic.OWNER_CONSTRAINT_SPECIALIZER();
+            _under_determination_detector = Semantic.UNDER_DETERMINATION_DETECTOR();
+            _type_arg_placeholder_registry = Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY(symbol_table);
+            _closure_arg_resolver = Semantic.CLOSURE_ARG_RESOLVER(logger);
+            _numeric_literal_classifier = NUMERIC_LITERAL_CLASSIFIER(logger, innate_symbol_lookup);
             _symbol_use_locations = symbol_use_locations;
             _value_converter = value_converter;
             _value_boxer = value_boxer;
-
-            _type_arg_placeholder_origins = Collections.MAP[Trees.Node, Collections.LIST[Semantic.Symbols.Variable]]();
 
             _narrowing = NARROWING();
 
@@ -291,7 +291,7 @@ namespace Syntax.Process is
             // function need stable phantoms, but those happen inside
             // visit(function: FUNCTION) below this point, so clearing at
             // the start of apply is safe.
-            _type_arg_placeholder_origins.clear();
+            _type_arg_placeholder_registry.clear();
 
             // Narrowing stack must be empty at apply() boundaries —
             // every push has to be balanced by a release before its
@@ -556,7 +556,7 @@ namespace Syntax.Process is
                 // would emit malformed IL with the placeholder's
                 // gen_type comment string in the type-arg position,
                 // which ilasm rejects.
-                if _fill_in_default_typearg_placeholders() then
+                if _type_arg_placeholder_registry.fill_in_defaults(_innate_symbol_lookup.get_object_type()) then
                     _logger.roll_back();
                     _logger.speculate();
 
@@ -567,30 +567,6 @@ namespace Syntax.Process is
             fi
 
             super.visit(function);
-        si
-
-        // Walk all phantom origins cached during this body retry; for
-        // each that's still unresolved, default to object via
-        // add_constraint. Returns true when at least one default was
-        // injected — the caller does one more body walk so the AST
-        // values pick up the resolved type.
-        _fill_in_default_typearg_placeholders() -> bool is
-            let added_any = false;
-            let object_type = _innate_symbol_lookup.get_object_type();
-
-            for kv in _type_arg_placeholder_origins do
-                for origin in kv.value do
-                    let resolved = origin.try_get_inferred_type();
-
-                    if !resolved? \/ resolved.is_inferred \/ resolved.is_error then
-                        if origin.add_constraint(object_type) then
-                            added_any = true;
-                        fi
-                    fi
-                od
-            od
-
-            return added_any;
         si
 
         pre(`let: Trees.Statements.LET) -> bool is
@@ -1392,89 +1368,10 @@ namespace Syntax.Process is
 
             _symbol_table.current_closure_context.add_closure(closure);
 
-            let argument_names = Collections.LIST[string]();
-            let argument_types = Collections.LIST[Type]();
-
-            let any_errors: bool;
-
-            let arguments = function.arguments.expressions;
-
             // we are walking the arguments here while speculating
-            for index in 0..arguments.count do
-                let a = arguments[index];
-                
-                // TODO: destructure
-                if isa Trees.Expressions.VARIABLE(a) then
-                    let argument = cast Trees.Expressions.VARIABLE(a);
+            let arguments_resolved = _closure_arg_resolver.resolve(function.arguments.expressions, closure, implied_argument_types);
 
-                    argument_names.add(argument.name.name);
-                    let partial_argument_type: Type;
-                    let symbol = cast Semantic.Symbols.Variable(closure.find_direct(argument.name.name));
-
-                    if symbol.type? /\ !symbol.type.is_inferred /\ !symbol.type.is_error then
-                        // Argument symbol already carries a usable type
-                        // from a previous walk (call-site second-pass
-                        // set it from the formal, or a function-level
-                        // retry is re-walking the body). Don't
-                        // overwrite — the existing narrower type is
-                        // correct.
-                        argument_types.add(symbol.type);
-                    elif !isa Trees.TypeExpressions.INFER(argument.type_expression) then
-                        argument_types.add(argument.type_expression.type);
-                    elif implied_argument_types? then
-                        let implied_argument_type = implied_argument_types[index];
-
-                        if implied_argument_type? /\ !implied_argument_type.is_type_variable then
-                            argument_types.add(implied_argument_type);
-
-                            symbol.set_type(implied_argument_type);
-                        else
-                            // Iterative-inference path: previous
-                            // iteration's body walk may have
-                            // accumulated constraints on the symbol
-                            // via overload-resolver back-feed (e.g.
-                            // `x` in `x + 1` constrained to int when
-                            // `+`'s int+int overload won). Try
-                            // resolving the LUB before falling back
-                            // to a fresh placeholder.
-                            let inferred = symbol.try_get_inferred_type();
-
-                            if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
-                                symbol.set_type(inferred);
-                                argument_types.add(inferred);
-                            else
-                                _logger.error(a.location, "cannot infer type here");
-
-                                let placeholder = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol);
-                                symbol.set_type(placeholder);
-                                argument_types.add(placeholder);
-                            fi
-                        fi
-                    else
-                        let inferred = symbol.try_get_inferred_type();
-
-                        if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
-                            symbol.set_type(inferred);
-                            argument_types.add(inferred);
-                        else
-                            _logger.error(a.location, "cannot infer type here");
-
-                            let placeholder = Semantic.Types.INFERRED_VARIABLE_TYPE(symbol);
-                            symbol.set_type(placeholder);
-                            argument_types.add(placeholder);
-                        fi
-                    fi
-                else
-                    _logger.error(a.location, "unexpected kind of argument ({a.get_type()})");
-                    any_errors = true;
-                fi
-
-                index = index + 1;
-            od
-
-            if !any_errors then
-                closure.arguments = Collections.LIST[Type](argument_types);
-
+            if arguments_resolved then
                 let return_type: Type;
 
                 if function.type_expression.type? then
@@ -1483,8 +1380,6 @@ namespace Syntax.Process is
                     return_type = Semantic.Types.INFERED_RETURN_TYPE();
                     closure.return_type_was_inferred = true;
                 fi
-
-                closure.argument_names = argument_names;
 
                 closure.set_return_type(return_type);
             fi
@@ -1503,7 +1398,7 @@ namespace Syntax.Process is
                 function.body.walk(self);
             fi
 
-            if _will_generate_code /\ !any_errors /\ closure.could_be_delegate then
+            if _will_generate_code /\ arguments_resolved /\ closure.could_be_delegate then
                 _logger.roll_back();
                 _logger.speculate();
 
@@ -2178,7 +2073,7 @@ namespace Syntax.Process is
 
             let function = overload_result.function;
 
-            function = _try_specialize_owner_from_constraint(`new.location, function, `new.constraint);
+            function = _owner_constraint_specializer.specialize_from_constraint(`new.location, function, `new.constraint);
 
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
@@ -2210,169 +2105,37 @@ namespace Syntax.Process is
                 );
         si
 
-        // When the call site couldn't bind every owner-generic argument
-        // from the constructor arguments alone but the surrounding
-        // context has a constraint of the same generic class (e.g.
-        // `let b: Box[int] = Box();` — zero-arg init), use the
-        // constraint's type-argument map to specialize the owner and
-        // re-resolve the function via the specialized owner.
-        // Returns the original function unchanged when the constraint
-        // doesn't apply (no constraint, owner already specialized,
-        // constraint is a different shape, type-arg names don't line
-        // up). The returned function's .owner is a Symbols.GENERIC, so
-        // the caller's existing `isa GENERIC(function.owner)` branch
-        // picks up the type/type_symbol update naturally.
-        // Look up (or lazily create) the per-AST-node phantom Variables
-        // that act as origins for unbound owner type-arg placeholders.
-        // The same call expression on a later body-retry iteration
-        // reuses the same phantoms, so any constraints accumulated by
-        // overload back-feed in iter N persist into iter N+1's lub_map
-        // resolution.
-        _get_or_create_type_arg_placeholder_origins(
+        // Sibling-arg specialisation entry: produce the phantom-
+        // origin list for unbound slots from the per-AST cache, then
+        // delegate to `OWNER_TYPE_ARG_SPECIALIZER` for the binding
+        // and specialisation logic. Phantom origins live on the
+        // visitor so back-feed across body-retry iterations lands on
+        // the same Variables; the specialiser itself is stateless,
+        // which lets the binding contract be unit-tested in
+        // isolation.
+        _specialise_candidate_from_concrete_siblings(
+            candidate: Semantic.Symbols.Function,
+            argument_types: Collections.List[Semantic.Types.Type],
             cache_key: Trees.Node,
-            location: LOCATION,
-            type_symbol: Semantic.Symbols.Classy
-        ) -> Collections.LIST[Semantic.Symbols.Variable] is
-            if _type_arg_placeholder_origins.contains_key(cache_key) then
-                return _type_arg_placeholder_origins[cache_key];
-            fi
-
-            let result = Collections.LIST[Semantic.Symbols.Variable]();
-            let owner = _symbol_table.current_function;
-
-            for i in 0..type_symbol.argument_names.count do
-                let arg_name = type_symbol.argument_names[i];
-                let phantom_name = "${type_symbol.name}.{arg_name}@{location.start_line}:{location.start_column}";
-                let phantom = Semantic.Symbols.INFERRED_TYPE_ARG_ORIGIN(location, owner, phantom_name);
-                result.add(phantom);
-            od
-
-            _type_arg_placeholder_origins[cache_key] = result;
-
-            return result;
-        si
-
-        // Iterative-inference: when a generic class is constructed
-        // with no constraint and no constructor args binding T (e.g.
-        // `let m = Box()`), produce a specialized owner where each
-        // type-arg slot carries an INFERRED_VARIABLE_TYPE pointing at
-        // a phantom Variable cached on the AST node. Overload back-
-        // feed in OVERLOAD_RESOLVER pushes downstream-discovered
-        // concrete types onto the phantom's `_lub_map`, and the body
-        // retry loop's next iteration resolves the type-arg by
-        // calling try_get_inferred_type() on the phantom.
-        _try_specialize_owner_with_placeholders(
-            location: LOCATION,
-            function: Semantic.Symbols.Function,
-            cache_key: Trees.Node
+            location: LOCATION
         ) -> Semantic.Symbols.Function is
-            if !cache_key? then
-                return function;
+            if !candidate? \/ !cache_key? then
+                return candidate;
             fi
 
-            if isa Semantic.Symbols.GENERIC(function.owner) then
-                return function;
+            if isa Semantic.Symbols.GENERIC(candidate.owner) then
+                return candidate;
             fi
 
-            let owner_classy = cast Semantic.Symbols.Classy(function.owner);
+            let owner_classy = cast Semantic.Symbols.Classy(candidate.owner);
 
             if !owner_classy? \/ !owner_classy.is_generic then
-                return function;
+                return candidate;
             fi
 
-            let origins = _get_or_create_type_arg_placeholder_origins(cache_key, location, owner_classy);
+            let origins = _type_arg_placeholder_registry.get_or_create(cache_key, location, owner_classy);
 
-            let type_map = Collections.MAP[string, Semantic.Types.Type]();
-
-            for i in 0..owner_classy.argument_names.count do
-                let arg_name = owner_classy.argument_names[i];
-                let origin = origins[i];
-                let resolved = origin.try_get_inferred_type();
-                let arg_type: Semantic.Types.Type;
-
-                if resolved? /\ !resolved.is_inferred /\ !resolved.is_error then
-                    arg_type = resolved;
-                else
-                    arg_type = Semantic.Types.INFERRED_VARIABLE_TYPE(origin);
-                fi
-
-                type_map[arg_name] = arg_type;
-            od
-
-            let specialized_owner = Semantic.Symbols.GENERIC.try_create_from(location, owner_classy, type_map);
-
-            if !specialized_owner? then
-                return function;
-            fi
-
-            let specialized = specialized_owner.find_specialized_function(function);
-
-            if !specialized? then
-                return function;
-            fi
-
-            return specialized;
-        si
-
-        _try_specialize_owner_from_constraint(
-            location: LOCATION,
-            function: Semantic.Symbols.Function,
-            constraint: Semantic.Types.Type
-        ) -> Semantic.Symbols.Function is
-            if !constraint? then
-                return function;
-            fi
-
-            if isa Semantic.Symbols.GENERIC(function.owner) then
-                return function;
-            fi
-
-            let owner_classy = cast Semantic.Symbols.Classy(function.owner);
-
-            if !owner_classy? \/ !owner_classy.is_generic then
-                return function;
-            fi
-
-            let constraint_named = cast Semantic.Types.NAMED(constraint);
-
-            if !constraint_named? then
-                return function;
-            fi
-
-            let constraint_generic = cast Semantic.Symbols.GENERIC(constraint_named.symbol);
-
-            if !constraint_generic? then
-                return function;
-            fi
-
-            // Direct match: constructor for the constrained type itself.
-            // Variant match: constructor for a variant of the constrained
-            // union. Variants share their parent union's argument_names
-            // (declare_variant passes the union's `argument_names`
-            // through), so the constraint's union-keyed type_map keys
-            // line up with the variant's slots.
-            let is_direct = constraint_generic.symbol =~ owner_classy;
-            let is_variant_of_constraint =
-                owner_classy.is_variant /\
-                cast Semantic.Symbols.Symbol(owner_classy.owner) =~ constraint_generic.symbol;
-
-            if !is_direct /\ !is_variant_of_constraint then
-                return function;
-            fi
-
-            let specialized_owner = Semantic.Symbols.GENERIC.try_create_from(location, owner_classy, constraint_generic.type_map);
-
-            if !specialized_owner? then
-                return function;
-            fi
-
-            let specialized = specialized_owner.find_specialized_function(function);
-
-            if !specialized? then
-                return function;
-            fi
-
-            return specialized;
+            return _owner_type_arg_specializer.specialize_from_concrete_siblings(candidate, argument_types, origins, location);
         si
 
         // Find the single arity- and instance-matching candidate in a
@@ -2412,91 +2175,6 @@ namespace Syntax.Process is
             fi
 
             return null;
-        si
-
-        // Predicate: pushing `formal` as a constraint to `arg_value_type`
-        // could plausibly resolve under-determined owner-generic args.
-        // True when the actual arg type is a NAMED type wrapping a
-        // generic Classy (i.e. unspecialised — `Box` from `Box()` with
-        // no T-binding from args) AND the formal type is a GENERIC for
-        // the same Classy (`Box[int]`). Also true when the formal is a
-        // function type and the actual is a function type with at least
-        // one INFERRED_VARIABLE_TYPE placeholder argument — covers
-        // lambda literals whose parameter types couldn't be inferred
-        // from the body alone (`element is ... si` where the body
-        // doesn't reference `element`, identity bodies, etc.). Only
-        // these shapes benefit from the constraint-push retry; pushing
-        // to an already-specialised SEQUENCE / TUPLE arg risks
-        // introducing new element-mismatch errors that aren't an
-        // improvement on the original "no overload found" error.
-        _arg_under_determined_for_formal(
-            formal: Semantic.Types.Type,
-            arg_value_type: Semantic.Types.Type
-        ) -> bool is
-            if !formal? \/ !arg_value_type? then
-                return false;
-            fi
-
-            let formal_generic = cast Semantic.Types.GENERIC(formal);
-
-            if !formal_generic? then
-                return false;
-            fi
-
-            // Function-typed actual with placeholder args: covers the
-            // lambda-as-call-arg case where the body provided no
-            // constraint on the parameter type. Pushing the formal
-            // function type as a constraint flows the formal arg types
-            // into the lambda's `implied_argument_types` on re-walk.
-            if formal.is_function /\ arg_value_type.is_function then
-                let arg_generic = cast Semantic.Types.GENERIC(arg_value_type);
-
-                if arg_generic? /\ arg_generic.arguments | .any(a => a? /\ a.is_inferred) then
-                    return true;
-                fi
-            fi
-
-            if isa Semantic.Types.GENERIC(arg_value_type) then
-                return false;
-            fi
-
-            let arg_named = cast Semantic.Types.NAMED(arg_value_type);
-
-            if !arg_named? then
-                return false;
-            fi
-
-            let arg_classy = cast Semantic.Symbols.Classy(arg_named.symbol);
-
-            if !arg_classy? \/ !arg_classy.is_generic then
-                return false;
-            fi
-
-            let formal_symbol_generic = cast Semantic.Symbols.GENERIC(formal_generic.symbol);
-
-            if !formal_symbol_generic? then
-                return false;
-            fi
-
-            return arg_classy =~ formal_symbol_generic.symbol;
-        si
-
-        // Returns true when at least one argument's first-walk type is
-        // under-determined for the corresponding formal type — i.e. the
-        // constraint-push retry might recover. Cheap pre-check: avoids
-        // the expensive logger roll-back / re-walk loop when there's
-        // no plausible benefit.
-        _any_arg_under_determined(
-            candidate: Semantic.Symbols.Function,
-            argument_types: Collections.List[Semantic.Types.Type]
-        ) -> bool is
-            for i in 0..argument_types.count do
-                if _arg_under_determined_for_formal(candidate.arguments[i], argument_types[i]) then
-                    return true;
-                fi
-            od
-
-            return false;
         si
 
         // should be called with logger speculating
@@ -2545,6 +2223,62 @@ namespace Syntax.Process is
 
             let overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
 
+            // Sibling-arg fall-back: first resolve returned null AND
+            // there's at least one FUNCTION-literal arg in the call.
+            // The lambda's body walked under no parameter-type
+            // constraint and likely errored, leaving an actual type
+            // that doesn't reflect the real signature; binding fails;
+            // resolver returns null. Try tentatively binding the
+            // candidate's owner-generic args from the *resolvable*
+            // sibling actuals (skipping the failing lambda), fill the
+            // remaining slots with cached phantoms, then push the
+            // substituted formals as constraints to each arg and
+            // re-walk. The second resolve sees the lambda's now-
+            // resolved actual type and binds T from it.
+            //
+            // The lambda guard matters: if no arg is a lambda, the
+            // original null result reflects a genuine type mismatch
+            // (e.g. `Pair([1,2,3], LIST[int]([4,5,6]))` — int[] and
+            // LIST[int] don't unify for T) and the user-facing
+            // diagnostic is correct as-is.
+            if overload_result == null /\ argument_types | .any(a => a? /\ a.is_function_with_any_implicit_argument_types) then
+                let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, true);
+
+                if candidate? then
+                    let specialized_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, cache_key, location);
+
+                    if specialized_candidate? /\ specialized_candidate != candidate then
+                        _logger.roll_back();
+                        _logger.speculate();
+
+                        for (index, a) in argument_expressions | .index() do
+                            if !a? then
+                                continue;
+                            fi
+
+                            let f = specialized_candidate.arguments[index];
+
+                            if f? then
+                                a.set_constraint(f, "{{0}} is not assignable to {{1}}");
+                            fi
+
+                            a.walk(self);
+
+                            if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                                arguments[index] = a.value;
+                                argument_types[index] = a.value.type;
+                            else
+                                let t = Semantic.Types.ERROR();
+                                arguments[index] = DUMMY(t, a.location);
+                                argument_types[index] = t;
+                            fi
+                        od
+
+                        overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
+                    fi
+                fi
+            fi
+
             if overload_result == null then
                 return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
             fi
@@ -2581,8 +2315,8 @@ namespace Syntax.Process is
 
             let function = overload_result.function;
 
-            function = _try_specialize_owner_from_constraint(location, function, constraint);
-            function = _try_specialize_owner_with_placeholders(location, function, cache_key);
+            function = _owner_constraint_specializer.specialize_from_constraint(location, function, constraint);
+            function = _type_arg_placeholder_registry.specialize_with_placeholders(location, function, cache_key);
 
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
@@ -3026,6 +2760,24 @@ namespace Syntax.Process is
                     type = type.get_element_type();
 
                     member.left.value = DEREF(member.left.value, type);
+                fi
+
+                // Demand-driven inference: when the receiver is an
+                // INFERRED_VARIABLE_TYPE placeholder, record a
+                // MEMBER_DEMAND on the placeholder's origin so the
+                // constraint-aware LUB can later filter candidate
+                // types to those that actually expose this member.
+                // mark_consumed_any drives the retry loop to re-walk
+                // the body with the resolved type (if any).
+                if isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) then
+                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(type);
+
+                    if placeholder.origin.add_demand(Semantic.MEMBER_DEMAND(member.identifier.name)) then
+                        _logger.mark_consumed_any();
+                    fi
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
                 fi
 
                 if !isa Semantic.Types.NAMED(type) then
@@ -3679,210 +3431,14 @@ namespace Syntax.Process is
         si
 
         visit(integer: Trees.Expressions.Literals.INTEGER) is
-            let type: Type;
-            let suffix = "i4";
+            let value = _numeric_literal_classifier.classify_integer(integer.location, integer.value_string);
 
-            let value_string = integer.value_string;
-            let conv: string;
-
-            let last_char = value_string.get_chars(value_string.length-1);
-
-            if "bBcCsSiIlLwWuU".contains(last_char) then
-                let is_unsigned = false;
-
-                let cutoff = value_string.length;
-
-                if last_char == 'u' \/ last_char == 'U' then
-                    is_unsigned = true;
-
-                    cutoff = cutoff - 1;
-                elif value_string.length > 2 then
-                    let sign_char = value_string.get_chars(value_string.length - 2);
-
-                    if sign_char == 'u' \/ sign_char == 'U' then
-                        is_unsigned = true;
-
-                        cutoff = cutoff - 1;
-                    elif sign_char == 's' \/ sign_char == 'S' then
-                        cutoff = cutoff - 1;
-                    fi
-                fi
-
-                case last_char
-                when 'b', 'B': 
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_ubyte_type();
-                    else
-                        type = _innate_symbol_lookup.get_byte_type();
-                    fi
-                    
-                    cutoff = cutoff - 1;
-
-                when 'c', 'C':
-                    if is_unsigned then
-                        _logger.error(integer.location, "numeric character literal cannot be unsigned");
-                    else
-                        type = _innate_symbol_lookup.get_char_type();
-                    fi
-
-                    cutoff = cutoff - 1;
-
-                when 's', 'S':
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_ushort_type();
-                    else
-                        type = _innate_symbol_lookup.get_short_type();
-                    fi
-
-                    cutoff = cutoff - 1;
-
-                when 'i', 'I':
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_uint_type();
-                    else
-                        type = _innate_symbol_lookup.get_int_type();
-                    fi
-
-                    cutoff = cutoff - 1;
-
-                when 'l', 'L':
-                    suffix = "i8";
-
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_ulong_type();
-                    else
-                        type = _innate_symbol_lookup.get_long_type();
-                    fi
-
-                    cutoff = cutoff - 1;
-
-                when 'w', 'W':
-                    suffix = "i8";
-
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_uword_type();
-                        conv = "conv.u";
-                    else
-                        type = _innate_symbol_lookup.get_word_type();
-                        conv = "conv.i";
-                    fi
-
-                    cutoff = cutoff - 1;
-
-                default
-                    if is_unsigned then
-                        type = _innate_symbol_lookup.get_uint_type();
-                    else
-                        type = _innate_symbol_lookup.get_int_type();
-                    fi
-                esac
-
-                value_string = value_string.substring(0, cutoff);
-            else
-                type = _innate_symbol_lookup.get_int_type();
-            fi
-
-            if !_check_int_literal_fits(integer.location, value_string, type) then
-                integer.value = DUMMY(type, integer.location);
+            if !value? then
+                integer.value = DUMMY(Semantic.Types.ERROR(), integer.location);
                 return;
             fi
 
-            integer.value = Literal.NUMBER(
-                value_string,
-                type,
-                suffix,
-                conv
-            );
-        si
-
-        // Range-check a parsed integer literal against its target type.
-        // The lexer accepts arbitrarily long digit strings; without this
-        // check oversize literals reach IL emission and ilasm rejects
-        // the resulting `ldc.i4 <bignum>` with an opaque syntax error
-        // (issue #580). Comparing as a ulong and using each type's
-        // unsigned max preserves the standard "literal fits in N
-        // unsigned bits, unary minus negates separately" convention.
-        _check_int_literal_fits(location: Source.LOCATION, value_string: string, type: Type) -> bool is
-            let (ok, parsed) =
-                if value_string.starts_with("0x") \/ value_string.starts_with("0X") then
-                    _parse_hex(value_string.substring(2, value_string.length - 2));
-                else
-                    let v: ulong;
-                    let parsed_ok = ulong.try_parse(value_string, v ref);
-                    (parsed_ok, v);
-                fi;
-
-            if !ok then
-                _logger.error(location, "numeric literal {value_string} does not fit in {type}");
-                return false;
-            fi
-
-            let max_value = _max_unsigned_for(type);
-
-            if max_value > 0UL /\ parsed > max_value then
-                _logger.error(location, "numeric literal {value_string} does not fit in {type}");
-                return false;
-            fi
-
-            return true;
-        si
-
-        _parse_hex(s: string) -> (ok: bool, value: ulong) is
-            if s.length == 0 \/ s.length > 16 then
-                return (false, 0UL);
-            fi
-
-            let value: ulong = 0UL;
-
-            for c in s do
-                let digit: int;
-
-                if c >= '0' /\ c <= '9' then
-                    digit = cast int(c) - cast int('0');
-                elif c >= 'a' /\ c <= 'f' then
-                    digit = cast int(c) - cast int('a') + 10;
-                elif c >= 'A' /\ c <= 'F' then
-                    digit = cast int(c) - cast int('A') + 10;
-                else
-                    return (false, 0UL);
-                fi
-
-                value = (value << 4UL) + cast ulong(digit);
-            od
-
-            return (true, value);
-        si
-
-        // Returns the maximum value a non-negative integer literal of
-        // the given target type may take. Returns 0 for any type whose
-        // range we don't recognise — caller treats that as "no check".
-        // Returns the largest non-negative literal value the type
-        // accepts, or 0 to signal "no narrower bound than the
-        // ulong-parse range" (used for ulong / uword: ulong.try_parse
-        // already enforces the 64-bit ceiling). 0 makes the caller
-        // skip the narrower-bound check.
-        _max_unsigned_for(type: Type) -> ulong is
-            if type =~ _innate_symbol_lookup.get_byte_type() then
-                return 127UL;
-            elif type =~ _innate_symbol_lookup.get_ubyte_type() then
-                return 255UL;
-            elif type =~ _innate_symbol_lookup.get_short_type() then
-                return 32767UL;
-            elif type =~ _innate_symbol_lookup.get_ushort_type() then
-                return 65535UL;
-            elif type =~ _innate_symbol_lookup.get_char_type() then
-                return 65535UL;
-            elif type =~ _innate_symbol_lookup.get_int_type() then
-                return 2147483647UL;
-            elif type =~ _innate_symbol_lookup.get_uint_type() then
-                return 4294967295UL;
-            elif type =~ _innate_symbol_lookup.get_long_type() then
-                return 9223372036854775807UL;
-            elif type =~ _innate_symbol_lookup.get_word_type() then
-                return 9223372036854775807UL;
-            fi
-
-            return 0UL;
+            integer.value = value;
         si
 
         visit(float: Trees.Expressions.Literals.FLOAT) is
@@ -4061,7 +3617,26 @@ namespace Syntax.Process is
                     if !overload_result? then
                         let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
 
-                        if candidate? /\ _any_arg_under_determined(candidate, argument_types) then
+                        if candidate? /\ _under_determination_detector.any_arg_under_determined(candidate, argument_types) then
+                            // Sibling-arg specialisation, symmetric to
+                            // the path in `resolve_constructor`: when
+                            // one actual is a not-yet-resolved FUNCTION
+                            // literal AND the candidate has a generic
+                            // owner, push specialised formals (bound
+                            // from concrete sibling actuals) rather
+                            // than unsubstituted formals containing
+                            // free type variables that the lambda's
+                            // argument-setup would reject as "type
+                            // variable" anyway. Owners that aren't
+                            // generic short-circuit inside
+                            // OWNER_TYPE_ARG_SPECIALIZER and the
+                            // pre-existing behaviour is preserved.
+                            let push_candidate = candidate;
+
+                            if argument_types | .any(a => a? /\ a.is_function_with_any_implicit_argument_types) then
+                                push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
+                            fi
+
                             _logger.roll_back();
                             _logger.speculate();
 
@@ -4070,7 +3645,7 @@ namespace Syntax.Process is
                                     continue;
                                 fi
 
-                                let f = candidate.arguments[index];
+                                let f = push_candidate.arguments[index];
 
                                 if f? then
                                     a.set_constraint(f, "{{0}} is not assignable to {{1}}");
@@ -4211,6 +3786,20 @@ namespace Syntax.Process is
                     fi
                 fi
 
+                // Demand-driven inference: regardless of whether the
+                // args are concrete enough to synthesize a Function
+                // constraint above, record a CALL_DEMAND with the
+                // captured arg-types on the placeholder's origin so
+                // the constraint-aware LUB can later filter candidate
+                // types to those that actually accept this call shape.
+                // The demand's own discharge defers conservatively
+                // when the captured args still contain placeholders,
+                // so emitting unconditionally here is safe.
+                let demand_args = Collections.LIST[Type](argument_types);
+                if placeholder.origin.add_demand(Semantic.CALL_DEMAND(demand_args)) then
+                    _logger.mark_consumed_any();
+                fi
+
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                 return;
             elif !function_type? \/ !isa Semantic.Types.NAMED(function_type) then
@@ -4253,6 +3842,17 @@ namespace Syntax.Process is
             let ok = true;
 
             for i in 0..arguments.count do
+                // Back-feed BEFORE the compare so a Closure-call with
+                // a placeholder parameter type (`let f = x => ...; f(1)`)
+                // propagates the actual's concrete type to the
+                // placeholder's origin. The body retry loop's next
+                // iteration then sees a concrete x's-type and walks
+                // the lambda body cleanly. Without this the call path
+                // validated types but propagated nothing — local
+                // lambdas with use-site-only constraints failed to
+                // converge.
+                _overload_resolver.back_feed.pair(function_generic_type.arguments[i], argument_types[i]);
+
                 if cast int(function_generic_type.arguments[i].compare(argument_types[i])) > cast int(Semantic.Types.MATCH.CONVERTABLE)
                 then
                     ok = false;
