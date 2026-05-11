@@ -1,0 +1,166 @@
+namespace Semantic is
+    use Source.LOCATION;
+
+    use Types.Type;
+
+    // Registry of phantom Variables that stand in for unbound
+    // owner-generic type-args at constructor expressions.
+    //
+    // Each constructor AST node gets one phantom INFERRED_TYPE_ARG_
+    // ORIGIN per type-arg slot. The phantom carries a `_lub_map`
+    // accumulator that overload back-feed pushes downstream-discovered
+    // concrete types onto, and a `_demands` SET that demand-driven
+    // inference records member/call requirements against. The body-
+    // retry loop's next iteration resolves the type-arg by calling
+    // `try_get_inferred_type()` on the phantom.
+    //
+    // The registry is owned by the COMPILE_EXPRESSIONS visitor (one
+    // registry per visitor instance, lifetime = the body retry loop)
+    // rather than living on the AST nodes themselves. The visitor
+    // instance is the body retry loop's lifecycle, so origins
+    // persist across iterations — constraint accumulation needs that
+    // stability.
+    //
+    // `clear()` is called at apply() boundaries; without it stale
+    // entries from a previous compile of the same file would
+    // reference Type instances from a symbol table that's since been
+    // wiped by clear_symbols.
+    class TYPE_ARG_PLACEHOLDER_REGISTRY is
+        _symbol_table: SYMBOL_TABLE;
+        _origins: Collections.MAP[Syntax.Trees.Node, Collections.LIST[Symbols.Variable]];
+
+        init(symbol_table: SYMBOL_TABLE) is
+            super.init();
+
+            _symbol_table = symbol_table;
+            _origins = Collections.MAP[Syntax.Trees.Node, Collections.LIST[Symbols.Variable]]();
+        si
+
+        clear() is
+            _origins.clear();
+        si
+
+        // Returns the phantom origin list for `cache_key`. On cache
+        // miss creates one phantom Variable per slot in
+        // `type_symbol.argument_names`, owned by the current function.
+        // The phantom's name encodes type / arg / location for
+        // debuggability — `${ClassName}.{arg_name}@{line}:{col}`.
+        get_or_create(
+            cache_key: Syntax.Trees.Node,
+            location: LOCATION,
+            type_symbol: Symbols.Classy
+        ) -> Collections.LIST[Symbols.Variable] is
+            if _origins.contains_key(cache_key) then
+                return _origins[cache_key];
+            fi
+
+            let result = Collections.LIST[Symbols.Variable]();
+            let owner = _symbol_table.current_function;
+
+            for i in 0..type_symbol.argument_names.count do
+                let arg_name = type_symbol.argument_names[i];
+                let phantom_name = "${type_symbol.name}.{arg_name}@{location.start_line}:{location.start_column}";
+                let phantom = Symbols.INFERRED_TYPE_ARG_ORIGIN(location, owner, phantom_name);
+                result.add(phantom);
+            od
+
+            _origins[cache_key] = result;
+
+            return result;
+        si
+
+        // Produce a specialised owner where each type-arg slot
+        // carries either the phantom's currently-resolved type (if
+        // body-retry has accumulated enough constraints to pin it)
+        // or an INFERRED_VARIABLE_TYPE pointing at the phantom.
+        //
+        // Returns the original function unchanged when:
+        //   - cache_key is null (caller hasn't given us an AST node
+        //     to anchor the phantoms against)
+        //   - the candidate already has a specialised owner
+        //   - the owner isn't generic
+        //   - GENERIC.try_create_from or find_specialized_function
+        //     rejects the result
+        specialize_with_placeholders(
+            location: LOCATION,
+            function: Symbols.Function,
+            cache_key: Syntax.Trees.Node
+        ) -> Symbols.Function is
+            if !cache_key? then
+                return function;
+            fi
+
+            if isa Symbols.GENERIC(function.owner) then
+                return function;
+            fi
+
+            let owner_classy = cast Symbols.Classy(function.owner);
+
+            if !owner_classy? \/ !owner_classy.is_generic then
+                return function;
+            fi
+
+            let origins = get_or_create(cache_key, location, owner_classy);
+
+            let type_map = Collections.MAP[string, Type]();
+
+            for i in 0..owner_classy.argument_names.count do
+                let arg_name = owner_classy.argument_names[i];
+                let origin = origins[i];
+                let resolved = origin.try_get_inferred_type();
+                let arg_type: Type;
+
+                if resolved? /\ !resolved.is_inferred /\ !resolved.is_error then
+                    arg_type = resolved;
+                else
+                    arg_type = Types.INFERRED_VARIABLE_TYPE(origin);
+                fi
+
+                type_map[arg_name] = arg_type;
+            od
+
+            let specialized_owner = Symbols.GENERIC.try_create_from(location, owner_classy, type_map);
+
+            if !specialized_owner? then
+                return function;
+            fi
+
+            let specialized = specialized_owner.find_specialized_function(function);
+
+            if !specialized? then
+                return function;
+            fi
+
+            return specialized;
+        si
+
+        // Walk all phantom origins; for each whose body-retry didn't
+        // pin a concrete type, default to `object_type` via
+        // add_constraint. Returns true when at least one default was
+        // injected — the caller does one more body walk so the AST
+        // values pick up the resolved type.
+        //
+        // Without this fallback, a construction whose owner type-args
+        // are never pinned by downstream usage (e.g.
+        // `let m = Box(); Std.write_line("hi")`) would emit malformed
+        // IL with the placeholder's gen_type comment string in the
+        // type-arg position, which ilasm rejects.
+        fill_in_defaults(object_type: Type) -> bool is
+            let added_any = false;
+
+            for kv in _origins do
+                for origin in kv.value do
+                    let resolved = origin.try_get_inferred_type();
+
+                    if !resolved? \/ resolved.is_inferred \/ resolved.is_error then
+                        if origin.add_constraint(object_type) then
+                            added_any = true;
+                        fi
+                    fi
+                od
+            od
+
+            return added_any;
+        si
+    si
+si
