@@ -124,6 +124,101 @@ namespace Semantic.Symbols is
         
         find_or_add_capture_self() -> Field => find_or_add_capture(null);
 
+        outer_recurse_field_name(outer: Closure) -> string =>
+            "$outer_recurse_{outer.name}";
+
+        // Captures the recurse-target of an outer recursive ancestor
+        // so `rec` can be used from a nested non-recursive lambda.
+        // The captured Symbol stored in `captured_values` is the
+        // outer Closure itself, used as a sentinel by
+        // `_get_actual_arguments` to dispatch to the outer-recurse
+        // codepath. Declaration order in `captured_values` mirrors
+        // declaration order in the frame, so the constructor-arg
+        // ordering stays in step with the frame-field ordering.
+        find_or_add_captured_outer_recurse(outer: Closure) -> Field is
+            assert outer? else "outer is null";
+            assert outer != self else "cannot capture self as outer recurse";
+
+            if !frame? then
+                captured_values = Collections.SET[Symbol]();
+
+                frame = Semantic.Symbols.FRAME(owner, self);
+            fi
+
+            let field_name = outer_recurse_field_name(outer);
+            let existing = frame.find_member(field_name);
+
+            if existing? then
+                let `field = cast Field(existing);
+
+                if
+                    `field? /\ `field.type? /\
+                    (`field.type.contains_inferred \/ `field.type.is_error) /\
+                    outer.type? /\
+                    !outer.type.contains_inferred /\
+                    !outer.type.is_error
+                then
+                    `field.set_type(outer.type);
+                fi
+
+                return `field;
+            fi
+
+            captured_values.add(outer);
+
+            return frame.declare_captured(field_name, outer.type, IoC.CONTAINER.instance.symbol_definition_locations);
+        si
+
+        load_captured_outer_recurse(location: LOCATION, outer: Closure, loader: SYMBOL_LOADER) -> Value is
+            let `field = find_or_add_captured_outer_recurse(outer);
+
+            return loader.load_instance_variable(LOCATION.internal, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+        si
+
+        // Called from the enclosing closure's _get_actual_arguments to
+        // produce the value to pass for an inner frame's
+        // $outer_recurse_<outer> capture. If we are outer directly,
+        // load $recurse from our own frame; otherwise we must have
+        // captured outer's recurse ourselves (the chain-establish loop
+        // in visit(RECURSE) guarantees it).
+        load_outer_recurse_value(outer: Closure, location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            if self == outer then
+                return load_recurse(location, loader);
+            fi
+
+            let field_name = outer_recurse_field_name(outer);
+            let `field = cast Field(frame.find_member(field_name));
+
+            assert `field? else "outer recurse field {field_name} not found on intermediate closure {name}";
+
+            return loader.load_instance_variable(LOCATION.internal, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+        si
+
+        // Walks the live scope stack to find the closure that
+        // lexically encloses self — i.e. the closure into whose body
+        // the IR currently being built will be inserted. `current_function`
+        // is no good here: when this runs, self is still on the stack so
+        // `current_function` returns self.
+        _find_enclosing_closure() -> Closure is
+            let stack = IoC.CONTAINER.instance.symbol_table.stack;
+            let i mut = stack.count - 1;
+            let seen_self mut = false;
+
+            while i >= 0 do
+                let scope = stack[i];
+
+                if seen_self /\ isa Closure(scope) then
+                    return cast Closure(scope);
+                fi
+
+                if scope == self then
+                    seen_self = true;
+                fi
+
+                i = i - 1;
+            od
+        si
+
         type_updated(type: Semantic.Types.Type) is
             if is_recursive /\ frame? then
                 frame.try_update_recurse_type(type)
@@ -245,6 +340,8 @@ namespace Semantic.Symbols is
                 fi
             si;
 
+            let enclosing: Closure mut = null;
+
             for c in captured_values do
                 if c == null then
                     let outer_self = loader.load_outer_self(location);
@@ -262,6 +359,20 @@ namespace Semantic.Symbols is
                     // defined here" diagnostic.
                     if outer_self.type? then
                         outer_self.type.walk(capture_type_argument);
+                    fi
+                elif isa Closure(c) then
+                    let outer = cast Closure(c);
+
+                    if !enclosing? then
+                        enclosing = _find_enclosing_closure();
+                    fi
+
+                    let value = enclosing.load_outer_recurse_value(outer, location, loader);
+
+                    actual_arguments.add(value);
+
+                    if value.type? then
+                        value.type.walk(capture_type_argument);
                     fi
                 else
                     let outer_captured_value =
