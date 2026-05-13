@@ -58,27 +58,40 @@ namespace Semantic is
     // named `member_name`. Emitted at MEMBER-expression visit
     // sites when the receiver is an INFERRED_VARIABLE_TYPE.
     //
-    // Discharge is intentionally name-only — it doesn't (yet)
-    // check the member's signature against any expected call
-    // shape. That refinement is what `CALL_CONSTRAINT` captures
-    // by recording argument types as well. Member-name presence
-    // is enough to distinguish (say) `Box[T]` from a bare `int`
-    // when the call site is `m.set(42)`.
+    // `call_arity = -1` (the default) leaves discharge name-only.
+    // When the MEMBER expression is the LHS of a CALL, the
+    // CALL-site emits an additional MEMBER_CONSTRAINT carrying the
+    // call's arg-count so the resolved member must be callable at
+    // that arity — useful when a name collides across types but
+    // the arities don't (e.g. `o.add(x)` excludes a type whose
+    // only `add` is two-arg). Type-aware refinement is what
+    // `CALL_CONSTRAINT` captures separately; this is the cheap
+    // structural check.
     class MEMBER_CONSTRAINT: Constraint is
         member_name: string;
+        call_arity: int;
 
         init(member_name: string) is
             super.init();
             self.member_name = member_name;
+            self.call_arity = -1;
+        si
+
+        init(member_name: string, call_arity: int) is
+            super.init();
+            self.member_name = member_name;
+            self.call_arity = call_arity;
         si
 
         try_discharge(candidate: Type) -> bool is
-            if !candidate? \/ candidate.is_inferred \/ candidate.is_error then
+            if !candidate? \/ candidate.is_sentinel then
                 return false;
             fi
 
-            if candidate.find_member(member_name)? then
-                return true;
+            let direct = candidate.find_member(member_name);
+
+            if direct? then
+                return check_arity(direct);
             fi
 
             // Variant-specific fields are not directly visible on a
@@ -109,29 +122,72 @@ namespace Semantic is
 
             for variant in classy.symbols do
                 let variant_classy = cast Symbols.Classy(variant);
-                if variant_classy? /\ variant.is_variant /\ variant_classy.find_member(member_name)? then
-                    return true;
+                if variant_classy? /\ variant.is_variant then
+                    let variant_member = variant_classy.find_member(member_name);
+                    if variant_member? /\ check_arity(variant_member) then
+                        return true;
+                    fi
                 fi
             od
 
             return false;
         si
 
+        // call_arity = -1 means "no arity check"; any found member
+        // passes. Otherwise we accept only when the symbol resolves
+        // to a callable that takes call_arity arguments: a Function
+        // with matching arg count, a FUNCTION_GROUP whose
+        // overload set contains a matching arity, or any other
+        // kind (Property / Field carrying a callable type) — we
+        // can't statically verify those without resolving the
+        // field's type, so we let them through and trust the
+        // overload resolver at the call site to catch a real
+        // mismatch.
+        check_arity(member: Symbols.Symbol) -> bool is
+            if call_arity < 0 \/ !member? then
+                return true;
+            fi
+
+            let function = cast Symbols.Function(member);
+            if function? /\ function.arguments? then
+                return function.arguments.count == call_arity;
+            fi
+
+            let group = cast Symbols.FUNCTION_GROUP(member);
+            if group? then
+                for f in group.functions do
+                    if f? /\ f.arguments? /\ f.arguments.count == call_arity then
+                        return true;
+                    fi
+                od
+                return false;
+            fi
+
+            return true;
+        si
+
         // Two member constraints collide iff they share a member
-        // name. The discharge logic is name-only today, so this
-        // is the right granularity for set-based dedup.
+        // name AND arity. An arity-aware emission is strictly more
+        // restrictive than the name-only version, so we keep both
+        // in the set; the candidate must discharge each.
         equals(other: object) -> bool is
             if !other? \/ !isa MEMBER_CONSTRAINT(other) then
                 return false;
             fi
 
             let m = cast MEMBER_CONSTRAINT(other);
-            return member_name == m.member_name;
+            return member_name == m.member_name /\ call_arity == m.call_arity;
         si
 
-        get_hash_code() -> int => member_name.get_hash_code();
+        get_hash_code() -> int =>
+            member_name.get_hash_code() * 31 + call_arity;
 
-        to_string() -> string => "member {member_name}";
+        to_string() -> string =>
+            if call_arity < 0 then
+                "member {member_name}";
+            else
+                "member {member_name}/{call_arity}";
+            fi;
     si
 
     // The placeholder must resolve to a type that is callable
@@ -164,7 +220,7 @@ namespace Semantic is
         si
 
         try_discharge(candidate: Type) -> bool is
-            if !candidate? \/ candidate.is_inferred \/ candidate.is_error then
+            if !candidate? \/ candidate.is_sentinel then
                 return false;
             fi
 
@@ -174,7 +230,7 @@ namespace Semantic is
 
             // Captured args containing placeholders — defer.
             for a in argument_types do
-                if !a? \/ a.is_error \/ a.contains_inferred then
+                if !a? \/ !a.is_settled then
                     return false;
                 fi
             od
@@ -277,5 +333,323 @@ namespace Semantic is
             buffer.append(")");
             return buffer.to_string();
         si
+    si
+
+    // The placeholder must resolve to a type that can be
+    // destructured into at least `member_count` positions —
+    // either a value-tuple of the right arity, or any other type
+    // whose `find_destructure_member(0..member_count-1)` all
+    // return non-null. Emitted at destructure-binding sites
+    // (`let (a, b) = p`) when the RHS type is still an
+    // INFERRED_VARIABLE_TYPE so the body-retry loop has a basis
+    // to filter candidate types instead of bailing out with
+    // "cannot destructure" on a placeholder.
+    class DESTRUCTURE_CONSTRAINT: Constraint is
+        member_count: int public;
+
+        init(member_count: int) is
+            super.init();
+            self.member_count = member_count;
+        si
+
+        try_discharge(candidate: Type) -> bool is
+            if !candidate? \/ candidate.is_sentinel then
+                return false;
+            fi
+
+            if has_destructure_shape(candidate) then
+                return true;
+            fi
+
+            // Variant-specific destructure members aren't visible on
+            // a wide union type — they're reached inside an
+            // `if .is_X then` branch where narrowing makes the
+            // receiver the variant. Accept the candidate when any
+            // variant supplies the destructure shape, since the
+            // constraint was recorded on the still-placeholder
+            // receiver in a context where narrowing couldn't fire;
+            // once the placeholder resolves to the union, narrowing
+            // kicks in at the destructure site and the variant's
+            // members become reachable.
+            let named = cast Types.NAMED(candidate);
+            if !named? then
+                return false;
+            fi
+
+            let symbol mut = named.symbol;
+            let generic = cast Symbols.GENERIC(symbol);
+            if generic? then
+                symbol = generic.symbol;
+            fi
+
+            let classy = cast Symbols.Classy(symbol);
+            if !classy? \/ !classy.is_union then
+                return false;
+            fi
+
+            for variant in classy.symbols do
+                let variant_classy = cast Symbols.Classy(variant);
+                if variant_classy? /\ variant.is_variant then
+                    if has_destructure_shape(variant_classy.type) then
+                        return true;
+                    fi
+                fi
+            od
+
+            return false;
+        si
+
+        // True iff `t` directly satisfies the destructure shape —
+        // a value tuple of matching arity, or a type whose
+        // `find_destructure_member(0..N-1)` all return non-null.
+        // Used both for the direct candidate and for each variant
+        // when the candidate is a union.
+        has_destructure_shape(t: Type) -> bool is
+            if !t? then
+                return false;
+            fi
+
+            if t.is_value_tuple then
+                return t.arguments? /\ t.arguments.count == member_count;
+            fi
+
+            for i in 0..member_count do
+                if !t.find_destructure_member(i)? then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        equals(other: object) -> bool is
+            if !other? \/ !isa DESTRUCTURE_CONSTRAINT(other) then
+                return false;
+            fi
+
+            let d = cast DESTRUCTURE_CONSTRAINT(other);
+            return member_count == d.member_count;
+        si
+
+        get_hash_code() -> int => member_count;
+
+        to_string() -> string => "destructure/{member_count}";
+    si
+
+    // The placeholder must resolve to a type the for-loop expression
+    // path treats as iterable: either it carries `move_next` (the
+    // direct iterator shape) or `$get_iterator` (the iterable
+    // shape — a property returning an iterator). Emitted at
+    // `for x in t` sites when `t`'s type is still an
+    // `INFERRED_VARIABLE_TYPE` so the body-retry loop can filter
+    // candidate types by iterability instead of letting set_iterator_for
+    // fire a hard "not iterable" on a placeholder it couldn't have
+    // checked anyway.
+    //
+    // Carries no payload — every iterable constraint at every
+    // for-loop site is structurally identical, so equality / hash
+    // are constant and the SET accumulator dedupes to a single
+    // entry per placeholder.
+    class ITERABLE_CONSTRAINT: Constraint is
+        init() is
+            super.init();
+        si
+
+        try_discharge(candidate: Type) -> bool is
+            if !candidate? \/ candidate.is_sentinel then
+                return false;
+            fi
+
+            if has_iterable_shape(candidate) then
+                return true;
+            fi
+
+            // Variant-aware. Mirroring DESTRUCTURE_CONSTRAINT: a
+            // union itself doesn't iterate but a variant might
+            // (e.g. a generator-shaped variant of a multi-variant
+            // sum). Accept the union when any variant satisfies.
+            let named = cast Types.NAMED(candidate);
+            if !named? then
+                return false;
+            fi
+
+            let symbol mut = named.symbol;
+            let generic = cast Symbols.GENERIC(symbol);
+            if generic? then
+                symbol = generic.symbol;
+            fi
+
+            let classy = cast Symbols.Classy(symbol);
+            if !classy? \/ !classy.is_union then
+                return false;
+            fi
+
+            for variant in classy.symbols do
+                let variant_classy = cast Symbols.Classy(variant);
+                if variant_classy? /\ variant.is_variant /\ has_iterable_shape(variant_classy.type) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        has_iterable_shape(t: Type) -> bool is
+            if !t? then
+                return false;
+            fi
+
+            if t.find_member("move_next")? then
+                return true;
+            fi
+
+            if t.find_member("$get_iterator")? then
+                return true;
+            fi
+
+            return false;
+        si
+
+        equals(other: object) -> bool =>
+            other? /\ isa ITERABLE_CONSTRAINT(other);
+
+        get_hash_code() -> int => 23;
+
+        to_string() -> string => "iterable";
+    si
+
+    // The placeholder must resolve to a type that admits indexing
+    // by `index_type` — i.e. exposes either `get_Item` /
+    // `get_item` (the convention auto-synthesised on classes with
+    // an indexer) or an explicit `get_item(index)` member whose
+    // first formal accepts `index_type`. Emitted at `t[i]` sites
+    // when `t`'s type is still an `INFERRED_VARIABLE_TYPE`.
+    //
+    // The index_type itself may contain inference placeholders;
+    // discharge defers conservatively in that case so the LUB
+    // gets to re-check on the next iteration once placeholders
+    // resolve.
+    class INDEX_CONSTRAINT: Constraint is
+        index_type: Type public;
+
+        init(index_type: Type) is
+            super.init();
+            self.index_type = index_type;
+        si
+
+        try_discharge(candidate: Type) -> bool is
+            if !candidate? \/ candidate.is_sentinel then
+                return false;
+            fi
+
+            if !index_type? \/ !index_type.is_settled then
+                return false;
+            fi
+
+            if has_indexable_shape(candidate) then
+                return true;
+            fi
+
+            // Variant-aware. As above.
+            let named = cast Types.NAMED(candidate);
+            if !named? then
+                return false;
+            fi
+
+            let symbol mut = named.symbol;
+            let generic = cast Symbols.GENERIC(symbol);
+            if generic? then
+                symbol = generic.symbol;
+            fi
+
+            let classy = cast Symbols.Classy(symbol);
+            if !classy? \/ !classy.is_union then
+                return false;
+            fi
+
+            for variant in classy.symbols do
+                let variant_classy = cast Symbols.Classy(variant);
+                if variant_classy? /\ variant.is_variant /\ has_indexable_shape(variant_classy.type) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        has_indexable_shape(t: Type) -> bool is
+            if !t? then
+                return false;
+            fi
+
+            // `get_Item` is the .NET-imported convention; `get_item`
+            // is the ghūl-source convention.
+            return is_indexer_match(t, "get_Item") \/ is_indexer_match(t, "get_item");
+        si
+
+        // True iff `t` exposes a `member_name` callable whose first
+        // formal accepts `index_type`. Function or FUNCTION_GROUP
+        // surface; other kinds aren't considered indexers.
+        is_indexer_match(t: Type, member_name: string) -> bool is
+            let member = t.find_member(member_name);
+            if !member? then
+                return false;
+            fi
+
+            let function = cast Symbols.Function(member);
+            if function? then
+                return accepts_index(function);
+            fi
+
+            let group = cast Symbols.FUNCTION_GROUP(member);
+            if group? then
+                for f in group.functions do
+                    if f? /\ accepts_index(f) then
+                        return true;
+                    fi
+                od
+                return false;
+            fi
+
+            return false;
+        si
+
+        accepts_index(f: Symbols.Function) -> bool is
+            if !f? \/ !f.arguments? \/ f.arguments.count == 0 then
+                return false;
+            fi
+
+            let formal = f.arguments[0];
+            if !formal? \/ formal.is_error then
+                return false;
+            fi
+
+            return formal.is_assignable_from(index_type);
+        si
+
+        equals(other: object) -> bool is
+            if !other? \/ !isa INDEX_CONSTRAINT(other) then
+                return false;
+            fi
+
+            let i = cast INDEX_CONSTRAINT(other);
+            if !index_type? /\ !i.index_type? then return true; fi
+            if !index_type? \/ !i.index_type? then return false; fi
+            return index_type =~ i.index_type;
+        si
+
+        get_hash_code() -> int =>
+            if index_type? then
+                index_type.get_hash_code() * 31 + 29;
+            else
+                29;
+            fi;
+
+        to_string() -> string =>
+            if index_type? then
+                "index[{index_type}]";
+            else
+                "index[<null>]";
+            fi;
     si
 si
