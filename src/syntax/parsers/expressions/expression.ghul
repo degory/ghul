@@ -7,26 +7,27 @@ namespace Syntax.Parsers.Expressions is
     use Source;
 
     enum PRECEDENCE is
-        NONE,           // 0
-        MIN,            // 1
-        UNDEFINED,      // 2
-        USER_1,         // 3
-        BOOLEAN,        // 4
-        USER_2,         // 5
-        RELATIONAL,     // 6
-        USER_3,         // 7
-        RANGE,          // 8
-        USER_4,         // 9
-        SHIFT,          // 10
-        USER_5,         // 11
-        BITWISE,        // 12
-        USER_6,         // 13
-        ADDITION,       // 14
-        USER_7,         // 15
-        MULTIPLICATION, // 16
-        USER_8,         // 17
-        MEMBER,         // 18
-        PRIMARY         // 19
+        NONE           = 0,
+        MIN            = 10,
+        YIELD          = 20,    // reserved for `||` generator yield infix
+        UNDEFINED      = 30,
+        USER_1         = 40,
+        BOOLEAN        = 50,
+        USER_2         = 60,
+        RELATIONAL     = 70,
+        USER_3         = 80,
+        RANGE          = 90,
+        USER_4         = 100,
+        SHIFT          = 110,
+        USER_5         = 120,
+        BITWISE        = 130,
+        USER_6         = 140,
+        ADDITION       = 150,
+        USER_7         = 160,
+        MULTIPLICATION = 170,
+        USER_8         = 180,
+        MEMBER         = 190,
+        PRIMARY        = 200
     si
 
     class EXPRESSION: Base[Trees.Expressions.Expression] is
@@ -76,6 +77,7 @@ namespace Syntax.Parsers.Expressions is
             _precedence["\\/"] = PRECEDENCE.BOOLEAN;
             _precedence["∧"] = PRECEDENCE.BOOLEAN;
             _precedence["∨"] = PRECEDENCE.BOOLEAN;
+            _precedence["||"] = PRECEDENCE.YIELD;
 
             _real_operation = Collections.MAP[string,string]();
 
@@ -96,13 +98,68 @@ namespace Syntax.Parsers.Expressions is
                 return PRECEDENCE.NONE;
             fi
 
-            if !_precedence.contains_key(context.current.value_string) then
-                context.error(context.current.location, 
-                "operator '{context.current.value_string}' has unknown precedence");
-                return PRECEDENCE.UNDEFINED;
+            let op = context.current.value_string;
+
+            let known: PRECEDENCE mut;
+            if _precedence.try_get_value(op, known ref) then
+                return known;
             fi
 
-            return _precedence[context.current.value_string];
+            let auto = auto_precedence_for(op);
+            _precedence[op] = auto;
+
+            return auto;
+        si
+
+        // First-character-based precedence heuristic for user-defined
+        // operators. Modelled on OCaml/F#. Every built-in operator in the
+        // _precedence table matches what this would compute, so the table
+        // is purely an optimisation and a hook point for explicit overrides
+        // via @precedence.
+        auto_precedence_for(op: string) -> PRECEDENCE static is
+            if op =~ "/\\" \/ op =~ "\\/" then
+                return PRECEDENCE.BOOLEAN;
+            fi
+            if op =~ ".." \/ op =~ "::" then
+                return PRECEDENCE.RANGE;
+            fi
+
+            let first = op.get_chars(0);
+
+            if first == '*' \/ first == '/' \/ first == '%' \/
+               first == '×' \/ first == '÷' \/ first == '✕'
+            then
+                return PRECEDENCE.MULTIPLICATION;
+            fi
+            if first == '+' \/ first == '-' then
+                return PRECEDENCE.ADDITION;
+            fi
+            if first == '<' \/ first == '>' then
+                if op.length >= 2 /\ op.get_chars(1) == first then
+                    return PRECEDENCE.SHIFT;
+                else
+                    return PRECEDENCE.RELATIONAL;
+                fi
+            fi
+            if first == '=' \/ first == '!' \/ first == '~' \/
+               first == '≈' \/ first == '≡'
+            then
+                return PRECEDENCE.RELATIONAL;
+            fi
+            if first == '&' \/ first == '∩' then
+                return PRECEDENCE.BITWISE;
+            fi
+            if first == '|' \/ first == '¦' \/ first == '∪' then
+                return PRECEDENCE.BITWISE;
+            fi
+            if first == '^' then
+                return PRECEDENCE.BITWISE;
+            fi
+            if first == '∧' \/ first == '∨' then
+                return PRECEDENCE.BOOLEAN;
+            fi
+
+            return PRECEDENCE.USER_5;
         si
 
         parse(context: CONTEXT) -> Trees.Expressions.Expression is
@@ -120,6 +177,8 @@ namespace Syntax.Parsers.Expressions is
 
         // precedence climbing expression parser:
         parse(context: CONTEXT, left: Trees.Expressions.Expression mut, min_precedence: PRECEDENCE) -> Trees.Expressions.Expression is
+            let last_was_yield_infix mut = false;
+
             do
                 let left_precedence = precedence(context);
 
@@ -134,8 +193,10 @@ namespace Syntax.Parsers.Expressions is
                 if _real_operation.contains_key(apparent_op) then
                     real_op = _real_operation[apparent_op];
                 fi
-                
+
                 let op = Trees.Identifiers.Identifier(context.location, real_op);
+
+                let op_location = context.location;
 
                 context.next_token();
 
@@ -153,10 +214,63 @@ namespace Syntax.Parsers.Expressions is
                     right = parse(context, right, right_precedence);
                 od
 
-                left = Trees.Expressions.BINARY(left.location::right.location, op, apparent_op, left, right);
+                if apparent_op =~ "||" then
+                    if last_was_yield_infix then
+                        IoC.CONTAINER.instance.logger.error(
+                            op_location,
+                            "yield infix `||` does not chain — the right operand should be a complete next-step expression, not another `||`"
+                        );
+                    fi
+                    left = lower_yield_infix(left, right);
+                    last_was_yield_infix = true;
+                else
+                    left = Trees.Expressions.BINARY(left.location::right.location, op, apparent_op, left, right);
+                    last_was_yield_infix = false;
+                fi
             od
 
             return left;
+        si
+
+        // Desugar `value || rest_expr` into a call to the lazy-stream
+        // YIELD variant: `Ghul.Pipes.STREAM.YIELD(value, () => rest_expr)`.
+        // The empty-args lambda makes the right-hand side lazy so the
+        // step is produced on demand by the consumer pipe.
+        lower_yield_infix(
+            left: Trees.Expressions.Expression,
+            right: Trees.Expressions.Expression
+        ) -> Trees.Expressions.Expression static is
+            let location = left.location::right.location;
+
+            let ghul   = Trees.Identifiers.Identifier(location, "Ghul");
+            let pipes  = Trees.Identifiers.QUALIFIED(location, ghul,   "Pipes",  location, location);
+            let stream = Trees.Identifiers.QUALIFIED(location, pipes,  "STREAM", location, location);
+            let yield  = Trees.Identifiers.QUALIFIED(location, stream, "YIELD",  location, location);
+
+            let yield_function = Trees.Expressions.IDENTIFIER(location, yield);
+
+            let thunk_arguments = Trees.Expressions.LIST(
+                right.location,
+                Collections.LIST[Trees.Expressions.Expression]()
+            );
+
+            let thunk_type = Trees.TypeExpressions.INFER(right.location);
+            let thunk_body = Trees.Bodies.EXPRESSION(right.location, right);
+
+            let thunk = Trees.Expressions.FUNCTION(
+                right.location,
+                thunk_arguments,
+                thunk_type,
+                thunk_body,
+                false
+            );
+
+            let call_arguments = Trees.Expressions.LIST(
+                location,
+                [left, thunk]: Trees.Expressions.Expression
+            );
+
+            return Trees.Expressions.CALL(location, yield_function, call_arguments);
         si
     si
 si
