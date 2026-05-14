@@ -1672,6 +1672,7 @@ namespace Syntax.Process is
 
             let implied_type: Type;
             let implied_argument_types: Collections.List[Type] mut;
+            let constraint_return_type: Type mut;
 
             // have we been passed expected arguments types? If so we'll use them
             // to argument types of any anonymous function literal arguments.
@@ -1681,6 +1682,28 @@ namespace Syntax.Process is
             // arg whose chosen-formal type is now known (#1174).
             if function.constraint? /\ function.constraint.is_function then
                 implied_argument_types = function.constraint.arguments;
+
+                // FUNCTION encodes its return type as the last entry in
+                // `arguments`. Capture it for body-constraint pushdown
+                // below. (Leave closure.return_type alone — taking the
+                // constraint there would pre-widen the lambda's emitted
+                // return type and break `(o: object) => 123` covariant-
+                // returning into an `object -> object` slot.)
+                let argument_count = function.constraint.arguments.count;
+                if argument_count > 0 then
+                    let candidate = function.constraint.arguments[argument_count - 1];
+
+                    if
+                        candidate?              /\
+                        !candidate.is_inferred  /\
+                        !candidate.is_error     /\
+                        !candidate.is_void      /\
+                        !candidate.is_any
+                    then
+                        constraint_return_type = candidate;
+                    fi
+                fi
+
             fi
 
             _symbol_table.current_closure_context.add_closure(closure);
@@ -1699,6 +1722,30 @@ namespace Syntax.Process is
                 fi
 
                 closure.set_return_type(return_type);
+            fi
+
+            // Push the constraint's return-type slot onto the body's
+            // last expression before walking. The implicit-return path
+            // (pre(Bodies.EXPRESSION)) is gated on
+            // `!function.return_type.is_any` and skips when the closure
+            // hasn't been given an explicit return-type annotation —
+            // but that's exactly the case where a bare variant
+            // constructor (`DONE()`) in the body would benefit from
+            // knowing the expected type. Set it here so the body's
+            // CALL nodes see the constraint; without setting
+            // closure.return_type, the lambda's emitted return type
+            // is still inferred from the body so covariant-return-via-
+            // assignment is unaffected.
+            if
+                constraint_return_type? /\
+                !function.type_expression.type? /\
+                isa Trees.Bodies.EXPRESSION(function.body)
+            then
+                let body = cast Trees.Bodies.EXPRESSION(function.body);
+
+                if body.expression? then
+                    body.expression.set_constraint(constraint_return_type, "cannot return value of type {{0}} where {{1}} expected");
+                fi
             fi
 
             _logger.commit();
@@ -4035,6 +4082,43 @@ namespace Syntax.Process is
             return false;
         si
 
+        // True iff any formal arg in the resolver's PARTIAL function
+        // still references one of the function's own generic
+        // type-variables (i.e. the resolver couldn't bind that slot
+        // from any sibling actual). Same shape problem as
+        // `_partial_arguments_contain_error`: pushing the formal as-is
+        // burdens the lambda's re-walk with a constraint
+        // (`int -> STEP[T]`) that can't be satisfied by anything
+        // concrete the body produces. Re-specialise with phantoms in
+        // those slots so the constraint pushed becomes
+        // (`int -> STEP[<phantom>]`) — actually informative, and
+        // back-feedable from inside the body.
+        _partial_arguments_contain_unbound_function_type_variable(function: Semantic.Symbols.Function) -> bool is
+            if !function? \/ !function.arguments? then
+                return false;
+            fi
+
+            let found = Ghul.BOX[bool](false);
+
+            for arg in function.arguments do
+                if !arg? then
+                    continue;
+                fi
+
+                arg.walk((t: Type) is
+                    if t? /\ t.is_function_generic_argument then
+                        found.value = true;
+                    fi
+                si);
+
+                if found.value then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
         // True if any of the CALL's arguments is a Trees.Expressions.FUNCTION
         // literal. Used to gate the constraint-push retry on the
         // recoverable case where a not-yet-constrained lambda body
@@ -4392,9 +4476,22 @@ namespace Syntax.Process is
                         // function-own-args specialiser (which skips
                         // ERROR / placeholder-bearing actuals); push
                         // that cleaner form.
+                        //
+                        // Same shape for unbound function-own type
+                        // variables: when the resolver couldn't bind a
+                        // slot, the formal still contains the
+                        // candidate's literal `T` / `S` /…, which is
+                        // useless as a constraint downstream
+                        // (literal `T` matches nothing concrete the
+                        // body could produce). Re-specialise so those
+                        // slots become phantoms — back-feedable from
+                        // inside the lambda body.
                         let push_function mut = overload_result.function;
 
-                        if _partial_arguments_contain_error(push_function) then
+                        if
+                            _partial_arguments_contain_error(push_function) \/
+                            _partial_arguments_contain_unbound_function_type_variable(push_function)
+                        then
                             let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
 
                             if candidate? /\ candidate.is_generic then
