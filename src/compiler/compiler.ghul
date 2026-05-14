@@ -20,50 +20,71 @@ namespace Compiler is
 
         build_passes: MutableList[Pass];
 
+        // Cached reference to the compile-expressions pass — lets handlers
+        // ask "is this file compiled through expressions" without exposing
+        // every pass individually.
+        _compile_expressions_pass: Pass;
+
         generated_source_files: MutableList[string];
 
         init() is
             container = IoC.CONTAINER.instance;
-            logger = container.logger;       
+            logger = container.logger;
 
             source_files = LIST[SOURCE_FILE]();
             generated_source_files = LIST[string]();
 
             post_parse_passes = LIST[Pass]();
-            add_pass(post_parse_passes, "conditional-compilation", (source_file) -> void is conditional_compilation_pass(source_file); si);
-            add_pass(post_parse_passes, "rewrite-syntax-trees", (source_file) -> void is rewrite_syntax_tree_pass(source_file); si);
+            add_pass(post_parse_passes, "conditional-compilation", (source_file) -> bool => conditional_compilation_pass(source_file));
+            add_pass(post_parse_passes, "rewrite-syntax-trees", (source_file) -> bool => rewrite_syntax_tree_pass(source_file));
 
             build_passes = LIST[Pass]();
-            add_pass(build_passes, "declare-symbols", (source_file) -> void is declare_symbols_pass(source_file); si);
-            add_pass(build_passes, "resolve-uses", (source_file) -> void is resolve_uses_pass(source_file); si);
-            add_pass(build_passes, "resolve-type-expressions", (source_file: SOURCE_FILE ) -> void is resolve_type_expressions_pass(source_file); si);
-            add_pass(build_passes, "resolve-ancestors", (source_file) -> void is resolve_ancestors_pass(source_file); si);
-            add_pass(build_passes, "resolve-explicit-types", (source_file) -> void is resolve_explicit_types_pass(source_file); si);
+            add_pass(build_passes, "declare-symbols", (source_file) -> bool => declare_symbols_pass(source_file));
+            add_pass(build_passes, "resolve-uses", (source_file) -> bool => resolve_uses_pass(source_file));
+            add_pass(build_passes, "resolve-type-expressions", (source_file: SOURCE_FILE) -> bool => resolve_type_expressions_pass(source_file));
+            add_pass(build_passes, "resolve-ancestors", (source_file) -> bool => resolve_ancestors_pass(source_file));
+            add_pass(build_passes, "resolve-explicit-types", (source_file) -> bool => resolve_explicit_types_pass(source_file));
             add_pass(
-                build_passes, 
-                "resolve-overrides", 
+                build_passes,
+                "resolve-overrides",
                 () -> void is si,
-                (source_file) -> void is resolve_overrides_pass(source_file); si,
+                (source_file) -> bool => resolve_overrides_pass(source_file),
                 () -> void is
                     container.resolve_overrides.check_duplicate_global_functions();
                 si
             );
-            add_pass(build_passes, "record-type-argument-uses", (source_file) -> void is record_type_argument_uses_pass(source_file); si);
+            add_pass(build_passes, "record-type-argument-uses", (source_file) -> bool => record_type_argument_uses_pass(source_file));
 
-            add_pass(build_passes, "compile-expressions", (source_file) -> void is compile_expressions_pass(source_file); si);
+            _compile_expressions_pass = add_pass(build_passes, "compile-expressions", (source_file) -> bool => compile_expressions_pass(source_file));
 
-            add_pass(build_passes, "warn-implicit-mutable-let", (source_file) -> void is warn_implicit_mutable_let_pass(source_file); si);
+            add_pass(build_passes, "warn-implicit-mutable-let", (source_file) -> bool => warn_implicit_mutable_let_pass(source_file));
 
             // TODO: is this actually needed?
             add_pass(
-                build_passes, 
-                "generate-il", 
+                build_passes,
+                "generate-il",
                 () -> void is
                     container.referenced_assemblies.gen();
                 si,
-                (source_file) -> void is generate_il_pass(source_file); si,
+                (source_file) -> bool => generate_il_pass(source_file),
                 () -> void is si
             );
+
+            // Pass.order is set in registration order so a SOURCE_FILE's
+            // compiled_through.order can be compared numerically against the
+            // order of a target pass (e.g. _compile_expressions_pass). Post-
+            // parse passes get their own counter starting at zero and don't
+            // participate in compiled_through queries.
+            assign_pass_orders(post_parse_passes);
+            assign_pass_orders(build_passes);
+        si
+
+        assign_pass_orders(passes: Collections.Iterable[Pass]) static is
+            let order = 0;
+            for p in passes do
+                p.order = order;
+                order = order + 1;
+            od
         si
 
         dump_counts() is 
@@ -79,25 +100,41 @@ namespace Compiler is
             container.symbol_use_locations.clear();
             container.symbol_definition_locations.clear();
             // container.logger.clear();
+
+            // Every previously-queued file's expression-level state now
+            // references symbols that have just been abandoned. Drop the
+            // marker so query handlers can tell.
+            for f in source_files do
+                f.compiled_through = null;
+            od
         si
+
+        is_compiled_through_expressions(source_file: SOURCE_FILE) -> bool =>
+            source_file? /\
+            source_file.compiled_through? /\
+            source_file.compiled_through.order >= _compile_expressions_pass.order;
 
         clear_queue() is
             source_files.clear();
         si
 
-        add_pass(passes: Collections.MutableList[Pass], description: string, apply: SOURCE_FILE -> void) is
-            passes.add(PASS(container.timers, description, null, apply, null));
+        add_pass(passes: Collections.MutableList[Pass], description: string, apply: SOURCE_FILE -> bool) -> Pass is
+            let pass = PASS(container.timers, description, null, apply, null);
+            passes.add(pass);
+            return pass;
         si
 
         add_pass(
             passes: Collections.MutableList[Pass],
             description: string,
             start: () -> void,
-            apply: SOURCE_FILE -> void, 
+            apply: SOURCE_FILE -> bool,
             finish: () -> void
-        )
+        ) -> Pass
         is
-            passes.add(PASS(container.timers, description, start, apply, finish));
+            let pass = PASS(container.timers, description, start, apply, finish);
+            passes.add(pass);
+            return pass;
         si
 
         add_pass(passes: Collections.MutableList[Pass], pass: Pass) is
@@ -184,45 +221,53 @@ namespace Compiler is
 
         build(passes: Collections.Iterable[Pass], source_files: Collections.Iterable[SOURCE_FILE]) is
             for pass in passes do
-                if !pass? then                    
+                if !pass? then
                     continue;
                 fi
 
                 pass.start();
-                
+
                 for i in source_files do
                     let symbol_table = IoC.CONTAINER.instance.symbol_table;
                     let symbol_table_mark = symbol_table.mark_scope_stack();
                     let diagnostics_mark = logger.mark();
 
+                    let did_work = false;
+
                     try
-                        pass.apply(i);
+                        did_work = pass.apply(i);
                     catch e: Exception
                         logger.exception(i.definition.location, e, "caught exception running pass {pass} on work item {i}");
                     finally
                         logger.release(diagnostics_mark);
-                        symbol_table.release_scope_stack(symbol_table_mark);                    
+                        symbol_table.release_scope_stack(symbol_table_mark);
                     yrt
 
-                    IoC.CONTAINER.instance.namespaces.pop_all_namespaces();                    
+                    if did_work then
+                        i.compiled_through = pass;
+                    fi
+
+                    IoC.CONTAINER.instance.namespaces.pop_all_namespaces();
                 od
-                
+
                 pass.finish();
             od
         si
 
-        conditional_compilation_pass(source_file: SOURCE_FILE) is
+        conditional_compilation_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
-            
+
             container
                 .conditional_compilation
                 .apply(
                     definition
                 );
+
+            return true;
         si
-        
-        rewrite_syntax_tree_pass(source_file: SOURCE_FILE) is
+
+        rewrite_syntax_tree_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -233,9 +278,11 @@ namespace Compiler is
             container
                 .add_accessors_for_properties
                 .apply(definition);
+
+            return true;
         si
 
-        declare_symbols_pass(source_file: SOURCE_FILE) is
+        declare_symbols_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -243,10 +290,14 @@ namespace Compiler is
                 container
                     .declare_symbols
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        resolve_uses_pass(source_file: SOURCE_FILE) is
+        resolve_uses_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -254,10 +305,14 @@ namespace Compiler is
                 container
                     .resolve_uses
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        resolve_ancestors_pass(source_file: SOURCE_FILE) is
+        resolve_ancestors_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -265,10 +320,14 @@ namespace Compiler is
                 container
                     .resolve_ancestors
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        resolve_type_expressions_pass(source_file: SOURCE_FILE) is
+        resolve_type_expressions_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -276,10 +335,14 @@ namespace Compiler is
                 container
                     .resolve_type_expressions
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        resolve_explicit_types_pass(source_file: SOURCE_FILE) is
+        resolve_explicit_types_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -287,10 +350,14 @@ namespace Compiler is
                 container
                     .resolve_explicit_types
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        compile_expressions_pass(source_file: SOURCE_FILE) is
+        compile_expressions_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -298,10 +365,14 @@ namespace Compiler is
                 container
                     .compile_expressions
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        resolve_overrides_pass(source_file: SOURCE_FILE) is
+        resolve_overrides_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
             let definition = source_file.definition;
 
@@ -309,10 +380,14 @@ namespace Compiler is
                 container
                     .resolve_overrides
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        record_type_argument_uses_pass(source_file: SOURCE_FILE) is
+        record_type_argument_uses_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
 
             if flags.want_assembler \/ flags.want_executable then
@@ -321,10 +396,14 @@ namespace Compiler is
                 container
                     .record_type_argument_uses
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
 
-        warn_implicit_mutable_let_pass(source_file: SOURCE_FILE) is
+        warn_implicit_mutable_let_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
 
             if flags.want_warn_implicit_mutable_let then
@@ -333,10 +412,14 @@ namespace Compiler is
                 container
                     .warn_implicit_mutable_let
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
-        
-        generate_il_pass(source_file: SOURCE_FILE) is
+
+        generate_il_pass(source_file: SOURCE_FILE) -> bool is
             let flags = source_file.build_flags;
 
             if flags.want_assembler \/ flags.want_executable then
@@ -344,13 +427,17 @@ namespace Compiler is
                 container
                     .ir_context
                     .throw_on_fixme = false;
-    
+
                 let definition = source_file.definition;
 
                 container
                     .generate_il
                     .apply(definition);
+
+                return true;
             fi
+
+            return false;
         si
     si
 si
