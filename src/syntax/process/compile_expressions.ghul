@@ -15,25 +15,49 @@ namespace Syntax.Process is
 
     use Syntax.Trees.Definitions.PRAGMA;
 
-    // Per-IF bookkeeping for else-branch complement narrowing on
-    // 2-variant unions. An IF "qualifies" when it has exactly
-    // 2 branches with the second being an `else` — in
-    // `if cond then ... else ... fi`, a 2-variant union narrowed
-    // by `cond` of the form `<simple-id>.is_<variant>` lets the
-    // else body see the variable narrowed to the other variant.
-    // Multi-variant complements need an internal sum type — see
-    // issue #1265.
+    // Per-IF bookkeeping for trailing-else complement narrowing
+    // over an if + elif* + else chain. The IF "qualifies"
+    // structurally when it has ≥ 2 branches, the last is `else`,
+    // and every other branch has a condition. visit(IF_BRANCH)
+    // for each cond branch tries to extract a (target, variant)
+    // pair from a `<simple-id>.is_<variant>` condition on a union;
+    // matching branches append the variant to `eliminated`. Any
+    // non-matching cond shape, or a different target from the
+    // chain's first entry, marks the frame dead so the trailing
+    // else does not narrow.
     //
-    // pre(IF) pushes a frame; visit(IF) pops it. visit(IF_BRANCH)
-    // for the if-branch fills in (target, complement_type) when
-    // the qualifying cond shape matches; pre(IF_BRANCH) for the
-    // else-branch reads them and pushes the narrowing.
+    // pre(IF_BRANCH) for the else branch reads the frame: when
+    // still live with a non-empty eliminated set, builds the
+    // complement variant set against the underlying union and
+    // pushes Types.ONE_OF.create (which degenerates a singleton
+    // complement to a plain variant type) onto the narrowing
+    // stack. Multi-variant complements are represented by ONE_OF
+    // — see Semantic.Types.ONE_OF for the contract.
+    //
+    // pre(IF) pushes a frame; visit(IF) pops it.
     class ELSE_COMPLEMENT_FRAME is
-        is_two_branch_if_else: bool public;
+        is_qualifying: bool public;
+        is_dead: bool public;
         target: Semantic.Symbols.Variable public;
-        complement_type: Type public;
+        underlying_type: Semantic.Types.NAMED public;
+        eliminated: Collections.LIST[Semantic.Symbols.Classy] public;
 
         init() is
+            eliminated = Collections.LIST[Semantic.Symbols.Classy]();
+        si
+
+        contains_eliminated(v: Semantic.Symbols.Classy) -> bool is
+            if !v? then
+                return false;
+            fi
+
+            for u in eliminated do
+                if u == v then
+                    return true;
+                fi
+            od
+
+            return false;
         si
     si
 
@@ -168,14 +192,36 @@ namespace Syntax.Process is
             return cast Semantic.Symbols.Classy(symbol);
         si
 
-        // For an `is_<variant>` access on a value of union type,
-        // return the variant type with the same generic args as the
-        // receiver. Null if the receiver isn't a union, or no variant
-        // matches the suffix.
-        try_get_variant_type_for_is_accessor(
+        // Pick the type that carries the receiver's generic args
+        // for variant-type construction. ONE_OF holds its original
+        // union NAMED/GENERIC as `underlying_type`; any other NAMED
+        // (plain or GENERIC) can be used directly.
+        pick_underlying_type(receiver_type: Type) -> Semantic.Types.NAMED is
+            if !receiver_type? then
+                return null;
+            fi
+
+            if isa Semantic.Types.ONE_OF(receiver_type) then
+                return (cast Semantic.Types.ONE_OF(receiver_type)).underlying_type;
+            fi
+
+            if isa Semantic.Types.NAMED(receiver_type) then
+                return cast Semantic.Types.NAMED(receiver_type);
+            fi
+
+            return null;
+        si
+
+        // Find the variant Classy a `is_<suffix>` accessor refers
+        // to on a union receiver. Returns null when the receiver
+        // isn't a union, the accessor name is malformed, or — for
+        // a ONE_OF receiver — the matched variant is not in the
+        // narrowed set (predicate is statically false; a diagnostic
+        // is deferred).
+        try_get_variant_for_is_accessor(
             receiver_type: Type,
             member_name: string
-        ) -> Type is
+        ) -> Semantic.Symbols.Classy is
             if !is_variant_accessor_name(member_name) then
                 return null;
             fi
@@ -184,6 +230,78 @@ namespace Syntax.Process is
 
             if !classy? \/ !classy.is_union then
                 return null;
+            fi
+
+            let suffix = member_name.substring(3);
+
+            let one_of: Semantic.Types.ONE_OF mut;
+            if isa Semantic.Types.ONE_OF(receiver_type) then
+                one_of = cast Semantic.Types.ONE_OF(receiver_type);
+            fi
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    if one_of? /\ !one_of.contains_variant(variant) then
+                        return null;
+                    fi
+
+                    return variant;
+                fi
+            od
+
+            return null;
+        si
+
+        // For an `is_<variant>` access on a value of union type,
+        // return the variant type with the same generic args as the
+        // receiver. Null if the receiver isn't a union, the variant
+        // doesn't match, or — for a ONE_OF receiver — the variant
+        // is outside the narrowed set.
+        try_get_variant_type_for_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> Type is
+            let variant = try_get_variant_for_is_accessor(receiver_type, member_name);
+
+            if !variant? then
+                return null;
+            fi
+
+            let underlying = pick_underlying_type(receiver_type);
+
+            if !underlying? then
+                return null;
+            fi
+
+            return Semantic.Types.ONE_OF.build_singleton_variant_type(underlying, variant);
+        si
+
+        // True iff the predicate `receiver.<member_name>` is
+        // statically false because the receiver is a ONE_OF and the
+        // matched variant is outside the narrowed set. Other "no
+        // match" reasons (not a variant accessor, not a union,
+        // variant doesn't exist at all) return false — those are
+        // either ill-formed (the existing find_member error reports
+        // them) or simply not a is_X predicate.
+        is_statically_false_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> bool is
+            if !is_variant_accessor_name(member_name) then
+                return false;
+            fi
+
+            if !isa Semantic.Types.ONE_OF(receiver_type) then
+                return false;
+            fi
+
+            let one_of = cast Semantic.Types.ONE_OF(receiver_type);
+            let classy = get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return false;
             fi
 
             let suffix = member_name.substring(3);
@@ -192,83 +310,103 @@ namespace Syntax.Process is
                 if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
                     let variant = cast Semantic.Symbols.Classy(s);
 
-                    if isa Semantic.Types.GENERIC(receiver_type) then
-                        let generic_receiver = cast Semantic.Types.GENERIC(receiver_type);
-
-                        return Semantic.Types.GENERIC(
-                            variant.location,
-                            variant,
-                            generic_receiver.arguments
-                        );
-                    else
-                        return Semantic.Types.NAMED(variant);
-                    fi
+                    return !one_of.contains_variant(variant);
                 fi
             od
 
-            return null;
+            return false;
         si
 
-        // For an `is_<variant>` access on a 2-variant union, return
-        // the type of the OTHER variant carrying the receiver's
-        // generic args. Null if the receiver isn't a union, has more
-        // or fewer than 2 variants, or no variant matches the suffix.
-        // Multi-variant complements need a sum-type representation
-        // — see issue #1265.
-        try_get_two_variant_complement(
+        // Build a hinted "narrow further" message when a member
+        // access on a ONE_OF fails to find the member on the union
+        // but every in-set variant has a same-named member. Returns
+        // null when the hint doesn't apply (receiver isn't a ONE_OF,
+        // name is a is_<variant> accessor that has its own
+        // diagnostic, or the name is missing on at least one
+        // in-set variant). Variant-private fields can't be accessed
+        // through ONE_OF without IL-side variant-dispatching support
+        // — for now we just direct the user to narrow further.
+        try_describe_intersection_miss(
             receiver_type: Type,
             member_name: string
-        ) -> Type is
-            if !is_variant_accessor_name(member_name) then
+        ) -> string is
+            if !isa Semantic.Types.ONE_OF(receiver_type) then
                 return null;
             fi
 
+            if is_variant_accessor_name(member_name) then
+                return null;
+            fi
+
+            let one_of = cast Semantic.Types.ONE_OF(receiver_type);
+
+            let any_variant mut = false;
+            for variant in one_of.variants do
+                if !variant? \/ !variant.find_member(member_name)? then
+                    return null;
+                fi
+                any_variant = true;
+            od
+
+            if !any_variant then
+                return null;
+            fi
+
+            let names = System.Text.StringBuilder();
+            let seen_any mut = false;
+            for variant in one_of.variants do
+                if seen_any then
+                    names.append(", ");
+                fi
+                names.append(variant.name);
+                seen_any = true;
+            od
+
+            return "member {member_name} is on every variant of \{{names}\} but not on the union — narrow further with `if v.is_<variant>` before access";
+        si
+
+        // Build the complement narrowing for the trailing else of
+        // an if/elif chain — variants of the union behind
+        // `receiver_type` that don't appear in `eliminated`. Returns
+        // a singleton variant type, a ONE_OF, or null when the
+        // chain exhausts the union (caller's exhaustiveness signal).
+        try_get_complement_after_eliminated(
+            receiver_type: Type,
+            eliminated: Collections.Iterable[Semantic.Symbols.Classy]
+        ) -> Type is
             let classy = get_classy_for_narrowing(receiver_type);
 
             if !classy? \/ !classy.is_union then
                 return null;
             fi
 
-            let suffix = member_name.substring(3);
-
-            let variants = Collections.LIST[Semantic.Symbols.Classy]();
+            let complement = Collections.LIST[Semantic.Symbols.Classy]();
 
             for s in classy.symbols do
                 if s? /\ s.is_variant then
-                    variants.add(cast Semantic.Symbols.Classy(s));
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    let is_eliminated mut = false;
+
+                    for e in eliminated do
+                        if e == variant then
+                            is_eliminated = true;
+                        fi
+                    od
+
+                    if !is_eliminated then
+                        complement.add(variant);
+                    fi
                 fi
             od
 
-            if variants.count != 2 then
+            let underlying = pick_underlying_type(receiver_type);
+
+            if !underlying? then
                 return null;
             fi
 
-            let other: Semantic.Symbols.Classy mut;
-            let saw_match mut = false;
-
-            for v in variants do
-                if v.name? /\ v.name.to_lower_invariant() =~ suffix then
-                    saw_match = true;
-                else
-                    other = v;
-                fi
-            od
-
-            if !saw_match \/ !other? then
-                return null;
-            fi
-
-            if isa Semantic.Types.GENERIC(receiver_type) then
-                let generic_receiver = cast Semantic.Types.GENERIC(receiver_type);
-
-                return Semantic.Types.GENERIC(
-                    other.location,
-                    other,
-                    generic_receiver.arguments
-                );
-            else
-                return Semantic.Types.NAMED(other);
-            fi
+            return Semantic.Types.ONE_OF.create(underlying, complement);
         si
 
         apply(root: Trees.Node) is
@@ -571,6 +709,31 @@ namespace Syntax.Process is
 
         pre(`let: Trees.Statements.LET) -> bool is
             super.pre(`let);
+
+            // Reset is_defined on each LHS variable at the start of
+            // every body-retry walk of the let. Without this reset,
+            // an earlier walk's define() call leaves is_defined=true,
+            // and check_is_defined in `load_captured_value` no longer
+            // fires for a forward self-reference inside the RHS
+            // lambda on subsequent walks (`let f = ... f ...` is the
+            // canonical case). The error gets rolled back per iter
+            // via mark_consumed_any rolling back diagnostics, but
+            // the final iter's error survives so the user-visible
+            // diagnostic is preserved.
+            if `let.variables? then
+                for v in `let.variables do
+                    if v.names? then
+                        for name in v.names do
+                            let symbol = find(name);
+                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
+                                let variable = cast Semantic.Symbols.Variable(symbol);
+                                variable.is_defined = false;
+                            fi
+                        od
+                    fi
+                od
+            fi
+
             return false;
         si
 
@@ -617,11 +780,30 @@ namespace Syntax.Process is
             let symbol: Semantic.Symbols.Symbol;
 
             let type: Type mut = Semantic.Types.ERROR();
-    
+
             if `for.expression? /\ !`for.expression.is_poisoned then
                 `for.expression.walk(self);
 
-                if 
+                // Iterable inference: a still-placeholder for-loop
+                // expression records an ITERABLE_CONSTRAINT on its
+                // origin so the body-retry loop can filter candidate
+                // types to those that actually iterate. set_iterator_for
+                // below will still emit "not iterable" on this iter —
+                // the speculate/roll-back wrapper drops the error on
+                // retry once the placeholder resolves.
+                if
+                    `for.expression.value? /\
+                    `for.expression.value.type? /\
+                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(`for.expression.value.type)
+                then
+                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(`for.expression.value.type);
+
+                    if placeholder.origin.add_constraint(Semantic.ITERABLE_CONSTRAINT()) then
+                        _logger.mark_consumed_any();
+                    fi
+                fi
+
+                if
                     `for.expression.value? /\ set_iterator_for(`for, `for.expression.value.type, false)
                 then
                     if `for.variable.type_expression? /\ !isa Trees.TypeExpressions.INFER(`for.variable.type_expression) then
@@ -824,6 +1006,14 @@ namespace Syntax.Process is
             // loop iteration.
             let lhs_type = _try_get_assignment_left_type(assignment.left);
 
+            // `!is_inferred` (not !is_sentinel or is_settled):
+            // we're asking "is the LHS anything other than a
+            // bare placeholder?". ERROR is pre-filtered by
+            // _try_get_assignment_left_type. A composite-with-
+            // placeholder LHS like Function[placeholder, int]
+            // *is* useful as an RHS constraint — the placeholder
+            // arg slot is filled by the lambda's body inference,
+            // and the return slot does its job.
             if lhs_type? /\ !lhs_type.is_inferred then
                 assignment.right.set_constraint(lhs_type, "{{0}} is not assignable to {{1}}");
             fi
@@ -1190,17 +1380,31 @@ namespace Syntax.Process is
             // in visit() pops them once the body has been walked.
             _narrowing.mark_scope();
 
-            // Else-complement narrowing: if this is the else
-            // branch of a qualifying IF and the if-branch's visit
-            // already stashed a (target, complement_type) pair on
-            // the frame, push it onto the just-marked scope so
-            // the body sees the variable narrowed to the other
-            // variant.
+            // Else-complement chain narrowing: trailing else of a
+            // qualifying IF. Visit(IF_BRANCH) for every cond branch
+            // has accumulated (target, underlying_type, eliminated)
+            // on the frame; here we materialise the complement
+            // narrow against the still-living set and push it. A
+            // null complement (chain exhausted the union) leaves
+            // the body unnarrowed.
             if !`if.condition? /\ _else_complement_stack.count > 0 then
                 let frame = _else_complement_stack[_else_complement_stack.count - 1];
 
-                if frame.is_two_branch_if_else /\ frame.target? /\ frame.complement_type? then
-                    _narrowing.try_push(frame.target, frame.complement_type);
+                if
+                    frame.is_qualifying /\
+                    !frame.is_dead /\
+                    frame.target? /\
+                    frame.underlying_type? /\
+                    frame.eliminated.count > 0
+                then
+                    let complement = try_get_complement_after_eliminated(
+                        frame.underlying_type,
+                        frame.eliminated
+                    );
+
+                    if complement? then
+                        _narrowing.try_push(frame.target, complement);
+                    fi
                 fi
             fi
         si
@@ -1208,31 +1412,24 @@ namespace Syntax.Process is
         visit(`if: Trees.Statements.IF_BRANCH) is
             _narrowing.release_scope();
 
-            // Else-complement narrowing: if the just-finished
-            // branch is the if-branch of a qualifying IF and its
-            // condition is `<simple-id>.is_<variant>` on a 2-variant
-            // union, stash the complement variant type on the frame
-            // for pre(IF_BRANCH) of the else-branch to consume.
+            // Else-complement chain accumulation: a cond branch of
+            // a still-live qualifying IF tries to extract a
+            // (target, variant) pair from a
+            // `<simple-id>.is_<variant>` condition on a union.
+            // Matching branches append the variant to the frame's
+            // eliminated set; non-matching branches (different
+            // target, non-`is_<variant>` shape, non-union receiver)
+            // mark the frame dead so the trailing else does not
+            // narrow.
             if
                 _else_complement_stack.count > 0 /\
                 `if? /\
-                `if.condition? /\
-                isa Trees.Expressions.MEMBER(`if.condition)
+                `if.condition?
             then
                 let frame = _else_complement_stack[_else_complement_stack.count - 1];
 
-                if frame.is_two_branch_if_else /\ !frame.target? then
-                    let member = cast Trees.Expressions.MEMBER(`if.condition);
-
-                    if member.left? /\ member.left.value? /\ member.left.value.type? /\ member.identifier? then
-                        let target = try_get_narrowing_target(member.left);
-                        let complement = try_get_two_variant_complement(member.left.value.type, member.identifier.name);
-
-                        if target? /\ complement? then
-                            frame.target = target;
-                            frame.complement_type = complement;
-                        fi
-                    fi
+                if frame.is_qualifying /\ !frame.is_dead then
+                    record_branch_elimination(frame, `if.condition);
                 fi
             fi
 
@@ -1247,6 +1444,102 @@ namespace Syntax.Process is
             fi
 
             super.visit(`if);
+        si
+
+        // Extract (target, variant)s from `condition` and append
+        // each variant to `frame.eliminated`. Handles a single
+        // `<id>.is_<variant>` leaf and any flat `\/` chain of such
+        // leaves on the same target. Marks the frame dead on any
+        // non-qualifying shape (different target, non-`is_<variant>`
+        // leaf, non-union receiver).
+        record_branch_elimination(
+            frame: ELSE_COMPLEMENT_FRAME,
+            condition: Trees.Expressions.Expression
+        ) is
+            if !try_extend_state_with_chain(frame, condition) then
+                frame.is_dead = true;
+            fi
+        si
+
+        // Walk a `\/` chain (or a single MEMBER leaf), appending
+        // each `<id>.is_<variant>` predicate's variant to
+        // `state.eliminated`. The frame's `target` and
+        // `underlying_type` are locked by the first leaf; later
+        // leaves must agree or the chain disqualifies. Returns
+        // false on any non-qualifying shape so the caller can mark
+        // its frame dead.
+        //
+        // The state shape (target / underlying_type / eliminated)
+        // is dual-purpose: the if/elif accumulator collects variants
+        // ruled out by the chain (they don't reach the trailing
+        // else), while the BINARY-\/ then-narrow uses the same
+        // accumulator to gather the variants the chain *does*
+        // accept. Same data, different role.
+        try_extend_state_with_chain(
+            state: ELSE_COMPLEMENT_FRAME,
+            expr: Trees.Expressions.Expression
+        ) -> bool is
+            if !expr? then
+                return false;
+            fi
+
+            if isa Trees.Expressions.BINARY(expr) then
+                let bin = cast Trees.Expressions.BINARY(expr);
+
+                if bin.operation? /\ bin.operation.name =~ "\\/" then
+                    if !try_extend_state_with_chain(state, bin.left) then
+                        return false;
+                    fi
+
+                    if !try_extend_state_with_chain(state, bin.right) then
+                        return false;
+                    fi
+
+                    return true;
+                fi
+            fi
+
+            return try_append_is_variant_leaf(state, expr);
+        si
+
+        // Single MEMBER leaf appender. Verifies receiver is a union,
+        // target is a simple identifier, and (if state already has
+        // a target) the new target matches. Adds the matched variant
+        // to state.eliminated (dedupe by reference).
+        try_append_is_variant_leaf(
+            state: ELSE_COMPLEMENT_FRAME,
+            expr: Trees.Expressions.Expression
+        ) -> bool is
+            if !isa Trees.Expressions.MEMBER(expr) then
+                return false;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(expr);
+
+            if !member.left? \/ !member.left.value? \/ !member.left.value.type? \/ !member.identifier? then
+                return false;
+            fi
+
+            let receiver_type = member.left.value.type;
+            let target = try_get_narrowing_target(member.left);
+            let variant = try_get_variant_for_is_accessor(receiver_type, member.identifier.name);
+
+            if !target? \/ !variant? then
+                return false;
+            fi
+
+            if !state.target? then
+                state.target = target;
+                state.underlying_type = pick_underlying_type(receiver_type);
+            elif state.target != target then
+                return false;
+            fi
+
+            if !state.contains_eliminated(variant) then
+                state.eliminated.add(variant);
+            fi
+
+            return true;
         si
 
         pre(expression: Trees.Bodies.EXPRESSION) -> bool is
@@ -1416,7 +1709,7 @@ namespace Syntax.Process is
             // resolve the args on the next outer iteration. Defaulting
             // the return to void here would lock in `*** -> void` and
             // poison the overload resolution that follows.
-            if closure.return_type.is_inferred /\ ! closure.arguments | .any(a => a.is_error \/ a.is_inferred) then
+            if closure.return_type.is_inferred /\ closure.arguments | .all(a => a.is_settled) then
                 closure.set_return_type(_innate_symbol_lookup.get_void_type());
             fi
 
@@ -2454,10 +2747,10 @@ namespace Syntax.Process is
         pre(binary: Trees.Expressions.BINARY) -> bool is
             // `\/` (OR) — cancel each side's narrowings during
             // walk so the right operand evaluates as if the left
-            // was false, and so neither side leaks predicates into
-            // the surrounding (post-OR) context. v2 will replace
-            // this with a smart-merge along the variant-identity
-            // and generic-args axes.
+            // was false, and so per-leaf narrowings don't leak into
+            // the surrounding (post-OR) context. The whole-chain
+            // narrowing is reconstructed below for the qualifying
+            // `<id>.is_<variant>` shape.
             if binary.operation? /\ binary.operation.name =~ "\\/" then
                 if binary.left? then
                     _narrowing.mark_scope();
@@ -2479,10 +2772,43 @@ namespace Syntax.Process is
                     yrt
                 fi
 
+                // Disjunction-chain narrowing: when the whole \/
+                // chain is `<id>.is_<variant>` predicates on the
+                // same target, push the union of matched variants
+                // as a ONE_OF (or singleton variant) into the
+                // surrounding scope. Per-leaf narrowings above were
+                // wiped by the inner mark/release isolation; this
+                // is how the then-body of `if a.is_X \/ a.is_Y`
+                // sees `a` narrowed to {X, Y}.
+                try_push_disjunction_chain_narrowing(binary);
+
                 return true;
             fi
 
             return false;
+        si
+
+        // After both sides of a `\/` chain have walked at unnarrowed
+        // type, build the combined variant-set narrowing and push
+        // it into the surrounding scope. No-op when the chain isn't
+        // a qualifying shape (non-`is_<variant>` leaf, mixed targets,
+        // non-union receiver).
+        try_push_disjunction_chain_narrowing(binary: Trees.Expressions.BINARY) is
+            let state = ELSE_COMPLEMENT_FRAME();
+
+            if !try_extend_state_with_chain(state, binary) then
+                return;
+            fi
+
+            if !state.target? \/ !state.underlying_type? \/ state.eliminated.count == 0 then
+                return;
+            fi
+
+            let narrowed = Semantic.Types.ONE_OF.create(state.underlying_type, state.eliminated);
+
+            if narrowed? then
+                _narrowing.try_push(state.target, narrowed);
+            fi
         si
 
         visit(binary: Trees.Expressions.BINARY) is
@@ -2672,6 +2998,31 @@ namespace Syntax.Process is
                     return;
                 fi
 
+                // Indexable inference: an `INFERRED_VARIABLE_TYPE`
+                // receiver records an INDEX_CONSTRAINT carrying the
+                // index expression's type, so the body-retry loop
+                // can filter candidates to indexable types. Skip
+                // the "cannot index" hard error path on placeholder
+                // — the existing speculate/roll-back would discard
+                // it on retry but emitting it is noise; soft-error
+                // out to DUMMY(ERROR) instead.
+                if
+                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) /\
+                    index.index? /\
+                    index.index.value? /\
+                    index.index.value.type?
+                then
+                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(type);
+                    let constraint = Semantic.INDEX_CONSTRAINT(index.index.value.type);
+
+                    if placeholder.origin.add_constraint(constraint) then
+                        _logger.mark_consumed_any();
+                    fi
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
                 if !isa Semantic.Types.NAMED(type) then
                     _logger.error(index.left.location, "cannot index {type}");
 
@@ -2851,7 +3202,13 @@ namespace Syntax.Process is
                 let symbol = named_type.scope.find_member(member.identifier.name);
 
                 if !symbol? then
-                    _logger.error(member.identifier.location, "member {member.identifier.name} not found in {named_type}");
+                    let hint = try_describe_intersection_miss(named_type, member.identifier.name);
+
+                    if hint? then
+                        _logger.error(member.identifier.location, hint);
+                    else
+                        _logger.error(member.identifier.location, "member {member.identifier.name} not found in {named_type}");
+                    fi
 
                     member.value = DUMMY(Semantic.Types.ERROR(), member.location);
                     return;
@@ -2887,6 +3244,13 @@ namespace Syntax.Process is
                 member.value = value;
 
                 if !need_store /\ is_variant_accessor_name(member.identifier.name) then
+                    if is_statically_false_is_accessor(named_type, member.identifier.name) then
+                        _logger.warn(
+                            member.location,
+                            "predicate {member.identifier.name} is always false: receiver narrowed to {named_type}"
+                        );
+                    fi
+
                     _narrowing.try_push(
                         try_get_narrowing_target(member.left),
                         try_get_variant_type_for_is_accessor(named_type, member.identifier.name)
@@ -3176,22 +3540,12 @@ namespace Syntax.Process is
                         left.location;
                     fi;
 
-                // Iterative-inference re-narrowing: if the current
-                // type still carries an INFERRED_VARIABLE_TYPE
-                // placeholder somewhere in its tree (e.g.
-                // Function[placeholder, int] from iter 1 of the
-                // body retry loop), allow re-set from the
-                // initializer's now-narrower type. Same applies if
-                // the current type is ERROR — that's iter 1's
-                // attempt that propagated through (e.g. from the
-                // function-typed-value branch's is_error early-
-                // return on a placeholder-armed lambda whose body
-                // failed). Iter N+1 with constraints in hand may
-                // produce a real type.
-                let needs_set =
-                    typed_symbol.type == null \/
-                    typed_symbol.type.contains_inferred \/
-                    typed_symbol.type.is_error;
+                // Iterative-inference re-narrowing: an iter-N type
+                // that's a sentinel or contains a placeholder may
+                // be overwritten on iter N+1 with the now-narrower
+                // value (e.g. Function[placeholder, int] →
+                // Function[int, int] once the lambda arg resolves).
+                let needs_set = !typed_symbol.type? \/ !typed_symbol.type.is_settled;
 
                 if needs_set then
                     if left.explicit_type? then
@@ -3212,11 +3566,22 @@ namespace Syntax.Process is
                         // subsequent assignments can attach
                         // constraints and the body retry loop
                         // resolves on iteration N+1.
+                        //
+                        // !is_sentinel deliberate (not is_settled):
+                        // if try_get_inferred_type returns a
+                        // composite-with-placeholder LUB, we commit
+                        // it on iter N. The needs_set path above
+                        // uses is_settled, so iter N+1 picks the
+                        // slot up again and may refresh with a
+                        // more-resolved value. !is_sentinel accepts
+                        // a one-iter delayed convergence in exchange
+                        // for not re-deriving the LUB every iter
+                        // while it's stable.
                         if isa Semantic.Symbols.Variable(symbol) then
                             let variable = cast Semantic.Symbols.Variable(symbol);
                             let inferred = variable.try_get_inferred_type();
 
-                            if inferred? /\ !inferred.is_inferred /\ !inferred.is_error then
+                            if inferred? /\ !inferred.is_sentinel then
                                 typed_symbol.set_type(inferred);
                             else
                                 typed_symbol.set_type(Semantic.Types.INFERRED_VARIABLE_TYPE(variable));
@@ -3264,6 +3629,25 @@ namespace Syntax.Process is
                 _logger.error(left.location, "oops: null type");
 
                 from_type = Semantic.Types.ERROR();
+            fi
+
+            // Destructure on a still-unresolved placeholder: emit a
+            // DESTRUCTURE_CONSTRAINT(member_count) on the
+            // placeholder's origin so the body-retry loop can filter
+            // candidate types against it, then defer rather than
+            // hard-erroring "cannot destructure". Without this the
+            // body-retry never gets a useful signal — the destructure
+            // type is fixed and the lambda's RHS placeholder is
+            // forced to resolve via some other use.
+            if isa Semantic.Types.INFERRED_VARIABLE_TYPE(from_type) then
+                let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(from_type);
+                let constraint = Semantic.DESTRUCTURE_CONSTRAINT(left.elements.count);
+
+                if placeholder.origin.add_constraint(constraint) then
+                    _logger.mark_consumed_any();
+                fi
+
+                return true;
             fi
 
             let from_types =
@@ -3583,7 +3967,219 @@ namespace Syntax.Process is
             yrt
         si
 
+        // True iff any formal arg in the resolver's PARTIAL function
+        // is itself ERROR or contains an ERROR. Signal that the
+        // partial binding was driven from a tainted lambda actual
+        // (a typical free-function-with-lambda inference scenario)
+        // and the PARTIAL formals shouldn't be pushed as constraints
+        // unchanged.
+        _partial_arguments_contain_error(function: Semantic.Symbols.Function) -> bool is
+            if !function? \/ !function.arguments? then
+                return false;
+            fi
+
+            let found = Ghul.BOX[bool](false);
+
+            for arg in function.arguments do
+                if !arg? then
+                    continue;
+                fi
+
+                arg.walk((t: Type) is
+                    if t? /\ t.is_error then
+                        found.value = true;
+                    fi
+                si);
+
+                if found.value then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        // True if any of the CALL's arguments is a Trees.Expressions.FUNCTION
+        // literal. Used to gate the constraint-push retry on the
+        // recoverable case where a not-yet-constrained lambda body
+        // walked with placeholder args and produced an ERROR-tainted
+        // type that the under-determination detector wouldn't
+        // otherwise recognise as recoverable.
+        _has_function_literal_call_argument(call: Trees.Expressions.CALL) -> bool is
+            if !call.arguments? \/ !call.arguments.expressions? then
+                return false;
+            fi
+
+            for a in call.arguments.expressions do
+                if a? /\ isa Trees.Expressions.FUNCTION(a) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        // Walk the scope stack from current_function outward to find
+        // the recursive closure a `rec` reference here would bind to.
+        // Mirrors the lookup in `visit(RECURSE)`.
+        _find_recursive_target() -> Semantic.Symbols.Closure is
+            let function = current_function;
+
+            if !function? \/ !function.is_closure then
+                return null;
+            fi
+
+            let closure = cast Semantic.Symbols.Closure(function);
+
+            if closure.is_recursive then
+                return closure;
+            fi
+
+            let stack = _symbol_table.stack;
+            let index mut = stack.count - 1;
+            let seen_self mut = false;
+
+            while index >= 0 do
+                let scope = stack[index];
+
+                if scope.is_closure then
+                    let c = cast Semantic.Symbols.Closure(scope);
+
+                    if seen_self then
+                        if c.is_recursive then
+                            return c;
+                        fi
+                    elif c == closure then
+                        seen_self = true;
+                    fi
+                fi
+
+                index = index - 1;
+            od
+
+            return null;
+        si
+
+        // Push each actual argument of a `rec(actual...)` call onto
+        // the recursive closure's parameter Variables as a LUB
+        // candidate. When the actual isn't assignable to the
+        // parameter's current type, reset that type back to an
+        // INFERRED_VARIABLE_TYPE placeholder so the next outer-body
+        // retry iteration's closure_arg_resolver re-derives the
+        // parameter type from the widened LUB. Handles both self-rec
+        // and nested-rec (rec referring to an outer recursive
+        // ancestor) — the target is determined by walking the
+        // closure stack mirroring `visit(RECURSE)`.
+        try_back_feed_recursive_call(call: Trees.Expressions.CALL) is
+            if !isa Trees.Expressions.RECURSE(call.function) then
+                return;
+            fi
+
+            let closure = _find_recursive_target();
+
+            if !closure? \/ !closure.argument_names? then
+                return;
+            fi
+
+            let param_count = closure.argument_names.count;
+            let args = if call.arguments? then call.arguments.expressions else null fi;
+            let arg_count = if args? then args.count else 0 fi;
+
+            let n = if param_count < arg_count then param_count else arg_count fi;
+
+            let i mut = 0;
+            while i < n do
+                let name = closure.argument_names[i];
+                let param = cast Semantic.Symbols.Variable(closure.find_direct(name));
+                let arg_expr = args[i];
+
+                // Prefer arg_expr.value.type, but fall back to the
+                // resolved symbol's type when the value's snapshot
+                // is null — happens for outer-scope locals captured
+                // into a nested closure before being typed.
+                let actual: Semantic.Types.Type mut = null;
+                if arg_expr? /\ arg_expr.value? /\ arg_expr.value.type? then
+                    actual = arg_expr.value.type;
+                elif isa Trees.Expressions.IDENTIFIER(arg_expr) then
+                    let id_expr = cast Trees.Expressions.IDENTIFIER(arg_expr);
+                    let sym = find(id_expr.identifier);
+                    if sym? then
+                        actual = sym.type;
+                    fi
+                fi
+
+                if param? /\ actual? then
+                    if actual.is_settled then
+                        if param.add_constraint(actual) then
+                            _logger.mark_consumed_any();
+                        fi
+
+                        // Reset the param's type if currently
+                        // resolved to something narrower than the
+                        // actual — leaves it concrete when the
+                        // actual fits.
+                        if
+                            param.type? /\
+                            !param.type.is_sentinel /\
+                            !param.type.is_assignable_from(actual)
+                        then
+                            param.set_type(Semantic.Types.INFERRED_VARIABLE_TYPE(param));
+                            _logger.mark_consumed_any();
+                        fi
+                    fi
+                fi
+
+                i = i + 1;
+            od
+        si
+
         _visit(call: Trees.Expressions.CALL) is
+            // Recursive-call back-feed for self-recursive lambdas
+            // (`let f = x rec => ... rec(actual) ...`). The
+            // call-site back-feed at line ~4180 only widens a
+            // closure's argument type when the formal is still an
+            // INFERRED_VARIABLE_TYPE placeholder. For a rec call the
+            // formal is the closure's own parameter Variable, which
+            // by iter N is already resolved to (often the narrow)
+            // outer call-site type. Without further widening, a rec
+            // call with a wider actual fails type-check.
+            //
+            // Widen here: push each actual as a candidate on the
+            // closure parameter's LUB. When the actual isn't
+            // assignable to the current parameter type, reset the
+            // parameter's type back to a placeholder so the next
+            // outer-body-retry iteration's closure_arg_resolver pass
+            // re-derives from the now-wider LUB.
+            try_back_feed_recursive_call(call);
+
+            // Arity-aware refinement of MEMBER_CONSTRAINT for the
+            // `<placeholder>.<name>(args...)` shape. MEMBER.visit
+            // already emitted MEMBER_CONSTRAINT(name); pin the
+            // arity here so the resolved type must have `name`
+            // callable at this arg count, not merely present. The
+            // receiver may already have been ERROR-typed by
+            // MEMBER.visit's placeholder branch — read the *member's
+            // left*'s type to find the placeholder regardless.
+            if isa Trees.Expressions.MEMBER(call.function) then
+                let member = cast Trees.Expressions.MEMBER(call.function);
+                if
+                    member.left? /\
+                    member.left.value? /\
+                    member.left.value.type? /\
+                    member.identifier? /\
+                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(member.left.value.type)
+                then
+                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(member.left.value.type);
+                    let arity = if call.arguments? then call.arguments.count else 0 fi;
+
+                    if placeholder.origin.add_constraint(
+                        Semantic.MEMBER_CONSTRAINT(member.identifier.name, arity)
+                    ) then
+                        _logger.mark_consumed_any();
+                    fi
+                fi
+            fi
+
             if !call.function.value? \/ !call.function.value.type? then
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                 return;
@@ -3661,7 +4257,21 @@ namespace Syntax.Process is
                     if !overload_result? then
                         let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
 
-                        if candidate? /\ _under_determination_detector.any_arg_under_determined(candidate, argument_types) then
+                        // Trigger the retry when at least one actual
+                        // is a FUNCTION literal even if its first-walk
+                        // type has been ERROR-tainted by a body that
+                        // walked without a constraint. The lambda can
+                        // be re-walked under a pushed formal, so a
+                        // FUNCTION arg is the natural signal that the
+                        // null overload result might be recoverable.
+                        // The pre-existing `any_arg_under_determined`
+                        // path still covers the constructor-arg shape
+                        // (e.g. `apply(Box())`).
+
+                        if candidate? /\ (
+                            _under_determination_detector.any_arg_under_determined(candidate, argument_types) \/
+                            _has_function_literal_call_argument(call)
+                        ) then
                             // Sibling-arg specialisation, symmetric to
                             // the path in `resolve_constructor`: when
                             // one actual is a not-yet-resolved FUNCTION
@@ -3677,8 +4287,25 @@ namespace Syntax.Process is
                             // pre-existing behaviour is preserved.
                             let push_candidate mut = candidate;
 
-                            if argument_types | .any(a => a? /\ a.is_function_with_any_implicit_argument_types) then
-                                push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
+                            // Two-step specialisation: try
+                            // owner-class generic args first (for
+                            // method calls whose receiver class is
+                            // generic), then if push_candidate is
+                            // still the unsubstituted candidate and
+                            // the candidate has its own generic
+                            // args, try binding those from concrete
+                            // siblings. The function-own path is
+                            // what catches free-function HOFs like
+                            // `generate[T,S]((0,1), state => ...)` —
+                            // S binds from the (0,1) actual, T fills
+                            // from a phantom, and the substituted
+                            // formal-arg-type can then constrain the
+                            // lambda's body re-walk.
+                            push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
+
+                            if push_candidate == candidate /\ candidate.is_generic then
+                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
+                                push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
                             fi
 
                             _logger.roll_back();
@@ -3718,6 +4345,32 @@ namespace Syntax.Process is
                     fi
 
                     if overload_result.score == Semantic.Types.MATCH.PARTIAL then
+                        // PARTIAL re-specialisation: the resolver may
+                        // have driven its type-arg binding from a
+                        // tainted lambda actual whose body errored on
+                        // the first walk (the free-function lambda-
+                        // inference gap). Pushing those ERROR-bearing
+                        // formals as constraints to the lambda would
+                        // taint its re-walk too. Detect the case and
+                        // re-specialise from CLEAN siblings via the
+                        // function-own-args specialiser (which skips
+                        // ERROR / placeholder-bearing actuals); push
+                        // that cleaner form.
+                        let push_function mut = overload_result.function;
+
+                        if _partial_arguments_contain_error(push_function) then
+                            let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
+
+                            if candidate? /\ candidate.is_generic then
+                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
+                                let respecialized = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
+
+                                if respecialized != candidate then
+                                    push_function = respecialized;
+                                fi
+                            fi
+                        fi
+
                         _logger.roll_back();
                         _logger.speculate();
 
@@ -3725,7 +4378,7 @@ namespace Syntax.Process is
                             if !a? then
                                 continue;
                             elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                                let f = overload_result.function.arguments[index];
+                                let f = push_function.arguments[index];
 
                                 a.set_constraint(f, "{{0}} is not assignable to {{1}}");
                                 a.walk(self);
@@ -3821,7 +4474,7 @@ namespace Syntax.Process is
                 // signature depends on the other.
                 let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(function_type);
 
-                if !argument_types | .any(a => !a? \/ a.contains_inferred \/ a.is_error) then
+                if argument_types | .all(a => a? /\ a.is_settled) then
                     let function_type_components = Collections.LIST[Type](argument_types);
                     function_type_components.add(Semantic.Types.INFERED_RETURN_TYPE());
                     let synthesized = _innate_symbol_lookup.get_function_type(function_type_components);
@@ -4174,27 +4827,39 @@ namespace Syntax.Process is
             fi
 
             // Push an else-complement frame for this IF. Structural
-            // qualification check: exactly 2 branches, branch 0 has a
-            // condition, branch 1 is `else` (null condition). The
-            // type-dependent variant-count check is deferred until
-            // visit(IF_BRANCH) for branch 0 — we only know the
-            // receiver's resolved type after the cond walk.
+            // qualification: ≥ 2 branches, every branch but the
+            // last carries a condition, and the last branch is
+            // `else` (null condition). The receiver-type and
+            // variant identities are derived later in
+            // visit(IF_BRANCH) for each cond branch — we only know
+            // the receiver's resolved type once the cond has been
+            // walked.
             let frame = ELSE_COMPLEMENT_FRAME();
 
-            let count mut = 0;
-            let first_has_condition mut = false;
-            let second_is_else mut = false;
+            let branches = Collections.LIST[Trees.Statements.IF_BRANCH](`if.branches);
+            let total = branches.count;
 
-            for b in `if.branches do
-                count = count + 1;
-                if count == 1 then
-                    first_has_condition = b? /\ b.condition?;
-                elif count == 2 then
-                    second_is_else = b? /\ !b.condition?;
+            let well_shaped mut = total >= 2;
+
+            if well_shaped then
+                let last = branches[total - 1];
+                if !last? \/ last.condition? then
+                    well_shaped = false;
                 fi
-            od
+            fi
 
-            frame.is_two_branch_if_else = count == 2 /\ first_has_condition /\ second_is_else;
+            if well_shaped then
+                let i mut = 0;
+                while i < total - 1 do
+                    let b = branches[i];
+                    if !b? \/ !b.condition? then
+                        well_shaped = false;
+                    fi
+                    i = i + 1;
+                od
+            fi
+
+            frame.is_qualifying = well_shaped;
 
             _else_complement_stack.add(frame);
 

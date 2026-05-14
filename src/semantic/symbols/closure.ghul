@@ -70,23 +70,45 @@ namespace Semantic.Symbols is
                 else
                     let existing = frame.get_captured(variable.name);
 
-                    // Iterative-inference body retry: an earlier walk may
-                    // have captured this variable while its type carried
-                    // a placeholder — either directly (`INFERRED_VARIABLE_TYPE`)
-                    // or nested inside a generic (`Func<placeholder, bool>`
-                    // for a lambda whose arg type wasn't yet resolved).
-                    // When the source symbol's type later resolves to a
-                    // fully-concrete type, refresh the field so subsequent
-                    // loads see the resolved type. `contains_inferred`
-                    // covers both the direct- and nested-placeholder
-                    // cases; `is_inferred` alone misses lambda-value
-                    // types like Func<placeholder, bool>.
-                    if
-                        existing? /\ existing.type? /\
-                        (existing.type.contains_inferred \/ existing.type.is_error) /\
+                    // Iterative-inference body retry: an earlier walk
+                    // may have captured this variable while its type
+                    // wasn't yet IL-emit-stable. Two cases:
+                    //
+                    //   1. Existing field type contains a placeholder
+                    //      (`INFERRED_VARIABLE_TYPE` directly or nested
+                    //      inside a generic) or is_error. Refresh
+                    //      once the source variable's type resolves.
+                    //
+                    //   2. Existing field type is null. This happens
+                    //      when the source local was captured before
+                    //      being typed — e.g. a destructured local
+                    //      `let (head, tail) = l in ...` captured
+                    //      into a nested closure during an early body-
+                    //      retry iter where `l` was still INFERRED.
+                    //      Once the destructure resolves `tail`'s
+                    //      type, refresh the field.
+                    //
+                    // Gate the null-case refresh on
+                    // `variable.is_defined`: for a `let f = ... f ...`
+                    // self-reference, find returns the variable
+                    // before define() has run, and its type may also
+                    // be transient at that moment. Refreshing in
+                    // that case would silently "fix" the forward-
+                    // reference and skip the diagnostic the user
+                    // wants ("cannot emit IL for function with
+                    // unresolved return type"). For destructured
+                    // locals, is_defined is set by the destructure
+                    // before the inner closure references them, so
+                    // the gap #2 case still refreshes.
+                    let local = cast LOCAL_VARIABLE(variable);
+                    let source_ready =
                         variable.type? /\
-                        !variable.type.contains_inferred /\
-                        !variable.type.is_error
+                        variable.type.is_settled /\
+                        (!local? \/ local.is_defined);
+
+                    if
+                        existing? /\ source_ready /\
+                        (!existing.type? \/ !existing.type.is_settled)
                     then
                         existing.set_type(variable.type);
                     fi
@@ -151,13 +173,20 @@ namespace Semantic.Symbols is
             if existing? then
                 let `field = cast Field(existing);
 
-                if
-                    `field? /\ `field.type? /\
-                    (`field.type.contains_inferred \/ `field.type.is_error) /\
-                    outer.type? /\
-                    !outer.type.contains_inferred /\
-                    !outer.type.is_error
-                then
+                // Always refresh from outer.type when non-error.
+                // outer.type is rebuilt by Function.set_return_type
+                // each iteration so a stale field would miss any
+                // widening (arg slot CONS[int] → List[int] from rec
+                // back-feed) or any return-slot resolution (INFERRED
+                // → string). Type-level `=~` returns true whenever
+                // one side is INFERRED, so it can't distinguish
+                // "still placeholder" from "now concrete".
+                // Refreshing unconditionally is safe: gen_type on
+                // placeholders emits a comment (per
+                // INFERRED_VARIABLE_TYPE / INFERED_RETURN_TYPE
+                // overrides) and the next iter's freeze produces a
+                // cleaner RAW.
+                if `field? /\ outer.type? /\ !outer.type.is_error then
                     `field.set_type(outer.type);
                 fi
 
@@ -416,6 +445,17 @@ namespace Semantic.Symbols is
         si
 
         _load_closure_generic(actual_arguments: Collections.LIST[Value], loader: SYMBOL_LOADER) -> Value is
+            // See _load_closure_non_generic for the failed-speculation
+            // try-catch rationale.
+            try
+                return _load_closure_generic_body(actual_arguments, loader);
+            catch ex: System.Exception
+                IoC.CONTAINER.instance.logger.mark_consumed_any();
+                return IR.Values.DUMMY(self.type, location);
+            yrt
+        si
+
+        _load_closure_generic_body(actual_arguments: Collections.LIST[Value], loader: SYMBOL_LOADER) -> Value is
             let block = IR.Values.BLOCK(type);
 
             owner = frame;
@@ -461,18 +501,33 @@ namespace Semantic.Symbols is
             // Bail early when any captured value has an error or
             // unresolved type. Trying to construct the frame
             // instance with ERROR-typed captures cascades into IL
-            // gen_type throws and an NRE further down the path.
-            // The upstream error (e.g. "variable is not defined
-            // here" for a forward-referenced mutual-recursion
-            // partner, or "incompatible types in if branches"
-            // when the body produced ERROR) has already been
-            // logged; bailing here keeps the cascade quiet.
+            // gen_type throws further down the path.
             for a in actual_arguments do
                 if !a? \/ !a.type? \/ a.type.is_error then
                     return IR.Values.DUMMY(Types.ERROR(), location);
                 fi
             od
 
+            // Closure loading invokes IR.Value.gen eagerly via freeze
+            // to capture IL text under transient context. The
+            // iterative-inference body-retry loop may reach this
+            // point during an early iter where the FRAME's
+            // declare_constructor defensive-defaulted a not-yet-typed
+            // field to Types.ERROR — gen_type throws on that.
+            // Treat the exception as failed speculation: return a
+            // DUMMY of the closure's own type so downstream paths
+            // see a placeholder closure rather than a poison value,
+            // and mark_consumed_any so the body-retry loop iterates
+            // again from improved types.
+            try
+                return _load_closure_non_generic_body(actual_arguments, loader);
+            catch ex: System.Exception
+                IoC.CONTAINER.instance.logger.mark_consumed_any();
+                return IR.Values.DUMMY(self.type, location);
+            yrt
+        si
+
+        _load_closure_non_generic_body(actual_arguments: Collections.LIST[Value], loader: SYMBOL_LOADER) -> Value is
             let block = IR.Values.BLOCK(type);
 
             owner = frame;
@@ -665,25 +720,14 @@ namespace Semantic.Symbols is
         si
         
         load_captured_value(location: LOCATION, symbol: Variable, loader: SYMBOL_LOADER) -> Value is
-            // A closure can only capture a local variable that has
-            // already been defined by the time the closure is created.
-            // If the variable's is_defined flag is still false here,
-            // the closure is being built inside the variable's own
-            // initializer (or before it) — the captured slot will be
-            // null at runtime. Surface this at compile time before the
-            // ERROR-typed reference escapes to IL emission. The capture
-            // field is built with whatever type the variable has at
-            // this point (often null/ERROR), so without the check the
-            // crash falls out at GENERATE_IL.visit(FUNCTION) when
-            // Type.gen_type is asked to emit ERROR. (Function
-            // arguments and other Variable subclasses are always
-            // defined at scope entry, so the check only matters for
-            // LOCAL_VARIABLE.)
-            let local = cast LOCAL_VARIABLE(symbol);
-            if local? then
-                local.check_is_defined(location);
-            fi
-
+            // Capture-before-define is detected by LOCAL_VARIABLE.load
+            // (`variable.ghul`) via its own check_is_defined call;
+            // duplicating the check here fired the same diagnostic
+            // twice for the captured-load path. The capture field is
+            // built with whatever type the variable has at this
+            // point (often null/ERROR), which without the upstream
+            // check would crash Type.gen_type at IL emission — but
+            // the upstream check is the only place we need.
             symbol.is_captured = true;
 
             let `field = find_or_add_capture(symbol);
