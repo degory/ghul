@@ -15,7 +15,7 @@ The `COMPILER` class (see `src/compiler/compiler.ghul`) runs these in order:
 5. **resolve_uses.ghul** – binds identifier uses to symbols within the current scope.
 6. **resolve_type_expressions.ghul** – resolves references inside type expressions.
 7. **resolve_ancestors.ghul** – attaches base classes and trait implementations.
-8. **resolve_explicit_variable_types\ copy.ghul** – checks variables with explicit types against their initialisers.
+8. **resolve_explicit_variable_types.ghul** – checks variables with explicit types against their initialisers.
 9. **resolve_overrides.ghul** – verifies override methods match inherited signatures.
 10. **record_type_argument_uses.ghul** – records generic type argument usage for later IL generation.
 11. **compile_expressions.ghul** – translates expressions into the intermediate representation.
