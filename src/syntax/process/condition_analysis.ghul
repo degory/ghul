@@ -1,0 +1,297 @@
+namespace Syntax.Process is
+    use Semantic.Types.Type;
+
+    // The then/else narrowing environments a boolean condition
+    // implies: `then_env` holds while the condition is true,
+    // `else_env` while it is false.
+    class CONDITION_FACTS is
+        then_env: NARROW_ENV public;
+        else_env: NARROW_ENV public;
+
+        init(then_env: NARROW_ENV, else_env: NARROW_ENV) is
+            self.then_env = then_env;
+            self.else_env = else_env;
+        si
+    si
+
+    // Pure analysis of a *walked* boolean condition AST: given the
+    // environment in force before the condition, produce the
+    // environments in force along its true and false edges.
+    //
+    // `isa T(x)` and `x.is_<variant>` leaves contribute a narrow on
+    // their target; `/\` `\/` `!` compose the leaves; anything else
+    // is opaque (no narrowing either way). Narrowing targets are
+    // resolved through the `resolve_target` delegate supplied at
+    // construction — in the compiler it is the visitor's
+    // scope-aware lookup; in tests it is a stub.
+    //
+    // See `docs/claude/flow-sensitive-narrowing.md`.
+    class CONDITION_ANALYZER is
+        _resolve_target: (Trees.Expressions.Expression) -> Semantic.Symbols.Variable;
+
+        init(resolve_target: (Trees.Expressions.Expression) -> Semantic.Symbols.Variable) is
+            _resolve_target = resolve_target;
+        si
+
+        // True if `name` looks like a synthesized variant accessor
+        // (`is_<lowercased_variant_name>`).
+        is_variant_accessor_name(name: string) -> bool =>
+            name? /\ name.length > 3 /\ name.starts_with("is_");
+
+        // Drill `type` to the underlying Classy (peeling Symbols.GENERIC
+        // wrapping for specialized generics). Null if `type` isn't a
+        // NAMED of a Classy.
+        get_classy_for_narrowing(type: Type) -> Semantic.Symbols.Classy is
+            if !type? \/ !isa Semantic.Types.NAMED(type) then
+                return null;
+            fi
+
+            let symbol mut = (cast Semantic.Types.NAMED(type)).symbol;
+
+            if isa Semantic.Symbols.GENERIC(symbol) then
+                symbol = (cast Semantic.Symbols.GENERIC(symbol)).symbol;
+            fi
+
+            if !isa Semantic.Symbols.Classy(symbol) then
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Classy(symbol);
+        si
+
+        // Pick the type that carries the receiver's generic args for
+        // variant-type construction. ONE_OF holds its original union
+        // NAMED/GENERIC as `underlying_type`; any other NAMED can be
+        // used directly.
+        pick_underlying_type(receiver_type: Type) -> Semantic.Types.NAMED is
+            if !receiver_type? then
+                return null;
+            fi
+
+            if isa Semantic.Types.ONE_OF(receiver_type) then
+                return (cast Semantic.Types.ONE_OF(receiver_type)).underlying_type;
+            fi
+
+            if isa Semantic.Types.NAMED(receiver_type) then
+                return cast Semantic.Types.NAMED(receiver_type);
+            fi
+
+            return null;
+        si
+
+        // Find the variant Classy a `is_<suffix>` accessor refers to
+        // on a union receiver. Null when the receiver isn't a union,
+        // the accessor name is malformed, or — for a ONE_OF receiver
+        // — the matched variant is not in the narrowed set.
+        try_get_variant_for_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> Semantic.Symbols.Classy is
+            if !is_variant_accessor_name(member_name) then
+                return null;
+            fi
+
+            let classy = get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return null;
+            fi
+
+            let suffix = member_name.substring(3);
+
+            let one_of: Semantic.Types.ONE_OF mut;
+            if isa Semantic.Types.ONE_OF(receiver_type) then
+                one_of = cast Semantic.Types.ONE_OF(receiver_type);
+            fi
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    if one_of? /\ !one_of.contains_variant(variant) then
+                        return null;
+                    fi
+
+                    return variant;
+                fi
+            od
+
+            return null;
+        si
+
+        // For an `is_<variant>` access on a value of union type,
+        // return the variant type with the same generic args as the
+        // receiver. Null when not applicable.
+        try_get_variant_type_for_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> Type is
+            let variant = try_get_variant_for_is_accessor(receiver_type, member_name);
+
+            if !variant? then
+                return null;
+            fi
+
+            let underlying = pick_underlying_type(receiver_type);
+
+            if !underlying? then
+                return null;
+            fi
+
+            return Semantic.Types.ONE_OF.build_singleton_variant_type(underlying, variant);
+        si
+
+        // Build the complement narrowing — variants of the union
+        // behind `receiver_type` that don't appear in `eliminated`.
+        // Returns a singleton variant type, a ONE_OF, or null when
+        // the chain exhausts the union.
+        try_get_complement_after_eliminated(
+            receiver_type: Type,
+            eliminated: Collections.Iterable[Semantic.Symbols.Classy]
+        ) -> Type is
+            let classy = get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return null;
+            fi
+
+            let complement = Collections.LIST[Semantic.Symbols.Classy]();
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant then
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    let is_eliminated mut = false;
+
+                    for e in eliminated do
+                        if e == variant then
+                            is_eliminated = true;
+                        fi
+                    od
+
+                    if !is_eliminated then
+                        complement.add(variant);
+                    fi
+                fi
+            od
+
+            let underlying = pick_underlying_type(receiver_type);
+
+            if !underlying? then
+                return null;
+            fi
+
+            return Semantic.Types.ONE_OF.create(underlying, complement);
+        si
+
+        // Analyze a walked boolean condition into its true/false
+        // narrowing environments. Always returns fresh (copied)
+        // environments — callers may mutate them freely.
+        analyze_condition(cond: Trees.Expressions.Expression, in_env: NARROW_ENV) -> CONDITION_FACTS is
+            if !cond? \/ !in_env? then
+                return _opaque(in_env);
+            fi
+
+            if isa Trees.Expressions.BINARY(cond) then
+                let binary = cast Trees.Expressions.BINARY(cond);
+
+                if binary.operation? /\ binary.left? /\ binary.right? then
+                    let op = binary.operation.name;
+
+                    if op =~ "/\\" then
+                        let l = analyze_condition(binary.left, in_env);
+                        let r = analyze_condition(binary.right, l.then_env);
+
+                        return CONDITION_FACTS(
+                            r.then_env,
+                            NARROW_ENV.join(l.else_env, r.else_env)
+                        );
+                    elif op =~ "\\/" then
+                        let l = analyze_condition(binary.left, in_env);
+                        let r = analyze_condition(binary.right, l.else_env);
+
+                        return CONDITION_FACTS(
+                            NARROW_ENV.join(l.then_env, r.then_env),
+                            r.else_env
+                        );
+                    fi
+                fi
+            elif isa Trees.Expressions.UNARY(cond) then
+                let unary = cast Trees.Expressions.UNARY(cond);
+
+                if unary.operation? /\ unary.operation.name =~ "!" /\ unary.right? then
+                    let inner = analyze_condition(unary.right, in_env);
+
+                    // `!` swaps the true and false edges.
+                    return CONDITION_FACTS(inner.else_env, inner.then_env);
+                fi
+            elif isa Trees.Expressions.ISA(cond) then
+                return _analyze_isa(cast Trees.Expressions.ISA(cond), in_env);
+            elif isa Trees.Expressions.MEMBER(cond) then
+                return _analyze_member(cast Trees.Expressions.MEMBER(cond), in_env);
+            fi
+
+            return _opaque(in_env);
+        si
+
+        // A condition that discriminates no variable's type — both
+        // edges keep the incoming environment.
+        _opaque(in_env: NARROW_ENV) -> CONDITION_FACTS =>
+            CONDITION_FACTS(in_env.copy(), in_env.copy());
+
+        _analyze_isa(`isa: Trees.Expressions.ISA, in_env: NARROW_ENV) -> CONDITION_FACTS is
+            let then_env = in_env.copy();
+            let else_env = in_env.copy();
+
+            let target = _resolve_target(`isa.right);
+            let isa_type =
+                if `isa.type_expression? then `isa.type_expression.type else null fi;
+
+            if
+                target? /\ isa_type? /\
+                !isa_type.is_error /\ !isa_type.is_inferred
+            then
+                then_env.set_narrow(target, isa_type);
+            fi
+
+            return CONDITION_FACTS(then_env, else_env);
+        si
+
+        _analyze_member(member: Trees.Expressions.MEMBER, in_env: NARROW_ENV) -> CONDITION_FACTS is
+            let then_env = in_env.copy();
+            let else_env = in_env.copy();
+
+            if
+                member.left? /\ member.left.value? /\ member.left.value.type? /\
+                member.identifier? /\ is_variant_accessor_name(member.identifier.name)
+            then
+                let receiver_type = member.left.value.type;
+                let name = member.identifier.name;
+                let target = _resolve_target(member.left);
+
+                if target? then
+                    let variant_type = try_get_variant_type_for_is_accessor(receiver_type, name);
+
+                    if variant_type? then
+                        then_env.set_narrow(target, variant_type);
+                    fi
+
+                    let variant = try_get_variant_for_is_accessor(receiver_type, name);
+
+                    if variant? then
+                        let eliminated = Collections.LIST[Semantic.Symbols.Classy]();
+                        eliminated.add(variant);
+
+                        let complement = try_get_complement_after_eliminated(receiver_type, eliminated);
+
+                        if complement? then
+                            else_env.set_narrow(target, complement);
+                        fi
+                    fi
+                fi
+            fi
+
+            return CONDITION_FACTS(then_env, else_env);
+        si
+    si
+si

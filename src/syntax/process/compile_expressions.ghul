@@ -15,52 +15,6 @@ namespace Syntax.Process is
 
     use Syntax.Trees.Definitions.PRAGMA;
 
-    // Per-IF bookkeeping for trailing-else complement narrowing
-    // over an if + elif* + else chain. The IF "qualifies"
-    // structurally when it has ≥ 2 branches, the last is `else`,
-    // and every other branch has a condition. visit(IF_BRANCH)
-    // for each cond branch tries to extract a (target, variant)
-    // pair from a `<simple-id>.is_<variant>` condition on a union;
-    // matching branches append the variant to `eliminated`. Any
-    // non-matching cond shape, or a different target from the
-    // chain's first entry, marks the frame dead so the trailing
-    // else does not narrow.
-    //
-    // pre(IF_BRANCH) for the else branch reads the frame: when
-    // still live with a non-empty eliminated set, builds the
-    // complement variant set against the underlying union and
-    // pushes Types.ONE_OF.create (which degenerates a singleton
-    // complement to a plain variant type) onto the narrowing
-    // stack. Multi-variant complements are represented by ONE_OF
-    // — see Semantic.Types.ONE_OF for the contract.
-    //
-    // pre(IF) pushes a frame; visit(IF) pops it.
-    class ELSE_COMPLEMENT_FRAME is
-        is_qualifying: bool public;
-        is_dead: bool public;
-        target: Semantic.Symbols.Variable public;
-        underlying_type: Semantic.Types.NAMED public;
-        eliminated: Collections.LIST[Semantic.Symbols.Classy] public;
-
-        init() is
-            eliminated = Collections.LIST[Semantic.Symbols.Classy]();
-        si
-
-        contains_eliminated(v: Semantic.Symbols.Classy) -> bool is
-            if !v? then
-                return false;
-            fi
-
-            for u in eliminated do
-                if u == v then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-    si
-
     class COMPILE_EXPRESSIONS: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -82,21 +36,40 @@ namespace Syntax.Process is
 
         _will_generate_code: bool;
 
+        // Definite-return / definite-assignment flow warnings — on
+        // by default, suppressed by the `--no-warn-definite-*` flags.
+        _warn_definite_return: bool;
+        _warn_definite_assignment: bool;
+
         _stub_depth: int;
         _keep_depth: int;
 
-        // Type-narrowing stack — owns scope marks and per-symbol
-        // saves. Visit hooks (IF_BRANCH for marking, BINARY/UNARY
-        // for `\/`/`!` cancellation, ISA/MEMBER for predicate
-        // pushes, SIMPLE_LEFT_EXPRESSION for assignment cancel)
-        // delegate here. See `narrowing.ghul` for the mechanism.
-        _narrowing: NARROWING;
+        // Flow-sensitive narrowing — holds the narrowing environment
+        // in force at the current walk point and keeps each narrowed
+        // variable's `.type` reconciled to it. See
+        // `docs/claude/flow-sensitive-narrowing.md`.
+        _flow: NARROWING_FLOW;
 
-        // Stack of frames, one per IF currently being walked.
-        // pre/visit(IF) push and pop; visit(IF_BRANCH) for the
-        // if-branch of a qualifying frame stashes the complement
-        // narrowing for pre(IF_BRANCH) of the else-branch to push.
-        _else_complement_stack: Collections.LIST[ELSE_COMPLEMENT_FRAME];
+        // Pure analysis of boolean conditions into then/else
+        // narrowing environments, plus the variant-type helpers.
+        _condition_analyzer: CONDITION_ANALYZER;
+
+        // Stack of per-IF frames, one per IF currently being walked.
+        // pre(IF) pushes; each branch's controlled walk records its
+        // exit environment; visit(IF) joins them and pops.
+        _if_flow_stack: Collections.LIST[IF_FLOW_FRAME];
+
+        // Stack of loop kill-set environments, one per `while`/`do`
+        // currently being walked. pre(DO) computes and pushes;
+        // visit(DO) pops to restore the after-loop environment.
+        _loop_kept_stack: Collections.LIST[NARROW_ENV];
+
+        // Stack of per-`try` frames, one per `try` currently being
+        // walked. pre(TRY) pushes; visit(TRY) pops. The
+        // definite-assignment facts established before a try survive
+        // it; the try / catch bodies' own narrowing is discarded
+        // conservatively (an exception can leave the body anywhere).
+        _try_flow_stack: Collections.LIST[TRY_FLOW_FRAME];
 
         current_statement_list: Trees.Statements.LIST;
 
@@ -135,16 +108,13 @@ namespace Syntax.Process is
             _value_converter = value_converter;
             _value_boxer = value_boxer;
 
-            _narrowing = NARROWING();
+            _flow = NARROWING_FLOW();
+            _condition_analyzer = CONDITION_ANALYZER(expr => try_get_narrowing_target(expr));
 
-            _else_complement_stack = Collections.LIST[ELSE_COMPLEMENT_FRAME]();
+            _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
+            _loop_kept_stack = Collections.LIST[NARROW_ENV]();
+            _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
         si
-
-        // True if `name` looks like a synthesized variant accessor
-        // (`is_<lowercased_variant_name>`) — i.e. starts with `is_`
-        // and has at least one suffix character.
-        is_variant_accessor_name(name: string) -> bool =>
-            name? /\ name.length > 3 /\ name.starts_with("is_");
 
         // If `expr` is an unqualified identifier resolving (in the
         // current scope) to a Variable, return that Variable; null
@@ -171,111 +141,41 @@ namespace Syntax.Process is
             return cast Semantic.Symbols.Variable(symbol);
         si
 
-        // Drill `type` to the underlying Classy (peeling Symbols.GENERIC
-        // wrapping for specialized generics). Null if `type` isn't a
-        // NAMED of a Classy.
-        get_classy_for_narrowing(type: Type) -> Semantic.Symbols.Classy is
-            if !type? \/ !isa Semantic.Types.NAMED(type) then
-                return null;
+        // The narrowing environment to use inside and after a loop
+        // whose body is `body`. A loop body may run any number of
+        // times, so a narrow on a variable the body *writes* cannot
+        // be assumed across the back-edge — those narrows are
+        // dropped. A narrow on a variable the body never writes is
+        // loop-invariant and survives. The body is scanned
+        // syntactically for assignment / `ref` targets.
+        _loop_kept_env(body: Trees.Node) -> NARROW_ENV is
+            let env = _flow.current_env;
+
+            if !env? \/ env.is_bottom \/ env.is_empty \/ !body? then
+                return if env? then env.copy() else NARROW_ENV() fi;
             fi
 
-            let symbol mut = (cast Semantic.Types.NAMED(type)).symbol;
+            let collector = LOOP_ASSIGNMENT_COLLECTOR();
+            body.walk(collector);
 
-            if isa Semantic.Symbols.GENERIC(symbol) then
-                symbol = (cast Semantic.Symbols.GENERIC(symbol)).symbol;
-            fi
+            let kept = NARROW_ENV();
 
-            if !isa Semantic.Symbols.Classy(symbol) then
-                return null;
-            fi
-
-            return cast Semantic.Symbols.Classy(symbol);
-        si
-
-        // Pick the type that carries the receiver's generic args
-        // for variant-type construction. ONE_OF holds its original
-        // union NAMED/GENERIC as `underlying_type`; any other NAMED
-        // (plain or GENERIC) can be used directly.
-        pick_underlying_type(receiver_type: Type) -> Semantic.Types.NAMED is
-            if !receiver_type? then
-                return null;
-            fi
-
-            if isa Semantic.Types.ONE_OF(receiver_type) then
-                return (cast Semantic.Types.ONE_OF(receiver_type)).underlying_type;
-            fi
-
-            if isa Semantic.Types.NAMED(receiver_type) then
-                return cast Semantic.Types.NAMED(receiver_type);
-            fi
-
-            return null;
-        si
-
-        // Find the variant Classy a `is_<suffix>` accessor refers
-        // to on a union receiver. Returns null when the receiver
-        // isn't a union, the accessor name is malformed, or — for
-        // a ONE_OF receiver — the matched variant is not in the
-        // narrowed set (predicate is statically false; a diagnostic
-        // is deferred).
-        try_get_variant_for_is_accessor(
-            receiver_type: Type,
-            member_name: string
-        ) -> Semantic.Symbols.Classy is
-            if !is_variant_accessor_name(member_name) then
-                return null;
-            fi
-
-            let classy = get_classy_for_narrowing(receiver_type);
-
-            if !classy? \/ !classy.is_union then
-                return null;
-            fi
-
-            let suffix = member_name.substring(3);
-
-            let one_of: Semantic.Types.ONE_OF mut;
-            if isa Semantic.Types.ONE_OF(receiver_type) then
-                one_of = cast Semantic.Types.ONE_OF(receiver_type);
-            fi
-
-            for s in classy.symbols do
-                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
-                    let variant = cast Semantic.Symbols.Classy(s);
-
-                    if one_of? /\ !one_of.contains_variant(variant) then
-                        return null;
-                    fi
-
-                    return variant;
+            for v in env.variables do
+                if v.name? /\ !collector.names.contains(v.name) then
+                    kept.set_narrow(v, env.narrowed_type_of(v));
                 fi
             od
 
-            return null;
-        si
+            // Definite-assignment is not subject to the kill-set: a
+            // variable assigned before the loop stays assigned
+            // regardless of what the body writes. Body-only
+            // assignments are dropped by restoring `kept` after the
+            // loop (a loop may run zero times).
+            for v in env.assigned_variables do
+                kept.set_assigned(v);
+            od
 
-        // For an `is_<variant>` access on a value of union type,
-        // return the variant type with the same generic args as the
-        // receiver. Null if the receiver isn't a union, the variant
-        // doesn't match, or — for a ONE_OF receiver — the variant
-        // is outside the narrowed set.
-        try_get_variant_type_for_is_accessor(
-            receiver_type: Type,
-            member_name: string
-        ) -> Type is
-            let variant = try_get_variant_for_is_accessor(receiver_type, member_name);
-
-            if !variant? then
-                return null;
-            fi
-
-            let underlying = pick_underlying_type(receiver_type);
-
-            if !underlying? then
-                return null;
-            fi
-
-            return Semantic.Types.ONE_OF.build_singleton_variant_type(underlying, variant);
+            return kept;
         si
 
         // True iff the predicate `receiver.<member_name>` is
@@ -289,7 +189,7 @@ namespace Syntax.Process is
             receiver_type: Type,
             member_name: string
         ) -> bool is
-            if !is_variant_accessor_name(member_name) then
+            if !_condition_analyzer.is_variant_accessor_name(member_name) then
                 return false;
             fi
 
@@ -298,7 +198,7 @@ namespace Syntax.Process is
             fi
 
             let one_of = cast Semantic.Types.ONE_OF(receiver_type);
-            let classy = get_classy_for_narrowing(receiver_type);
+            let classy = _condition_analyzer.get_classy_for_narrowing(receiver_type);
 
             if !classy? \/ !classy.is_union then
                 return false;
@@ -334,7 +234,7 @@ namespace Syntax.Process is
                 return null;
             fi
 
-            if is_variant_accessor_name(member_name) then
+            if _condition_analyzer.is_variant_accessor_name(member_name) then
                 return null;
             fi
 
@@ -365,55 +265,13 @@ namespace Syntax.Process is
             return "member {member_name} is on every variant of \{{names}\} but not on the union — narrow further with `if v.is_<variant>` before access";
         si
 
-        // Build the complement narrowing for the trailing else of
-        // an if/elif chain — variants of the union behind
-        // `receiver_type` that don't appear in `eliminated`. Returns
-        // a singleton variant type, a ONE_OF, or null when the
-        // chain exhausts the union (caller's exhaustiveness signal).
-        try_get_complement_after_eliminated(
-            receiver_type: Type,
-            eliminated: Collections.Iterable[Semantic.Symbols.Classy]
-        ) -> Type is
-            let classy = get_classy_for_narrowing(receiver_type);
-
-            if !classy? \/ !classy.is_union then
-                return null;
-            fi
-
-            let complement = Collections.LIST[Semantic.Symbols.Classy]();
-
-            for s in classy.symbols do
-                if s? /\ s.is_variant then
-                    let variant = cast Semantic.Symbols.Classy(s);
-
-                    let is_eliminated mut = false;
-
-                    for e in eliminated do
-                        if e == variant then
-                            is_eliminated = true;
-                        fi
-                    od
-
-                    if !is_eliminated then
-                        complement.add(variant);
-                    fi
-                fi
-            od
-
-            let underlying = pick_underlying_type(receiver_type);
-
-            if !underlying? then
-                return null;
-            fi
-
-            return Semantic.Types.ONE_OF.create(underlying, complement);
-        si
-
         apply(root: Trees.Node) is
             assert _keep_depth == 0;
             assert _stub_depth == 0;
 
             _will_generate_code = IoC.CONTAINER.instance.build_flags.want_assembler;
+            _warn_definite_return = !IoC.CONTAINER.instance.build_flags.no_warn_definite_return;
+            _warn_definite_assignment = !IoC.CONTAINER.instance.build_flags.no_warn_definite_assignment;
 
             IR.LABEL.reset_id();
             IR.LABEL.set_pass("E");
@@ -433,31 +291,25 @@ namespace Syntax.Process is
 
             // Narrowing stack must be empty at apply() boundaries —
             // every push has to be balanced by a release before its
-            // owning AST exits. A leak here means a `pre`/`visit` pair
-            // got out of step (likely an early return / exception that
-            // skipped a release) and would surface as confusing
-            // type-mismatch errors on later walks. Unwind defensively
-            // so a leaked narrowing doesn't poison subsequent runs of
-            // the same compiler instance — restores symbol types as
-            // it goes, not just clears the stacks.
-            _narrowing.unwind_all();
-
-            // Defensive — same rationale as _narrowing.unwind_all above.
-            // Frames are pushed in pre(IF) and popped in visit(IF); a
-            // leak from an aborted earlier walk would let stale frames
-            // misroute else-complement narrowings on later compiles.
-            _else_complement_stack.clear();
+            // owning AST exits. Reset defensively so a narrowing
+            // leaked by an aborted earlier walk (early return /
+            // exception) doesn't poison subsequent runs — restores
+            // symbol types and empties the environment.
+            _flow.reset();
+            _if_flow_stack.clear();
+            _loop_kept_stack.clear();
+            _try_flow_stack.clear();
 
             root.walk(self);
 
             assert _keep_depth == 0;
             assert _stub_depth == 0;
-            assert _narrowing.saves_count == 0
-                else "narrowing saves stack leaked: {_narrowing.saves_count} unreleased";
-            assert _narrowing.marks_count == 0
-                else "narrowing marks stack leaked: {_narrowing.marks_count} unreleased";
-            assert _else_complement_stack.count == 0
-                else "else-complement frame stack leaked: {_else_complement_stack.count} unreleased";
+            assert _if_flow_stack.count == 0
+                else "if-flow frame stack leaked: {_if_flow_stack.count} unreleased";
+            assert _loop_kept_stack.count == 0
+                else "loop-kept env stack leaked: {_loop_kept_stack.count} unreleased";
+            assert _try_flow_stack.count == 0
+                else "try-flow frame stack leaked: {_try_flow_stack.count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
@@ -662,6 +514,11 @@ namespace Syntax.Process is
                 let retries = 20;
 
                 for i in 1::retries do
+                    // Narrowing is method-local — start each body
+                    // walk (and each inference-retry re-walk) from
+                    // an empty environment.
+                    _flow.reset();
+
                     function.body.walk(self);
 
                     // Convergence: clean or no progress signal raised.
@@ -699,6 +556,27 @@ namespace Syntax.Process is
                     _logger.speculate();
 
                     function.body.walk(self);
+                fi
+
+                // Definite return: control can reach the end of a
+                // non-void, block-bodied function's body without a
+                // value having been returned. `_flow.is_unreachable`
+                // is false here only when at least one path falls
+                // off the end — every path that returns / throws
+                // leaves the flow at `bottom`.
+                let function_symbol = current_function;
+
+                if
+                    _warn_definite_return /\
+                    function.body.is_block /\
+                    !_flow.is_unreachable /\
+                    function_symbol? /\
+                    function_symbol.return_type? /\
+                    !function_symbol.return_type.is_any /\
+                    !function_symbol.return_type.is_inferred /\
+                    function_symbol.return_type !~ _innate_symbol_lookup.get_void_type()
+                then
+                    _logger.warn(function.location, "function may not return a value on all paths");
                 fi
 
                 _logger.commit();
@@ -739,6 +617,23 @@ namespace Syntax.Process is
 
         visit(`let: Trees.Statements.LET) is
             super.visit(`let);
+
+            // Definite assignment: a `let` binding with no
+            // initializer introduces a deferred-init local. Until it
+            // is assigned, a read of it is a use-before-assignment.
+            if _warn_definite_assignment then
+                for v in `let.variables do
+                    if v? /\ !v.initializer? then
+                        for name in v.names do
+                            let symbol = find(name);
+
+                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
+                                _flow.track_deferred(cast Semantic.Symbols.Variable(symbol));
+                            fi
+                        od
+                    fi
+                od
+            fi
 
             if `let.want_dispose then
                 let idisposable = _innate_symbol_lookup.get_idisposable_type();
@@ -823,7 +718,14 @@ namespace Syntax.Process is
             fi
 
             if `for.body? then
+                // Loop kill-set narrowing: narrows on variables the
+                // loop writes are dropped (the back-edge could
+                // invalidate them); narrows on variables it never
+                // writes survive the loop.
+                let kept = _loop_kept_env(`for);
+                _flow.set_env(kept);
                 `for.body.walk(self);
+                _flow.set_env(kept);
             fi
         si
 
@@ -864,7 +766,7 @@ namespace Syntax.Process is
             let target_variable = try_get_narrowing_target(left.expression);
             let lhs_type =
                 if target_variable? then
-                    _narrowing.declared_type_of(target_variable)
+                    _flow.declared_type_of(target_variable)
                 else
                     left.expression.value.type
                 fi;
@@ -876,12 +778,13 @@ namespace Syntax.Process is
 
             left.value = left.expression.value;
 
-            // Reassignment cancels narrowing for the target — the
-            // new value may not satisfy the narrow, so subsequent
-            // reads in the same scope should observe the declared
-            // type. Saves for *other* symbols stay in place.
+            // Reassignment invalidates any narrow for the target —
+            // the new value may not satisfy it, so subsequent reads
+            // observe the declared type — and makes the target
+            // definitely assigned from here on.
             if target_variable? then
-                _narrowing.cancel_for(target_variable);
+                _flow.on_assignment(target_variable);
+                _flow.mark_assigned(target_variable);
             fi
         si
         
@@ -1141,7 +1044,7 @@ namespace Syntax.Process is
 
                     type =
                         if target_variable? then
-                            _narrowing.declared_type_of(target_variable)
+                            _flow.declared_type_of(target_variable)
                         else
                             simple.expression.value.type
                         fi;
@@ -1203,6 +1106,10 @@ namespace Syntax.Process is
 
         visit(r: Trees.Statements.RETURN) is
             super.visit(r);
+
+            // Control does not fall through a return — the rest of
+            // the enclosing block is unreachable.
+            _flow.set_unreachable();
 
             let function = current_function;
 
@@ -1286,7 +1193,10 @@ namespace Syntax.Process is
         visit(`throw: Trees.Statements.THROW) is
             super.visit(`throw);
 
-            if 
+            // Control does not fall through a throw.
+            _flow.set_unreachable();
+
+            if
                 !Value.check_is_consumable(_logger, `throw.expression.location, `throw.expression.value)
             then
                 return;
@@ -1302,11 +1212,34 @@ namespace Syntax.Process is
             // if all branches are throws, an error can be reported
         si
 
+        visit(`break: Trees.Statements.BREAK) is
+            super.visit(`break);
+
+            // Control does not fall through a break.
+            _flow.set_unreachable();
+        si
+
+        visit(`continue: Trees.Statements.CONTINUE) is
+            super.visit(`continue);
+
+            // Control does not fall through a continue.
+            _flow.set_unreachable();
+        si
+
         visit(`assert: Trees.Statements.ASSERT) is
             super.visit(`assert);
 
-            if 
-                !`assert.expression.value? \/ 
+            // `assert false` always throws — control does not
+            // continue past it.
+            if
+                isa Trees.Expressions.Literals.BOOLEAN(`assert.expression) /\
+                (cast Trees.Expressions.Literals.BOOLEAN(`assert.expression)).value_string =~ "false"
+            then
+                _flow.set_unreachable();
+            fi
+
+            if
+                !`assert.expression.value? \/
                 !`assert.expression.value.type? \/
                 !`assert.expression.value.check_is_consumable(_logger, `assert.expression.location)
             then
@@ -1339,8 +1272,55 @@ namespace Syntax.Process is
             fi
         si
 
+        pre(`try: Trees.Statements.TRY) -> bool is
+            super.pre(`try);
+
+            // Record the pre-try environment. Its narrowing facts
+            // are discarded after the try (an exception can leave
+            // the body anywhere), but its definite-assignment facts
+            // survive — those assignments already happened.
+            _try_flow_stack.add(TRY_FLOW_FRAME(_flow.current_env.copy()));
+
+            return false;
+        si
+
+        // The frame for the `try` currently being walked, or null.
+        _try_flow_frame: TRY_FLOW_FRAME =>
+            if _try_flow_stack.count > 0 then
+                _try_flow_stack[_try_flow_stack.count - 1]
+            else
+                null
+            fi;
+
         visit(`try: Trees.Statements.TRY) is
             super.visit(`try);
+
+            let frame = _try_flow_frame;
+
+            if _try_flow_stack.count > 0 then
+                _try_flow_stack.remove_at(_try_flow_stack.count - 1);
+            fi
+
+            if frame? then
+                // A try with no catches never reached pre(CATCH), so
+                // the body exit is the current environment here.
+                if !frame.body_seen /\ !_flow.is_unreachable then
+                    frame.can_complete = true;
+                fi
+
+                // Conservative: an exception can leave the try body
+                // at any point, so no narrowing survives the try —
+                // only the pre-try definite-assignment facts. When
+                // neither the body nor any handler can complete
+                // normally, control cannot fall through the try.
+                if frame.can_complete then
+                    _flow.set_env(frame.entry.with_only_assigned());
+                else
+                    _flow.set_unreachable();
+                fi
+            else
+                _flow.set_env(NARROW_ENV());
+            fi
 
             if
                 (!`try.catches? \/ `try.catches.count == 0) /\
@@ -1349,9 +1329,44 @@ namespace Syntax.Process is
                 _logger.warn(`try.location, "try statement should have at least one catch clause and/or a finally clause");
             fi
         si
-        
+
+        pre(`catch: Trees.Statements.CATCH) -> bool is
+            super.pre(`catch);
+
+            let frame = _try_flow_frame;
+
+            // The first catch is reached right after the try body,
+            // so the current environment is the body's exit: record
+            // whether the body can complete normally.
+            if frame? /\ !frame.body_seen then
+                frame.body_seen = true;
+
+                if !_flow.is_unreachable then
+                    frame.can_complete = true;
+                fi
+            fi
+
+            // A throw can land anywhere in the try body, so nothing
+            // narrowed there can be assumed in the handler — the
+            // catch body is walked with only the pre-try
+            // definite-assignment facts.
+            _flow.set_env(
+                if frame? then frame.entry.with_only_assigned() else NARROW_ENV() fi
+            );
+
+            return false;
+        si
+
         visit(`catch: Trees.Statements.CATCH) is
             super.visit(`catch);
+
+            // A catch handler that completes normally is a path that
+            // reaches the end of the try statement.
+            let frame = _try_flow_frame;
+
+            if frame? /\ !_flow.is_unreachable then
+                frame.can_complete = true;
+            fi
 
             if !`catch.variable? then
                 return;
@@ -1381,6 +1396,19 @@ namespace Syntax.Process is
             fi
         si
 
+        pre(`do: Trees.Statements.DO) -> bool is
+            super.pre(`do);
+
+            // Loop kill-set narrowing — see _pre(FOR). The
+            // kept-environment is stashed for visit(DO) to restore
+            // after the loop.
+            let kept = _loop_kept_env(`do);
+            _loop_kept_stack.add(kept);
+            _flow.set_env(kept);
+
+            return false;
+        si
+
         visit(`do: Trees.Statements.DO) is
             if
                 `do? /\
@@ -1393,70 +1421,76 @@ namespace Syntax.Process is
             fi
 
             super.visit(`do);
+
+            if _loop_kept_stack.count > 0 then
+                let kept = _loop_kept_stack[_loop_kept_stack.count - 1];
+                _loop_kept_stack.remove_at(_loop_kept_stack.count - 1);
+
+                if `do? /\ !`do.condition? /\ !_loop_body_has_break(`do.body) then
+                    // An unconditional loop with no `break` cannot
+                    // be exited — control never falls through it.
+                    _flow.set_unreachable();
+                else
+                    _flow.set_env(kept);
+                fi
+            fi
+        si
+
+        // True iff `body` contains a `break` targeting the loop it
+        // is the body of — a `break` inside a nested loop does not
+        // count (it targets that inner loop).
+        _loop_body_has_break(body: Trees.Statements.LIST) -> bool is
+            if !body? then
+                return false;
+            fi
+
+            let finder = LOOP_BREAK_FINDER();
+            body.walk(finder);
+
+            return finder.found;
         si
 
         pre(`if: Trees.Statements.IF_BRANCH) -> bool is
             super.pre(`if);
 
-            // Mark the narrowing scope before walking the
-            // condition so any predicates the cond observes push
-            // saves into this branch's frame; the matching release
-            // in visit() pops them once the body has been walked.
-            _narrowing.mark_scope();
+            // Controlled walk: walk the condition, derive its
+            // then/else narrowing environments, walk the body under
+            // the then-environment, and record the body's exit
+            // environment for the join in visit(IF). The condition
+            // itself walks under the running-else environment so
+            // within-condition narrowing (`isa T(x) /\ x.foo`)
+            // applies as it compiles.
+            let frame = _if_flow_stack[_if_flow_stack.count - 1];
 
-            // Else-complement chain narrowing: trailing else of a
-            // qualifying IF. Visit(IF_BRANCH) for every cond branch
-            // has accumulated (target, underlying_type, eliminated)
-            // on the frame; here we materialise the complement
-            // narrow against the still-living set and push it. A
-            // null complement (chain exhausted the union) leaves
-            // the body unnarrowed.
-            if !`if.condition? /\ _else_complement_stack.count > 0 then
-                let frame = _else_complement_stack[_else_complement_stack.count - 1];
+            if `if.condition? then
+                _flow.set_env(frame.running_else);
+                `if.condition.walk(self);
 
-                if
-                    frame.is_qualifying /\
-                    !frame.is_dead /\
-                    frame.target? /\
-                    frame.underlying_type? /\
-                    frame.eliminated.count > 0
-                then
-                    let complement = try_get_complement_after_eliminated(
-                        frame.underlying_type,
-                        frame.eliminated
-                    );
+                let facts = _condition_analyzer.analyze_condition(`if.condition, frame.running_else);
 
-                    if complement? then
-                        _narrowing.try_push(frame.target, complement);
-                    fi
+                _flow.set_env(facts.then_env);
+
+                if `if.body? then
+                    `if.body.walk(self);
                 fi
+
+                frame.branch_exits.add(_flow.current_env.copy());
+                frame.running_else = facts.else_env;
+            else
+                _flow.set_env(frame.running_else);
+
+                if `if.body? then
+                    `if.body.walk(self);
+                fi
+
+                frame.branch_exits.add(_flow.current_env.copy());
+                frame.has_else = true;
             fi
+
+            return true;
         si
 
         visit(`if: Trees.Statements.IF_BRANCH) is
-            _narrowing.release_scope();
-
-            // Else-complement chain accumulation: a cond branch of
-            // a still-live qualifying IF tries to extract a
-            // (target, variant) pair from a
-            // `<simple-id>.is_<variant>` condition on a union.
-            // Matching branches append the variant to the frame's
-            // eliminated set; non-matching branches (different
-            // target, non-`is_<variant>` shape, non-union receiver)
-            // mark the frame dead so the trailing else does not
-            // narrow.
-            if
-                _else_complement_stack.count > 0 /\
-                `if? /\
-                `if.condition?
-            then
-                let frame = _else_complement_stack[_else_complement_stack.count - 1];
-
-                if frame.is_qualifying /\ !frame.is_dead then
-                    record_branch_elimination(frame, `if.condition);
-                fi
-            fi
-
             if
                 `if? /\
                 `if.condition? /\
@@ -1468,102 +1502,6 @@ namespace Syntax.Process is
             fi
 
             super.visit(`if);
-        si
-
-        // Extract (target, variant)s from `condition` and append
-        // each variant to `frame.eliminated`. Handles a single
-        // `<id>.is_<variant>` leaf and any flat `\/` chain of such
-        // leaves on the same target. Marks the frame dead on any
-        // non-qualifying shape (different target, non-`is_<variant>`
-        // leaf, non-union receiver).
-        record_branch_elimination(
-            frame: ELSE_COMPLEMENT_FRAME,
-            condition: Trees.Expressions.Expression
-        ) is
-            if !try_extend_state_with_chain(frame, condition) then
-                frame.is_dead = true;
-            fi
-        si
-
-        // Walk a `\/` chain (or a single MEMBER leaf), appending
-        // each `<id>.is_<variant>` predicate's variant to
-        // `state.eliminated`. The frame's `target` and
-        // `underlying_type` are locked by the first leaf; later
-        // leaves must agree or the chain disqualifies. Returns
-        // false on any non-qualifying shape so the caller can mark
-        // its frame dead.
-        //
-        // The state shape (target / underlying_type / eliminated)
-        // is dual-purpose: the if/elif accumulator collects variants
-        // ruled out by the chain (they don't reach the trailing
-        // else), while the BINARY-\/ then-narrow uses the same
-        // accumulator to gather the variants the chain *does*
-        // accept. Same data, different role.
-        try_extend_state_with_chain(
-            state: ELSE_COMPLEMENT_FRAME,
-            expr: Trees.Expressions.Expression
-        ) -> bool is
-            if !expr? then
-                return false;
-            fi
-
-            if isa Trees.Expressions.BINARY(expr) then
-                let bin = cast Trees.Expressions.BINARY(expr);
-
-                if bin.operation? /\ bin.operation.name =~ "\\/" then
-                    if !try_extend_state_with_chain(state, bin.left) then
-                        return false;
-                    fi
-
-                    if !try_extend_state_with_chain(state, bin.right) then
-                        return false;
-                    fi
-
-                    return true;
-                fi
-            fi
-
-            return try_append_is_variant_leaf(state, expr);
-        si
-
-        // Single MEMBER leaf appender. Verifies receiver is a union,
-        // target is a simple identifier, and (if state already has
-        // a target) the new target matches. Adds the matched variant
-        // to state.eliminated (dedupe by reference).
-        try_append_is_variant_leaf(
-            state: ELSE_COMPLEMENT_FRAME,
-            expr: Trees.Expressions.Expression
-        ) -> bool is
-            if !isa Trees.Expressions.MEMBER(expr) then
-                return false;
-            fi
-
-            let member = cast Trees.Expressions.MEMBER(expr);
-
-            if !member.left? \/ !member.left.value? \/ !member.left.value.type? \/ !member.identifier? then
-                return false;
-            fi
-
-            let receiver_type = member.left.value.type;
-            let target = try_get_narrowing_target(member.left);
-            let variant = try_get_variant_for_is_accessor(receiver_type, member.identifier.name);
-
-            if !target? \/ !variant? then
-                return false;
-            fi
-
-            if !state.target? then
-                state.target = target;
-                state.underlying_type = pick_underlying_type(receiver_type);
-            elif state.target != target then
-                return false;
-            fi
-
-            if !state.contains_eliminated(variant) then
-                state.eliminated.add(variant);
-            fi
-
-            return true;
         si
 
         pre(expression: Trees.Bodies.EXPRESSION) -> bool is
@@ -1645,6 +1583,22 @@ namespace Syntax.Process is
         visit(function: Trees.Expressions.FUNCTION) is
             let mark = _logger.mark();
 
+            // The lambda body walks under the enclosing method's
+            // environment (a closure may soundly observe a narrow
+            // in force at its construction point), but its own ifs /
+            // assignments / divergence must not leak back out — so
+            // the enclosing environment is saved and restored.
+            //
+            // The tracked deferred-init locals are deliberately NOT
+            // swapped out. Closures capture by value at construction
+            // time, so the closure body walking under `saved_env`
+            // observes exactly the definite-assignment facts in
+            // force where the closure is built — reading a captured
+            // local that is unassigned there is a genuine
+            // use-before-assignment (the closure captured a
+            // not-yet-assigned value), not a false positive.
+            let saved_env = _flow.current_env.copy();
+
             try
                 _logger.speculate();
 
@@ -1656,9 +1610,11 @@ namespace Syntax.Process is
             catch e: Exception
                 function.value = DUMMY(Semantic.Types.ERROR(), function.location);
                 _logger.release(mark);
- 
+
                 _logger.exception(function.location, e, "exception compiling function literal");
             yrt
+
+            _flow.set_env(saved_env);
         si
 
         _visit(function: Trees.Expressions.FUNCTION) is
@@ -2369,11 +2325,6 @@ namespace Syntax.Process is
                     isa_type,
                     `isa.right.value
                 );
-
-            _narrowing.try_push(
-                try_get_narrowing_target(`isa.right),
-                isa_type
-            );
         si
 
         visit(`typeof: Trees.Expressions.TYPEOF) is
@@ -2605,6 +2556,12 @@ namespace Syntax.Process is
         ) -> (Value, Value) is
             let result: Value;
 
+            // An explicit `Foo[...]` callee enters already specialized
+            // and was constraint-checked by `specialize_type`; an
+            // inferred `Foo(...)` callee is specialized below by
+            // overload resolution and is checked post-resolution.
+            let was_generic_on_entry = isa Semantic.Types.GENERIC(type);
+
             let named_type = cast Semantic.Types.NAMED(type);
             let type_symbol mut = named_type.symbol;
 
@@ -2755,29 +2712,23 @@ namespace Syntax.Process is
             _symbol_use_locations.add_symbol_use(right_location, function);
             _symbol_use_locations.add_symbol_use(right_location, type_symbol.root_unspecialized_symbol);
 
-            return (cast Value(Load.SYMBOL(null, function_group)), cast Value(NEW(type, function, arguments)));
-        si
+            if !was_generic_on_entry then
+                let constructed = cast Semantic.Types.GENERIC(type);
 
-        pre(unary: Trees.Expressions.UNARY) -> bool is
-            // `!` cancels narrowings observed in its operand —
-            // a v1 conservative choice, since the negation form
-            // (e.g. `!x.is_some` ⇒ `x` is `NONE`) would need the
-            // smart-merge LUB machinery deferred to v2.
-            if unary.operation? /\ unary.operation.name =~ "!" then
-                if unary.right? then
-                    _narrowing.mark_scope();
+                if constructed? then
+                    let generic_symbol = cast Semantic.Symbols.GENERIC(constructed.symbol);
 
-                    try
-                        unary.right.walk(self);
-                    finally
-                        _narrowing.release_scope();
-                    yrt
+                    if generic_symbol? then
+                        let classy = cast Semantic.Symbols.Classy(generic_symbol.symbol);
+
+                        if classy? then
+                            classy.check_argument_constraints(location, _logger, constructed.arguments);
+                        fi
+                    fi
                 fi
-
-                return true;
             fi
 
-            return false;
+            return (cast Value(Load.SYMBOL(null, function_group)), cast Value(NEW(type, function, arguments)));
         si
 
         visit(unary: Trees.Expressions.UNARY) is
@@ -2828,70 +2779,38 @@ namespace Syntax.Process is
         si        
 
         pre(binary: Trees.Expressions.BINARY) -> bool is
-            // `\/` (OR) — cancel each side's narrowings during
-            // walk so the right operand evaluates as if the left
-            // was false, and so per-leaf narrowings don't leak into
-            // the surrounding (post-OR) context. The whole-chain
-            // narrowing is reconstructed below for the qualifying
-            // `<id>.is_<variant>` shape.
-            if binary.operation? /\ binary.operation.name =~ "\\/" then
-                if binary.left? then
-                    _narrowing.mark_scope();
+            // For `/\` / `\/`, walk the operands with the narrowing
+            // environment threaded so within-condition narrowing
+            // applies as the right operand compiles: in
+            // `isa T(x) /\ x.foo`, `x.foo` sees `x` as `T`. The
+            // `/\` right walks under the left's true edge, the `\/`
+            // right under its false edge. The BINARY as a whole
+            // leaves the ambient environment unchanged — the
+            // enclosing IF derives the overall narrowing from
+            // analyze_condition once the condition is fully walked.
+            if binary.operation? /\ binary.left? /\ binary.right? then
+                let op = binary.operation.name;
 
-                    try
-                        binary.left.walk(self);
-                    finally
-                        _narrowing.release_scope();
-                    yrt
+                if op =~ "/\\" \/ op =~ "\\/" then
+                    let saved = _flow.current_env.copy();
+
+                    binary.left.walk(self);
+
+                    let left_facts = _condition_analyzer.analyze_condition(binary.left, saved);
+
+                    _flow.set_env(
+                        if op =~ "/\\" then left_facts.then_env else left_facts.else_env fi
+                    );
+
+                    binary.right.walk(self);
+
+                    _flow.set_env(saved);
+
+                    return true;
                 fi
-
-                if binary.right? then
-                    _narrowing.mark_scope();
-
-                    try
-                        binary.right.walk(self);
-                    finally
-                        _narrowing.release_scope();
-                    yrt
-                fi
-
-                // Disjunction-chain narrowing: when the whole \/
-                // chain is `<id>.is_<variant>` predicates on the
-                // same target, push the union of matched variants
-                // as a ONE_OF (or singleton variant) into the
-                // surrounding scope. Per-leaf narrowings above were
-                // wiped by the inner mark/release isolation; this
-                // is how the then-body of `if a.is_X \/ a.is_Y`
-                // sees `a` narrowed to {X, Y}.
-                try_push_disjunction_chain_narrowing(binary);
-
-                return true;
             fi
 
             return false;
-        si
-
-        // After both sides of a `\/` chain have walked at unnarrowed
-        // type, build the combined variant-set narrowing and push
-        // it into the surrounding scope. No-op when the chain isn't
-        // a qualifying shape (non-`is_<variant>` leaf, mixed targets,
-        // non-union receiver).
-        try_push_disjunction_chain_narrowing(binary: Trees.Expressions.BINARY) is
-            let state = ELSE_COMPLEMENT_FRAME();
-
-            if !try_extend_state_with_chain(state, binary) then
-                return;
-            fi
-
-            if !state.target? \/ !state.underlying_type? \/ state.eliminated.count == 0 then
-                return;
-            fi
-
-            let narrowed = Semantic.Types.ONE_OF.create(state.underlying_type, state.eliminated);
-
-            if narrowed? then
-                _narrowing.try_push(state.target, narrowed);
-            fi
         si
 
         visit(binary: Trees.Expressions.BINARY) is
@@ -3326,18 +3245,13 @@ namespace Syntax.Process is
 
                 member.value = value;
 
-                if !need_store /\ is_variant_accessor_name(member.identifier.name) then
+                if !need_store /\ _condition_analyzer.is_variant_accessor_name(member.identifier.name) then
                     if is_statically_false_is_accessor(named_type, member.identifier.name) then
                         _logger.warn(
                             member.location,
                             "predicate {member.identifier.name} is always false: receiver narrowed to {named_type}"
                         );
                     fi
-
-                    _narrowing.try_push(
-                        try_get_narrowing_target(member.left),
-                        try_get_variant_type_for_is_accessor(named_type, member.identifier.name)
-                    );
                 fi
             fi
         si
@@ -4544,7 +4458,27 @@ namespace Syntax.Process is
 
                     if function.is_unsafe_constraints then
                         _logger.warn(call.location, "call to {function} has unchecked constraints");
-                    fi    
+                    fi
+
+                    // A function whose type arguments were bound by
+                    // inference keeps `is_generic` set with concrete
+                    // `generic_arguments`; an explicitly specialized one
+                    // has `is_generic` cleared and was already checked
+                    // at `FUNCTION_GROUP.try_specialize`.
+                    if
+                        function.is_generic /\
+                        function.generic_arguments? /\
+                        function.generic_argument_names? /\
+                        function.generic_arguments.count == function.generic_argument_names.count
+                    then
+                        Semantic.Symbols.GENERIC_CONSTRAINT_CHECKER().check_arguments(
+                            call.location,
+                            _logger,
+                            function,
+                            function.generic_argument_names,
+                            function.generic_arguments
+                        );
+                    fi
 
                     _symbol_use_locations.add_symbol_use(call.function.right_location, function);
 
@@ -4766,7 +4700,18 @@ namespace Syntax.Process is
                         identifier.value = symbol.store(identifier.location, null, store_value, _symbol_loader, false);
                     else
                         identifier.value = symbol.load(identifier.location, null, _symbol_loader);
-                    fi    
+
+                        // Definite assignment: reading a tracked
+                        // deferred-init local before it is assigned
+                        // on every path reaching here.
+                        if _warn_definite_assignment /\ isa Semantic.Symbols.Variable(symbol) then
+                            let variable = cast Semantic.Symbols.Variable(symbol);
+
+                            if _flow.is_tracked(variable) /\ !_flow.is_assigned(variable) then
+                                _logger.warn(identifier.location, "{variable.name} may be used before it is assigned");
+                            fi
+                        fi
+                    fi
                 fi
 
             else
@@ -4890,8 +4835,16 @@ namespace Syntax.Process is
             fi
 
             reference.left.value.check_is_consumable(_logger, reference.left.location);
-            
+
             reference.value = ADDRESS(reference.left.value, _innate_symbol_lookup.get_reference_type(reference.left.value.type));
+
+            // The callee reached through `x ref` may write the
+            // target, so treat the `ref` as a definite assignment.
+            let ref_target = try_get_narrowing_target(reference.left);
+
+            if ref_target? then
+                _flow.mark_assigned(ref_target);
+            fi
         si
         
         visit(`null: Trees.Expressions.NULL) is
@@ -4962,7 +4915,7 @@ namespace Syntax.Process is
     
                 list.value = IR.Values.BLOCK(last.value.type);
             finally
-                current_statement_list = enclosing_statement_list
+                current_statement_list = enclosing_statement_list;
             yrt
         si
 
@@ -4975,48 +4928,34 @@ namespace Syntax.Process is
                 od
             fi
 
-            // Push an else-complement frame for this IF. Structural
-            // qualification: ≥ 2 branches, every branch but the
-            // last carries a condition, and the last branch is
-            // `else` (null condition). The receiver-type and
-            // variant identities are derived later in
-            // visit(IF_BRANCH) for each cond branch — we only know
-            // the receiver's resolved type once the cond has been
-            // walked.
-            let frame = ELSE_COMPLEMENT_FRAME();
-
-            let branches = Collections.LIST[Trees.Statements.IF_BRANCH](`if.branches);
-            let total = branches.count;
-
-            let well_shaped mut = total >= 2;
-
-            if well_shaped then
-                let last = branches[total - 1];
-                if !last? \/ last.condition? then
-                    well_shaped = false;
-                fi
-            fi
-
-            if well_shaped then
-                let i mut = 0;
-                while i < total - 1 do
-                    let b = branches[i];
-                    if !b? \/ !b.condition? then
-                        well_shaped = false;
-                    fi
-                    i = i + 1;
-                od
-            fi
-
-            frame.is_qualifying = well_shaped;
-
-            _else_complement_stack.add(frame);
+            // Open a flow frame for this IF. Each branch's controlled
+            // walk (pre(IF_BRANCH)) records its exit environment on
+            // the frame; visit(IF) joins them.
+            _if_flow_stack.add(IF_FLOW_FRAME(_flow.current_env.copy()));
 
             return false;
         si
 
         visit(`if: Trees.Statements.IF) is
-            _else_complement_stack.remove_at(_else_complement_stack.count - 1);
+            // Merge the branch exit environments into the environment
+            // in force after the IF. A branch whose body diverges
+            // contributes the bottom environment; with no else
+            // branch, the no-branch-taken fall-through contributes
+            // the trailing running-else environment.
+            let if_flow = _if_flow_stack[_if_flow_stack.count - 1];
+            _if_flow_stack.remove_at(_if_flow_stack.count - 1);
+
+            let after mut = NARROW_ENV.bottom();
+
+            for branch_exit in if_flow.branch_exits do
+                after = NARROW_ENV.join(after, branch_exit);
+            od
+
+            if !if_flow.has_else then
+                after = NARROW_ENV.join(after, if_flow.running_else);
+            fi
+
+            _flow.set_env(after);
 
             for i in `if.branches do
                 if i.condition? then
@@ -5185,19 +5124,21 @@ namespace Syntax.Process is
                 fi
             od
 
-            let result = Semantic.Types.GENERIC(
-                location,
-                cast Semantic.Symbols.Classy(symbol),
-                arguments | .map(
-                    // FIXME type inference issue
-                    a -> Type => if a? /\ a.type? then a.type else Semantic.Types.ERROR() fi
-                ).collect()
-            );
+            let classy = cast Semantic.Symbols.Classy(symbol);
+
+            let actual_arguments = arguments | .map(
+                // FIXME type inference issue
+                a -> Type => if a? /\ a.type? then a.type else Semantic.Types.ERROR() fi
+            ).collect();
+
+            let result = Semantic.Types.GENERIC(location, classy, actual_arguments);
+
+            classy.check_argument_constraints(location, _logger, actual_arguments);
 
             if symbol.is_unsafe_constraints then
-                _logger.warn(location, "type {result} has unchecked constraints");            
+                _logger.warn(location, "type {result} has unchecked constraints");
             fi
-            
+
             return result;
         si
 

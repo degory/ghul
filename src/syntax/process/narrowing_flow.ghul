@@ -1,0 +1,217 @@
+namespace Syntax.Process is
+    use Semantic.Types.Type;
+    use Semantic.Symbols.Variable;
+
+    // Per-IF bookkeeping for the flow pass. pre(IF) pushes a frame;
+    // each branch's controlled walk records its body-exit
+    // environment and threads the running else-environment to the
+    // next branch; visit(IF) joins the branch exits.
+    class IF_FLOW_FRAME is
+        // Environment for the next not-yet-walked branch — refined
+        // by each cond branch's false edge as the chain proceeds.
+        running_else: NARROW_ENV public;
+        // Exit environment of each branch already walked (bottom for
+        // a branch whose body diverges).
+        branch_exits: Collections.LIST[NARROW_ENV] public;
+        // True once an unconditional (else) branch has been seen.
+        has_else: bool public;
+
+        init(in_env: NARROW_ENV) is
+            running_else = in_env;
+            branch_exits = Collections.LIST[NARROW_ENV]();
+        si
+    si
+
+    // Per-`try` bookkeeping for the flow pass. pre(TRY) pushes a
+    // frame; pre(CATCH) observes the try body's exit, visit(CATCH)
+    // each handler's exit, and visit(TRY) the no-catch body exit, so
+    // visit(TRY) can tell whether control can fall through the try
+    // statement at all (it cannot when the body and every handler
+    // diverge).
+    class TRY_FLOW_FRAME is
+        // The environment in force before the try — its
+        // definite-assignment facts survive the statement.
+        entry: NARROW_ENV public;
+        // True once the try body's exit environment has been
+        // observed (at the first catch, or — with no catches — at
+        // visit(TRY)).
+        body_seen: bool public;
+        // True if the body, or some catch handler, can complete
+        // normally and so reach the end of the try statement.
+        can_complete: bool public;
+
+        init(entry: NARROW_ENV) is
+            self.entry = entry;
+        si
+    si
+
+    // The flow-sensitive narrowing orchestrator. Holds the narrowing
+    // environment in force at the current walk point and keeps each
+    // narrowed variable's `Variable.type` reconciled to it, so the
+    // rest of COMPILE_EXPRESSIONS — and the per-use-site IR value
+    // snapshots the IDE reads — observe the narrowed type.
+    //
+    // Replaces the scope-stack NARROWING. See
+    // `docs/claude/flow-sensitive-narrowing.md`.
+    class NARROWING_FLOW is
+        _current_env: NARROW_ENV;
+        // Declared (pre-narrowing) type of every variable that has
+        // been narrowed — the restore target. Captured lazily the
+        // first time a variable is narrowed.
+        _declared: Collections.MAP[Variable, Type];
+
+        // Deferred-initialization locals (`let x: T;` with no
+        // initializer) subject to the definite-assignment read
+        // check. Method-global within one body walk — a variable,
+        // once declared, stays tracked until the next reset.
+        _tracked: Collections.SET[Variable];
+
+        init() is
+            _current_env = NARROW_ENV();
+            _declared = Collections.MAP[Variable, Type]();
+            _tracked = Collections.SET[Variable]();
+        si
+
+        current_env: NARROW_ENV => _current_env;
+        is_unreachable: bool => _current_env.is_bottom;
+
+        // Restore every currently-narrowed variable to its declared
+        // type, empty the environment, and forget declared types.
+        // Called at each method-body boundary.
+        reset() is
+            restore_all();
+            _current_env = NARROW_ENV();
+            _declared.clear();
+            _tracked.clear();
+        si
+
+        // Restore every currently-narrowed variable's `.type` to its
+        // declared type (without emptying the environment).
+        restore_all() is
+            for v in _current_env.variables do
+                let declared: Type;
+
+                if _declared.try_get_value(v, declared ref) /\ declared? then
+                    v.set_type(declared);
+                fi
+            od
+        si
+
+        // The declared (pre-narrowing) type of `v` — used for the
+        // assignment-LHS typecheck, which must see past any narrow.
+        declared_type_of(v: Variable) -> Type is
+            if !v? then
+                return null;
+            fi
+
+            let declared: Type;
+
+            if _declared.try_get_value(v, declared ref) /\ declared? then
+                return declared;
+            fi
+
+            return v.type;
+        si
+
+        // Make `target` the environment in force: restore all
+        // current narrows, then apply `target`'s sound narrows,
+        // reconciling `Variable.type` to match. `_current_env`
+        // becomes the actually-applied subset of `target`.
+        set_env(target: NARROW_ENV) is
+            if !target? then
+                return;
+            fi
+
+            restore_all();
+
+            let applied = NARROW_ENV();
+
+            if target.is_bottom then
+                applied.is_bottom = true;
+            else
+                for v in target.variables do
+                    let t = target.narrowed_type_of(v);
+
+                    if _apply_one(v, t) then
+                        applied.set_narrow(v, t);
+                    fi
+                od
+
+                for v in target.assigned_variables do
+                    applied.set_assigned(v);
+                od
+            fi
+
+            _current_env = applied;
+        si
+
+        // Mark the current point unreachable (after return / throw /
+        // break / continue).
+        set_unreachable() is
+            set_env(NARROW_ENV.bottom());
+        si
+
+        // Assignment transfer: a write to `v` invalidates any narrow
+        // on it — subsequent reads must observe the declared type.
+        on_assignment(v: Variable) is
+            if !v? \/ !_current_env.contains(v) then
+                return;
+            fi
+
+            _current_env.drop_narrow(v);
+
+            let declared = declared_type_of(v);
+
+            if declared? then
+                v.set_type(declared);
+            fi
+        si
+
+        // Register `v` as a deferred-init local subject to the
+        // definite-assignment use-before-assignment check.
+        track_deferred(v: Variable) is
+            if v? then
+                _tracked.add(v);
+            fi
+        si
+
+        // True iff `v` is a tracked deferred-init local.
+        is_tracked(v: Variable) -> bool => v? /\ _tracked.contains(v);
+
+        // True iff `v` is definitely assigned at the current point.
+        is_assigned(v: Variable) -> bool => _current_env.is_assigned(v);
+
+        // Record `v` as definitely assigned at the current point.
+        mark_assigned(v: Variable) is
+            _current_env.set_assigned(v);
+        si
+
+        // Apply one narrow if it is sound — `t` strictly narrower
+        // than `v`'s declared type, and not an error/placeholder.
+        // Captures the declared type on first narrow. Returns true
+        // when the narrow was applied.
+        _apply_one(v: Variable, t: Type) -> bool is
+            if !v? \/ !t? \/ !v.type? then
+                return false;
+            fi
+
+            if t.is_error \/ t.is_inferred then
+                return false;
+            fi
+
+            let declared = declared_type_of(v);
+
+            if !declared? \/ declared =~ t \/ !declared.is_assignable_from(t) then
+                return false;
+            fi
+
+            if !_declared.contains_key(v) then
+                _declared[v] = v.type;
+            fi
+
+            v.set_type(t);
+
+            return true;
+        si
+    si
+si
