@@ -1,65 +1,131 @@
 namespace Analysis is
-    use System.Exception;
     use IO.Std;
 
-    use Collections.Iterable;
+    // Decides when the long-lived analyser should exit so the IDE can spawn a
+    // fresh process. Two independent triggers:
+    //
+    //  - heap growth: the managed heap is sampled after the first full compile
+    //    to fix a baseline, then after every later full compile. The compiler
+    //    retains state across compiles (ASTs, caches) that clear_symbols does
+    //    not all reclaim, so a steady climb is the expected leak signature.
+    //    A recycle returns that memory to a fresh process.
+    //
+    //  - instability: a burst of exceptions escaping command handlers. Isolated
+    //    failures decay away; a sustained run of them means the analyser's
+    //    state is corrupt and a fresh process is the only recovery.
+    class WATCHDOG is
+        // Recycle once the heap has grown past both thresholds relative to the
+        // baseline: a multiple of it, and an absolute floor so a small baseline
+        // can't trip a recycle on ordinary working-set noise.
+        heap_growth_factor: double static => 2.0D;
+        heap_growth_floor_bytes: long static => 256L * 1024L * 1024L;
 
-    use Pair = Collections.KeyValuePair`2;
+        // Consecutive failing operations needed to trip an instability recycle.
+        // request_restart() adds 2 per failure, a clean operation decays 1, so
+        // this is reached by roughly this many failures in an unbroken run.
+        instability_limit: int static => 20;
 
-    use IoC;
-    use Logging;
-    use Source;
-    use Compiler;
+        // How often to echo a heap reading to the log (every Nth full compile).
+        heap_log_interval: int static => 32;
 
-    class WATCHDOG is        
-        operation_limit: int static => 10000;
+        _restart_score: int;
 
-        _is_enabled: bool;
-        _operation_count: int;
-        _restart_count: int;
+        _have_baseline: bool;
+        _baseline_heap_bytes: long;
+        _full_compile_pending: bool;
+        _compile_count: int;
 
         want_restart: bool;
 
         init() is si
 
+        // An exception escaped a command handler. Nudge the instability score;
+        // a sustained run of failures trips want_restart, isolated ones decay.
         request_restart() is
-            _restart_count = _restart_count + 2;
+            _restart_score = _restart_score + 2;
 
-            if _restart_count > 20 then
+            if _restart_score > instability_limit then
                 want_restart = true;
             fi
         si
-        
-        enable() is
-            _is_enabled = true;
+
+        // A full project compile completed successfully. The heap reading is
+        // taken at the next operation boundary (on_operation_complete), once
+        // the in-flight response frame has been flushed.
+        note_full_compile() is
+            _full_compile_pending = true;
+            _compile_count = _compile_count + 1;
         si
 
-        increment(writer: IO.TextWriter) is
-            if _is_enabled then
-                _operation_count = _operation_count + 1;
-            fi
-            
-            if want_restart \/ _operation_count > operation_limit then
-                want_restart = false;
-
-                if want_restart then
-                    Std.error.write_line("watchdog: restart due to instability...");
-                else
-                    Std.error.write_line("watchdog: recycle...");
-                fi
-
-                Std.error.flush();
-
-                writer.write_line("RESTART");
-                writer.write("{cast char(12)}");
-                writer.flush();
-
-                System.Environment.exit(1);
+        // Called by the despatcher after every command, once the handler has
+        // returned and its response is on the wire. This is the only place a
+        // recycle is issued, so a recycle never truncates a response frame.
+        on_operation_complete(writer: IO.TextWriter) is
+            if want_restart then
+                recycle(writer, "instability");
             fi
 
-            if _restart_count > 0 then
-                _restart_count = _restart_count - 1;
+            if _restart_score > 0 then
+                _restart_score = _restart_score - 1;
             fi
+
+            if _full_compile_pending then
+                _full_compile_pending = false;
+
+                check_heap(writer);
+            fi
+        si
+
+        check_heap(writer: IO.TextWriter) is
+            let heap = System.GC.get_total_memory(true);
+
+            if !_have_baseline then
+                set_baseline(heap);
+
+                return;
+            fi
+
+            if _compile_count % heap_log_interval == 0 then
+                log_heap("heap", heap);
+            fi
+
+            if is_heap_over_limit(heap) then
+                log_heap("heap", heap);
+                recycle(writer, "heap growth");
+            fi
+        si
+
+        set_baseline(heap: long) is
+            _have_baseline = true;
+            _baseline_heap_bytes = heap;
+
+            log_heap("baseline", heap);
+        si
+
+        // The recycle decision for a heap reading. Pure — no sampling, no exit —
+        // so it can be exercised directly by unit tests. Both thresholds must be
+        // crossed: a multiple of the baseline and an absolute byte floor.
+        is_heap_over_limit(heap: long) -> bool =>
+            _have_baseline /\
+            heap - _baseline_heap_bytes > heap_growth_floor_bytes /\
+            cast double(heap) > cast double(_baseline_heap_bytes) * heap_growth_factor;
+
+        log_heap(label: string, heap: long) is
+            Std.error.write_line(
+                "watchdog: {label} {heap / 1024L / 1024L} MB (baseline {_baseline_heap_bytes / 1024L / 1024L} MB, {_compile_count} compiles)"
+            );
+            Std.error.flush();
+        si
+
+        recycle(writer: IO.TextWriter, reason: string) is
+            Std.error.write_line("watchdog: recycling analyser ({reason})");
+            Std.error.flush();
+
+            writer.write_line("RESTART");
+            writer.write("{cast char(12)}");
+            writer.flush();
+
+            System.Environment.exit(1);
         si
     si
 si
