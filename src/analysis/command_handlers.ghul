@@ -1062,4 +1062,198 @@ namespace Analysis is
             writer.flush();
         si
     si
+
+    // Reformats just the run of definitions/statements covering a requested
+    // range. The request frame is the path, the range (start/end line and
+    // column, 1-based), then the buffer contents (form-feed terminated). The
+    // response is the whole-line span actually replaced followed by the
+    // reformatted text; a `0 0` span means nothing was formatted (the buffer
+    // is left untouched).
+    class FORMATRANGE_HANDLER: CommandHandler is
+        _compiler: COMPILER;
+        _build_flags: BUILD_FLAGS;
+
+        init(compiler: COMPILER, build_flags: BUILD_FLAGS) is
+            _compiler = compiler;
+            _build_flags = build_flags;
+        si
+
+        handle(reader: IO.TextReader, writer: IO.TextWriter) is
+            let path = reader.read_line();
+            let start_line = System.Convert.to_int32(reader.read_line());
+            let start_column = System.Convert.to_int32(reader.read_line());
+            let end_line = System.Convert.to_int32(reader.read_line());
+            let end_column = System.Convert.to_int32(reader.read_line());
+
+            let buffer = System.Text.StringBuilder();
+
+            do
+                let c = reader.read();
+                if c < 0 \/ c == 12 then
+                    break;
+                fi
+                buffer.append(cast char(c));
+            od
+
+            let source = buffer.to_string();
+
+            let response_start_line mut = 0;
+            let response_start_column mut = 0;
+            let response_end_line mut = 0;
+            let response_end_column mut = 0;
+            let formatted mut = "";
+
+            try
+                IoC.CONTAINER.instance.logger.clear(path, false);
+
+                let source_file =
+                    _compiler.parse(path, IO.StringReader(source), _build_flags, false);
+
+                if !IoC.CONTAINER.instance.logger.any_errors then
+                    let root = cast Syntax.Trees.Definitions.LIST(source_file.definition);
+
+                    if root? then
+                        let locator =
+                            Syntax.Process.Printer.RANGE_LOCATOR(
+                                start_line, start_column, end_line, end_column
+                            );
+
+                        let target = locator.locate(root);
+
+                        if target? /\ target.node? then
+                            // the run's own leading indentation is not part of
+                            // the replaced span — continuation lines must be
+                            // re-indented back to it
+                            let continuation_indent = target.start_column - 1;
+
+                            let formatter =
+                                Syntax.Process.Printer.FORMATTER(
+                                    _trivia_in_lines(
+                                        source_file.trivia,
+                                        target.start_line,
+                                        target.end_line
+                                    ),
+                                    100 - continuation_indent
+                                );
+
+                            formatted =
+                                _reindent(formatter.format(target.node), continuation_indent);
+
+                            response_start_line = target.start_line;
+                            response_start_column = target.start_column;
+                            response_end_line = target.end_line;
+                            // exclusive end of the span to replace, one past
+                            // the run's last character (and any ';' the
+                            // statement node's location does not cover)
+                            response_end_column = _span_end_column(source, target) + 1;
+                        fi
+                    fi
+                fi
+            catch ex: Exception
+                debug_always("FORMATRANGE caught: {ex.get_type()} {ex.message}");
+            yrt
+
+            writer.write_line("FORMATRANGE");
+            writer.write_line(
+                "{response_start_line}\t{response_start_column}\t{response_end_line}\t{response_end_column}"
+            );
+            // trailing newline is protocol framing — the response parser drops
+            // the final line; the formatted span itself carries no newline
+            writer.write_line(formatted);
+            writer.write("{cast char(12)}");
+            writer.flush();
+        si
+
+        _trivia_in_lines(
+            trivia: Collections.Iterable[Lexical.TRIVIA],
+            start_line: int,
+            end_line: int
+        ) -> Collections.Iterable[Lexical.TRIVIA] is
+            let result = Collections.LIST[Lexical.TRIVIA]();
+
+            if trivia? then
+                for t in trivia do
+                    let line = t.location.start_line;
+                    if line >= start_line /\ line <= end_line then
+                        result.add(t);
+                    fi
+                od
+            fi
+
+            return result;
+        si
+
+        _char_index(source: string, line: int, column: int) -> int is
+            let i mut = 0;
+            let current_line mut = 1;
+            while current_line < line /\ i < source.length do
+                if source.get_chars(i) == '\n' then
+                    current_line = current_line + 1;
+                fi
+                i = i + 1;
+            od
+            return i + column - 1;
+        si
+
+        // The column of the run's last character to replace. A statement's
+        // trailing ';' is not part of its node location, so if one follows the
+        // run it is swallowed into the span — otherwise the formatted text
+        // (which re-emits the ';') would leave the original stranded.
+        _span_end_column(source: string, target: Syntax.Process.Printer.RANGE_TARGET) -> int is
+            let end_index = _char_index(source, target.end_line, target.end_column);
+
+            let scan mut = end_index + 1;
+            while
+                scan < source.length /\
+                (source.get_chars(scan) == ' ' \/ source.get_chars(scan) == '\t')
+            do
+                scan = scan + 1;
+            od
+
+            if scan < source.length /\ source.get_chars(scan) == ';' then
+                return target.end_column + (scan - end_index);
+            fi
+
+            return target.end_column;
+        si
+
+        // Re-indent the formatted run for splicing back at its original
+        // position: the first line goes in after the run's existing leading
+        // indentation (which is not part of the replaced span), so it stays
+        // bare; every later line is indented to that same depth. The trailing
+        // newline the formatter appends is dropped.
+        _reindent(body: string, continuation_indent: int) -> string is
+            let prefix = System.Text.StringBuilder();
+            let p mut = 0;
+            while p < continuation_indent do
+                prefix.append(' ');
+                p = p + 1;
+            od
+            let prefix_string = prefix.to_string();
+
+            let result = System.Text.StringBuilder();
+            let lines = Collections.LIST[string](body.split(['\n']));
+            let index mut = 0;
+
+            while index < lines.count do
+                let line = lines[index];
+
+                if index == lines.count - 1 /\ line.length == 0 then
+                    break;
+                fi
+
+                if index > 0 then
+                    result.append('\n');
+                    if line.length > 0 then
+                        result.append(prefix_string);
+                    fi
+                fi
+
+                result.append(line);
+                index = index + 1;
+            od
+
+            return result.to_string();
+        si
+    si
 si
