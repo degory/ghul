@@ -1,0 +1,707 @@
+namespace Syntax.Process.Printer is
+    use Collections;
+
+    use Trees;
+    use Source;
+
+    use Lexical.TRIVIA;
+    use Lexical.TRIVIA_KIND;
+
+    // The ghūl code formatter.
+    //
+    // Extends the plain GHUL printer (which the diagnostics path uses via
+    // Node.to_string and must not be disturbed) and redirects its output
+    // primitives into a DOC tree, so DOC_RENDERER can lay the result out
+    // against a column budget. Comments and blank lines collected by the
+    // tokenizer as TRIVIA are interleaved back in by source position.
+    //
+    // Selected visits are overridden to introduce soft breaks (GROUP/LINE)
+    // where wrapping should happen; everything else inherits the printer's
+    // structural layout unchanged.
+    class FORMATTER: GHUL is
+        _builder: DOC_BUILDER;
+        _width: int;
+
+        _trivia: LIST[TRIVIA];
+        _trivia_index: int;
+
+        // Source line of the furthest content emitted so far. Drives
+        // trailing-comment detection: a comment starting on a line we have
+        // already passed trails that line rather than leading the next node.
+        _last_line: int;
+
+        // True between opening a block and emitting its first real content;
+        // suppresses a blank line immediately inside a block.
+        _at_block_start: bool;
+
+        init(trivia: Iterable[TRIVIA], width: int) is
+            super.init();
+
+            _width = width;
+            _builder = DOC_BUILDER();
+
+            _trivia = LIST[TRIVIA]();
+            if trivia? then
+                for t in trivia do
+                    _trivia.add(t);
+                od
+            fi
+        si
+
+        // Format a parsed file (or any node) and return the rendered text.
+        format(node: Node) -> string is
+            node.accept(self);
+            flush_remaining();
+
+            let text = DOC_RENDERER(_width).render(_builder.build());
+
+            // Strip trailing whitespace from every line (blank lines pick up
+            // indentation from the renderer) and end with a single newline.
+            let result = System.Text.StringBuilder();
+            let first mut = true;
+            for line in text.split(['\n']) do
+                if !first then
+                    result.append('\n');
+                fi
+                result.append(line.trim_end());
+                first = false;
+            od
+
+            return "{result.to_string().trim_end()}\n";
+        si
+
+        // --- output primitives, redirected into the DOC builder ---
+
+        write(value: string) is
+            if value? /\ value.length > 0 then
+                _at_block_start = false;
+            fi
+            _builder.text(value);
+        si
+
+        write(c: char) is
+            _at_block_start = false;
+            _builder.text("{c}");
+        si
+
+        write_line() is
+            flush_trailing_comments();
+            _builder.hard_line();
+        si
+
+        indent() is
+            _builder.begin_nest(4);
+            _at_block_start = true;
+        si
+
+        outdent() is
+            _builder.end_nest();
+        si
+
+        write_indent() is si
+
+        // --- line tracking ---
+
+        location(location: LOCATION) is
+            note(location);
+        si
+
+        note(location: LOCATION) is
+            if location? /\ location.start_line > _last_line then
+                _last_line = location.start_line;
+            fi
+        si
+
+        // --- trivia interleaving ---
+
+        _has_trivia: bool => _trivia_index < _trivia.count;
+
+        _peek: TRIVIA => _trivia[_trivia_index];
+
+        _consume() is
+            _trivia_index = _trivia_index + 1;
+        si
+
+        // Emit any trivia positioned strictly before `limit` (a LOCATION.start
+        // value) that is not a trailing comment of an already-emitted line.
+        flush_leading(limit: int) is
+            while _has_trivia /\ _peek.location.start < limit do
+                let t = _peek;
+
+                if t.is_blank_line then
+                    if !_at_block_start then
+                        _builder.hard_line();
+                    fi
+                    _consume();
+                else
+                    emit_comment(t);
+                    _builder.hard_line();
+                    _at_block_start = false;
+                    _consume();
+                fi
+            od
+        si
+
+        // Emit comments that start on a line we have already emitted: they
+        // trail that line. Called from write_line, before the newline.
+        flush_trailing_comments() is
+            while
+                _has_trivia /\
+                _peek.is_comment /\
+                _peek.location.start_line <= _last_line
+            do
+                _builder.text(" ");
+                emit_comment(_peek);
+                _consume();
+            od
+        si
+
+        // Emit everything left over (file-trailing comments).
+        flush_remaining() is
+            while _has_trivia do
+                let t = _peek;
+                if t.is_comment then
+                    emit_comment(t);
+                    _builder.hard_line();
+                fi
+                _consume();
+            od
+        si
+
+        emit_comment(t: TRIVIA) is
+            note(t.location);
+
+            if t.kind == TRIVIA_KIND.BLOCK_COMMENT /\ t.text? then
+                let lines = t.text.split(['\n']);
+                let first mut = true;
+                for line in lines do
+                    if !first then
+                        _builder.hard_line();
+                    fi
+                    _builder.text(line);
+                    first = false;
+                od
+            elif t.text? then
+                _builder.text(t.text);
+            fi
+        si
+
+        // --- definition / statement lists: leading-trivia interleaving ---
+
+        visit(definitions: Definitions.LIST) is
+            for d in definitions do
+                flush_leading(d.location.start);
+
+                d.accept(self);
+
+                if isa Variables.VARIABLE(d) then
+                    let variable = cast Variables.VARIABLE(d);
+                    if
+                        variable.name? /\
+                        variable.name.name? /\
+                        variable.name.name.starts_with("$")
+                    then
+                        write_line(";");
+                    fi
+                fi
+            od
+        si
+
+        visit(list: Statements.LIST) is
+            for s in list do
+                flush_leading(s.location.start);
+                s.accept(self);
+            od
+        si
+
+        visit(block: Bodies.BLOCK) is
+            write_line("is");
+            indent();
+            block.statements.accept(self);
+            if block.location? then
+                flush_leading(block.location.end);
+            fi
+            outdent();
+            write("si");
+        si
+
+        // --- visits the plain printer never implemented ---
+
+        visit(let_in: Expressions.LET_IN) is
+            note(let_in.location);
+            write("let ");
+            let_in.variables.accept(self);
+            write(" in ");
+            let_in.expression.accept(self);
+        si
+
+        visit(recurse: Expressions.RECURSE) is
+            note(recurse.location);
+            write("rec");
+        si
+
+        // --- faithfulness fix: an `if ... fi` in expression position is
+        //     Expressions.STATEMENT wrapping Statements.IF. The inherited
+        //     visit renders the statement form — `;`-terminated branch
+        //     bodies plus a trailing `;` — which is invalid in expression
+        //     position. Render the expression form instead. ---
+
+        visit(statement: Expressions.STATEMENT) is
+            note(statement.location);
+
+            if let if_statement: Statements.IF = statement.statement then
+                emit_if_expression(if_statement);
+            else
+                statement.statement.accept(self);
+            fi
+        si
+
+        // --- faithfulness fix: the inherited visit(Statements.IF) ignores a
+        //     branch binding, so `if let v = e then` renders as a bare `else`
+        //     with the binding dropped. ---
+
+        visit(if_statement: Statements.IF) is
+            note(if_statement.location);
+
+            let first mut = true;
+            for branch in if_statement.branches do
+                if branch.binding? then
+                    if first then
+                        write("if let ");
+                    else
+                        write("elif let ");
+                    fi
+                    branch.binding.accept(self);
+                    write_line(" then");
+                elif branch.condition? then
+                    if first then
+                        write("if ");
+                    else
+                        write("elif ");
+                    fi
+                    branch.condition.accept(self);
+                    write_line(" then");
+                else
+                    write_line("else");
+                fi
+
+                indent();
+                branch.body.accept(self);
+                outdent();
+
+                first = false;
+            od
+
+            write_line("fi");
+        si
+
+        // --- faithfulness fix: the inherited visit(Statements.FOR) emits
+        //     `for` with a trailing newline, stranding it on its own line. ---
+
+        visit(for_statement: Statements.FOR) is
+            note(for_statement.location);
+
+            write("for ");
+            for_statement.variable.accept(self);
+            write(" in ");
+            for_statement.expression.accept(self);
+            write_line(" do");
+
+            indent();
+            for_statement.body.accept(self);
+            outdent();
+
+            write_line("od");
+        si
+
+        emit_if_expression(if_statement: Statements.IF) is
+            _builder.begin_group();
+
+            let first mut = true;
+            for branch in if_statement.branches do
+                if !first then
+                    _builder.line();
+                fi
+
+                if branch.binding? then
+                    if first then
+                        write("if let ");
+                    else
+                        write("elif let ");
+                    fi
+                    branch.binding.accept(self);
+                    write(" then");
+                elif branch.condition? then
+                    if first then
+                        write("if ");
+                    else
+                        write("elif ");
+                    fi
+                    branch.condition.accept(self);
+                    write(" then");
+                else
+                    write("else");
+                fi
+
+                _builder.begin_nest(4);
+                _builder.line();
+                emit_branch_value(branch.body);
+                _builder.end_nest();
+
+                first = false;
+            od
+
+            _builder.line();
+            write("fi");
+            _builder.end_group();
+        si
+
+        // Emit an if-expression branch body. The branch's value is its last
+        // statement; if that is an expression statement, emit the bare
+        // expression (no `;`). Any leading statements render normally.
+        emit_branch_value(body: Statements.LIST) is
+            let statements = LIST[Statements.Statement]();
+            for s in body do
+                statements.add(s);
+            od
+
+            let i mut = 0;
+            while i < statements.count do
+                let s = statements[i];
+                if i == statements.count - 1 /\ isa Statements.EXPRESSION(s) then
+                    let expression_statement = cast Statements.EXPRESSION(s);
+                    expression_statement.expression.accept(self);
+                else
+                    s.accept(self);
+                fi
+                i = i + 1;
+            od
+        si
+
+        // --- faithfulness fix: string interpolation. The inherited visit
+        //     runs each literal fragment through visit(STRING), which wraps
+        //     it in quotes — producing invalid nested-string output. Emit the
+        //     literal fragments as raw escaped text instead. ---
+
+        visit(interpolation: Expressions.STRING_INTERPOLATION) is
+            note(interpolation.location);
+
+            write(cast char(34));
+
+            for fragment in interpolation.values do
+                if fragment.is_expression then
+                    write('{');
+                    fragment.expression.accept(self);
+                    if fragment.alignment? then
+                        write(',');
+                        fragment.alignment.accept(self);
+                    fi
+                    if fragment.format? then
+                        write(':');
+                        write(fragment.format);
+                    fi
+                    write('}');
+                else
+                    emit_interpolation_literal(fragment);
+                fi
+            od
+
+            write(cast char(34));
+        si
+
+        emit_interpolation_literal(fragment: Expressions.INTERPOLATION_FRAGMENT) is
+            let literal = cast Expressions.Literals.STRING(fragment.expression);
+
+            if !literal? then
+                return;
+            fi
+
+            for c in literal.value_string do
+                if c == '{' then
+                    write('{');
+                    write('{');
+                elif c == '}' then
+                    write('}');
+                    write('}');
+                else
+                    write_escape_char(c);
+                fi
+            od
+        si
+
+        // --- faithfulness fix: the inherited write_escape_char renders
+        //     control characters via string.format("X", ci), which returns
+        //     the literal "X" (no placeholder), mangling e.g. '\n' to '\X'.
+        //     Emit the escapes the tokenizer actually understands. ---
+
+        write_escape_char(c: char) is
+            let ci = cast int(c);
+
+            if c == '\n' then
+                write("\\");
+                write('n');
+            elif ci == 9 then
+                write("\\");
+                write('t');
+            elif ci == 13 then
+                write("\\");
+                write('r');
+            elif ci == 34 then
+                write("\\");
+                write(cast char(34));
+            elif ci == 92 then
+                write("\\\\");
+            elif ci < 32 then
+                write("\\");
+                write("{(ci >> 6) ∩ 7}");
+                write("{(ci >> 3) ∩ 7}");
+                write("{ci ∩ 7}");
+            else
+                write(c);
+            fi
+        si
+
+        // --- faithfulness fix: a lambda's argument list must be parenthesised
+        //     when the lambda has an explicit return type, otherwise
+        //     `arg: T -> U => body` reparses as arg-of-function-type `T -> U`. ---
+
+        visit(function: Expressions.FUNCTION) is
+            note(function.location);
+
+            let explicit_return = !isa TypeExpressions.INFER(function.type_expression);
+
+            if explicit_return then
+                write("(");
+            fi
+
+            let first mut = true;
+            for a in function.arguments do
+                if !first then
+                    write(", ");
+                fi
+                a.accept(self);
+                first = false;
+            od
+
+            if explicit_return then
+                write(") -> ");
+                function.type_expression.accept(self);
+            fi
+
+            write(" ");
+            function.body.accept(self);
+        si
+
+        // --- faithfulness fix: an unresolved AMBIGUOUS_EXPRESSION (a parse-
+        //     time `x[y]` that could be a generic application or an index)
+        //     has the same surface syntax either way. The plain printer emits
+        //     a debug `(ambiguous ... or ...)` form, which is not valid ghūl. ---
+
+        visit(ambiguous: Expressions.AMBIGUOUS_EXPRESSION) is
+            note(ambiguous.location);
+
+            if ambiguous.left? then
+                ambiguous.left.accept(self);
+                write(".");
+            fi
+
+            ambiguous.identifier.accept(self);
+            write("[");
+            ambiguous.type_arguments.accept(self);
+            write("]");
+        si
+
+        // --- faithfulness fix: STRUCT printed as `struct`, not `trait` ---
+
+        visit(`struct: Definitions.STRUCT) is
+            write("struct ");
+            `struct.name.accept(self);
+
+            if `struct.arguments? then
+                write("[");
+                `struct.arguments.accept(self);
+                write("]");
+            fi
+
+            `struct.modifiers.accept(self);
+            write_line(" is");
+            indent();
+            `struct.body.accept(self);
+            outdent();
+            write_line("si");
+        si
+
+        // --- faithfulness fix: a body-less property (a field) is terminated
+        //     with `;` and a newline, which the plain printer omits ---
+
+        visit(property: Definitions.PROPERTY) is
+            if property.name? then
+                property.name.accept(self);
+            fi
+
+            if
+                property.type_expression? /\
+                !isa TypeExpressions.INFER(property.type_expression)
+            then
+                write(": ");
+                property.type_expression.accept(self);
+            fi
+
+            if property.modifiers? /\ !property.modifiers.is_empty then
+                write(" ");
+                emit_modifiers(property.modifiers);
+            fi
+
+            if !property.read_body? /\ !property.assign_body? then
+                write_line(";");
+                return;
+            fi
+
+            let out_again = indent_property(property.read_body?, property.assign_body?);
+
+            if property.read_body? then
+                property.read_body.accept(self);
+                if property.assign_body? then
+                    write_line(",");
+                else
+                    after_body(property.read_body);
+                fi
+            else
+                write(" ");
+            fi
+
+            if property.assign_body? then
+                write("= ");
+                property.assign_argument.accept(self);
+                property.assign_body.accept(self);
+                after_body(property.assign_body);
+            fi
+
+            if out_again then
+                outdent();
+            fi
+        si
+
+        // Emit modifiers without the trailing space the inherited
+        // Modifiers.LIST visit appends (which would strand a space before a
+        // following `;`).
+        emit_modifiers(modifiers: Modifiers.LIST) is
+            let first mut = true;
+
+            if modifiers.access_modifier? then
+                modifiers.access_modifier.accept(self);
+                first = false;
+            fi
+
+            if modifiers.storage_class? then
+                if !first then
+                    write(" ");
+                fi
+                modifiers.storage_class.accept(self);
+                first = false;
+            fi
+        si
+
+        // --- wrapping: call argument lists and function parameter lists ---
+
+        visit(call: Expressions.CALL) is
+            note(call.location);
+            call.function.accept(self);
+            write("(");
+            emit_argument_list(call.arguments);
+            write(")");
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            function.name.accept(self);
+            write("(");
+            emit_parameter_list(function.arguments);
+            write(")");
+
+            if !isa TypeExpressions.INFER(function.type_expression) then
+                write(" -> ");
+                function.type_expression.accept(self);
+            fi
+
+            if function.modifiers? /\ !function.modifiers.is_empty then
+                write(" ");
+                emit_modifiers(function.modifiers);
+            fi
+
+            if function.body? then
+                write(" ");
+                function.body.accept(self);
+            fi
+
+            after_body(function.body);
+        si
+
+        emit_parameter_list(parameters: Variables.LIST) is
+            if !_has_parameters(parameters) then
+                return;
+            fi
+
+            _builder.begin_group();
+            _builder.begin_nest(4);
+            _builder.soft_line();
+
+            let first mut = true;
+            for p in parameters do
+                if !first then
+                    _builder.text(",");
+                    _builder.line();
+                fi
+                p.accept(self);
+                first = false;
+            od
+
+            _builder.end_nest();
+            _builder.soft_line();
+            _builder.end_group();
+        si
+
+        _has_parameters(parameters: Variables.LIST) -> bool is
+            if !parameters? then
+                return false;
+            fi
+            for p in parameters do
+                return true;
+            od
+            return false;
+        si
+
+        emit_argument_list(arguments: Expressions.LIST) is
+            if !_has_arguments(arguments) then
+                return;
+            fi
+
+            _builder.begin_group();
+            _builder.begin_nest(4);
+            _builder.soft_line();
+
+            let first mut = true;
+            for a in arguments do
+                if !first then
+                    _builder.text(",");
+                    _builder.line();
+                fi
+                a.accept(self);
+                first = false;
+            od
+
+            _builder.end_nest();
+            _builder.soft_line();
+            _builder.end_group();
+        si
+
+        _has_arguments(arguments: Expressions.LIST) -> bool is
+            if !arguments? then
+                return false;
+            fi
+            for a in arguments do
+                return true;
+            od
+            return false;
+        si
+    si
+si
