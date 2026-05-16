@@ -1,0 +1,434 @@
+namespace Analysis.Tests is
+    use Collections.Iterable;
+    use Collections.LIST;
+    use Collections.SET;
+
+    use IO.File;
+    use IO.Path;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.RENAME_EDIT;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Coverage for the RENAMEREQUEST analysis command — the symbol rename
+    // the VS Code extension drives. The analyser locates the symbol at the
+    // requested position and returns one edit per occurrence (definitions
+    // and uses) as `file \t sl \t sc \t el \t ec \t new_name` lines.
+    //
+    // Three things this exercises:
+    //   1. rename of every symbol class, including across file boundaries;
+    //   2. rename of an overriding / overridden method or property — the
+    //      whole override family must move together;
+    //   3. rename that would collide with an existing symbol.
+    // Plus a flow-narrowing case: a local narrowed in one branch must
+    // still rename at the narrowed use site, not just the unnarrowed ones.
+    class RENAME_TESTS is
+        @test()
+
+        init() is si
+
+        load(group: string, file: string) -> string is
+            let path = fixture_path(Path.combine(group, file));
+
+            assert File.exists(path) else "fixture missing: {path}";
+
+            return File.read_all_text(path);
+        si
+
+        // 1-based column of the first character of `needle` on `line` of
+        // `source`. The request only needs to land somewhere inside the
+        // target identifier; `needle` should start with that identifier.
+        column_of(source: string, line: int, needle: string) -> int is
+            let lines = LIST[string](source.split(['\n']));
+
+            assert line >= 1 /\ line <= lines.count
+                else "line {line} out of range (1..{lines.count})";
+
+            let text = lines[line - 1];
+            let index = text.index_of(needle);
+
+            assert index >= 0
+                else "'{needle}' not found on line {line}: '{text}'";
+
+            return index + 1;
+        si
+
+        prime(analyser: ANALYSER_PROCESS, files: Iterable[EDIT_FILE]) is
+            analyser.send_edit_files(files);
+
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", diagnostics.header);
+
+            let user_diagnostics = LIST(diagnostics.user_diagnostics);
+            Assert.are_equal(
+                0,
+                user_diagnostics.count,
+                diagnostics_summary("priming EDIT had unexpected diagnostics", user_diagnostics)
+            );
+
+            let partial_done = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", partial_done.header);
+        si
+
+        rename(
+            analyser: ANALYSER_PROCESS,
+            path: string, line: int, column: int, new_name: string
+        ) -> LIST[RENAME_EDIT] is
+            analyser.send_rename_request(path, line, column, new_name);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal(
+                "RENAMEREQUEST",
+                response.header,
+                "expected RENAMEREQUEST response, got '{response.header}'.\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            return LIST[RENAME_EDIT](response.parse_rename_edits());
+        si
+
+        summary(label: string, edits: Iterable[RENAME_EDIT]) -> string is
+            let result = System.Text.StringBuilder();
+
+            result.append("{label} ({edits | .count()} edits):\n");
+
+            for e in edits do
+                result.append("  {e}\n");
+            od
+
+            return result.to_string();
+        si
+
+        files_of(edits: Iterable[RENAME_EDIT]) -> SET[string] is
+            let result = SET[string]();
+
+            for e in edits do
+                result.add(e.file);
+            od
+
+            return result;
+        si
+
+        // Every returned edit must carry the requested new name — the
+        // analyser substitutes it verbatim into each occurrence's span.
+        assert_new_name(edits: Iterable[RENAME_EDIT], expected: string) is
+            for e in edits do
+                Assert.are_equal(expected, e.new_name, "edit carried wrong new name: {e}");
+            od
+        si
+
+        // --- 1. all symbol classes, across file boundaries -----------------
+
+        // The `rename-symbol-classes` fixture is two files in one
+        // namespace: `library.ghul` declares class WIDGET (field, ctor,
+        // property, method) and the namespace function make_widget;
+        // `consumer.ghul` constructs and uses them.
+        symbol_classes_files() -> Iterable[EDIT_FILE] is
+            return [
+                EDIT_FILE("library.ghul", load("rename-symbol-classes", "library.ghul")),
+                EDIT_FILE("consumer.ghul", load("rename-symbol-classes", "consumer.ghul"))
+            ];
+        si
+
+        rename_class_renames_declaration_and_uses_across_files() is
+            @test()
+
+            let library = load("rename-symbol-classes", "library.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // class WIDGET is — declaration on line 2.
+            let edits = rename(analyser, "library.ghul", 2, column_of(library, 2, "WIDGET"), "GADGET");
+
+            assert_new_name(edits, "GADGET");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("library.ghul") /\ files.contains("consumer.ghul"),
+                summary("renaming class WIDGET should touch both files", edits)
+            );
+            Assert.are_equal(4, edits.count, summary("renaming class WIDGET", edits));
+        si
+
+        rename_method_renames_declaration_and_call_across_files() is
+            @test()
+
+            let consumer = load("rename-symbol-classes", "consumer.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // w.grow(5) — a use on line 6 of consumer.ghul.
+            let edits = rename(analyser, "consumer.ghul", 6, column_of(consumer, 6, "grow"), "expand");
+
+            assert_new_name(edits, "expand");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("library.ghul") /\ files.contains("consumer.ghul"),
+                summary("renaming method grow should touch both files", edits)
+            );
+            Assert.are_equal(2, edits.count, summary("renaming method grow", edits));
+        si
+
+        rename_property_renames_declaration_and_uses_across_files() is
+            @test()
+
+            let consumer = load("rename-symbol-classes", "consumer.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // "{w.size}" — a use on line 7 of consumer.ghul.
+            let edits = rename(analyser, "consumer.ghul", 7, column_of(consumer, 7, "size"), "extent");
+
+            assert_new_name(edits, "extent");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("library.ghul") /\ files.contains("consumer.ghul"),
+                summary("renaming property size should touch both files", edits)
+            );
+            Assert.are_equal(3, edits.count, summary("renaming property size", edits));
+        si
+
+        rename_field_renames_all_uses_in_class() is
+            @test()
+
+            let library = load("rename-symbol-classes", "library.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // _size: int; — field declaration on line 3.
+            let edits = rename(analyser, "library.ghul", 3, column_of(library, 3, "_size"), "_extent");
+
+            assert_new_name(edits, "_extent");
+
+            let files = files_of(edits);
+            Assert.are_equal(1, files.count, summary("renaming field _size should stay in library.ghul", edits));
+            Assert.is_true(files.contains("library.ghul"), summary("renaming field _size", edits));
+            Assert.are_equal(5, edits.count, summary("renaming field _size", edits));
+        si
+
+        rename_namespace_function_renames_declaration_and_calls() is
+            @test()
+
+            let consumer = load("rename-symbol-classes", "consumer.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // make_widget(3) — a call on line 8 of consumer.ghul.
+            let edits = rename(analyser, "consumer.ghul", 8, column_of(consumer, 8, "make_widget"), "build_widget");
+
+            assert_new_name(edits, "build_widget");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("library.ghul") /\ files.contains("consumer.ghul"),
+                summary("renaming function make_widget should touch both files", edits)
+            );
+            Assert.are_equal(2, edits.count, summary("renaming function make_widget", edits));
+        si
+
+        // make_widget and WIDGET.init both declare a parameter named
+        // `size`; renaming one must leave the other untouched.
+        rename_parameter_renames_only_that_parameter() is
+            @test()
+
+            let library = load("rename-symbol-classes", "library.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // make_widget(size: int) — the parameter declaration on line 16.
+            let edits = rename(analyser, "library.ghul", 16, column_of(library, 16, "size"), "amount");
+
+            assert_new_name(edits, "amount");
+
+            for e in edits do
+                Assert.are_equal(
+                    16,
+                    e.start_line,
+                    summary("renaming make_widget's `size` must not touch init's `size`", edits)
+                );
+            od
+            Assert.are_equal(2, edits.count, summary("renaming parameter size", edits));
+        si
+
+        rename_local_variable_renames_declaration_and_uses() is
+            @test()
+
+            let consumer = load("rename-symbol-classes", "consumer.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, symbol_classes_files());
+
+            // let w = WIDGET(10); — local declaration on line 5.
+            let edits = rename(analyser, "consumer.ghul", 5, column_of(consumer, 5, "w ="), "widget");
+
+            assert_new_name(edits, "widget");
+
+            let files = files_of(edits);
+            Assert.are_equal(1, files.count, summary("renaming local w should stay in consumer.ghul", edits));
+            Assert.is_true(files.contains("consumer.ghul"), summary("renaming local w", edits));
+            Assert.are_equal(3, edits.count, summary("renaming local w", edits));
+        si
+
+        // --- 2. overriding / overridden methods and properties ------------
+
+        // The `rename-inheritance` fixture: ANIMAL with an overridable
+        // method `speak` and property `name`; DOG overrides both;
+        // `zoo.ghul` calls them through both static types.
+        inheritance_files() -> Iterable[EDIT_FILE] is
+            return [
+                EDIT_FILE("animals.ghul", load("rename-inheritance", "animals.ghul")),
+                EDIT_FILE("zoo.ghul", load("rename-inheritance", "zoo.ghul"))
+            ];
+        si
+
+        // Renaming from the base declaration must carry the override and
+        // every call site with it.
+        rename_overridden_method_from_base_covers_override() is
+            @test()
+
+            let animals = load("rename-inheritance", "animals.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, inheritance_files());
+
+            // ANIMAL.speak() — base declaration on line 5.
+            let edits = rename(analyser, "animals.ghul", 5, column_of(animals, 5, "speak"), "vocalise");
+
+            assert_new_name(edits, "vocalise");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("animals.ghul") /\ files.contains("zoo.ghul"),
+                summary("renaming speak from the base should touch both files", edits)
+            );
+            Assert.are_equal(4, edits.count, summary("renaming overridden method speak from base", edits));
+        si
+
+        // Renaming from the override must carry the base declaration too —
+        // the analyser walks up to the root overridee.
+        rename_overriding_method_from_derived_covers_base() is
+            @test()
+
+            let animals = load("rename-inheritance", "animals.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, inheritance_files());
+
+            // DOG.speak() — the override declaration on line 13.
+            let edits = rename(analyser, "animals.ghul", 13, column_of(animals, 13, "speak"), "vocalise");
+
+            assert_new_name(edits, "vocalise");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("animals.ghul") /\ files.contains("zoo.ghul"),
+                summary("renaming speak from the override should touch both files", edits)
+            );
+            Assert.are_equal(4, edits.count, summary("renaming overriding method speak from derived", edits));
+        si
+
+        rename_overridden_property_covers_override() is
+            @test()
+
+            let animals = load("rename-inheritance", "animals.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, inheritance_files());
+
+            // ANIMAL.name — base property declaration on line 7.
+            let edits = rename(analyser, "animals.ghul", 7, column_of(animals, 7, "name"), "label");
+
+            assert_new_name(edits, "label");
+
+            let files = files_of(edits);
+            Assert.is_true(
+                files.contains("animals.ghul") /\ files.contains("zoo.ghul"),
+                summary("renaming property name should touch both files", edits)
+            );
+            Assert.are_equal(4, edits.count, summary("renaming overridden property name", edits));
+        si
+
+        // --- 3. rename that would introduce a duplicate symbol -----------
+
+        // BOX declares methods `width` and `height`. Renaming `width` to
+        // `height` would put two `height` members on one class. A correct
+        // rename should refuse and return no edits.
+        //
+        // It currently does NOT — the RENAMEREQUEST handler has no
+        // collision check; it returns the edit for `width` regardless,
+        // which would produce a duplicate member. This test pins that
+        // behaviour so the gap is visible; when the handler learns to
+        // refuse colliding renames, the expectation below flips to zero.
+        rename_to_existing_member_name_is_not_yet_refused() is
+            @test()
+
+            let box = load("rename-duplicate", "box.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, [EDIT_FILE("box.ghul", box)]);
+
+            // BOX.width() — declaration on line 5; rename onto sibling `height`.
+            let edits = rename(analyser, "box.ghul", 5, column_of(box, 5, "width"), "height");
+
+            Assert.are_equal(
+                1,
+                edits.count,
+                summary("renaming width->height currently returns edits instead of refusing the collision", edits)
+            );
+        si
+
+        // --- 4. local narrowed by flow-sensitive analysis ----------------
+
+        // In `describe`, the local `item` is declared `object` and
+        // narrowed to `string` inside the `isa` branch. Every occurrence
+        // — the declaration, the `isa` test, the narrowed `item.length`
+        // use, and the unnarrowed `{item}` use — must rename together.
+        narrowed_files() -> Iterable[EDIT_FILE] is
+            return [EDIT_FILE("narrowed.ghul", load("rename-narrowed", "narrowed.ghul"))];
+        si
+
+        assert_narrowed_rename(edits: LIST[RENAME_EDIT]) is
+            assert_new_name(edits, "thing");
+
+            // Line 8 is `return "len {item.length}";` — the narrowed use.
+            let has_narrowed_use = edits | .any(e => e.start_line == 8);
+            Assert.is_true(
+                has_narrowed_use,
+                summary("rename of narrowed local must include the narrowed use on line 8", edits)
+            );
+
+            // Line 11 is `return "{item}";` — the unnarrowed use.
+            let has_unnarrowed_use = edits | .any(e => e.start_line == 11);
+            Assert.is_true(
+                has_unnarrowed_use,
+                summary("rename of narrowed local must include the unnarrowed use on line 11", edits)
+            );
+
+            Assert.are_equal(4, edits.count, summary("renaming narrowed local item", edits));
+        si
+
+        rename_narrowed_local_from_declaration_covers_narrowed_use() is
+            @test()
+
+            let narrowed = load("rename-narrowed", "narrowed.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, narrowed_files());
+
+            // let item = value; — declaration on line 5.
+            let edits = rename(analyser, "narrowed.ghul", 5, column_of(narrowed, 5, "item"), "thing");
+
+            assert_narrowed_rename(edits);
+        si
+
+        rename_narrowed_local_from_narrowed_use_covers_all() is
+            @test()
+
+            let narrowed = load("rename-narrowed", "narrowed.ghul");
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser, narrowed_files());
+
+            // {item.length} — the narrowed use on line 8.
+            let edits = rename(analyser, "narrowed.ghul", 8, column_of(narrowed, 8, "item"), "thing");
+
+            assert_narrowed_rename(edits);
+        si
+    si
+si
