@@ -35,6 +35,7 @@ namespace Syntax.Process is
         _access: COMPILE_ACCESS;
         _generic_application: COMPILE_GENERIC_APPLICATION;
         _calls: COMPILE_CALLS;
+        _conditionals: COMPILE_CONDITIONALS;
         _type_caster: Semantic.TYPE_CASTER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _value_converter: VALUE_CONVERTER;
@@ -174,6 +175,15 @@ namespace Syntax.Process is
             _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
             _loop_kept_stack = Collections.LIST[NARROW_ENV]();
             _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
+
+            _conditionals = COMPILE_CONDITIONALS(
+                logger,
+                innate_symbol_lookup,
+                _flow,
+                _condition_analyzer,
+                _if_flow_stack,
+                self
+            );
         si
 
         // If `expr` is an unqualified identifier resolving (in the
@@ -1472,123 +1482,11 @@ namespace Syntax.Process is
 
         pre(`if: Trees.Statements.IF_BRANCH) -> bool is
             super.pre(`if);
-
-            // Controlled walk: walk the condition, derive its
-            // then/else narrowing environments, walk the body under
-            // the then-environment, and record the body's exit
-            // environment for the join in visit(IF). The condition
-            // itself walks under the running-else environment so
-            // within-condition narrowing (`isa T(x) /\ x.foo`)
-            // applies as it compiles.
-            let frame = _if_flow_stack[_if_flow_stack.count - 1];
-
-            if `if.condition? then
-                _flow.set_env(frame.running_else);
-                `if.condition.walk(self);
-
-                let facts = _condition_analyzer.analyze_condition(`if.condition, frame.running_else);
-
-                _flow.set_env(facts.then_env);
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-                frame.running_else = facts.else_env;
-            elif `if.binding? then
-                // `if let` branch: the binding's initializer is checked
-                // and the binding's symbol typed by walking it. It
-                // narrows only its own then-scoped binding, so the
-                // running-else environment is left unchanged.
-                _flow.set_env(frame.running_else);
-
-                `if.binding.walk(self);
-
-                // The presence test is the `?` (has-value) operator.
-                // A reference type tests for null. A value type must
-                // be option-shaped — `T?`/OPTION[T] or any struct with
-                // `has_value` and `value` members; the binding then
-                // yields the unwrapped `.value`. A plain value type is
-                // always present and cannot be tested this way.
-                let binding_type =
-                    if `if.binding.initializer? /\ `if.binding.initializer.value? then
-                        `if.binding.initializer.value.type;
-                    else
-                        null;
-                    fi;
-
-                if binding_type? /\ binding_type.is_value_type then
-                    let has_value_member = binding_type.find_member("has_value");
-                    let value_member = binding_type.find_member("value");
-
-                    if !has_value_member? \/ !value_member? then
-                        _logger.error(
-                            `if.binding.location,
-                            "if let binding must be a reference type or an option-shaped value type, not {binding_type}"
-                        );
-
-                        // Error recovery: an impossible match still binds its
-                        // names — typed ERROR — so the one diagnostic above is
-                        // not followed by a cascade of spurious errors on uses
-                        // of the binding within the then-arm.
-                        for name in `if.binding.left.names do
-                            let symbol = find(name);
-
-                            if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
-                                symbol.define();
-
-                                (cast Semantic.Types.SettableTyped(symbol)).set_type(Semantic.Types.ERROR());
-                            fi
-                        od
-                    else
-                        // The bound names take the unwrapped `.value`
-                        // type, not the optional itself.
-                        set_symbol_type(`if.binding.left, value_member.type);
-                    fi
-                fi
-
-                // The bound names hold a value throughout the
-                // then-arm — that is what `if let` establishes — so a
-                // dereference of one is not flagged.
-                for name in `if.binding.left.names do
-                    let symbol = find(name);
-
-                    if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                        _flow.mark_non_null(cast Semantic.Symbols.Variable(symbol));
-                    fi
-                od
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-            else
-                _flow.set_env(frame.running_else);
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-                frame.has_else = true;
-            fi
-
-            return true;
+            return _conditionals.pre_if_branch(`if);
         si
 
         visit(`if: Trees.Statements.IF_BRANCH) is
-            if
-                `if? /\
-                `if.condition? /\
-                Value.check_is_consumable(_logger, `if.condition.location, `if.condition.value)
-            then
-                if `if.condition.value.type !~_innate_symbol_lookup.get_bool_type() then
-                    _logger.error(`if.condition.location, "if condition must be bool");
-                fi
-            fi
-
+            _conditionals.visit_if_branch(`if);
             super.visit(`if);
         si
 
@@ -2692,185 +2590,11 @@ namespace Syntax.Process is
 
         pre(`if: Trees.Statements.IF) -> bool is
             super.pre(`if);
-
-            if `if.want_value then
-                for i in `if.branches do
-                    i.body.want_value = true;
-                od
-            fi
-
-            // Open a flow frame for this IF. Each branch's controlled
-            // walk (pre(IF_BRANCH)) records its exit environment on
-            // the frame; visit(IF) joins them.
-            _if_flow_stack.add(IF_FLOW_FRAME(_flow.current_env.copy()));
-
-            return false;
+            return _conditionals.pre_if(`if);
         si
 
         visit(`if: Trees.Statements.IF) is
-            // Merge the branch exit environments into the environment
-            // in force after the IF. A branch whose body diverges
-            // contributes the bottom environment; with no else
-            // branch, the no-branch-taken fall-through contributes
-            // the trailing running-else environment.
-            let if_flow = _if_flow_stack[_if_flow_stack.count - 1];
-            _if_flow_stack.remove_at(_if_flow_stack.count - 1);
-
-            let after mut = NARROW_ENV.bottom();
-
-            for branch_exit in if_flow.branch_exits do
-                after = NARROW_ENV.join(after, branch_exit);
-            od
-
-            if !if_flow.has_else then
-                after = NARROW_ENV.join(after, if_flow.running_else);
-            fi
-
-            _flow.set_env(after);
-
-            for i in `if.branches do
-                if i.condition? then
-                    IR.Values.Value.check_is_consumable(_logger, i.condition.location, i.condition.value);
-                fi
-            od
-
-            if !`if.want_value then
-                return;
-            fi
-
-            if `if.is_poisoned then
-                // if the if is syntactically incomplete don't bother reporting any
-                // semantic errors:
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "if is poisoned");
-
-                return;
-            fi
-
-            if 
-                !`if.branches | .any(b => b? /\ !b.condition?) /\
-                (!`if.constraint? \/ !`if.constraint.is_void)
-            then
-                // if the if has no else branch, then don't bother reporting any
-                // semantic errors:
-                _logger.error(`if.location, "expected else in if expression");
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no else");
-                return;
-            fi
-
-            let type mut = `if.constraint;
-
-            let seen_any_values mut = false;
-            let seen_non_null_values mut = false;
-            let seen_null_values mut = false;
-            let all_tuple_literals mut = true;
-
-            let lub = LEAST_UPPER_BOUND_MAP();
-
-            for i in `if.branches do
-                let branch = i.body;
-
-                if !branch.value? then                    
-                    continue;
-                fi
-
-                if !branch.value.type? then
-                    continue;
-                fi
-
-                if `if.constraint? then
-                    if !branch.value.check_is_consumable_allow_void(_logger, branch.location) then
-                        continue;
-                    fi
-                else
-                    if !branch.value.check_is_consumable(_logger, branch.location) then
-                        continue;
-                    fi
-                fi
-
-                debug_indent();
-
-                if `if.constraint? then
-                    if !`if.constraint.is_void /\ !`if.constraint.is_assignable_from(branch.value.type) then
-                        _logger.error(branch.location, string.format(`if.constraint_error_message, branch.value.type, type));
-                    fi
-                elif branch.value.type.is_null then
-                    // could also be error
-                    seen_null_values = true;
-                else
-                    seen_non_null_values = true;
-
-                    if !branch.is_tuple_literal then
-                        all_tuple_literals = false;
-                    fi
-        
-                    lub.add(branch.value.type);
-                fi
-
-                seen_any_values = true;
-            od
-
-            if !`if.constraint? then
-                type = lub.get_result();
-
-                // FIXME factor this out - it's duplicated between here and list literal elements
-                if all_tuple_literals /\ seen_non_null_values /\ (!type? \/ !type.is_value_tuple) then
-                    let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
-
-                    for i in `if.branches do
-                        let branch = i.body;
-
-                        if !branch.value? \/ !branch.value.type? then
-                            continue;
-                        fi
-
-                        for (index, e) in branch.value.type.arguments | .index() do
-                            if index >= lubs.count then
-                                lubs.add(LEAST_UPPER_BOUND_MAP());
-                            fi
-
-                            lubs[index].add(e);
-                        od
-                    od
-
-                    type = 
-                        _innate_symbol_lookup.get_tuple_type(
-                            lubs |
-                                .map(l => 
-                                    let r: Type = l.get_result() in if r? then r else _innate_symbol_lookup.get_object_type() fi) 
-                                .collect(),
-                            lub.element_names
-                        );
-                fi
-
-                if type? /\ type.is_value_type /\ seen_null_values then
-                    for i in `if.branches do
-                        let branch = i.body;
-        
-                        if !branch.value? \/ !branch.value.type? then
-                            continue;
-                        fi
-        
-                        if branch.value.type.is_null then
-                            _logger.error(branch.location, "incompatible types in if branches: {branch.value.type} and {type}");                                                    
-                        fi
-                    od
-                fi
-            fi
-
-            if !type? then
-                if seen_any_values then
-                    if seen_non_null_values then
-                        _logger.error(`if.location, "no type inferred for if expression");
-                    else
-                        _logger.error(`if.location, "all branch values are null");                        
-                    fi
-                fi
-
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no type inferred");
-                return;
-            else
-                `if.value = IR.Values.BLOCK(type);
-            fi
+            _conditionals.visit_if(`if);
         si
 
         // Do not descend into properties (otherwise accessor functions will be walked twice)
