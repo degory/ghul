@@ -43,7 +43,7 @@ namespace Analysis is
                     let hover mut = _symbol_use_locations.find_hover_use(path, line, column);
 
                     if !hover? then
-                        _full_compiler.compile_all(writer);
+                        _full_compiler.compile_all(writer, path);
 
                         hover = _symbol_use_locations.find_hover_use(path, line, column);
                     fi
@@ -102,7 +102,7 @@ namespace Analysis is
                     let symbol mut = _symbol_use_locations.find_definition_from_use(path, line, column);
 
                     if !symbol? then
-                        _full_compiler.compile_all(writer);
+                        _full_compiler.compile_all(writer, path);
 
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
@@ -158,7 +158,7 @@ namespace Analysis is
                     let symbol mut = _symbol_use_locations.find_definition_from_use(path, line, column);
 
                     if !symbol? then
-                        _full_compiler.compile_all(writer);
+                        _full_compiler.compile_all(writer, path);
 
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
@@ -210,6 +210,16 @@ namespace Analysis is
             _compiler.is_compiled_through_expressions(source_file);
 
         compile_all(writer: IO.TextWriter) is
+            compile_all(writer, null);
+        si
+
+        // `only_path` null → every file is compiled through expressions: a
+        // full project compile. Non-null → only that file is; every other
+        // file is taken through resolve-* and keeps its retained
+        // expression-phase diagnostics. The scoped form backs cursor queries
+        // (HOVER / DEFINITION / DECLARATION / COMPLETE) that miss the
+        // symbol-use map — recompiling one file instead of the whole project.
+        compile_all(writer: IO.TextWriter, only_path: string) is
             try
                 _timers.start("compile-all");
 
@@ -219,9 +229,15 @@ namespace Analysis is
 
                 if !_watchdog.want_restart then
                     for i in _source_files do
-                        IoC.CONTAINER.instance.logger.clear(i.file_name, true);
                         i.build_flags.want_compile_up_to_expressions = true;
-                        i.build_flags.want_compile_expressions = true;
+
+                        if !only_path? \/ i.file_name =~ only_path then
+                            IoC.CONTAINER.instance.logger.clear(i.file_name, true);
+                            i.build_flags.want_compile_expressions = true;
+                        else
+                            IoC.CONTAINER.instance.logger.clear_resolve_phase(i.file_name);
+                            i.build_flags.want_compile_expressions = false;
+                        fi
                     od
 
                     // Clear per-build state cached on the (retained) AST nodes
@@ -249,6 +265,13 @@ namespace Analysis is
                     IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
 
                     _watchdog.note_full_compile();
+
+                    // An unscoped compile_all recompiled every file, so a
+                    // subsequent debounced COMPILE has nothing to do. A
+                    // scoped fallback (one file) does not clear it.
+                    if !only_path? then
+                        _compiler.full_compile_needed = false;
+                    fi
                 fi
 
             catch e: Exception
@@ -281,6 +304,11 @@ namespace Analysis is
         _symbol_table: Semantic.SYMBOL_TABLE;
         
         _source_files_by_path: Collections.MutableMap[string,SOURCE_FILE];
+
+        // Set during an EDIT if any edited file's declaration digest changed
+        // vs its previous parse — drives the "COMPILE needed" bit on the
+        // PARTIAL DONE response.
+        _interface_changed: bool;
 
         file_names: Iterable[string] => _source_files_by_path.keys;
 
@@ -315,16 +343,36 @@ namespace Analysis is
         parse_and_add_file(path: string, writer: IO.TextWriter, reader: IO.TextReader, is_internal_file: bool) is
             IoC.CONTAINER.instance.logger.clear(path, false);
 
+            let previous = find_source_file(path);
+
             let source_file = _compiler.parse(path, reader, _build_flags, is_internal_file);
             _source_files_by_path[path] = source_file;
 
             _compiler.post_parse([source_file]);
 
             source_file.build_flags.want_compile_expressions = true;
+
+            // Classify the edit: digest the declaration layer and compare it
+            // to the file's previous digest. A difference means another file
+            // may need recompiling; a body-only change does not. First parse
+            // of a file (no previous) counts as a change.
+            let digest = Syntax.INTERFACE_DIGEST();
+            source_file.definition.walk(digest);
+            source_file.interface_digest = digest.digest;
+
+            if
+                !previous? \/
+                !previous.interface_digest? \/
+                previous.interface_digest !~ source_file.interface_digest
+            then
+                _interface_changed = true;
+            fi
         si
         
         handle(reader: IO.TextReader, writer: IO.TextWriter) is
             IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+
+            _interface_changed = false;
 
             for i in _source_files_by_path.values do
                 i.build_flags.want_compile_expressions = false;
@@ -372,6 +420,15 @@ namespace Analysis is
                 if !_watchdog.want_restart then
                     for i in _source_files_by_path.values do
                         i.build_flags.want_compile_up_to_expressions = true;
+
+                        // The build re-runs resolve-* for every file, so drop
+                        // each file's resolve-phase diagnostics to be recomputed.
+                        // Expression-phase diagnostics are kept: compile-expressions
+                        // runs only for the edited file(s), and a non-edited file's
+                        // expression diagnostics are unchanged by this edit unless
+                        // it touched an interface (then a COMPILE follows). The
+                        // edited file(s) were already fully cleared at parse.
+                        IoC.CONTAINER.instance.logger.clear_resolve_phase(i.file_name);
                     od
 
                     IoC.CONTAINER.instance.logger.start_analysis();
@@ -396,9 +453,26 @@ namespace Analysis is
                     _timers.finish("edit-single");
                 fi
 
+                // "COMPILE needed" bit: an edited file's interface changed,
+                // and some file was not compiled through expressions this
+                // EDIT (so its expression-phase diagnostics may now be
+                // stale). A cold whole-project EDIT compiles every file, so
+                // this is "0" there. The VSCE uses it to skip the debounced
+                // COMPILE for body-only edits.
+                let compile_needed =
+                    _interface_changed /\
+                    (_source_files_by_path.values | .any(i => !i.build_flags.want_compile_expressions));
+
+                // Accumulate until the next full COMPILE consumes it: the
+                // COMPILE handler skips the rebuild while this stays false.
+                if compile_needed then
+                    _compiler.full_compile_needed = true;
+                fi
+
                 writer.write("{cast char(12)}");
                 writer.write_line("PARTIAL DONE");
                 writer.write_line(_timers.edit_single_timer.max_average_milliseconds);
+                writer.write_line(if compile_needed then "1" else "0" fi);
                 writer.write("{cast char(12)}");
                 writer.flush();
             yrt
@@ -435,37 +509,48 @@ namespace Analysis is
                 if !_watchdog.want_restart then
                     writer.write_line("DIAGNOSTICS");
 
-                    Semantic.Types.NAMED.clear_cache();
+                    if !_compiler.full_compile_needed then
+                        // No interface-affecting edit since the last full
+                        // compile: every file's diagnostics on the store are
+                        // already current — the EDIT path keeps non-edited
+                        // files' expression-phase diagnostics — so re-emit
+                        // them without rebuilding the project.
+                        IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                    else
+                        Semantic.Types.NAMED.clear_cache();
 
-                    for i in _source_files do
-                        IoC.CONTAINER.instance.logger.clear(i.file_name, true);
+                        for i in _source_files do
+                            IoC.CONTAINER.instance.logger.clear(i.file_name, true);
 
-                        i.build_flags.want_compile_up_to_expressions = true;
-                        i.build_flags.want_compile_expressions = true;
-                    od
+                            i.build_flags.want_compile_up_to_expressions = true;
+                            i.build_flags.want_compile_expressions = true;
+                        od
 
-                    // Clear per-build state cached on the (retained) AST nodes
-                    // by previous compile-expressions invocations. Without this
-                    // the rebuild reads stale Expression.value / .constraint /
-                    // TypeExpression.type referencing symbols that clear_symbols
-                    // is about to wipe and recreate. See
-                    // project_analysis_mode_workflow memory for the model.
-                    let clear_state = Syntax.Process.CLEAR_STATE_VISITOR();
-                    for i in _source_files do
-                        clear_state.apply(i.definition);
-                    od
+                        // Clear per-build state cached on the (retained) AST nodes
+                        // by previous compile-expressions invocations. Without this
+                        // the rebuild reads stale Expression.value / .constraint /
+                        // TypeExpression.type referencing symbols that clear_symbols
+                        // is about to wipe and recreate. See
+                        // project_analysis_mode_workflow memory for the model.
+                        let clear_state = Syntax.Process.CLEAR_STATE_VISITOR();
+                        for i in _source_files do
+                            clear_state.apply(i.definition);
+                        od
 
-                    IoC.CONTAINER.instance.logger.start_analysis();
+                        IoC.CONTAINER.instance.logger.start_analysis();
 
-                    _compiler.clear_symbols();
+                        _compiler.clear_symbols();
 
-                    _compiler.queue(_source_files);
+                        _compiler.queue(_source_files);
 
-                    _compiler.build();
+                        _compiler.build();
 
-                    IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                        IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
 
-                    _watchdog.note_full_compile();
+                        _watchdog.note_full_compile();
+
+                        _compiler.full_compile_needed = false;
+                    fi
                 fi
 
             catch ex: Exception
@@ -522,7 +607,7 @@ namespace Analysis is
             let source_file = _source_file_lookup.find_source_file(path);
 
             if !_full_compiler.is_compiled_through_expressions(source_file) then
-                _full_compiler.compile_all(writer);
+                _full_compiler.compile_all(writer, path);
             fi
 
             try
