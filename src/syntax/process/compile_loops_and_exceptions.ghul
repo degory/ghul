@@ -1,0 +1,233 @@
+namespace Syntax.Process is
+    use Logging;
+
+    // Compiles `while` / `do` loops and `try` / `catch` statements,
+    // and the flow-sensitive narrowing around them. Split out of
+    // COMPILE_EXPRESSIONS, which delegates the matching pre / visit
+    // methods here. The `super.pre` / `super.visit` base-visitor
+    // calls stay in the visitor's thin stubs; the methods here are
+    // the enclosed logic.
+    //
+    // A loop drops narrows on variables its body writes (they cannot
+    // survive the back-edge) — see loop_kept_env, which the `for`
+    // loop on the visitor also uses. A `try` opens a TRY_FLOW_FRAME
+    // tracking whether the body / handlers can complete normally;
+    // narrowing established inside a try is discarded conservatively
+    // (an exception can leave the body anywhere).
+    class COMPILE_LOOPS_AND_EXCEPTIONS is
+        _logger: Logger;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _flow: NARROWING_FLOW;
+        _try_flow_stack: Collections.LIST[TRY_FLOW_FRAME];
+        _loop_kept_stack: Collections.LIST[NARROW_ENV];
+
+        init(
+            logger: Logger,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
+            flow: NARROWING_FLOW,
+            try_flow_stack: Collections.LIST[TRY_FLOW_FRAME],
+            loop_kept_stack: Collections.LIST[NARROW_ENV]
+        ) is
+            super.init();
+
+            _logger = logger;
+            _innate_symbol_lookup = innate_symbol_lookup;
+            _flow = flow;
+            _try_flow_stack = try_flow_stack;
+            _loop_kept_stack = loop_kept_stack;
+        si
+
+        // The narrowing environment to use inside and after a loop
+        // whose body is `body`. A loop body may run any number of
+        // times, so a narrow on a variable the body *writes* cannot
+        // be assumed across the back-edge — those narrows are
+        // dropped. A narrow on a variable the body never writes is
+        // loop-invariant and survives. The body is scanned
+        // syntactically for assignment / `ref` targets.
+        loop_kept_env(body: Trees.Node) -> NARROW_ENV is
+            let env = _flow.current_env;
+
+            if !env? \/ env.is_bottom \/ env.is_empty \/ !body? then
+                return if env? then env.copy() else NARROW_ENV() fi;
+            fi
+
+            let collector = LOOP_ASSIGNMENT_COLLECTOR();
+            body.walk(collector);
+
+            let kept = NARROW_ENV();
+
+            for v in env.variables do
+                if v.name? /\ !collector.names.contains(v.name) then
+                    kept.set_narrow(v, env.narrowed_type_of(v));
+                fi
+            od
+
+            // Definite-assignment is not subject to the kill-set: a
+            // variable assigned before the loop stays assigned
+            // regardless of what the body writes. Body-only
+            // assignments are dropped by restoring `kept` after the
+            // loop (a loop may run zero times).
+            for v in env.assigned_variables do
+                kept.set_assigned(v);
+            od
+
+            return kept;
+        si
+
+        pre_try(`try: Trees.Statements.TRY) -> bool is
+            // Record the pre-try environment. Its narrowing facts
+            // are discarded after the try (an exception can leave
+            // the body anywhere), but its definite-assignment facts
+            // survive — those assignments already happened.
+            _try_flow_stack.add(TRY_FLOW_FRAME(_flow.current_env.copy()));
+
+            return false;
+        si
+
+        // The frame for the `try` currently being walked, or null.
+        _try_flow_frame: TRY_FLOW_FRAME? =>
+            if _try_flow_stack.count > 0 then
+                _try_flow_stack[_try_flow_stack.count - 1]
+            else
+                null
+            fi;
+
+        visit_try(`try: Trees.Statements.TRY) is
+            let frame = _try_flow_frame;
+
+            if _try_flow_stack.count > 0 then
+                _try_flow_stack.remove_at(_try_flow_stack.count - 1);
+            fi
+
+            if frame? then
+                // A try with no catches never reached pre(CATCH), so
+                // the body exit is the current environment here.
+                if !frame.body_seen /\ !_flow.is_unreachable then
+                    frame.can_complete = true;
+                fi
+
+                // Conservative: an exception can leave the try body
+                // at any point, so no narrowing survives the try —
+                // only the pre-try definite-assignment facts. When
+                // neither the body nor any handler can complete
+                // normally, control cannot fall through the try.
+                if frame.can_complete then
+                    _flow.set_env(frame.entry.with_only_assigned());
+                else
+                    _flow.set_unreachable();
+                fi
+            else
+                _flow.set_env(NARROW_ENV());
+            fi
+
+            if
+                (!`try.catches? \/ `try.catches.count == 0) /\
+                !`try.`finally?
+            then
+                _logger.warn(`try.location, "try statement should have at least one catch clause and/or a finally clause");
+            fi
+        si
+
+        pre_catch(`catch: Trees.Statements.CATCH) -> bool is
+            let frame = _try_flow_frame;
+
+            // The first catch is reached right after the try body,
+            // so the current environment is the body's exit: record
+            // whether the body can complete normally.
+            if frame? /\ !frame.body_seen then
+                frame.body_seen = true;
+
+                if !_flow.is_unreachable then
+                    frame.can_complete = true;
+                fi
+            fi
+
+            // A throw can land anywhere in the try body, so nothing
+            // narrowed there can be assumed in the handler — the
+            // catch body is walked with only the pre-try
+            // definite-assignment facts.
+            _flow.set_env(
+                if frame? then frame.entry.with_only_assigned() else NARROW_ENV() fi
+            );
+
+            return false;
+        si
+
+        visit_catch(`catch: Trees.Statements.CATCH) is
+            // A catch handler that completes normally is a path that
+            // reaches the end of the try statement.
+            let frame = _try_flow_frame;
+
+            if frame? /\ !_flow.is_unreachable then
+                frame.can_complete = true;
+            fi
+
+            if !`catch.variable? then
+                return;
+            fi
+
+            // Catch parameters must always have an explicit type —
+            // their whole purpose is to identify which exception
+            // shape the clause handles. Type inference (placeholder
+            // + LUB across writes) does not apply here, so the
+            // generalised let-without-type relaxation in
+            // pre(VARIABLE) doesn't extend to catch.
+            if !`catch.variable.type_expression? \/ isa Trees.TypeExpressions.INFER(`catch.variable.type_expression) then
+                _logger.error(`catch.variable.location, "catch variable must have an explicit type");
+                return;
+            fi
+
+            let type = `catch.variable.type_expression.type;
+
+            if !type? then
+                return;
+            fi
+
+            let exception_type = _innate_symbol_lookup.get_exception_type();
+
+            if !exception_type.is_assignable_from(type) then
+                _logger.error(`catch.variable.type_expression.location, "cannot catch {type} because it does not derive from System.Exception");
+            fi
+        si
+
+        pre_do(`do: Trees.Statements.DO) -> bool is
+            // Loop kill-set narrowing — see _pre(FOR). The
+            // kept-environment is stashed for visit(DO) to restore
+            // after the loop.
+            let kept = loop_kept_env(`do);
+            _loop_kept_stack.add(kept);
+            _flow.set_env(kept);
+
+            return false;
+        si
+
+        visit_do(`do: Trees.Statements.DO) is
+            if _loop_kept_stack.count > 0 then
+                let kept = _loop_kept_stack[_loop_kept_stack.count - 1];
+                _loop_kept_stack.remove_at(_loop_kept_stack.count - 1);
+
+                if `do? /\ !`do.condition? /\ !_loop_body_has_break(`do.body) then
+                    // An unconditional loop with no `break` cannot
+                    // be exited — control never falls through it.
+                    _flow.set_unreachable();
+                else
+                    _flow.set_env(kept);
+                fi
+            fi
+        si
+
+        // True iff `body` contains a `break` targeting the loop it
+        // is the body of — a `break` inside a nested loop does not
+        // count (it targets that inner loop).
+        _loop_body_has_break(body: Trees.Statements.LIST) -> bool is
+            if !body? then
+                return false;
+            fi
+
+            let finder = LOOP_BREAK_FINDER();
+            body.walk(finder);
+
+            return finder.found;
+        si
+    si
+si

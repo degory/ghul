@@ -29,20 +29,29 @@ namespace Syntax.Process is
         _type_arg_placeholder_registry: Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY;
         _closure_arg_resolver: Semantic.CLOSURE_ARG_RESOLVER;
         _numeric_literal_classifier: NUMERIC_LITERAL_CLASSIFIER;
+        _literals: COMPILE_LITERALS;
+        _tuples: COMPILE_TUPLES;
+        _operators: COMPILE_OPERATORS;
+        _access: COMPILE_ACCESS;
+        _generic_application: COMPILE_GENERIC_APPLICATION;
+        _calls: COMPILE_CALLS;
+        _conditionals: COMPILE_CONDITIONALS;
+        _loops: COMPILE_LOOPS_AND_EXCEPTIONS;
+        _bindings: COMPILE_BINDINGS;
+        _lambdas: COMPILE_LAMBDAS;
         _type_caster: Semantic.TYPE_CASTER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _value_converter: VALUE_CONVERTER;
         _value_boxer: VALUE_BOXER;
 
-        _will_generate_code: bool;
-
-        // Definite-return / definite-assignment / possible-null-
-        // dereference / non-optional-by-default flow warnings — on by
-        // default, suppressed by the `--no-warn-*` flags.
-        _warn_definite_return: bool;
-        _warn_definite_assignment: bool;
-        _warn_null_deref: bool;
-        _warn_non_optional: bool;
+        // The immutable, set-once command-line build flags. The
+        // GLOBAL_BUILD_FLAGS object is created with the IoC container;
+        // its fields are populated by the driver afterwards, so this
+        // captures the reference in init and reads fields at walk time.
+        // The `--no-warn-*` opt-outs for the definite-return /
+        // definite-assignment / possible-null-dereference / non-
+        // optional-by-default flow warnings are read straight off it.
+        _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
 
         _stub_depth: int;
         _keep_depth: int;
@@ -89,7 +98,8 @@ namespace Syntax.Process is
             symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
             context: IR.CONTEXT,
             value_converter: VALUE_CONVERTER,
-            value_boxer: VALUE_BOXER
+            value_boxer: VALUE_BOXER,
+            build_flags: Compiler.GLOBAL_BUILD_FLAGS
         )
         is
             super.init(logger, stable_symbols, symbol_table, namespaces);
@@ -107,16 +117,105 @@ namespace Syntax.Process is
             _type_arg_placeholder_registry = Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY(symbol_table);
             _closure_arg_resolver = Semantic.CLOSURE_ARG_RESOLVER(logger);
             _numeric_literal_classifier = NUMERIC_LITERAL_CLASSIFIER(logger, innate_symbol_lookup);
+            _literals = COMPILE_LITERALS(logger, innate_symbol_lookup, _numeric_literal_classifier);
             _symbol_use_locations = symbol_use_locations;
             _value_converter = value_converter;
             _value_boxer = value_boxer;
+            _build_flags = build_flags;
+
+            _tuples = COMPILE_TUPLES(logger, innate_symbol_lookup, value_boxer, self);
 
             _flow = NARROWING_FLOW();
             _condition_analyzer = CONDITION_ANALYZER(expr => try_get_narrowing_target(expr));
 
+            _operators = COMPILE_OPERATORS(
+                logger,
+                symbol_table,
+                innate_symbol_lookup,
+                overload_resolver,
+                symbol_use_locations,
+                function_caller,
+                _flow,
+                _condition_analyzer,
+                self
+            );
+
+            _access = COMPILE_ACCESS(
+                logger,
+                symbol_table,
+                symbol_loader,
+                symbol_use_locations,
+                innate_symbol_lookup,
+                overload_resolver,
+                function_caller,
+                _flow,
+                _condition_analyzer,
+                _build_flags,
+                self
+            );
+
+            _generic_application = COMPILE_GENERIC_APPLICATION(
+                logger,
+                symbol_use_locations,
+                symbol_loader,
+                self
+            );
+
+            _calls = COMPILE_CALLS(
+                logger,
+                symbol_table,
+                symbol_use_locations,
+                innate_symbol_lookup,
+                overload_resolver,
+                function_caller,
+                _owner_constraint_specializer,
+                _owner_type_arg_specializer,
+                _under_determination_detector,
+                _type_arg_placeholder_registry,
+                self
+            );
+
             _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
             _loop_kept_stack = Collections.LIST[NARROW_ENV]();
             _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
+
+            _conditionals = COMPILE_CONDITIONALS(
+                logger,
+                innate_symbol_lookup,
+                _flow,
+                _condition_analyzer,
+                _if_flow_stack,
+                self
+            );
+
+            _loops = COMPILE_LOOPS_AND_EXCEPTIONS(
+                logger,
+                innate_symbol_lookup,
+                _flow,
+                _try_flow_stack,
+                _loop_kept_stack
+            );
+
+            _bindings = COMPILE_BINDINGS(
+                logger,
+                symbol_table,
+                innate_symbol_lookup,
+                _flow,
+                _build_flags,
+                self
+            );
+
+            _lambdas = COMPILE_LAMBDAS(
+                logger,
+                symbol_table,
+                symbol_loader,
+                innate_symbol_lookup,
+                _closure_arg_resolver,
+                _type_arg_placeholder_registry,
+                _flow,
+                _build_flags,
+                self
+            );
         si
 
         // If `expr` is an unqualified identifier resolving (in the
@@ -144,34 +243,6 @@ namespace Syntax.Process is
             return symbol;
         si
 
-        // Warn when a value is dereferenced through a `T?` receiver —
-        // an optional reference or an OPTION[T] — that the flow
-        // analysis has not proven to hold a value here. Only a local
-        // variable's null-state is flow-tracked, so other receiver
-        // shapes (a field, a call result, an explicit `x!`) stay
-        // silent rather than risk a false positive. On by default;
-        // `--no-warn-null-deref` opts out.
-        _check_possible_null_dereference(receiver: Trees.Expressions.Expression) is
-            if !_warn_null_deref \/ !receiver? then
-                return;
-            fi
-
-            if
-                !receiver.value? \/ !receiver.value.type? \/
-                !receiver.value.type.is_optional
-            then
-                return;
-            fi
-
-            let target = try_get_narrowing_target(receiver);
-
-            if !target? \/ _flow.is_non_null(target) then
-                return;
-            fi
-
-            _logger.warn(receiver.location, "{target.name} may not hold a value here");
-        si
-
         // True iff `type` is a non-optional reference type — the kind
         // of slot the non-optional-by-default check guards. Value
         // types, `T?`, type variables, void and error/placeholder
@@ -193,8 +264,8 @@ namespace Syntax.Process is
         // `--no-warn-non-optional` opts out. A warning, not an error,
         // during the migration; the end state is `T?` not
         // assignment-compatible with `T`.
-        _check_non_optional(target: Semantic.Types.Type, source: Trees.Expressions.Expression, location: Source.LOCATION) is
-            if !_warn_non_optional \/ !target? \/ !source? then
+        check_non_optional(target: Semantic.Types.Type, source: Trees.Expressions.Expression, location: Source.LOCATION) is
+            if _build_flags.no_warn_non_optional \/ !target? \/ !source? then
                 return;
             fi
 
@@ -215,139 +286,9 @@ namespace Syntax.Process is
             fi
         si
 
-        // The narrowing environment to use inside and after a loop
-        // whose body is `body`. A loop body may run any number of
-        // times, so a narrow on a variable the body *writes* cannot
-        // be assumed across the back-edge — those narrows are
-        // dropped. A narrow on a variable the body never writes is
-        // loop-invariant and survives. The body is scanned
-        // syntactically for assignment / `ref` targets.
-        _loop_kept_env(body: Trees.Node) -> NARROW_ENV is
-            let env = _flow.current_env;
-
-            if !env? \/ env.is_bottom \/ env.is_empty \/ !body? then
-                return if env? then env.copy() else NARROW_ENV() fi;
-            fi
-
-            let collector = LOOP_ASSIGNMENT_COLLECTOR();
-            body.walk(collector);
-
-            let kept = NARROW_ENV();
-
-            for v in env.variables do
-                if v.name? /\ !collector.names.contains(v.name) then
-                    kept.set_narrow(v, env.narrowed_type_of(v));
-                fi
-            od
-
-            // Definite-assignment is not subject to the kill-set: a
-            // variable assigned before the loop stays assigned
-            // regardless of what the body writes. Body-only
-            // assignments are dropped by restoring `kept` after the
-            // loop (a loop may run zero times).
-            for v in env.assigned_variables do
-                kept.set_assigned(v);
-            od
-
-            return kept;
-        si
-
-        // True iff the predicate `receiver.<member_name>` is
-        // statically false because the receiver is a ONE_OF and the
-        // matched variant is outside the narrowed set. Other "no
-        // match" reasons (not a variant accessor, not a union,
-        // variant doesn't exist at all) return false — those are
-        // either ill-formed (the existing find_member error reports
-        // them) or simply not a is_X predicate.
-        is_statically_false_is_accessor(
-            receiver_type: Type,
-            member_name: string
-        ) -> bool is
-            if !_condition_analyzer.is_variant_accessor_name(member_name) then
-                return false;
-            fi
-
-            if !isa Semantic.Types.ONE_OF(receiver_type) then
-                return false;
-            fi
-
-            let one_of = receiver_type;
-            let classy = _condition_analyzer.get_classy_for_narrowing(receiver_type);
-
-            if !classy? \/ !classy.is_union then
-                return false;
-            fi
-
-            let suffix = member_name.substring(3);
-
-            for s in classy.symbols do
-                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
-                    let variant = cast Semantic.Symbols.Classy(s);
-
-                    return !one_of.contains_variant(variant);
-                fi
-            od
-
-            return false;
-        si
-
-        // Build a hinted "narrow further" message when a member
-        // access on a ONE_OF fails to find the member on the union
-        // but every in-set variant has a same-named member. Returns
-        // null when the hint doesn't apply (receiver isn't a ONE_OF,
-        // name is a is_<variant> accessor that has its own
-        // diagnostic, or the name is missing on at least one
-        // in-set variant). Variant-private fields can't be accessed
-        // through ONE_OF without IL-side variant-dispatching support
-        // — for now we just direct the user to narrow further.
-        try_describe_intersection_miss(
-            receiver_type: Type,
-            member_name: string
-        ) -> string? is
-            if !isa Semantic.Types.ONE_OF(receiver_type) then
-                return null;
-            fi
-
-            if _condition_analyzer.is_variant_accessor_name(member_name) then
-                return null;
-            fi
-
-            let one_of = receiver_type;
-
-            let any_variant mut = false;
-            for variant in one_of.variants do
-                if !variant? \/ !variant.find_member(member_name)? then
-                    return null;
-                fi
-                any_variant = true;
-            od
-
-            if !any_variant then
-                return null;
-            fi
-
-            let names = System.Text.StringBuilder();
-            let seen_any mut = false;
-            for variant in one_of.variants do
-                if seen_any then
-                    names.append(", ");
-                fi
-                names.append(variant.name);
-                seen_any = true;
-            od
-
-            return "member {member_name} is on every variant of \{{names}\} but not on the union — narrow further with `if v.is_<variant>` before access";
-        si
-
         apply(root: Trees.Node) is
             assert _keep_depth == 0;
             assert _stub_depth == 0;
-
-            _will_generate_code = IoC.CONTAINER.instance.build_flags.want_assembler;
-            _warn_definite_return = !IoC.CONTAINER.instance.build_flags.no_warn_definite_return;
-            _warn_definite_assignment = !IoC.CONTAINER.instance.build_flags.no_warn_definite_assignment;
-            _warn_null_deref = !IoC.CONTAINER.instance.build_flags.no_warn_null_deref;
-            _warn_non_optional = !IoC.CONTAINER.instance.build_flags.no_warn_non_optional;
 
             IR.LABEL.reset_id();
             IR.LABEL.set_pass("E");
@@ -403,61 +344,6 @@ namespace Syntax.Process is
                 od
             fi
             return null;
-        si
-
-        get_reference_has_value(
-            location: LOCATION,
-            value: Value,
-            member: Semantic.Symbols.Symbol,
-            bool_type: Type
-        ) -> Value is
-            let null_check = HAS_VALUE(value, bool_type);
-
-            if member? then
-                let member_check = member.load(location, value, _symbol_loader);
-
-                let and_identifier = Trees.Identifiers.Identifier(location, "/\\");
-                let and_symbol = find(and_identifier);
-
-                if and_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(and_symbol) then
-                    _symbol_loader.find_symbol = (name: string) => find(name);
-
-                    let argument_types = Collections.LIST[Type]();
-                    argument_types.add(bool_type);
-                    argument_types.add(bool_type);
-
-                    let overload_result =
-                        _overload_resolver.resolve(
-                            location,
-                            and_symbol,
-                            argument_types,
-                            false,
-                            false,
-                            false
-                        );
-
-                    if overload_result? then
-                        let function = overload_result.function;
-                        if function.is_unsafe_constraints then
-                            _logger.warn(location, "call to {function} has unchecked constraints");
-                        fi
-
-                        let arguments = Collections.LIST[Value]();
-                        arguments.add(null_check);
-                        arguments.add(member_check);
-
-                        return function.call(
-                            location,
-                            null,
-                            arguments,
-                            bool_type,
-                            _function_caller
-                        );
-                    fi
-                fi
-            fi
-
-            return null_check;
         si
 
         set_iterator_for(`for: Trees.Statements.FOR, type: Type, recursing: bool) -> bool is
@@ -574,167 +460,18 @@ namespace Syntax.Process is
         si
 
         visit(function: Trees.Definitions.FUNCTION) is
-            if function.name? then
-                function.name.walk(self);
-            fi
-
-            if function.type_expression? then
-                function.type_expression.walk(self);
-            fi
-
-            if function.arguments? then
-                function.arguments.walk(self);
-            fi
-
-            if function.body? then
-                _logger.speculate();
-
-                let retries = 20;
-
-                for i in 1::retries do
-                    // Narrowing is method-local — start each body
-                    // walk (and each inference-retry re-walk) from
-                    // an empty environment.
-                    _flow.reset();
-
-                    function.body.walk(self);
-
-                    // Convergence: clean or no progress signal raised.
-                    // Without a `has_consumed_any` flag from somewhere
-                    // in the walk, errors that did fire are real and
-                    // persistent — re-walking won't change them, and
-                    // re-walking AST nodes that hold partial state
-                    // produces *different* (often worse) error sets
-                    // because the second walk sees state left over
-                    // from the first. So retry only when something
-                    // explicitly flagged "I consumed an unresolved
-                    // type" — that's the case where iteration N+1
-                    // might find narrower constraints and make
-                    // progress.
-                    if _logger.is_clean \/ !_logger.has_consumed_any then
-                        break;
-                    fi
-
-                    if i < retries then
-                        _logger.roll_back();
-                        _logger.speculate();
-                    fi
-                od
-
-                // Fall-back: any constructor-type-arg placeholders that
-                // didn't acquire a concrete constraint from any usage
-                // default to `object`. Without this, a construction
-                // whose owner type-args are never pinned by downstream
-                // usage (e.g. `let m = Box(); Std.write_line("hi")`)
-                // would emit malformed IL with the placeholder's
-                // gen_type comment string in the type-arg position,
-                // which ilasm rejects.
-                if _type_arg_placeholder_registry.fill_in_defaults(_innate_symbol_lookup.get_object_type()) then
-                    _logger.roll_back();
-                    _logger.speculate();
-
-                    function.body.walk(self);
-                fi
-
-                // Definite return: control can reach the end of a
-                // non-void, block-bodied function's body without a
-                // value having been returned. `_flow.is_unreachable`
-                // is false here only when at least one path falls
-                // off the end — every path that returns / throws
-                // leaves the flow at `bottom`.
-                let function_symbol = current_function;
-
-                if
-                    _warn_definite_return /\
-                    function.body.is_block /\
-                    !_flow.is_unreachable /\
-                    function_symbol? /\
-                    function_symbol.return_type? /\
-                    !function_symbol.return_type.is_any /\
-                    !function_symbol.return_type.is_inferred /\
-                    function_symbol.return_type !~ _innate_symbol_lookup.get_void_type()
-                then
-                    _logger.warn(function.location, "function may not return a value on all paths");
-                fi
-
-                _logger.commit();
-            fi
-
+            _lambdas.visit_function_definition(function);
             super.visit(function);
         si
 
         pre(`let: Trees.Statements.LET) -> bool is
             super.pre(`let);
-
-            // Reset is_defined on each LHS variable at the start of
-            // every body-retry walk of the let. Without this reset,
-            // an earlier walk's define() call leaves is_defined=true,
-            // and check_is_defined in `load_captured_value` no longer
-            // fires for a forward self-reference inside the RHS
-            // lambda on subsequent walks (`let f = ... f ...` is the
-            // canonical case). The error gets rolled back per iter
-            // via mark_consumed_any rolling back diagnostics, but
-            // the final iter's error survives so the user-visible
-            // diagnostic is preserved.
-            if `let.variables? then
-                for v in `let.variables do
-                    if v.names? then
-                        for name in v.names do
-                            let symbol = find(name);
-                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                                let variable = symbol;
-                                variable.is_defined = false;
-                            fi
-                        od
-                    fi
-                od
-            fi
-
-            return false;
+            return _bindings.pre_let(`let);
         si
 
         visit(`let: Trees.Statements.LET) is
             super.visit(`let);
-
-            // Definite assignment: a `let` binding with no
-            // initializer introduces a deferred-init local. Until it
-            // is assigned, a read of it is a use-before-assignment.
-            if _warn_definite_assignment then
-                for v in `let.variables do
-                    if v? /\ !v.initializer? then
-                        for name in v.names do
-                            let symbol = find(name);
-
-                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                                _flow.track_deferred(symbol);
-                            fi
-                        od
-                    fi
-                od
-            fi
-
-            if `let.want_dispose then
-                let idisposable = _innate_symbol_lookup.get_idisposable_type();
-
-                for v in `let.variables do
-                    for name in v.names do
-                        let symbol = find(v.name);
-
-                        if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                            let variable = symbol;
-                            variable.is_disposed = true;
-
-                            let type = variable.type;
-
-                            if !idisposable.is_assignable_from(type) then
-                                _logger.error(v.name.location, "not disposable");
-                            fi
-
-                            current_statement_list.add_variable_to_dispose(variable);
-                        fi
-                    od
-                od
-            fi
+            _bindings.visit_let(`let);
         si
         
         pre(`for: Trees.Statements.FOR) -> bool is
@@ -800,7 +537,7 @@ namespace Syntax.Process is
                 // loop writes are dropped (the back-edge could
                 // invalidate them); narrows on variables it never
                 // writes survive the loop.
-                let kept = _loop_kept_env(`for);
+                let kept = _loops.loop_kept_env(`for);
                 _flow.set_env(kept);
                 `for.body.walk(self);
                 _flow.set_env(kept);
@@ -810,73 +547,17 @@ namespace Syntax.Process is
 
         pre(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) -> bool is
             super.pre(left);
-
-            if !left.value? then
-                return false;
-            fi
-
-            if !left.value.is_consumable then
-                _logger.error(left.location, "cannot use this here");
-                return false;
-            fi
-
-            left.expression.value = Need.STORE(left.value);
-            return false;
+            return _bindings.pre_simple_left(left);
         si
 
         visit(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) is
             super.visit(left);
-
-            if !left.value? \/ !left.value.type? \/ !left.expression.value? \/ !left.expression.value.type? then
-                return;
-            fi
-
-            if !left.expression.value.is_consumable then
-                // debug_always("cannot assign to {left} at {left.location} from AAA {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
-                _logger.error(left.location, "cannot assign to this");
-                return;
-            fi
-
-            // Bypass narrowing for assignability — the LHS value's
-            // type may be a narrowed view, but assignment must
-            // typecheck against the variable's declared type, or
-            // `if isa T(x) then x = wider_value` (idiomatic across
-            // the codebase) would fail at the narrow.
-            let target_variable = try_get_narrowing_target(left.expression);
-            let lhs_type =
-                if target_variable? then
-                    _flow.declared_type_of(target_variable)
-                else
-                    left.expression.value.type
-                fi;
-
-            if !lhs_type.is_assignable_from(left.value.type) then
-                _logger.error(left.assign_location, "{left.value.type} is not assignable to {lhs_type}");
-                return;
-            fi
-
-            left.value = left.expression.value;
-
-            // Reassignment invalidates any narrow for the target —
-            // the new value may not satisfy it, so subsequent reads
-            // observe the declared type — and makes the target
-            // definitely assigned from here on.
-            if target_variable? then
-                _flow.on_assignment(target_variable);
-                _flow.mark_assigned(target_variable);
-
-                // A non-optional RHS leaves the target known to hold
-                // a value — so `_field = arg; _field.method()` does
-                // not warn.
-                if _is_non_optional_value(left.value) then
-                    _flow.mark_non_null(target_variable);
-                fi
-            fi
+            _bindings.visit_simple_left(left);
         si
 
         // True iff `value` is statically known to hold a value — its
         // type is settled and is not an optional / null type.
-        _is_non_optional_value(value: IR.Values.Value) -> bool =>
+        is_non_optional_value(value: IR.Values.Value) -> bool =>
             value? /\ value.type? /\ value.type.is_settled /\
             !value.type.is_null /\ !value.type.is_optional;
         
@@ -1012,190 +693,11 @@ namespace Syntax.Process is
 
         visit(let_in: Trees.Expressions.LET_IN) is
             super.visit(let_in);
-
-            if 
-                !let_in.expression.value? \/
-                !let_in.expression.value.check_is_consumable_allow_void(_logger, let_in.expression.location)
-            then
-                let_in.value = IR.Values.DUMMY(Semantic.Types.ERROR(), let_in.location);
-                return;
-            fi
-
-            let_in.value = let_in.expression.value;
+            _bindings.visit_let_in(let_in);
         si
         
-        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
-            // Push the LHS type down to the RHS as a constraint. The
-            // RHS expression node is responsible for either consuming
-            // it (FUNCTION uses it for argument-type inference,
-            // SEQUENCE / TUPLE forward to their elements) or ignoring
-            // it (literals, identifiers — Expression's default
-            // set_constraint is a no-op). The post-walk assignability
-            // check still verifies type correctness for the cases
-            // where the RHS doesn't act on the constraint.
-            //
-            // When the LHS is itself a not-yet-resolved placeholder
-            // (`let l; ...; l = X` shape), the LHS type is not
-            // useful as a constraint to push *down*. Instead, after
-            // walking the RHS, push the RHS's type back to the
-            // LHS variable's symbol via add_constraint — the
-            // existing iterative-inference machinery will collapse
-            // the LUB across all assignments on the next retry-
-            // loop iteration.
-            let lhs_type = _try_get_assignment_left_type(assignment.left);
-
-            // `!is_inferred` (not !is_sentinel or is_settled):
-            // we're asking "is the LHS anything other than a
-            // bare placeholder?". ERROR is pre-filtered by
-            // _try_get_assignment_left_type. A composite-with-
-            // placeholder LHS like Function[placeholder, int]
-            // *is* useful as an RHS constraint — the placeholder
-            // arg slot is filled by the lambda's body inference,
-            // and the return slot does its job.
-            if lhs_type? /\ !lhs_type.is_inferred /\ !lhs_type.is_error then
-                assignment.right.set_constraint(lhs_type, "{{0}} is not assignable to {{1}}");
-            fi
-
-            assignment.right.walk(self);
-
-            if !assignment.right.value? then
-                return true;
-            fi
-
-            if !assignment.right.value.is_consumable then
-                _logger.error(assignment.right.location, "cannot use this here");
-                assignment.left.value = IR.Values.DUMMY(Semantic.Types.ERROR(), assignment.right.location);
-            else
-                assignment.left.value = assignment.right.value;
-
-                _check_non_optional(lhs_type, assignment.right, assignment.right.location);
-            fi
-
-            // Back-feed the RHS type as a constraint onto a
-            // placeholder-typed LHS variable (`let l; l = X` etc.).
-            // The next retry-loop iteration of the enclosing
-            // function-body walk picks up the LUB via
-            // try_get_inferred_type at visit(SIMPLE_VARIABLE_LEFT).
-            //
-            // `!is_settled` (not is_inferred or contains_inferred): a
-            // provisional composite LHS like `Func[List[int],
-            // INFERED_RETURN_TYPE]` — recorded on an early iter when
-            // the lambda's body was walked before the return type
-            // resolved — still needs refining once the placeholder
-            // inside settles. Same goes for an ERROR-carrying
-            // composite like `(ERROR, int)` left over from an iter
-            // where a sub-expression poisoned to DUMMY(ERROR):
-            // a later iter may produce a clean `(int, int)` value,
-            // and without the back-feed the LUB never picks it up
-            // and the per-position merge prefers the stale ERROR
-            // slot. `is_settled` ("no placeholders, no errors")
-            // captures both senses in one predicate.
-            if
-                lhs_type? /\
-                !lhs_type.is_settled /\
-                assignment.right.value? /\
-                assignment.right.value.type? /\
-                _try_back_feed_assignment_lhs(assignment.left, assignment.right.value.type)
-            then
-                _logger.mark_consumed_any();
-            fi
-
-            assignment.left.assign_location = assignment.location;
-
-            assignment.left.walk(self);
-
-            assignment.value = assignment.left.value;
-
-            return true;
-        si
-
-        // If the assignment's LHS is a simple identifier referring
-        // to a Variable whose current type is an inference
-        // placeholder, push the supplied RHS type onto the
-        // variable's LUB accumulator. Returns true when a real
-        // constraint actually landed (so the caller can signal
-        // progress to the retry loop).
-        _try_back_feed_assignment_lhs(
-            left: Trees.Expressions.AssignmentLeftExpression,
-            rhs_type: Semantic.Types.Type
-        ) -> bool is
-            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
-
-            if !simple? \/ !simple.expression? then
-                return false;
-            fi
-
-            let identifier = cast Trees.Expressions.IDENTIFIER(simple.expression);
-
-            if !identifier? \/ !identifier.identifier? then
-                return false;
-            fi
-
-            let symbol = find(identifier.identifier);
-
-            if !symbol? \/ !isa Semantic.Symbols.Variable(symbol) then
-                return false;
-            fi
-
-            let variable = symbol;
-
-            return variable.add_constraint(rhs_type);
-        si
-
-        // Speculatively walk a SIMPLE_LEFT_EXPRESSION's inner expression
-        // as a regular load, read its type, and roll back the logger so
-        // the probe is invisible to later passes. Destructuring lefts
-        // are skipped — extracting their effective type is a follow-up
-        // that needs a tuple-shape construction we don't have yet.
-        // The probe walks the live expression rather than a copy: the
-        // subsequent normal walk through pre(SIMPLE_LEFT_EXPRESSION)
-        // overwrites the inner expression's value with the STORE form
-        // anyway, so the probe's read-form value never escapes.
-        _try_get_assignment_left_type(left: Trees.Expressions.AssignmentLeftExpression) -> Type? is
-            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
-
-            if !simple? \/ !simple.expression? then
-                return null;
-            fi
-
-            let mark = _logger.mark();
-            let type: Type mut = default;
-
-            try
-                _logger.speculate();
-
-                simple.expression.walk(self);
-
-                // is_error left unfiltered here: an ERROR-bearing
-                // composite (e.g. `(ERROR, int)` set by an earlier
-                // iter on a delayed-init variable whose first-seen
-                // RHS poisoned to DUMMY(ERROR)) is exactly the case
-                // the assignment back-feed below needs to recognise
-                // — without the LHS type, the back-feed gate
-                // gets null, no refinement constraint lands, and
-                // the LUB stays frozen. Call sites that don't want
-                // to pass ERROR onward (the set_constraint push to
-                // RHS) gate it themselves.
-                if simple.expression.value? /\ simple.expression.value.type? then
-                    let target_variable = try_get_narrowing_target(simple.expression);
-
-                    type =
-                        if target_variable? then
-                            _flow.declared_type_of(target_variable)
-                        else
-                            simple.expression.value.type
-                        fi;
-                fi
-
-                _logger.roll_back();
-                _logger.release(mark);
-            catch e: Exception
-                _logger.release(mark);
-                return null;
-            yrt
-
-            return type;
-        si
+        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool =>
+            _bindings.pre_assignment(assignment);
 
         pre(expression: Trees.Statements.EXPRESSION) -> bool is
             super.pre(expression);
@@ -1205,128 +707,17 @@ namespace Syntax.Process is
 
         visit(expression: Trees.Statements.EXPRESSION) is
             super.visit(expression);
-
-            Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
-
-            if !expression.want_value then
-                if expression.expression.must_be_consumed then
-                    _logger.error(expression.expression.location, "{expression.expression.description} result is not used");
-                fi
-
-                return;
-            fi
-
-            expression.value = expression.expression.value;
+            _bindings.visit_expression_statement(expression);
         si
 
         pre(r: Trees.Statements.RETURN) -> bool is
             super.pre(r);
-
-            if !r.expression? then
-                return false;
-            fi
-
-            let function = current_function;
-
-            if
-                !function.return_type? \/ 
-                function.return_type.is_any \/ 
-                function.return_type =~ _innate_symbol_lookup.get_void_type()
-            then
-                return false;
-            fi
-
-            r.expression.set_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
-
-            return false;
+            return _bindings.pre_return(r);
         si
 
         visit(r: Trees.Statements.RETURN) is
             super.visit(r);
-
-            // Control does not fall through a return — the rest of
-            // the enclosing block is unreachable.
-            _flow.set_unreachable();
-
-            let function = current_function;
-
-            if !function? \/ !function.return_type? then
-                // FIXME: null function happens for properties, null return type happens for anonymous functions
-                return;
-            fi
-
-            if r.expression? then
-                if
-                    r.expression.value? /\
-                    r.expression.value.type? /\
-                    r.expression.value.check_is_consumable(_logger, r.expression.location)
-                then
-                    if function.return_type.is_inferred then
-                        // Filling in a previously-undeclared return
-                        // type from this return statement. is_inferred
-                        // (today only INFERED_RETURN_TYPE) rather than
-                        // is_any: a function whose return type was
-                        // already set to ERROR by an earlier failing
-                        // return shouldn't get silently overwritten
-                        // with a concrete type by a later (validly-
-                        // typed) return — the original error should
-                        // remain reported and the return-type contract
-                        // should stay ERROR until the user fixes the
-                        // source.
-                        function.set_return_type(r.expression.value.type);
-                    elif function.return_type =~ _innate_symbol_lookup.get_void_type() /\ !function.return_type.is_type_variable then
-                        _logger
-                            .error(
-                                r.expression.location,
-                                "cannot return value from function of void type"
-                            );
-                    elif !function.return_type.is_assignable_from(r.expression.value.type) then
-                        // Originally-inferred return type with a later
-                        // return that doesn't conform to the current
-                        // binding — widen via LUB rather than erroring
-                        // (#1173 checkbox "Inferring the return type
-                        // of function literals with multiple return
-                        // statements"). Covers both the narrower-first
-                        // / wider-second case and the siblings case.
-                        // For a declared return type the existing
-                        // error is correct.
-                        if function.return_type_was_inferred then
-                            let lub = Semantic.LEAST_UPPER_BOUND_MAP();
-                            lub.add(function.return_type);
-                            lub.add(r.expression.value.type);
-                            let widened = lub.get_result();
-
-                            if widened? then
-                                function.set_return_type(widened);
-                            else
-                                _logger
-                                    .error(
-                                        r.expression.location,
-                                        "cannot widen return type to common ancestor of {function.return_type} and {r.expression.value.type}"
-                                    );
-                            fi
-                        else
-                            _logger
-                                .error(
-                                    r.expression.location,
-                                    "cannot return value of type {r.expression.value.type} where {function.return_type} expected"
-                                );
-                        fi
-                    fi
-
-                    _check_non_optional(function.return_type, r.expression, r.expression.location);
-
-                    return;
-                fi
-            else
-                if function.return_type !~ _innate_symbol_lookup.get_void_type() then
-                    _logger
-                        .warn(
-                            r.location,
-                            "return without value from non void function returns default value of type {function.return_type}"
-                        );
-                fi
-            fi
+            _bindings.visit_return(r);
         si
 
         visit(`throw: Trees.Statements.THROW) is
@@ -1413,139 +804,27 @@ namespace Syntax.Process is
 
         pre(`try: Trees.Statements.TRY) -> bool is
             super.pre(`try);
-
-            // Record the pre-try environment. Its narrowing facts
-            // are discarded after the try (an exception can leave
-            // the body anywhere), but its definite-assignment facts
-            // survive — those assignments already happened.
-            _try_flow_stack.add(TRY_FLOW_FRAME(_flow.current_env.copy()));
-
-            return false;
+            return _loops.pre_try(`try);
         si
-
-        // The frame for the `try` currently being walked, or null.
-        _try_flow_frame: TRY_FLOW_FRAME? =>
-            if _try_flow_stack.count > 0 then
-                _try_flow_stack[_try_flow_stack.count - 1]
-            else
-                null
-            fi;
 
         visit(`try: Trees.Statements.TRY) is
             super.visit(`try);
-
-            let frame = _try_flow_frame;
-
-            if _try_flow_stack.count > 0 then
-                _try_flow_stack.remove_at(_try_flow_stack.count - 1);
-            fi
-
-            if frame? then
-                // A try with no catches never reached pre(CATCH), so
-                // the body exit is the current environment here.
-                if !frame.body_seen /\ !_flow.is_unreachable then
-                    frame.can_complete = true;
-                fi
-
-                // Conservative: an exception can leave the try body
-                // at any point, so no narrowing survives the try —
-                // only the pre-try definite-assignment facts. When
-                // neither the body nor any handler can complete
-                // normally, control cannot fall through the try.
-                if frame.can_complete then
-                    _flow.set_env(frame.entry.with_only_assigned());
-                else
-                    _flow.set_unreachable();
-                fi
-            else
-                _flow.set_env(NARROW_ENV());
-            fi
-
-            if
-                (!`try.catches? \/ `try.catches.count == 0) /\
-                !`try.`finally?
-            then
-                _logger.warn(`try.location, "try statement should have at least one catch clause and/or a finally clause");
-            fi
+            _loops.visit_try(`try);
         si
 
         pre(`catch: Trees.Statements.CATCH) -> bool is
             super.pre(`catch);
-
-            let frame = _try_flow_frame;
-
-            // The first catch is reached right after the try body,
-            // so the current environment is the body's exit: record
-            // whether the body can complete normally.
-            if frame? /\ !frame.body_seen then
-                frame.body_seen = true;
-
-                if !_flow.is_unreachable then
-                    frame.can_complete = true;
-                fi
-            fi
-
-            // A throw can land anywhere in the try body, so nothing
-            // narrowed there can be assumed in the handler — the
-            // catch body is walked with only the pre-try
-            // definite-assignment facts.
-            _flow.set_env(
-                if frame? then frame.entry.with_only_assigned() else NARROW_ENV() fi
-            );
-
-            return false;
+            return _loops.pre_catch(`catch);
         si
 
         visit(`catch: Trees.Statements.CATCH) is
             super.visit(`catch);
-
-            // A catch handler that completes normally is a path that
-            // reaches the end of the try statement.
-            let frame = _try_flow_frame;
-
-            if frame? /\ !_flow.is_unreachable then
-                frame.can_complete = true;
-            fi
-
-            if !`catch.variable? then
-                return;
-            fi
-
-            // Catch parameters must always have an explicit type —
-            // their whole purpose is to identify which exception
-            // shape the clause handles. Type inference (placeholder
-            // + LUB across writes) does not apply here, so the
-            // generalised let-without-type relaxation in
-            // pre(VARIABLE) doesn't extend to catch.
-            if !`catch.variable.type_expression? \/ isa Trees.TypeExpressions.INFER(`catch.variable.type_expression) then
-                _logger.error(`catch.variable.location, "catch variable must have an explicit type");
-                return;
-            fi
-
-            let type = `catch.variable.type_expression.type;
-
-            if !type? then
-                return;
-            fi
-
-            let exception_type = _innate_symbol_lookup.get_exception_type();
-
-            if !exception_type.is_assignable_from(type) then
-                _logger.error(`catch.variable.type_expression.location, "cannot catch {type} because it does not derive from System.Exception");
-            fi
+            _loops.visit_catch(`catch);
         si
 
         pre(`do: Trees.Statements.DO) -> bool is
             super.pre(`do);
-
-            // Loop kill-set narrowing — see _pre(FOR). The
-            // kept-environment is stashed for visit(DO) to restore
-            // after the loop.
-            let kept = _loop_kept_env(`do);
-            _loop_kept_stack.add(kept);
-            _flow.set_env(kept);
-
-            return false;
+            return _loops.pre_do(`do);
         si
 
         visit(`do: Trees.Statements.DO) is
@@ -1561,153 +840,16 @@ namespace Syntax.Process is
 
             super.visit(`do);
 
-            if _loop_kept_stack.count > 0 then
-                let kept = _loop_kept_stack[_loop_kept_stack.count - 1];
-                _loop_kept_stack.remove_at(_loop_kept_stack.count - 1);
-
-                if `do? /\ !`do.condition? /\ !_loop_body_has_break(`do.body) then
-                    // An unconditional loop with no `break` cannot
-                    // be exited — control never falls through it.
-                    _flow.set_unreachable();
-                else
-                    _flow.set_env(kept);
-                fi
-            fi
-        si
-
-        // True iff `body` contains a `break` targeting the loop it
-        // is the body of — a `break` inside a nested loop does not
-        // count (it targets that inner loop).
-        _loop_body_has_break(body: Trees.Statements.LIST) -> bool is
-            if !body? then
-                return false;
-            fi
-
-            let finder = LOOP_BREAK_FINDER();
-            body.walk(finder);
-
-            return finder.found;
+            _loops.visit_do(`do);
         si
 
         pre(`if: Trees.Statements.IF_BRANCH) -> bool is
             super.pre(`if);
-
-            // Controlled walk: walk the condition, derive its
-            // then/else narrowing environments, walk the body under
-            // the then-environment, and record the body's exit
-            // environment for the join in visit(IF). The condition
-            // itself walks under the running-else environment so
-            // within-condition narrowing (`isa T(x) /\ x.foo`)
-            // applies as it compiles.
-            let frame = _if_flow_stack[_if_flow_stack.count - 1];
-
-            if `if.condition? then
-                _flow.set_env(frame.running_else);
-                `if.condition.walk(self);
-
-                let facts = _condition_analyzer.analyze_condition(`if.condition, frame.running_else);
-
-                _flow.set_env(facts.then_env);
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-                frame.running_else = facts.else_env;
-            elif `if.binding? then
-                // `if let` branch: the binding's initializer is checked
-                // and the binding's symbol typed by walking it. It
-                // narrows only its own then-scoped binding, so the
-                // running-else environment is left unchanged.
-                _flow.set_env(frame.running_else);
-
-                `if.binding.walk(self);
-
-                // The presence test is the `?` (has-value) operator.
-                // A reference type tests for null. A value type must
-                // be option-shaped — `T?`/OPTION[T] or any struct with
-                // `has_value` and `value` members; the binding then
-                // yields the unwrapped `.value`. A plain value type is
-                // always present and cannot be tested this way.
-                let binding_type =
-                    if `if.binding.initializer? /\ `if.binding.initializer.value? then
-                        `if.binding.initializer.value.type;
-                    else
-                        null;
-                    fi;
-
-                if binding_type? /\ binding_type.is_value_type then
-                    let has_value_member = binding_type.find_member("has_value");
-                    let value_member = binding_type.find_member("value");
-
-                    if !has_value_member? \/ !value_member? then
-                        _logger.error(
-                            `if.binding.location,
-                            "if let binding must be a reference type or an option-shaped value type, not {binding_type}"
-                        );
-
-                        // Error recovery: an impossible match still binds its
-                        // names — typed ERROR — so the one diagnostic above is
-                        // not followed by a cascade of spurious errors on uses
-                        // of the binding within the then-arm.
-                        for name in `if.binding.left.names do
-                            let symbol = find(name);
-
-                            if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
-                                symbol.define();
-
-                                (cast Semantic.Types.SettableTyped(symbol)).set_type(Semantic.Types.ERROR());
-                            fi
-                        od
-                    else
-                        // The bound names take the unwrapped `.value`
-                        // type, not the optional itself.
-                        set_symbol_type(`if.binding.left, value_member.type);
-                    fi
-                fi
-
-                // The bound names hold a value throughout the
-                // then-arm — that is what `if let` establishes — so a
-                // dereference of one is not flagged.
-                for name in `if.binding.left.names do
-                    let symbol = find(name);
-
-                    if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                        _flow.mark_non_null(cast Semantic.Symbols.Variable(symbol));
-                    fi
-                od
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-            else
-                _flow.set_env(frame.running_else);
-
-                if `if.body? then
-                    `if.body.walk(self);
-                fi
-
-                frame.branch_exits.add(_flow.current_env.copy());
-                frame.has_else = true;
-            fi
-
-            return true;
+            return _conditionals.pre_if_branch(`if);
         si
 
         visit(`if: Trees.Statements.IF_BRANCH) is
-            if
-                `if? /\
-                `if.condition? /\
-                Value.check_is_consumable(_logger, `if.condition.location, `if.condition.value)
-            then
-                if `if.condition.value.type !~_innate_symbol_lookup.get_bool_type() then
-                    _logger.error(`if.condition.location, "if condition must be bool");
-                fi
-            fi
-
+            _conditionals.visit_if_branch(`if);
             super.visit(`if);
         si
 
@@ -1780,7 +922,7 @@ namespace Syntax.Process is
                 Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
             fi
 
-            _check_non_optional(function.return_type, expression.expression, expression.expression.location);
+            check_non_optional(function.return_type, expression.expression, expression.expression.location);
 
             super.visit(expression);
         si
@@ -1813,7 +955,9 @@ namespace Syntax.Process is
 
                 super.pre(function);
 
-                _visit(function);
+                _lambdas.visit_function(function);
+
+                super.visit(function);
 
                 _logger.commit();
             catch e: Exception
@@ -1826,344 +970,15 @@ namespace Syntax.Process is
             _flow.set_env(saved_env);
         si
 
-        _visit(function: Trees.Expressions.FUNCTION) is
-            if !function.value? then
-                function.value = IR.Values.WRAPPER();
-            fi
-
-            let closure = cast Semantic.Symbols.Closure(scope_for(function));
-
-            closure.map_type_arguments();
-
-            let implied_type: Type;
-            let implied_argument_types: Collections.List[Type] mut = default;
-            let constraint_return_type: Type mut = default;
-
-            // have we been passed expected arguments types? If so we'll use them
-            // to argument types of any anonymous function literal arguments.
-            // Single source of truth: function.constraint, set by the parent
-            // context — LHS of an assignment, typed variable initializer, or
-            // overload-resolution second-pass when this lambda was an actual
-            // arg whose chosen-formal type is now known (#1174).
-            if function.constraint? /\ function.constraint.is_function then
-                implied_argument_types = function.constraint.arguments;
-
-                // FUNCTION encodes its return type as the last entry in
-                // `arguments`. Capture it for body-constraint pushdown
-                // below. (Leave closure.return_type alone — taking the
-                // constraint there would pre-widen the lambda's emitted
-                // return type and break `(o: object) => 123` covariant-
-                // returning into an `object -> object` slot.)
-                let argument_count = function.constraint.arguments.count;
-                if argument_count > 0 then
-                    let candidate = function.constraint.arguments[argument_count - 1];
-
-                    if
-                        candidate?              /\
-                        !candidate.is_inferred  /\
-                        !candidate.is_error     /\
-                        !candidate.is_void      /\
-                        !candidate.is_any
-                    then
-                        constraint_return_type = candidate;
-                    fi
-                fi
-
-            fi
-
-            _symbol_table.current_closure_context.add_closure(closure);
-
-            // we are walking the arguments here while speculating
-            let arguments_resolved = _closure_arg_resolver.resolve(function.arguments.expressions, closure, implied_argument_types);
-
-            if arguments_resolved then
-                let return_type: Type mut;
-
-                if function.type_expression.type? then
-                    return_type = function.type_expression.type;
-                else
-                    return_type = Semantic.Types.INFERED_RETURN_TYPE();
-                    closure.return_type_was_inferred = true;
-                fi
-
-                closure.set_return_type(return_type);
-            fi
-
-            // Push the constraint's return-type slot onto the body's
-            // last expression before walking. The implicit-return path
-            // (pre(Bodies.EXPRESSION)) is gated on
-            // `!function.return_type.is_any` and skips when the closure
-            // hasn't been given an explicit return-type annotation —
-            // but that's exactly the case where a bare variant
-            // constructor (`DONE()`) in the body would benefit from
-            // knowing the expected type. Set it here so the body's
-            // CALL nodes see the constraint; without setting
-            // closure.return_type, the lambda's emitted return type
-            // is still inferred from the body so covariant-return-via-
-            // assignment is unaffected.
-            if
-                constraint_return_type? /\
-                !function.type_expression.type? /\
-                isa Trees.Bodies.EXPRESSION(function.body)
-            then
-                let body = cast Trees.Bodies.EXPRESSION(function.body);
-
-                if body.expression? then
-                    body.expression.set_constraint(constraint_return_type, "cannot return value of type {{0}} where {{1}} expected");
-                fi
-            fi
-
-            _logger.commit();
-            _logger.speculate();
-
-            function.body.walk(self);
-
-            let reported_inference_failure = false;
-
-            if closure.is_recursive then
-                _logger.roll_back();
-                _logger.speculate();
-
-                function.body.walk(self);
-            fi
-
-            if _will_generate_code /\ arguments_resolved /\ closure.could_be_delegate then
-                _logger.roll_back();
-                _logger.speculate();
-
-                closure.convert_to_delegate();
-
-                function.body.walk(self);
-            fi
-
-            // Default an unresolved return type to void only when the
-            // arguments are *fully* resolved — concrete types, not still
-            // INFERRED_VARIABLE_TYPE placeholders. With placeholder args,
-            // an unresolved return is the symptom of an identity-shaped
-            // body (`a => a`) where the body offered no constraint and
-            // we're depending on the call-site formal-arg-push to
-            // resolve the args on the next outer iteration. Defaulting
-            // the return to void here would lock in `*** -> void` and
-            // poison the overload resolution that follows.
-            if closure.return_type.is_inferred /\ closure.arguments | .all(a => a.is_settled) then
-                closure.set_return_type(_innate_symbol_lookup.get_void_type());
-            fi
-
-            closure.unmap_type_arguments();
-
-            let value = closure.load(function.location, _symbol_loader).freeze();
-
-            cast IR.Values.WRAPPER(function.value).value = value;
-
-            super.visit(function);
-        si
-
         visit(recurse: Trees.Expressions.RECURSE) is
-            let function = current_function;
-
-            if !function? \/ !function.is_closure then
-                recurse.value = IR.Values.DUMMY(Semantic.Types.ERROR(), recurse.location);
-
-                _logger.error(recurse.location, "rec can only be used in a function literal body");
-                return;
-            fi
-
-            let closure = cast Semantic.Symbols.Closure(function);
-
-            if closure.is_recursive then
-                recurse.value = closure.load_recurse(recurse.location, _symbol_loader);
-                return;
-            fi
-
-            // Walk up enclosing closures looking for a recursive
-            // ancestor whose $recurse we can capture. The chain in
-            // between needs to capture it too so the value can be
-            // threaded down through nested frame constructors.
-            let stack = _symbol_table.stack;
-            let index mut = stack.count - 1;
-            let seen_self mut = false;
-            let outer_recursive: Semantic.Symbols.Closure? mut = null;
-            let intermediates = Collections.LIST[Semantic.Symbols.Closure]();
-
-            while index >= 0 do
-                let scope = stack[index];
-
-                if scope.is_closure then
-                    let c = cast Semantic.Symbols.Closure(scope);
-
-                    if seen_self then
-                        if c.is_recursive then
-                            outer_recursive = c;
-                            break;
-                        fi
-                        intermediates.add(c);
-                    elif c == closure then
-                        seen_self = true;
-                    fi
-                fi
-
-                index = index - 1;
-            od
-
-            if !outer_recursive? then
-                recurse.value = IR.Values.DUMMY(Semantic.Types.ERROR(), recurse.location);
-
-                _logger.error(recurse.location, "rec can only be used in a recursive function");
-                return;
-            fi
-
-            for intermediate in intermediates do
-                intermediate.find_or_add_captured_outer_recurse(outer_recursive);
-            od
-
-            recurse.value = closure.load_captured_outer_recurse(recurse.location, outer_recursive, _symbol_loader);
+            _lambdas.visit_recurse(recurse);
         si
 
-        pre(tuple: Trees.Expressions.TUPLE) -> bool is
-            if tuple.elements.expressions.count == 1 then
-                // Single-element TUPLE is a parenthesised expression
-                // (TUPLE.visit unwraps its value). Forward whatever
-                // constraint applies to the outer expression directly
-                // to the inner one — splitting a value-tuple constraint
-                // across a phantom 1-tuple slot would push the wrong
-                // element type down into the inner expression.
-                if tuple.constraint? then
-                    tuple.elements.expressions[0].set_constraint(tuple.constraint, tuple.constraint_error_message);
-                else
-                    tuple.elements.expressions[0].clear_constraint();
-                fi
-            elif tuple.constraint? /\ tuple.constraint.is_value_tuple then
-                for (element, type) in tuple.elements | .zip(tuple.constraint.arguments) do
-                    element.set_constraint(type, tuple.constraint_error_message);
-                od
-            else
-                for element in tuple.elements do
-                    element.clear_constraint();
-                od
-            fi
-
-            return false;
-        si
+        pre(tuple: Trees.Expressions.TUPLE) -> bool =>
+            _tuples.pre_tuple(tuple);
 
         visit(tuple: Trees.Expressions.TUPLE) is
-            let names: Collections.LIST[string]? mut = Collections.LIST[string]();
-            let values = Collections.LIST[Value]();
-            let types = Collections.LIST[Type]();
-
-            let element_constraints: Collections.List[Type]? mut = null;
-            let constraint_error_message: string? mut = null;
-
-            if tuple.constraint? /\ tuple.constraint.is_value_tuple then
-                element_constraints = tuple.constraint.arguments;
-                constraint_error_message = tuple.constraint_error_message;
-            fi;
-
-            if tuple.elements.expressions.count == 1 then
-                tuple.value = tuple.elements.expressions[0].value;
-                return;
-            elif tuple.elements.expressions.count == 0 then
-                tuple.value = IR.Values.DUMMY(Semantic.Types.ERROR(), tuple.location);
-
-                _logger.error(tuple.location, "empty tuple");
-                return;
-            fi
-
-            let seen_any_named mut = false;
-
-            for (index, v) in tuple.elements | .index() do
-                let element_type_constraint =
-                    if element_constraints? then
-                        element_constraints[index];
-                    else
-                        null;
-                    fi;
-
-                if isa Trees.Expressions.TUPLE_ELEMENT(v) then
-                    let element = v;
-
-                    seen_any_named = true;
-                    names!.add(element.name.name);
-
-                    if element.initializer? then
-                        if Value.check_is_consumable(_logger, element.initializer.location, element.initializer.value) then
-                            if element.type_expression? /\ element.type_expression.type? then
-                                let type =
-                                    if element_type_constraint? then
-                                        element_type_constraint
-                                    else
-                                        element.type_expression.type
-                                    fi;
-
-                                if element.type_expression.check_is_not_reference(_logger, "tuple element cannot be a reference") then
-                                    if !type!.is_assignable_from(element.initializer.value.type) then
-                                        _logger.error(element.location, "{element.initializer.value.type} is not assignable to {type}");
-                                    elif element_type_constraint? /\ !element_type_constraint.is_assignable_from(element.type_expression.type) then
-                                        _logger.error(
-                                            element.type_expression.location,
-                                            string.format(constraint_error_message, [element.type_expression.type, element_type_constraint]:object));
-                                    fi
-                                fi
-
-                                types.add(type);
-                                values.add(_value_boxer.box_if_needed(element.initializer.value, type));
-
-                            elif element_type_constraint? then
-                                let type = element_type_constraint;
-
-                                if !type.is_assignable_from(element.initializer.value.type) then
-                                    _logger.error(
-                                        element.location,
-                                        string.format(constraint_error_message, [element.initializer.value.type, type]:object));
-                                fi
-
-                                types.add(type);
-                                values.add(_value_boxer.box_if_needed(element.initializer.value, type));
-                            else
-                                types.add(element.initializer.value.type);
-                                values.add(element.initializer.value);
-                            fi
-
-                            continue;
-                        fi
-                    else
-                        _logger.error(element.location, "tuple element must have a value");
-                    fi  
-
-                    values.add(IR.Values.DUMMY(Semantic.Types.ERROR(), element.location));
-                    types.add(Semantic.Types.ERROR());
-
-                elif Value.check_is_consumable(_logger, v.location, v.value) then
-                    names!.add("`{index}");
-
-                    if element_type_constraint? then
-                        let type = element_type_constraint;
-
-                        if !type.is_assignable_from(v.value.type) then
-                            _logger.error(
-                                v.location,
-                                string.format(constraint_error_message, [v.value.type, type]:object));
-                        fi
-
-                        types.add(type);
-                        values.add(_value_boxer.box_if_needed(v.value, type));
-                    else
-                        types.add(v.value.type);
-                        values.add(v.value);
-                    fi
-                else
-                    values.add(IR.Values.DUMMY(Semantic.Types.ERROR(), v.location));
-                    types.add(Semantic.Types.ERROR());
-                fi
-
-                debug_unindent();
-            od
-
-            if !seen_any_named then
-                names = null;
-            fi
-
-            let type = _innate_symbol_lookup.get_tuple_type(types, names);
-            tuple.value = TUPLE(type, values);
+            _tuples.visit_tuple(tuple);
         si
 
         pre(sequence: Trees.Expressions.SEQUENCE) -> bool is
@@ -2207,7 +1022,7 @@ namespace Syntax.Process is
 
                 sequence.elements.walk(self);
 
-                _visit(sequence);
+                _tuples.visit_sequence(sequence);
 
                 _logger.commit();
             catch e: Exception
@@ -2217,179 +1032,6 @@ namespace Syntax.Process is
                 _logger.exception(sequence.location, e, "exception compiling call");
             yrt
         si
-
-        _visit(sequence: Trees.Expressions.SEQUENCE) is
-            let type: Type mut = default;
-            let have_explicit_type: bool mut = default;
-
-            let elements = Collections.LIST[Trees.Expressions.Expression](sequence.elements);
-
-            let constraint_type: Type mut = default;
-            if sequence.constraint? then
-                constraint_type = sequence.constraint.get_element_type();
-            fi
-
-            if sequence.type_expression? /\ !isa Trees.TypeExpressions.INFER(sequence.type_expression) then
-                if sequence.type_expression.type? then
-                    type = sequence.type_expression.type;
-
-                    have_explicit_type = true;
-                else
-                    // FIXME probably not needed - type pass will have given an error
-                    _logger.error(sequence.type_expression.location, "bad explicit type expression");
-                    return;
-                fi
-            elif elements.count == 0 then
-                if constraint_type? then
-                    type = constraint_type;
-                    have_explicit_type = true;
-                else
-                    _logger.error(sequence.location, "cannot infer type of list literal with no elements");
-
-                    return;
-                fi
-            else
-                let seen_any mut = false;
-                let seen_error mut = false;
-                let all_tuple_literals mut = elements.count > 0; // assume all tuples until proved otherwise
-                let tuples_element_count mut = -1;
-                let lub = LEAST_UPPER_BOUND_MAP();
-
-                for v in elements do
-                    if !v.is_tuple_literal then
-                        all_tuple_literals = false;
-                    fi
-
-                    if v.value? /\ v.value.type? then
-                        if v.value.check_is_consumable(_logger, v.location) then
-                            if !v.value.type.is_null then
-                                seen_any = true;
-                                lub.add(v.value.type);
-                            elif v.value.type.is_error then
-                                seen_error = true;
-                            else
-                                _logger.warn(v.location, "is null {v.value.type.is_null}");
-                            fi
-
-                            if v.is_tuple_literal then
-                                if tuples_element_count == -1 then
-                                    tuples_element_count = v.value.type.arguments.count;
-                                elif v.value.type.arguments.count != tuples_element_count then
-                                    all_tuple_literals = false;
-                                fi
-                            fi
-                        else
-                            seen_error = true;
-                        fi
-                    else
-                        seen_error = true;
-                    fi
-                od
-
-                if !type? then
-                    type = lub.get_result();
-
-                    // FIXME factor this out - it's duplicated between here and if branches
-                    if all_tuple_literals /\ (!type? \/ !type.is_value_tuple) then
-                        let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
-    
-                        for element in elements do
-                            if !element.value? \/ !element.value.type? then
-                                continue;
-                            fi
-    
-                            for (index, e) in element.value.type.arguments | .index() do
-                                if index >= lubs.count then
-                                    lubs.add(LEAST_UPPER_BOUND_MAP());
-                                fi
-    
-                                lubs[index].add(e);
-                            od
-                        od
-   
-                        type = 
-                            _innate_symbol_lookup.get_tuple_type(
-                                lubs |
-                                    .map(l => 
-                                        let r: Type = l.get_result() in if r? then r else _innate_symbol_lookup.get_object_type() fi) 
-                                    .collect(),
-                                lub.element_names
-                            );
-
-                        // going to walk the elements again, so roll back
-                        // and re-speculate to avoid duplicate / misleading
-                        // error messages
-                        _logger.roll_back();
-                        _logger.speculate();
-
-                        // re-walk the type expression if present, to avoid
-                        // hiding any error message it may generate
-
-                        if sequence.type_expression? then
-                            sequence.type_expression.walk(self);
-                        fi
-
-                        for e in sequence.elements do
-                            e.set_constraint(type, "element type {{0}} not compatible with inferred list type {{1}}");
-                            e.walk(self);
-                        od
-                    fi
-                fi
-
-                // Reconcile bottom-up LUB with any constraint pushed
-                // by the parent context. Prefer the more-specific
-                // bottom-up type when it satisfies the constraint —
-                // that preserves the runtime allocation precision the
-                // covariance idiom relies on (e.g. `let ao: object[]
-                // = ["a", "b"];` should produce a string[] at run
-                // time, even though the variable is declared
-                // object[]). When the LUB doesn't satisfy the
-                // constraint, fall back to the constraint's element
-                // type and drive per-element mismatch errors via the
-                // post-walk assignability check.
-                if constraint_type? then
-                    if !type? \/ !constraint_type.is_assignable_from(type) then
-                        type = constraint_type;
-                        have_explicit_type = true;
-                    fi
-                fi
-
-                if !type? then
-                    if seen_error then
-                        sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
-                        return;
-                    elif seen_any then
-                        _logger.hint(sequence.location, "specify explicit list literal type to avoid infering object type here");
-                        type = _innate_symbol_lookup.get_object_type();
-                    else
-                        _logger.error(sequence.location, "cannot infer type of list literal with only null elements");
-
-                        sequence.value = DUMMY(_innate_symbol_lookup.get_array_type(Semantic.Types.ERROR()), sequence.location);
-                        return;
-                    fi
-                fi
-            fi
-
-            let values = Collections.LIST[Value](sequence.elements.expressions.count);
-            
-            for v in sequence.elements do
-                if v.value? /\ v.value.type? then
-                    let u = v.value.type;
-
-                    // FIXME should push explicit type into element as constraint and retry
-                    if have_explicit_type /\ !type.is_assignable_from(v.value.type) then
-                        _logger.error(v.location, "element not compatible with explicit type");
-                    fi
-
-                    values.add(v.value);
-                else
-                    values.add(DUMMY(Semantic.Types.ERROR(), v.location));
-                fi
-            od
-                        
-            sequence.value = 
-                SEQUENCE(_innate_symbol_lookup.get_array_type(type), type, values);
-        si        
 
         visit(`self: Trees.Expressions.SELF) is
             let s = current_instance_context;
@@ -2557,632 +1199,27 @@ namespace Syntax.Process is
         si
 
         visit(`new: Trees.Expressions.NEW) is
-            // TODO call resolve_constructor() instead
-
-            `new.value = null;
-
-            let type: Type mut;
-
-            if `new.type_expression? then
-                type = `new.type_expression.type;
-
-                if type == null then
-                    _logger.poison(`new.type_expression.location, "has no type");
-                    `new.value = DUMMY(Semantic.Types.ERROR(), `new.location);
-                    return;
-                fi
-            elif `new.constraint? then
-                // `new(args)` form: no explicit type, take the type
-                // from the parent context's constraint (LHS of an
-                // assignment / typed initializer / call arg whose
-                // formal type is known).
-                type = `new.constraint;
-            else
-                _logger.error(`new.location, "cannot infer type for `new`");
-                `new.value = DUMMY(Semantic.Types.ERROR(), `new.location);
-                return;
-            fi
-
-            if !isa Semantic.Types.NAMED(type) then
-                if `new.type_expression? then
-                    _logger.error(`new.type_expression.location, "cannot instantiate this: {type}");
-                else
-                    _logger.error(`new.location, "cannot instantiate inferred type: {type}");
-                fi
-                `new.value = DUMMY(Semantic.Types.ERROR(), `new.location);
-                return;
-            fi
-
-            if `new.type_expression? then
-                `new.type_expression.check_is_not_void(_logger, "cannot use void type here");
-            fi
-
-            let named_type = type;
-            let type_symbol mut = named_type.symbol;
-
-            let symbol = named_type.scope.find_direct("init");
-
-            let function_group = cast Semantic.Symbols.FUNCTION_GROUP(symbol);
-
-            let arguments = Collections.LIST[Value]();
-            let argument_types = Collections.LIST[Type]();
-
-            for a in `new.arguments do
-                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                    arguments.add(a.value);
-                    argument_types.add(a.value.type);
-                else
-                    let t = Semantic.Types.ERROR();
-
-                    if a? then
-                        arguments.add(DUMMY(t, a.location));
-                    else
-                        arguments.add(DUMMY(t, `new.arguments.location));
-                    fi
-                    
-                    argument_types.add(t);
-                fi
-            od
-
-            if !function_group? then
-                `new.value =
-                    DUMMY(
-                        type,
-                        `new.location
-                    );
-
-                _logger.error(`new.location, "no constructor found init({argument_types|})");                
-
-                return;
-            fi
-
-            let overload_result = _overload_resolver.resolve(`new.location, function_group, argument_types, false, true, true);
-
-            if overload_result == null then
-                `new.value =
-                    DUMMY(
-                        type,
-                        `new.location
-                    );
-    
-                return;
-            fi
-
-            let function mut = overload_result!.function;
-
-            function = _owner_constraint_specializer.specialize_from_constraint(`new.location, function, `new.constraint);
-
-            if isa Semantic.Symbols.GENERIC(function.owner) then
-                type_symbol = cast Semantic.Symbols.Symbol(function.owner);
-                type = function.owner.type;
-            fi;
-
-            let is_directly_owned mut = false;
-
-            if isa Semantic.Symbols.GENERIC(type_symbol) /\ isa Semantic.Symbols.Symbol(function.owner) then
-                is_directly_owned = type_symbol =~ cast Semantic.Symbols.Symbol(function.owner);
-            else
-                is_directly_owned = type_symbol == function.owner;
-            fi
-
-            if !is_directly_owned then
-                _logger.error(`new.location, "cannot call superclass constructor {function}");
-            fi
-
-            if `new.type_expression? then
-                _symbol_use_locations.add_symbol_use(`new.type_expression.right_location, function);
-                _symbol_use_locations.add_symbol_use(`new.type_expression.right_location, type_symbol.root_unspecialized_symbol);
-            fi
-
-            `new.value =
-                NEW(
-                    type,
-                    function,
-                    arguments
-                );
-        si
-
-        // Sibling-arg specialisation entry: produce the phantom-
-        // origin list for unbound slots from the per-AST cache, then
-        // delegate to `OWNER_TYPE_ARG_SPECIALIZER` for the binding
-        // and specialisation logic. Phantom origins live on the
-        // visitor so back-feed across body-retry iterations lands on
-        // the same Variables; the specialiser itself is stateless,
-        // which lets the binding contract be unit-tested in
-        // isolation.
-        _specialise_candidate_from_concrete_siblings(
-            candidate: Semantic.Symbols.Function,
-            argument_types: Collections.List[Semantic.Types.Type],
-            cache_key: Trees.Node,
-            location: LOCATION
-        ) -> Semantic.Symbols.Function? is
-            if !candidate? \/ !cache_key? then
-                return candidate;
-            fi
-
-            if isa Semantic.Symbols.GENERIC(candidate.owner) then
-                return candidate;
-            fi
-
-            let owner_classy = cast Semantic.Symbols.Classy(candidate.owner);
-
-            if !owner_classy? \/ !owner_classy.is_generic then
-                return candidate;
-            fi
-
-            let origins = _type_arg_placeholder_registry.get_or_create(cache_key, location, owner_classy);
-
-            return _owner_type_arg_specializer.specialize_from_concrete_siblings(candidate, argument_types, origins, location);
-        si
-
-        // Find the single arity- and instance-matching candidate in a
-        // function group, or null if there are zero or multiple. Used
-        // by `_visit(call)`'s constraint-push retry: when the first
-        // overload resolution fails, having exactly one candidate to
-        // push formal arg types from disambiguates the constraint
-        // direction. Multi-candidate disambiguation under constraint
-        // push is bigger work tracked under #1174.
-        _try_find_single_arity_candidate(
-            group: Semantic.Symbols.FUNCTION_GROUP,
-            arg_count: int,
-            want_instance: bool
-        ) -> Semantic.Symbols.Function? is
-            let result: Semantic.Symbols.Function mut = default;
-            let count mut = 0;
-
-            for f in group.functions do
-                if !want_instance /\ f.is_instance then
-                    continue;
-                fi
-
-                if !f.arguments? then
-                    continue;
-                fi
-
-                if f.arguments.count != arg_count then
-                    continue;
-                fi
-
-                result = f;
-                count = count + 1;
-            od
-
-            if count == 1 then
-                return result;
-            fi
-
-            return null;
-        si
-
-        // should be called with logger speculating
-        resolve_constructor(
-            location: LOCATION,
-            right_location: LOCATION,
-            type: Semantic.Types.Type mut,
-            argument_expressions: Trees.Expressions.LIST,
-            constraint: Semantic.Types.Type,
-            cache_key: Trees.Node
-        ) -> (Value, Value) is
-            let result: Value;
-
-            // An explicit `Foo[...]` callee enters already specialized
-            // and was constraint-checked by `specialize_type`; an
-            // inferred `Foo(...)` callee is specialized below by
-            // overload resolution and is checked post-resolution.
-            let was_generic_on_entry = isa Semantic.Types.GENERIC(type);
-
-            let named_type = cast Semantic.Types.NAMED(type);
-            let type_symbol mut = named_type.symbol;
-
-            let symbol = named_type.scope.find_direct("init");
-
-            let function_group = cast Semantic.Symbols.FUNCTION_GROUP(symbol);
-
-            let arguments = Collections.LIST[Value]();
-            let argument_types = Collections.LIST[Type]();
-
-            for a in argument_expressions do
-                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                    arguments.add(a.value);
-                    argument_types.add(a.value.type);
-                else
-                    let t = Semantic.Types.ERROR();
-
-                    if a? then
-                        arguments.add(DUMMY(t, a.location));
-                    else
-                        arguments.add(DUMMY(t, argument_expressions.location));
-                    fi
-                    
-                    argument_types.add(t);
-                fi
-            od
-
-            if !function_group? then
-                _logger.error(location, "no constructor found init({argument_types|})");                
-
-                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
-            fi
-
-            let overload_result mut = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
-
-            // Sibling-arg fall-back: first resolve returned null AND
-            // there's at least one FUNCTION-literal arg in the call.
-            // The lambda's body walked under no parameter-type
-            // constraint and likely errored, leaving an actual type
-            // that doesn't reflect the real signature; binding fails;
-            // resolver returns null. Try tentatively binding the
-            // candidate's owner-generic args from the *resolvable*
-            // sibling actuals (skipping the failing lambda), fill the
-            // remaining slots with cached phantoms, then push the
-            // substituted formals as constraints to each arg and
-            // re-walk. The second resolve sees the lambda's now-
-            // resolved actual type and binds T from it.
-            //
-            // The lambda guard matters: if no arg is a lambda, the
-            // original null result reflects a genuine type mismatch
-            // (e.g. `Pair([1,2,3], LIST[int]([4,5,6]))` — int[] and
-            // LIST[int] don't unify for T) and the user-facing
-            // diagnostic is correct as-is.
-            if overload_result == null /\ argument_types | .any(a => a? /\ a.is_function_with_any_implicit_argument_types) then
-                let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, true);
-
-                if candidate? then
-                    let specialized_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, cache_key, location);
-
-                    if specialized_candidate? /\ specialized_candidate != candidate then
-                        _logger.roll_back();
-                        _logger.speculate();
-
-                        for (index, a) in argument_expressions | .index() do
-                            if !a? then
-                                continue;
-                            fi
-
-                            let f = specialized_candidate.arguments[index];
-
-                            if f? then
-                                a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                            fi
-
-                            a.walk(self);
-
-                            if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                                arguments[index] = a.value;
-                                argument_types[index] = a.value.type;
-                            else
-                                let t = Semantic.Types.ERROR();
-                                arguments[index] = DUMMY(t, a.location);
-                                argument_types[index] = t;
-                            fi
-                        od
-
-                        overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
-                    fi
-                fi
-            fi
-
-            if overload_result == null then
-                return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
-            fi
-
-            if overload_result!.score == Semantic.Types.MATCH.PARTIAL then
-                _logger.roll_back();
-                _logger.speculate();
-
-                for (index, a) in argument_expressions | .index() do
-                    // let use debug_despose = debug_enter();
-                    if !a? then
-                        continue;
-                    elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                        let f = overload_result!.function.arguments[index];
-
-                        a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                        a.walk(self);
-
-                        argument_types[index] = a.value.type;
-                    else
-                        // ensure any error messages are committed
-                        a.walk(self);
-                    fi
-
-                    arguments[index] = a.value;
-                od
-
-                overload_result = _overload_resolver.resolve(location, function_group, argument_types, false, true, true);
-
-                if !overload_result? then
-                    return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
-                fi
-            fi
-
-            let function mut = overload_result!.function;
-
-            function = _owner_constraint_specializer.specialize_from_constraint(location, function, constraint);
-            function = _type_arg_placeholder_registry.specialize_with_placeholders(location, function, cache_key);
-
-            if isa Semantic.Symbols.GENERIC(function.owner) then
-                type_symbol = cast Semantic.Symbols.Symbol(function.owner);
-                type = function.owner.type;
-            fi;
-
-            let is_directly_owned mut = false;
-
-            if isa Semantic.Symbols.GENERIC(type_symbol) /\ isa Semantic.Symbols.Symbol(function.owner) then
-                is_directly_owned = type_symbol =~ cast Semantic.Symbols.Symbol(function.owner);
-            else
-                is_directly_owned = type_symbol == function.owner;
-            fi
-
-            if !is_directly_owned then
-                _logger.error(location, "cannot call superclass constructor {function}");
-            fi
-
-            _symbol_use_locations.add_symbol_use(right_location, function);
-            _symbol_use_locations.add_symbol_use(right_location, type_symbol.root_unspecialized_symbol);
-
-            if !was_generic_on_entry then
-                if let constructed: Semantic.Types.GENERIC = type then
-                    if let generic_symbol: Semantic.Symbols.GENERIC = constructed.symbol then
-                        if let classy: Semantic.Symbols.Classy = generic_symbol.symbol then
-                            classy.check_argument_constraints(location, _logger, constructed.arguments);
-                        fi
-                    fi
-                fi
-            fi
-
-            return (cast Value(Load.SYMBOL(null, function_group)), cast Value(NEW(type, function, arguments)));
+            _calls.visit_new(`new);
         si
 
         visit(unary: Trees.Expressions.UNARY) is
-            unary.value = null;
-
-            if unary.right.value? then
-                let arguments = Collections.LIST[Type]([unary.right.value.type]);
-
-                // TODO do we need to search members and globals like we do with binary operators
-                // or if not, can we simplify the binary operator function search to match this?
-
-                let function_group = find(unary.operation);
-
-                if function_group == null \/ !isa Semantic.Symbols.FUNCTION_GROUP(function_group) then
-                    _logger.error(unary.operation.location, "no unary operator {unary.operation} found");
-
-                    unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
-                    return;
-                fi
-
-                let overload_result =
-                    _overload_resolver.resolve(
-                        unary.location,
-                        function_group,
-                        arguments,
-                        false,
-                        unary.right.value.is_consumable, // FIXME: this doesn't seem right
-                        false
-                    );
-
-                if overload_result == null then
-                    unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
-                    return;
-                fi
-
-                let function = overload_result!.function;
-
-                if function.is_unsafe_constraints then
-                    _logger.warn(unary.location, "call to {function} has unchecked constraints");
-                fi
-
-                _symbol_use_locations.add_symbol_use(unary.operation.location, function);
-
-                let value = function.call(unary.location, null, Collections.LIST[Value]([unary.right.value]), null, _function_caller);
-
-                unary.value = value;
-            fi
-        si        
-
-        pre(binary: Trees.Expressions.BINARY) -> bool is
-            // For `/\` / `\/`, walk the operands with the narrowing
-            // environment threaded so within-condition narrowing
-            // applies as the right operand compiles: in
-            // `isa T(x) /\ x.foo`, `x.foo` sees `x` as `T`. The
-            // `/\` right walks under the left's true edge, the `\/`
-            // right under its false edge. The BINARY as a whole
-            // leaves the ambient environment unchanged — the
-            // enclosing IF derives the overall narrowing from
-            // analyze_condition once the condition is fully walked.
-            if binary.operation? /\ binary.left? /\ binary.right? then
-                let op = binary.operation.name;
-
-                if op =~ "/\\" \/ op =~ "\\/" then
-                    let saved = _flow.current_env.copy();
-
-                    binary.left.walk(self);
-
-                    let left_facts = _condition_analyzer.analyze_condition(binary.left, saved);
-
-                    _flow.set_env(
-                        if op =~ "/\\" then left_facts.then_env else left_facts.else_env fi
-                    );
-
-                    binary.right.walk(self);
-
-                    _flow.set_env(saved);
-
-                    return true;
-                fi
-            fi
-
-            return false;
+            _operators.visit_unary(unary);
         si
+
+        pre(binary: Trees.Expressions.BINARY) -> bool =>
+            _operators.pre_binary(binary);
 
         visit(binary: Trees.Expressions.BINARY) is
             try
-                _visit(binary);
+                _operators.visit_binary(binary);
             catch ex: Exception
                 _logger.exception(binary.location, ex, "exception compiling binary operator (called from {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")})");
             yrt
         si
 
-        _visit(binary: Trees.Expressions.BINARY) is
-            binary.value = null;
-
-            if !binary.left? \/ !binary.left.value? \/ !binary.right? \/ !binary.right.value? then
-                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
-                return;
-            fi
-
-            let left_is_consumable = binary.left.value.check_is_consumable(_logger, binary.left.location);
-            let right_is_consumable = binary.right.value.check_is_consumable(_logger, binary.right.location);
-            
-            let binary_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
-            let binary_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
-            let binary_errors: Logging.DIAGNOSTICS_STATE mut = default;
-
-            let binary_name = binary.operation.name.to_string();
-
-            let binary_function_symbol = find(binary.operation.name);
-
-            if binary_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(binary_function_symbol) then
-                binary_function_group = binary_function_symbol;
-
-                let use logger_snapshot = _logger.speculate_then_backtrack();
-
-                binary_overload_result =
-                    _overload_resolver
-                        .resolve(
-                            binary.location,
-                            binary_function_group,
-                            Collections.LIST[Type]([binary.left.value.type, binary.right.value.type]),
-                            false,
-                            _symbol_table.current_instance_context?,
-                            false
-                        );
-                        
-                binary_errors = logger_snapshot.backtrack();
-            fi
-
-            let member_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
-            let member_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
-            let member_errors: Logging.DIAGNOSTICS_STATE mut = default;
-
-            if binary.left.value.type? then
-                let member_function_symbol = 
-                    binary.left.value.type.find_member(binary.operation.name);
-
-                if member_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(member_function_symbol) then
-                    member_function_group = member_function_symbol;
-    
-                    let use logger_snapshot = _logger.speculate_then_backtrack();
-
-                    member_overload_result = 
-                        _overload_resolver
-                            .resolve(
-                                binary.location,
-                                cast Semantic.Symbols.FUNCTION_GROUP(member_function_group),
-                                Collections.LIST[Type]([binary.right.value.type]),
-                                false,
-                                binary.left.value.is_consumable,
-                                false
-                            );
-
-                    member_errors = logger_snapshot.backtrack();
-                fi
-            fi
-
-            let function: Semantic.Symbols.Function mut = default;
-
-            if member_overload_result? /\ binary_overload_result? then
-                if cast int(member_overload_result.score) <= cast int(binary_overload_result.score) then
-                    function = member_overload_result.function;
-                else
-                    function = binary_overload_result.function;
-                fi              
-            elif member_overload_result? then
-                function = member_overload_result.function;
-            elif binary_overload_result? then
-                function = binary_overload_result.function;
-            fi
-        
-            if function? then
-                _symbol_use_locations.add_symbol_use(binary.operation.location, function);
-
-                let force_type: Type mut = default;
-                let want_not mut = false;
-
-                if binary.operation.name =~ "<>" then
-                    if function.return_type !~ _innate_symbol_lookup.get_int_type() then
-                        // FIXME: do this check on the definition:
-                        _logger.error(binary.location, "<> order operator must return int");
-                    fi
-
-                    force_type = _innate_symbol_lookup.get_bool_type();
-                elif binary.operation.name =~ "==" then
-                    if 
-                        left_is_consumable /\ right_is_consumable /\
-                        cast int(binary.left.value.type.compare(binary.right.value.type)) > cast int(Semantic.Types.MATCH.ASSIGNABLE) /\
-                        cast int(binary.right.value.type.compare(binary.left.value.type)) > cast int(Semantic.Types.MATCH.ASSIGNABLE) 
-                    then
-                        if binary.actual_operation =~ "==" then
-                            _logger.error(binary.location, "== cannot be applied to values of non-assignable types");
-                        else
-                            _logger.error(binary.location, "!= cannot be applied to values of non-assignable types");
-                        fi
-                    fi
-                elif !function.is_innate /\ binary.actual_operation =~ "!~" then
-                    want_not = true;
-                fi
-
-                let value: Value mut;
-
-                if function.is_unsafe_constraints then
-                    _logger.warn(binary.location, "call to {function} has unchecked constraints");
-                fi
-                
-                if function.is_instance then
-                    value = function.call(binary.location, binary.left.value, Collections.LIST[Value]([binary.right.value]), force_type,_function_caller);
-                else
-                    value = function.call(binary.location, null, Collections.LIST[Value]([binary.left.value, binary.right.value]), force_type,_function_caller);
-
-                    if isa Call.INNATE(value) then
-                        let innate_value = value;
-
-                        innate_value.actual_operation = binary.actual_operation;
-
-                        value = innate_value.lower();
-                    fi
-                fi
-
-                if !function.is_innate /\ binary.operation.name =~ "<>" then
-                    value = COMPARE_ORDER_TO_ZERO(value, binary.actual_operation, _innate_symbol_lookup.get_bool_type());
-                fi
-
-                if want_not then
-                    value = NOT(value);
-                fi
-                
-                binary.value = value;
-            else
-                if binary_errors? /\ binary_errors.count > 0 then
-                    _logger.merge(binary_errors);
-                fi
-
-                if member_errors? /\ member_errors.count > 0 then
-                    _logger.merge(member_errors);
-                fi
-
-                if (!binary_errors? \/ binary_errors.count == 0) /\ (!member_errors? \/ member_errors.count == 0) then
-                    _logger.error(binary.operation.location, "operator {binary.left.value.type} {binary.operation} {binary.right.value.type} not found");
-                fi
-
-                // FIXME QQ should probably do this
-                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
-            fi
-        si
-
         visit(index: Trees.Expressions.INDEX) is
             try
-                _visit(index);
+                _operators.visit_index(index);
             catch e: Exception
                 index.value = null;
 
@@ -3190,535 +1227,22 @@ namespace Syntax.Process is
             yrt
         si
 
-        _visit(index: Trees.Expressions.INDEX) is
-            let need_store = index.value? /\ index.value.is_need_store;
-
-            if index.left.value? /\ index.index.value? then
-                let type = index.left.value.type;
-
-                if type == null \/ type.is_error then
-                    _logger.poison(index.left.location, "index left has no type");
-
-                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
-                    return;
-                fi
-
-                // Indexable inference: an `INFERRED_VARIABLE_TYPE`
-                // receiver records an INDEX_CONSTRAINT carrying the
-                // index expression's type, so the body-retry loop
-                // can filter candidates to indexable types. Skip
-                // the "cannot index" hard error path on placeholder
-                // — the existing speculate/roll-back would discard
-                // it on retry but emitting it is noise; soft-error
-                // out to DUMMY(ERROR) instead.
-                if
-                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) /\
-                    index.index? /\
-                    index.index.value? /\
-                    index.index.value.type?
-                then
-                    let placeholder = type;
-                    let constraint = Semantic.INDEX_CONSTRAINT(index.index.value.type);
-
-                    if placeholder.origin.add_constraint(constraint) then
-                        _logger.mark_consumed_any();
-                    fi
-
-                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
-                    return;
-                fi
-
-                if !isa Semantic.Types.NAMED(type) then
-                    _logger.error(index.left.location, "cannot index {type}");
-
-                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
-                    return;
-                fi
-
-                let named_type = type;
-
-                let function_name: string mut;
-                let arguments: Collections.LIST[Value] mut;
-                let argument_types: Collections.LIST[Type] mut;
-
-                if need_store then
-                    function_name = "set_Item";
-
-                    let need_store_value = cast Need.STORE(index.value).value;
-
-                    arguments = Collections.LIST[Value]([index.index.value, need_store_value]);
-                    argument_types = Collections.LIST[Type]([index.index.value.type, need_store_value.type]);
-                else
-                    function_name = "get_Item";
-                    arguments = Collections.LIST[Value]([index.index.value]);
-                    argument_types = Collections.LIST[Type]([index.index.value.type]);
-                fi
-
-                let symbol = named_type.scope.find_member(function_name);
-
-                if symbol == null then
-                    if need_store then
-                        if named_type.scope.find_member("get_Item")? then
-                            _logger.error(index.location, "indexer is read-only in {type}");
-                        else
-                            _logger.error(index.location, "no indexer found in {type}");
-                        fi
-                    else
-                        _logger.error(index.location, "no indexer found in {type}");
-                    fi
-                    
-                    if isa Semantic.Symbols.GENERIC(named_type.scope) then
-                        let g = cast Semantic.Symbols.GENERIC(named_type.scope);
-                    fi
-                    
-                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
-                    return;
-                fi
-
-                if !isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
-                    _logger.poison(index.index.location, "indexer is not a function group: {symbol}");
-                fi
-
-                let overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut;
-
-                let use logger_snapshot = _logger.speculate_then_backtrack();
-
-                overload_result =
-                    _overload_resolver.resolve(
-                        index.location,
-                        cast Semantic.Symbols.FUNCTION_GROUP(symbol),
-                        argument_types,
-                        false,
-                        true,
-                        false
-                    );
-
-                logger_snapshot.backtrack();
-
-                if overload_result == null then
-                    if need_store then
-                        _logger.error(index.location, "indexer [{argument_types[0]}] = {argument_types[1]} not found in {type}");
-                    else
-                        _logger.error(index.location, "indexer [{argument_types[0]}] not found in {type}");
-                    fi
-
-                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
-                    return;
-                fi
-
-                let function = overload_result.function;
-
-                _symbol_use_locations.add_symbol_use(
-                    LOCATION(
-                        index.left.location.file_name,
-                        index.left.location.end_line,
-                        index.left.location.end_column+1,
-                        index.index.location.start_line,
-                        index.index.location.end_column-1
-                    ), function);
-
-                if function.is_unsafe_constraints then
-                    _logger.warn(index.location, "call to {function} has unchecked constraints");
-                fi
-    
-                if need_store then
-                    index.value = 
-                    TYPE_WRAPPER(
-                        function.arguments[1],
-                        function.call(index.location, index.left.value, arguments, null, _function_caller));
-                else
-                    index.value = function.call(index.location, index.left.value, arguments, null, _function_caller);
-                fi
-            fi
-        si
-
         visit(member: Trees.Expressions.MEMBER) is
-            let need_store = member.value? /\ isa Need.STORE(member.value);
-            let need_deref mut = false;
-            
-            if member.identifier == null then
-                member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                return;
-            fi
-
-            if member.left? /\ member.left.value? then
-                let type mut = member.left.value.type;
-
-                if type == null then
-                    _logger.poison(member.left.location, "member left has no type");
-
-                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                    return;
-                fi
-
-                _check_possible_null_dereference(member.left);
-
-                // TODO we could loop here to handle multiple levels of dereferencing
-                if type.is_ref then
-                    need_deref = true;
-                    type = type.get_element_type();
-
-                    member.left.value = DEREF(member.left.value, type);
-                fi
-
-                // Operation-constraint inference: when the receiver
-                // is an INFERRED_VARIABLE_TYPE placeholder, record a
-                // MEMBER_CONSTRAINT on the placeholder's origin so
-                // the constraint-aware LUB can later filter candidate
-                // types to those that actually expose this member.
-                // mark_consumed_any drives the retry loop to re-walk
-                // the body with the resolved type (if any).
-                if isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) then
-                    let placeholder = type;
-
-                    if placeholder.origin.add_constraint(Semantic.MEMBER_CONSTRAINT(member.identifier.name)) then
-                        _logger.mark_consumed_any();
-                    fi
-
-                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                    return;
-                fi
-
-                if !isa Semantic.Types.NAMED(type) then
-                    if !isa Semantic.Types.ERROR(type) /\ !type.is_inferred then
-                        // Suppress for ERROR (existing — error already
-                        // reported, the contract says don't pile on)
-                        // and for is_inferred placeholders (deferred-
-                        // inference: the lambda's arg type is awaiting
-                        // the call-site second-pass to fill it in,
-                        // and emitting a fatal "type has no members"
-                        // here breaks that flow). Both share the
-                        // intent of "don't surface a member-resolution
-                        // failure on a stand-in type".
-                        _logger.poison(member.left.location, "type has no members: {type}");
-                    fi
-
-                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                    return;
-                fi
-
-                let named_type = type;
-
-                if named_type.scope == null then
-                    _logger.poison(member.left.location, "member left type has no type: {type}");
-
-                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                    return;
-                fi
-
-                let symbol = named_type.scope.find_member(member.identifier.name);
-
-                if !symbol? then
-                    let hint = try_describe_intersection_miss(named_type, member.identifier.name);
-
-                    if hint? then
-                        _logger.error(member.identifier.location, hint);
-                    else
-                        _logger.error(member.identifier.location, "member {member.identifier.name} not found in {named_type}");
-                    fi
-
-                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
-                    return;
-                fi
-
-                _symbol_use_locations.add_symbol_use(member.identifier.right_location, symbol);
-
-                if symbol.is_instance /\ !member.left.value.is_consumable then
-                    _logger.error(member.identifier.location, "cannot access instance member {member.identifier.name} in {named_type}");                    
-                fi
-
-                _symbol_loader.find_symbol = 
-                    (name: string) is
-                        let result = named_type.scope.find_member(name);
-
-                        return result;
-                    si;
-
-                let value: Value mut = default;
-
-                if need_store then
-                    let store_value = cast Need.STORE(member.value).value;
-
-                    if check_store_access(member.location, member.left.value, symbol, named_type) then
-                        value = symbol.store(member.location, member.left.value, store_value, _symbol_loader, false);
-                    fi
-                else
-                    if check_load_access(member.location, member.left.value, symbol, named_type) then
-                        value = symbol.load(member.location, member.left.value, _symbol_loader);
-                    fi
-                fi
-
-                member.value = value;
-
-                if !need_store /\ _condition_analyzer.is_variant_accessor_name(member.identifier.name) then
-                    if is_statically_false_is_accessor(named_type, member.identifier.name) then
-                        _logger.warn(
-                            member.location,
-                            "predicate {member.identifier.name} is always false: receiver narrowed to {named_type}"
-                        );
-                    fi
-                fi
-            fi
-        si
-
-        check_load_access(location: LOCATION, from: Value, symbol: Semantic.Symbols.Symbol, type: Type) -> bool is
-            if symbol.is_public_readable then
-                return true;
-            fi
-
-            if from? /\ from.is_self then
-                return true;
-            fi
-
-            let instance_context = _symbol_table.current_instance_context;
-
-            if instance_context? /\ instance_context.type.is_assignable_from(type) then
-                return true;
-            fi
-
-            _logger.error(location, "{symbol} is not publicly readable");
-
-            return false;            
-        si        
-
-        check_store_access(location: LOCATION, from: Value, symbol: Semantic.Symbols.Symbol, type: Type) -> bool is
-            if !symbol.is_private /\ !symbol.is_field then
-                return true;
-            fi
-
-            if from? /\ from.is_self then
-                return true;
-            fi
-
-            let instance_context = _symbol_table.current_instance_context;
-
-            if instance_context? /\ instance_context.type.is_assignable_from(type) then
-                return true;
-            fi
-
-            _logger.error(location, "{symbol} is not publicly assignable");
-
-            return false;
+            _access.visit_member(member);
         si
 
         visit(explicit_specialization: Trees.Expressions.EXPLICIT_SPECIALIZATION) is
-            if 
-                !explicit_specialization.left? \/
-                !explicit_specialization.left.value? \/
-                !explicit_specialization.left.value.type? \/
-                !explicit_specialization.left.value.type.symbol? \/
-                !explicit_specialization.types?
-            then
-                explicit_specialization.value = DUMMY(Semantic.Types.ERROR(), explicit_specialization.location);
-
-                return;
-            fi
-
-            if !explicit_specialization.left.value.has_symbol then
-                _logger.error(explicit_specialization.location, "can't explicitly specialize this");
-                return;
-            fi
-
-            let symbol mut = explicit_specialization.left.value.symbol;
-
-            symbol = 
-                symbol.try_specialize(
-                    explicit_specialization.location,
-                    _logger,
-                    explicit_specialization.types.elements | 
-                        .map(t => t.type).collect()
-                );
-
-            let from: IR.Values.Value mut = default;
-
-            if isa IR.Values.Load.SYMBOL(explicit_specialization.left.value) then
-                let load = cast IR.Values.Load.SYMBOL(explicit_specialization.left.value);
-
-                from = load.from;
-            fi
-
-            if symbol? then
-                explicit_specialization.value =
-                    IR.Values.Load.SYMBOL(from, symbol);
-            else
-                explicit_specialization.value = DUMMY(Semantic.Types.ERROR(), explicit_specialization.location);
-            fi
+            _generic_application.visit_explicit_specialization(explicit_specialization);
         si
 
-        pre(ambiguous_expression: Trees.Expressions.AMBIGUOUS_EXPRESSION) -> bool is
-            if ambiguous_expression.result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.INDEX then
-                if ambiguous_expression.value? /\ ambiguous_expression.value.is_need_store then
-                    ambiguous_expression.index.value = ambiguous_expression.value;
-                fi
-
-                ambiguous_expression.index.walk(self);
-
-                ambiguous_expression.value = ambiguous_expression.index.value;
-
-                return true;
-            fi
-
-            let arg = ambiguous_expression.type_arguments.elements[0];
-
-            arg.walk(self);
-
-            let symbol: Semantic.Symbols.Symbol mut = default;
-
-            if ambiguous_expression.left? then
-                ambiguous_expression.left.walk(self);
-
-                if ambiguous_expression.left.value? then
-                    symbol = ambiguous_expression.left.value.type.find_member(ambiguous_expression.identifier.name);
-
-                    // find member will not report an error for not found
-                    if !symbol? then
-                        _logger.error(ambiguous_expression.identifier.location, "member {ambiguous_expression.identifier.name} not found in {ambiguous_expression.left.value.type}");
-                    fi
-                fi
-            else
-                symbol = find(ambiguous_expression.identifier);
-            fi
-            
-            if !symbol? then
-                return true;
-            fi
-
-            _symbol_use_locations.add_symbol_use(ambiguous_expression.identifier.location, symbol);
-
-            let result_type: Semantic.Types.Type mut = default;
-            let result_symbol: Semantic.Symbols.Symbol mut = default;
-
-            if symbol.is_type then
-                ambiguous_expression.result = Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.TYPE;
-                result_type = 
-                    specialize_type(
-                        ambiguous_expression.location,
-                        symbol,
-                        ambiguous_expression.type_arguments
-                    );
-            elif symbol.is_function \/ symbol.is_function_group then
-                ambiguous_expression.result = Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.FUNCTION;
-                result_symbol = 
-                    specialize_symbol(
-                        ambiguous_expression.location,
-                        symbol,
-                        ambiguous_expression.type_arguments
-                    );
-            else
-                _logger.error(ambiguous_expression.location, "cannot apply type arguments here");
-                return true;
-            fi
-
-            let result = ambiguous_expression.result;
-
-            if result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.UNKNOWN then
-                // we didn't resolve what this was in the resolve type expressions phase
-                // don't report another error here, just produce a propagating error value:
-                ambiguous_expression.value = DUMMY(Semantic.Types.ERROR(), ambiguous_expression.location);
-            elif result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.INDEX then
-                // if the ambiguous expression resolved to an indexer
-                // call then walk that
-                ambiguous_expression.index.walk(self);
-
-                // our value is whatever value the index expression produced
-                ambiguous_expression.value = ambiguous_expression.index.value;
-            elif result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.TYPE then
-                ambiguous_expression.value = TYPE_EXPRESSION(result_type, ambiguous_expression.location);
-            elif result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.FUNCTION then
-                let left_value: Value? =
-                    if ambiguous_expression.left? then
-                        ambiguous_expression.left.value;
-                    else
-                        null
-                    fi;
-
-                ambiguous_expression.value = result_symbol.load(ambiguous_expression.location, left_value, _symbol_loader);
-            else 
-                assert false else "result variant is something unexpected {result}";
-            fi
-
-            return true;
-        si
+        pre(ambiguous_expression: Trees.Expressions.AMBIGUOUS_EXPRESSION) -> bool =>
+            _generic_application.pre_ambiguous_expression(ambiguous_expression);
 
         visit(ambiguous_expression: Trees.Expressions.AMBIGUOUS_EXPRESSION) is
         si
 
-        pre(generic_application: Trees.Expressions.GENERIC_APPLICATION) -> bool is
-            generic_application.type_arguments.walk(self);
-
-            let symbol: Semantic.Symbols.Symbol mut = default;
-
-            if generic_application.left? then
-                generic_application.left.walk(self);
-
-                if generic_application.left.value? then
-                    symbol = generic_application.left.value.type.find_member(generic_application.identifier.name);
-
-                    // find member will not report an error for not found
-                    if !symbol? then
-                        _logger.error(generic_application.identifier.location, "member {generic_application.identifier.name} not found in {generic_application.left.value.type}");
-                    fi
-                fi
-            else
-                // find will report an error for not found
-                symbol = find(generic_application.identifier);
-            fi
-            
-            if !symbol? then
-                return true;
-            fi
-
-            _symbol_use_locations.add_symbol_use(generic_application.identifier.location, symbol);
-
-            let result_type: Semantic.Types.Type mut = default;
-            let result_symbol: Semantic.Symbols.Symbol mut = default;
-
-            if symbol.is_type then
-                generic_application.result = Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.TYPE;
-
-                result_type = 
-                    specialize_type(
-                        generic_application.location,
-                        symbol,
-                        generic_application.type_arguments
-                    );
-            elif symbol.is_function \/ symbol.is_function_group then
-                generic_application.result = Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.FUNCTION;
-
-                result_symbol = 
-                    specialize_symbol(
-                        generic_application.location,
-                        symbol,
-                        generic_application.type_arguments
-                    );
-            else
-                _logger.error(generic_application.location, "cannot apply type arguments here");
-                return true;
-            fi
-
-            let result = generic_application.result;
-
-            if result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.UNKNOWN then
-                // we didn't resolve what this was in the resolve type expressions phase
-                // don't report another error here, just produce a propagating error value:
-                generic_application.value = DUMMY(Semantic.Types.ERROR(), generic_application.location);
-            elif result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.TYPE then
-                generic_application.value = TYPE_EXPRESSION(result_type, generic_application.location);
-            elif result == Trees.Expressions.AMBIGUOUS_EXPRESSION_RESULT.FUNCTION then
-                let left_value: Value? =
-                    if generic_application.left? then
-                        generic_application.left.value;
-                    else
-                        null
-                    fi;
-
-                generic_application.value = result_symbol.load(generic_application.location, left_value, _symbol_loader);
-            else 
-                assert false else "result is something unexpected {result}";
-            fi
-
-            return true;
-        si
+        pre(generic_application: Trees.Expressions.GENERIC_APPLICATION) -> bool =>
+            _generic_application.pre_generic_application(generic_application);
 
         visit(generic_application: Trees.Expressions.GENERIC_APPLICATION) is
         si
@@ -3813,7 +1337,7 @@ namespace Syntax.Process is
                     // not warn.
                     if
                         isa Semantic.Symbols.Variable(symbol) /\
-                        _is_non_optional_value(left.right_value)
+                        is_non_optional_value(left.right_value)
                     then
                         _flow.mark_non_null(cast Semantic.Symbols.Variable(symbol));
                     fi
@@ -3964,7 +1488,7 @@ namespace Syntax.Process is
             // the declared type. An untyped `let` infers its type
             // from the initializer, so there is no slot to violate.
             if variable.type_expression? /\ variable.initializer? then
-                _check_non_optional(
+                check_non_optional(
                     variable.type_expression.type,
                     variable.initializer,
                     variable.initializer.location
@@ -4066,86 +1590,27 @@ namespace Syntax.Process is
         si
 
         visit(integer: Trees.Expressions.Literals.INTEGER) is
-            let value = _numeric_literal_classifier.classify_integer(integer.location, integer.value_string);
-
-            if !value? then
-                integer.value = DUMMY(Semantic.Types.ERROR(), integer.location);
-                return;
-            fi
-
-            integer.value = value;
+            _literals.visit_integer(integer);
         si
 
         visit(float: Trees.Expressions.Literals.FLOAT) is
-            let type: Type mut;
-            let suffix: string mut;
-
-            let value_string = float.value_string;
-
-            if
-                value_string.ends_with('D') \/
-                value_string.ends_with('d')
-            then
-                type = _innate_symbol_lookup.get_double_type();
-                suffix = "r8";
-            else
-                type = _innate_symbol_lookup.get_single_type();
-                suffix = "r4";
-            fi
-            
-            float.value = Literal.NUMBER(
-                value_string.substring(0, value_string.length -1),
-                type,
-                suffix
-            );
+            _literals.visit_float(float);
         si
 
         visit(interpolation: Trees.Expressions.STRING_INTERPOLATION) is
-            interpolation.value = IR.Values.BLOCK(_innate_symbol_lookup.get_string_type());
+            _literals.visit_interpolation(interpolation);
         si
 
         visit(`string: Trees.Expressions.Literals.STRING) is
-            `string.value = Literal.STRING(
-                `string.value_string,
-                _innate_symbol_lookup.get_string_type()
-            );
-        si        
+            _literals.visit_string(`string);
+        si
 
         visit(character: Trees.Expressions.Literals.CHARACTER) is
-            let value_string = character.value_string;
-            let c: int mut = 0;
-
-            if value_string.length < 1 \/ value_string.length > 1 then
-                _logger.error(character.location, "invalid character literal");
-            else
-                c = cast int(value_string.get_chars(0));
-            fi
-            
-            character.value = Literal.NUMBER(
-                "{c}",
-                _innate_symbol_lookup.get_char_type(),
-                "i4"
-            );
+            _literals.visit_character(character);
         si
 
         visit(boolean: Trees.Expressions.Literals.BOOLEAN) is
-            let value_string = boolean.value_string;
-
-            let value: string mut;
-
-            if value_string =~ "true" then
-                value = "1";
-            elif value_string =~ "false" then
-                value = "0";
-            else
-                throw System.Exception("invalid value for boolean literal: {value_string}");
-            fi
-                        
-            boolean.value = Literal.NUMBER(
-                value,
-                _innate_symbol_lookup.get_bool_type(),
-                "i4"
-            );
+            _literals.visit_boolean(boolean);
         si
 
         pre(call: Trees.Expressions.CALL) -> bool is
@@ -4159,7 +1624,7 @@ namespace Syntax.Process is
                 super.pre(call);
 
                 // Function walks outside the speculation level that
-                // `_visit(call)` rolls back during constraint-push
+                // `visit_call` rolls back during constraint-push
                 // retry, so diagnostics from sub-walks of the function
                 // expression aren't scrubbed alongside first-pass
                 // overload noise.
@@ -4167,7 +1632,7 @@ namespace Syntax.Process is
 
                 _logger.speculate();
                 call.arguments.walk(self);
-                _visit(call);
+                _calls.visit_call(call);
                 _logger.commit();
             catch e: Exception
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
@@ -4177,925 +1642,30 @@ namespace Syntax.Process is
             yrt
         si
 
-        // True iff any formal arg in the resolver's PARTIAL function
-        // is itself ERROR or contains an ERROR. Signal that the
-        // partial binding was driven from a tainted lambda actual
-        // (a typical free-function-with-lambda inference scenario)
-        // and the PARTIAL formals shouldn't be pushed as constraints
-        // unchanged.
-        _partial_arguments_contain_error(function: Semantic.Symbols.Function) -> bool is
-            if !function? \/ !function.arguments? then
-                return false;
-            fi
-
-            let found = Ghul.BOX[bool](false);
-
-            for arg in function.arguments do
-                if !arg? then
-                    continue;
-                fi
-
-                arg.walk((t: Type) is
-                    if t? /\ t.is_error then
-                        found.value = true;
-                    fi
-                si);
-
-                if found.value then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        // True iff any formal arg in the resolver's PARTIAL function
-        // still references one of the function's own generic
-        // type-variables (i.e. the resolver couldn't bind that slot
-        // from any sibling actual). Same shape problem as
-        // `_partial_arguments_contain_error`: pushing the formal as-is
-        // burdens the lambda's re-walk with a constraint
-        // (`int -> STEP[T]`) that can't be satisfied by anything
-        // concrete the body produces. Re-specialise with phantoms in
-        // those slots so the constraint pushed becomes
-        // (`int -> STEP[<phantom>]`) — actually informative, and
-        // back-feedable from inside the body.
-        _partial_arguments_contain_unbound_function_type_variable(function: Semantic.Symbols.Function) -> bool is
-            if !function? \/ !function.arguments? then
-                return false;
-            fi
-
-            let found = Ghul.BOX[bool](false);
-
-            for arg in function.arguments do
-                if !arg? then
-                    continue;
-                fi
-
-                arg.walk((t: Type) is
-                    if t? /\ t.is_function_generic_argument then
-                        found.value = true;
-                    fi
-                si);
-
-                if found.value then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        // True if any of the CALL's arguments is a Trees.Expressions.FUNCTION
-        // literal. Used to gate the constraint-push retry on the
-        // recoverable case where a not-yet-constrained lambda body
-        // walked with placeholder args and produced an ERROR-tainted
-        // type that the under-determination detector wouldn't
-        // otherwise recognise as recoverable.
-        _has_function_literal_call_argument(call: Trees.Expressions.CALL) -> bool is
-            if !call.arguments? \/ !call.arguments.expressions? then
-                return false;
-            fi
-
-            for a in call.arguments.expressions do
-                if a? /\ isa Trees.Expressions.FUNCTION(a) then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        // Walk the scope stack from current_function outward to find
-        // the recursive closure a `rec` reference here would bind to.
-        // Mirrors the lookup in `visit(RECURSE)`.
-        _find_recursive_target() -> Semantic.Symbols.Closure? is
-            let function = current_function;
-
-            if !function? \/ !function.is_closure then
-                return null;
-            fi
-
-            let closure = cast Semantic.Symbols.Closure(function);
-
-            if closure.is_recursive then
-                return closure;
-            fi
-
-            let stack = _symbol_table.stack;
-            let index mut = stack.count - 1;
-            let seen_self mut = false;
-
-            while index >= 0 do
-                let scope = stack[index];
-
-                if scope.is_closure then
-                    let c = cast Semantic.Symbols.Closure(scope);
-
-                    if seen_self then
-                        if c.is_recursive then
-                            return c;
-                        fi
-                    elif c == closure then
-                        seen_self = true;
-                    fi
-                fi
-
-                index = index - 1;
-            od
-
-            return null;
-        si
-
-        // Push each actual argument of a `rec(actual...)` call onto
-        // the recursive closure's parameter Variables as a LUB
-        // candidate. When the actual isn't assignable to the
-        // parameter's current type, reset that type back to an
-        // INFERRED_VARIABLE_TYPE placeholder so the next outer-body
-        // retry iteration's closure_arg_resolver re-derives the
-        // parameter type from the widened LUB. Handles both self-rec
-        // and nested-rec (rec referring to an outer recursive
-        // ancestor) — the target is determined by walking the
-        // closure stack mirroring `visit(RECURSE)`.
-        try_back_feed_recursive_call(call: Trees.Expressions.CALL) is
-            if !isa Trees.Expressions.RECURSE(call.function) then
-                return;
-            fi
-
-            let closure = _find_recursive_target();
-
-            if !closure? \/ !closure.argument_names? then
-                return;
-            fi
-
-            let param_count = closure.argument_names.count;
-            let args = if call.arguments? then call.arguments.expressions else null fi;
-            let arg_count = if args? then args.count else 0 fi;
-
-            let n = if param_count < arg_count then param_count else arg_count fi;
-
-            let i mut = 0;
-            while i < n do
-                let name = closure.argument_names[i];
-                let param = cast Semantic.Symbols.Variable(closure.find_direct(name));
-                let arg_expr = args[i];
-
-                // Prefer arg_expr.value.type, but fall back to the
-                // resolved symbol's type when the value's snapshot
-                // is null — happens for outer-scope locals captured
-                // into a nested closure before being typed.
-                let actual: Semantic.Types.Type? mut = null;
-                if arg_expr? /\ arg_expr.value? /\ arg_expr.value.type? then
-                    actual = arg_expr.value.type;
-                elif isa Trees.Expressions.IDENTIFIER(arg_expr) then
-                    let id_expr = arg_expr;
-                    let sym = find(id_expr.identifier);
-                    if sym? then
-                        actual = sym.type;
-                    fi
-                fi
-
-                if param? /\ actual? then
-                    if actual.is_settled then
-                        if param.add_constraint(actual) then
-                            _logger.mark_consumed_any();
-                        fi
-
-                        // Reset the param's type if currently
-                        // resolved to something narrower than the
-                        // actual — leaves it concrete when the
-                        // actual fits.
-                        if
-                            param.type? /\
-                            !param.type.is_sentinel /\
-                            !param.type.is_assignable_from(actual)
-                        then
-                            param.set_type(Semantic.Types.INFERRED_VARIABLE_TYPE(param));
-                            _logger.mark_consumed_any();
-                        fi
-                    fi
-                fi
-
-                i = i + 1;
-            od
-        si
-
-        _visit(call: Trees.Expressions.CALL) is
-            // Recursive-call back-feed for self-recursive lambdas
-            // (`let f = x rec => ... rec(actual) ...`). The
-            // call-site back-feed at line ~4180 only widens a
-            // closure's argument type when the formal is still an
-            // INFERRED_VARIABLE_TYPE placeholder. For a rec call the
-            // formal is the closure's own parameter Variable, which
-            // by iter N is already resolved to (often the narrow)
-            // outer call-site type. Without further widening, a rec
-            // call with a wider actual fails type-check.
-            //
-            // Widen here: push each actual as a candidate on the
-            // closure parameter's LUB. When the actual isn't
-            // assignable to the current parameter type, reset the
-            // parameter's type back to a placeholder so the next
-            // outer-body-retry iteration's closure_arg_resolver pass
-            // re-derives from the now-wider LUB.
-            try_back_feed_recursive_call(call);
-
-            // Arity-aware refinement of MEMBER_CONSTRAINT for the
-            // `<placeholder>.<name>(args...)` shape. MEMBER.visit
-            // already emitted MEMBER_CONSTRAINT(name); pin the
-            // arity here so the resolved type must have `name`
-            // callable at this arg count, not merely present. The
-            // receiver may already have been ERROR-typed by
-            // MEMBER.visit's placeholder branch — read the *member's
-            // left*'s type to find the placeholder regardless.
-            if isa Trees.Expressions.MEMBER(call.function) then
-                let member = cast Trees.Expressions.MEMBER(call.function);
-                if
-                    member.left? /\
-                    member.left.value? /\
-                    member.left.value.type? /\
-                    member.identifier? /\
-                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(member.left.value.type)
-                then
-                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(member.left.value.type);
-                    let arity = if call.arguments? then call.arguments.count else 0 fi;
-
-                    if placeholder.origin.add_constraint(
-                        Semantic.MEMBER_CONSTRAINT(member.identifier.name, arity)
-                    ) then
-                        _logger.mark_consumed_any();
-                    fi
-                fi
-            fi
-
-            if !call.function.value? \/ !call.function.value.type? then
-                call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                return;
-            fi
-
-            if call.function.value.is_type_expression then
-                (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, call.function.value.type, call.arguments, call.constraint, call);
-
-                return;
-            fi
-
-            let arguments = Collections.LIST[Value]();
-            let argument_types = Collections.LIST[Type]();
-
-            let buffer: IO.TextWriter;
-
-            let outer_state: (writer: IO.TextWriter, error_count: int);
-
-            for a in call.arguments do
-                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                    arguments.add(a.value);
-                    argument_types.add(a.value.type);
-                else
-                    let t = Semantic.Types.ERROR();
-
-                    if a? then
-                        arguments.add(DUMMY(t, a.location));
-                    else
-                        arguments.add(DUMMY(t, call.arguments.location));
-                    fi
-                    
-                    argument_types.add(t);
-                fi
-            od
-
-            // TODO handle if left is actually a type not a function or method
-            // in which case we should treat this as a constructor call
-
-            // we could also treat consuming a bare type as a constructor call
-            // this would be done in the symbol loader
-
-            let load_symbol: Semantic.Symbols.Symbol mut = default;
-
-            if isa Load.SYMBOL(call.function.value) then
-                let load = cast Load.SYMBOL(call.function.value);
-                load_symbol = load.symbol;
-
-                if load_symbol? /\ load_symbol.is_function_group then
-                    let want_instance: bool mut;
-
-                    want_instance = 
-                        if load.from? then 
-                            load.from.is_consumable
-                        else 
-                            _symbol_table.current_instance_context?
-                        fi;
-                    
-                    let function_group = cast Semantic.Symbols.FUNCTION_GROUP(load_symbol);
-                    let overload_result mut = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
-
-                    // Constraint-push retry: when the first resolve fails AND
-                    // there's exactly one arity-matching candidate AND at least
-                    // one argument's first-walk type is under-determined for
-                    // its corresponding formal type, push that candidate's
-                    // formal arg types as constraints to each call argument
-                    // and re-walk. This catches `apply(Box())` cases where a
-                    // constructor argument's owner generic args were
-                    // under-determined the first time round but become
-                    // resolvable from the formal argument's type. The
-                    // candidate's signature is the only signal we have for
-                    // what the under-determined arg should resolve to —
-                    // multi-candidate disambiguation under constraint push
-                    // is left to a more general overload-as-constraint
-                    // pass under #1174.
-                    if !overload_result? then
-                        let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
-
-                        // Trigger the retry when at least one actual
-                        // is a FUNCTION literal even if its first-walk
-                        // type has been ERROR-tainted by a body that
-                        // walked without a constraint. The lambda can
-                        // be re-walked under a pushed formal, so a
-                        // FUNCTION arg is the natural signal that the
-                        // null overload result might be recoverable.
-                        // The pre-existing `any_arg_under_determined`
-                        // path still covers the constructor-arg shape
-                        // (e.g. `apply(Box())`).
-
-                        if candidate? /\ (
-                            _under_determination_detector.any_arg_under_determined(candidate, argument_types) \/
-                            _has_function_literal_call_argument(call)
-                        ) then
-                            // Sibling-arg specialisation, symmetric to
-                            // the path in `resolve_constructor`: when
-                            // one actual is a not-yet-resolved FUNCTION
-                            // literal AND the candidate has a generic
-                            // owner, push specialised formals (bound
-                            // from concrete sibling actuals) rather
-                            // than unsubstituted formals containing
-                            // free type variables that the lambda's
-                            // argument-setup would reject as "type
-                            // variable" anyway. Owners that aren't
-                            // generic short-circuit inside
-                            // OWNER_TYPE_ARG_SPECIALIZER and the
-                            // pre-existing behaviour is preserved.
-                            let push_candidate mut = candidate;
-
-                            // Two-step specialisation: try
-                            // owner-class generic args first (for
-                            // method calls whose receiver class is
-                            // generic), then if push_candidate is
-                            // still the unsubstituted candidate and
-                            // the candidate has its own generic
-                            // args, try binding those from concrete
-                            // siblings. The function-own path is
-                            // what catches free-function HOFs like
-                            // `generate[T,S]((0,1), state => ...)` —
-                            // S binds from the (0,1) actual, T fills
-                            // from a phantom, and the substituted
-                            // formal-arg-type can then constrain the
-                            // lambda's body re-walk.
-                            push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
-
-                            if push_candidate == candidate /\ candidate.is_generic then
-                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
-                                push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
-                            fi
-
-                            _logger.roll_back();
-                            _logger.speculate();
-
-                            for (index, a) in call.arguments | .index() do
-                                if !a? then
-                                    continue;
-                                fi
-
-                                let f = push_candidate!.arguments[index];
-
-                                if f? then
-                                    a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                                fi
-
-                                a.walk(self);
-
-                                if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                                    arguments[index] = a.value;
-                                    argument_types[index] = a.value.type;
-                                else
-                                    let t = Semantic.Types.ERROR();
-
-                                    arguments[index] = DUMMY(t, a.location);
-                                    argument_types[index] = t;
-                                fi
-                            od
-
-                            overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false);
-                        fi
-                    fi
-
-                    if overload_result == null then
-                        call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                        return;
-                    fi
-
-                    if overload_result!.score == Semantic.Types.MATCH.PARTIAL then
-                        // PARTIAL re-specialisation: the resolver may
-                        // have driven its type-arg binding from a
-                        // tainted lambda actual whose body errored on
-                        // the first walk (the free-function lambda-
-                        // inference gap). Pushing those ERROR-bearing
-                        // formals as constraints to the lambda would
-                        // taint its re-walk too. Detect the case and
-                        // re-specialise from CLEAN siblings via the
-                        // function-own-args specialiser (which skips
-                        // ERROR / placeholder-bearing actuals); push
-                        // that cleaner form.
-                        //
-                        // Same shape for unbound function-own type
-                        // variables: when the resolver couldn't bind a
-                        // slot, the formal still contains the
-                        // candidate's literal `T` / `S` /…, which is
-                        // useless as a constraint downstream
-                        // (literal `T` matches nothing concrete the
-                        // body could produce). Re-specialise so those
-                        // slots become phantoms — back-feedable from
-                        // inside the lambda body.
-                        let push_function mut = overload_result!.function;
-
-                        if
-                            _partial_arguments_contain_error(push_function) \/
-                            _partial_arguments_contain_unbound_function_type_variable(push_function)
-                        then
-                            let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
-
-                            if candidate? /\ candidate.is_generic then
-                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
-                                let respecialized = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
-
-                                if respecialized != candidate then
-                                    push_function = respecialized;
-                                fi
-                            fi
-                        fi
-
-                        _logger.roll_back();
-                        _logger.speculate();
-
-                        for (index, a) in call.arguments | .index() do
-                            if !a? then
-                                continue;
-                            elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                                let f = push_function.arguments[index];
-
-                                a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                                a.walk(self);
-
-                                argument_types[index] = a.value.type;
-                            else
-                                // ensure any error messages are committed
-                                a.walk(self);
-                            fi
-
-                            arguments[index] = a.value;
-                        od
-
-                        overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, false, want_instance, false);
-
-                        if !overload_result? then
-                            call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                            // caller will commit any error messages
-                            return;
-                        fi    
-                    fi
-
-                    if !overload_result? then
-                        call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                        // caller will commit any error messages
-                        return;
-                    fi
-
-                    let function = overload_result.function;
-
-                    if function.is_unsafe_constraints then
-                        _logger.warn(call.location, "call to {function} has unchecked constraints");
-                    fi
-
-                    // A function whose type arguments were bound by
-                    // inference keeps `is_generic` set with concrete
-                    // `generic_arguments`; an explicitly specialized one
-                    // has `is_generic` cleared and was already checked
-                    // at `FUNCTION_GROUP.try_specialize`.
-                    if
-                        function.is_generic /\
-                        function.generic_arguments? /\
-                        function.generic_argument_names? /\
-                        function.generic_arguments.count == function.generic_argument_names.count
-                    then
-                        Semantic.Symbols.GENERIC_CONSTRAINT_CHECKER().check_arguments(
-                            call.location,
-                            _logger,
-                            function,
-                            function.generic_argument_names,
-                            function.generic_arguments
-                        );
-                    fi
-
-                    _symbol_use_locations.add_symbol_use(call.function.right_location, function);
-
-                    call.value = function.call(call.function.location, load.from, arguments, null, _function_caller);
-                    return;
-                fi
-            fi
-
-            let function_type = call.function.value.type;
-
-            // Iterative-inference back-feed: if the function being
-            // called has a placeholder formal arg (e.g. f's type is
-            // Function[INFERRED_VARIABLE_TYPE, ?] from a let-bound
-            // lambda whose argument types weren't inferable from
-            // the body alone), push the actual arg's type onto the
-            // placeholder's origin symbol. Done *before* the
-            // is_error early-return because the return-type slot
-            // may legitimately be ERROR while the arg slot is a
-            // back-feedable placeholder (e.g. `x => x.length`'s
-            // body errors with ERROR-typed member access on
-            // unresolved receiver, propagating through the function
-            // type's is_error). The next iteration resolves x and
-            // x.length cleanly.
-            if isa Semantic.Types.NAMED(function_type) then
-                let ft_named = function_type;
-                let ft_args = ft_named.arguments;
-                let formal_count =
-                    if function_type.is_function then
-                        ft_args.count - 1;
-                    else
-                        ft_args.count;
-                    fi;
-
-                if formal_count == arguments.count then
-                    for i in 0..arguments.count do
-                        let formal = ft_args[i];
-                        let actual = argument_types[i];
-
-                        if formal? /\ actual? /\ isa Semantic.Types.INFERRED_VARIABLE_TYPE(formal) then
-                            let placeholder = formal;
-                            if placeholder.origin.add_constraint(actual) then
-                                _logger.mark_consumed_any();
-                            fi
-                        fi
-                    od
-                fi
-            fi
-
-            if function_type? /\ function_type.is_error then
-                call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                return;
-            elif isa Semantic.Types.INFERRED_VARIABLE_TYPE(function_type) then
-                // Iterative-inference back-feed when the call's receiver is
-                // itself an unresolved placeholder. Synthesize a function
-                // shape from the actual arg types plus a deferred return
-                // type and push it as a constraint on the placeholder's
-                // origin, so the next body-retry iteration sees the symbol
-                // resolved to a function type and the call can be compiled.
-                // Required for mutually-recursive lambdas where each side's
-                // signature depends on the other.
-                let placeholder = function_type;
-
-                // Skip the speculative function-shape constraint
-                // when the LUB already has a candidate (typically
-                // from an earlier `v = <lambda>` assignment in the
-                // same body). The synthesised type carries the
-                // call's actual arg types, which may differ from
-                // the assigned shape (e.g. `(v: List[int]) => 28`
-                // assigned, then called with `int[]`); the per-
-                // position LUB merge can't bridge that and the
-                // pair stays in the pool as ambiguous candidates,
-                // letting the placeholder-bearing one out-rank the
-                // settled one in IL emission. CALL_CONSTRAINT
-                // below still records the call shape for filter
-                // purposes. Mutual recursion (the original motivator
-                // of this back-feed) keeps working because there
-                // the receiver has no other source of candidate
-                // types.
-                if !placeholder.origin.has_lub_candidate /\ argument_types | .all(a => a? /\ a.is_settled) then
-                    let function_type_components = Collections.LIST[Type](argument_types);
-                    function_type_components.add(Semantic.Types.INFERED_RETURN_TYPE());
-                    let synthesized = _innate_symbol_lookup.get_function_type(function_type_components);
-                    if placeholder.origin.add_constraint(synthesized) then
-                        _logger.mark_consumed_any();
-                    fi
-                fi
-
-                // Operation-constraint inference: regardless of
-                // whether the args are concrete enough to synthesize
-                // a Function constraint above, record a CALL_CONSTRAINT
-                // with the captured arg-types on the placeholder's
-                // origin so the constraint-aware LUB can later filter
-                // candidate types to those that actually accept this
-                // call shape. The constraint's own discharge defers
-                // conservatively when the captured args still contain
-                // placeholders, so emitting unconditionally here is
-                // safe.
-                let call_args = Collections.LIST[Type](argument_types);
-                if placeholder.origin.add_constraint(Semantic.CALL_CONSTRAINT(call_args)) then
-                    _logger.mark_consumed_any();
-                fi
-
-                call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                return;
-            elif !function_type? \/ !isa Semantic.Types.NAMED(function_type) then
-                _logger.error(call.function.location, "cannot call value of non-function type {call.function.value.type}");
-                call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                return;
-            fi
-
-            let function_generic_type = function_type;
-
-            let function_type_arguments = function_generic_type.arguments;
-
-            if function_type.is_action then
-                if function_type_arguments.count != arguments.count then
-                    _logger.error(
-                        call.arguments.location, 
-                        "expected {function_type_arguments.count} arguments but {arguments.count} supplied");
-                    call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                    return;
-                fi
-            elif function_type.is_function then
-                if function_type_arguments.count != arguments.count + 1 then
-                    _logger.error(
-                        call.arguments.location, 
-                        "expected {function_type_arguments.count - 1} arguments but {arguments.count} supplied");
-                    call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                    return;
-                fi
-            else
-                if load_symbol? /\ load_symbol.is_type then
-                    (call.function.value, call.value) = resolve_constructor(call.location, call.right_location, load_symbol.type, call.arguments, call.constraint, call);
-                else
-                    _logger.error(call.function.location, "cannot call value of non-function type {call.function.value.type}");
-                    call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                fi
-
-                return;                    
-            fi
-
-            let ok mut = true;
-
-            for i in 0..arguments.count do
-                // Back-feed BEFORE the compare so a Closure-call with
-                // a placeholder parameter type (`let f = x => ...; f(1)`)
-                // propagates the actual's concrete type to the
-                // placeholder's origin. The body retry loop's next
-                // iteration then sees a concrete x's-type and walks
-                // the lambda body cleanly. Without this the call path
-                // validated types but propagated nothing — local
-                // lambdas with use-site-only constraints failed to
-                // converge.
-                _overload_resolver.back_feed.pair(function_generic_type.arguments[i], argument_types[i]);
-
-                if cast int(function_generic_type.arguments[i].compare(argument_types[i])) > cast int(Semantic.Types.MATCH.CONVERTABLE)
-                then
-                    ok = false;
-                    _logger.error(call.arguments.expressions[i].location, "expected argument of type {function_type_arguments[i]} but {argument_types[i]} supplied");
-                fi
-            od
-
-            if !ok then
-                call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                return;
-            fi
-
-            let result_type =
-                if function_type.is_action then
-                    _innate_symbol_lookup.get_void_type();
-                else
-                    function_generic_type.arguments[function_type_arguments.count - 1];
-                fi;
-
-            call.value =
-                Call.CLOSURE(
-                    call.function.value,
-                    result_type,
-                    function_type.is_action,
-                    function_generic_type,
-                    arguments
-                );
-        si
-
         visit(identifier: Trees.Expressions.IDENTIFIER) is
             let mark = _logger.mark();
-            
+
             try
-                _visit(identifier);
+                _access.visit_identifier(identifier);
 
             catch ex: Exception
                 _logger.exception(identifier.location, ex, "something went wrong with identifier");
 
-            finally 
+            finally
                 _logger.release(mark);
-            yrt            
-        si
-
-        _visit(identifier: Trees.Expressions.IDENTIFIER) is
-            let need_store = identifier.value? /\ isa Need.STORE(identifier.value);
-        
-            let symbol = find(identifier.identifier);
-
-            if symbol? then
-                if symbol.is_type then
-                    _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
-
-                    identifier.value = TYPE_EXPRESSION(symbol.type, identifier.location);
-
-                    // if need_store then
-                    //     debug_always("cannot assign to {identifier} at {identifier.location} from BBB {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
-                    //     _logger.error(identifier.location, "cannot assign to this");
-                    // fi
-                else
-                    _symbol_loader.find_symbol = (name: string) => find(name);
-
-                    if need_store then
-                        let store_value = cast Need.STORE(identifier.value).value;
-                        identifier.value = symbol.store(identifier.location, null, store_value, _symbol_loader, false);
-
-                        _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
-                    else
-                        identifier.value = symbol.load(identifier.location, null, _symbol_loader);
-
-                        // Optional-narrowing: when flow analysis has
-                        // established this variable is non-null here,
-                        // the load is of the non-optional type. Pin
-                        // that on the use-site node, matching how
-                        // `isa`-narrowing reaches the load via a
-                        // mutated `symbol.type`.
-                        if
-                            isa Semantic.Symbols.Variable(symbol) /\
-                            isa IR.Values.Load.SYMBOL(identifier.value) /\
-                            identifier.value.has_type /\
-                            identifier.value.type.is_optional
-                        then
-                            let variable = symbol;
-
-                            if _flow.is_non_null(variable) then
-                                let narrowed = identifier.value.type.as_non_optional();
-
-                                if narrowed? /\ !narrowed.is_optional then
-                                    (cast IR.Values.Load.SYMBOL(identifier.value)).narrow_snapshot_type(narrowed);
-                                fi
-                            fi
-                        fi
-
-                        // HOVER reads a narrowed local's type off
-                        // this use-site node, not the symbol — the
-                        // symbol's `type` is restored after the walk.
-                        _symbol_use_locations.add_variable_use(identifier.right_location, symbol, identifier.value);
-
-                        // Definite assignment: reading a tracked
-                        // deferred-init local before it is assigned
-                        // on every path reaching here.
-                        if _warn_definite_assignment /\ isa Semantic.Symbols.Variable(symbol) then
-                            let variable = symbol;
-
-                            if _flow.is_tracked(variable) /\ !_flow.is_assigned(variable) then
-                                _logger.warn(identifier.location, "{variable.name} may be used before it is assigned");
-                            fi
-                        fi
-                    fi
-                fi
-
-            else
-                identifier.value = DUMMY(Semantic.Types.ERROR(), identifier.location);
-            fi                
+            yrt
         si
 
         visit(has_value: Trees.Expressions.HAS_VALUE) is
-
-            if !has_value.left? then
-                _logger.poison(has_value.location, "has value expression has no left expression");
-                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
-                return;
-            elif !has_value.left.value? then
-                _logger.poison(has_value.left.location, "has value expression has no value");
-                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
-                return;                
-            fi
-
-            if 
-                !has_value.left.value.check_is_consumable(_logger, has_value.left.location)
-            then
-                _logger.error(has_value.left.location, "cannot use this here");
-                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
-                return;
-            fi
-
-            let has_value_member =
-                has_value.left.value.type.find_member("has_value");
-            let bool_type = _innate_symbol_lookup.get_bool_type();
-            let has_value_valid mut = false;
-
-            if has_value_member? then
-                if !isa Semantic.Symbols.Property(has_value_member) then
-                    _logger.error(
-                        has_value.left.location,
-                        "has_value member must be a bool property"
-                    );
-                elif has_value_member.type !~ bool_type then
-                    _logger.error(
-                        has_value.left.location,
-                        "has_value property must be bool"
-                    );
-                else
-                    has_value_valid = true;
-                fi
-            fi
-
-            if !has_value.left.value.type.is_value_type then
-                has_value.value =
-                    get_reference_has_value(
-                        has_value.location,
-                        has_value.left.value,
-                        if has_value_valid then has_value_member else null fi,
-                        bool_type
-                    );
-            elif has_value_member? then
-                if has_value_valid then
-                    has_value.value =
-                        has_value_member.load(
-                            has_value.location,
-                            has_value.left.value,
-                            _symbol_loader
-                        );
-                else
-                    has_value.value = DUMMY(bool_type, has_value.location);
-                fi
-            else
-                _logger.error(has_value.left.location, "must be a reference type or provide a has_value property");
-                has_value.value = DUMMY(bool_type, has_value.location);
-            fi
+            _access.visit_has_value(has_value);
         si
 
         visit(unwrap: Trees.Expressions.UNWRAP) is
-            if !unwrap.left? then
-                _logger.poison(unwrap.location, "unwrap expression has no left expression");
-                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
-                return;
-            elif !unwrap.left.value? then
-                _logger.poison(unwrap.left.location, "unwrap expression has no value");
-                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
-                return;                
-            fi
-
-            if 
-                !unwrap.left.value.check_is_consumable(_logger, unwrap.left.location)
-            then
-                _logger.error(unwrap.left.location, "cannot use this here");
-                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
-                return;
-            fi
-
-            let value_member = unwrap.left.value.type.find_member("value");
-
-            if !unwrap.left.value.type.is_value_type then
-                // on a reference type, it's a no-op
-                // TODO we could do an explicit null check here: 
-                unwrap.value = unwrap.left.value;
-            elif value_member? then
-                // TODO we could do an explicit has-value check here:
-                unwrap.value = value_member.load(unwrap.location, unwrap.left.value, _symbol_loader);
-            else
-                _logger.error(unwrap.left.location, "must be a reference type or provide a value property");
-                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
-            fi
-
-            // `x!` asserts `x` holds a value — record it, so a
-            // subsequent dereference of `x` is not flagged.
-            let target = try_get_narrowing_target(unwrap.left);
-
-            if target? then
-                _flow.mark_non_null(target);
-            fi
-
-            // TODO, we could handle ref and ptr here as well
+            _access.visit_unwrap(unwrap);
         si
 
         visit(reference: Trees.Expressions.REFERENCE) is
-            if !reference.left? then
-                _logger.poison(reference.location, "reference expression has no left expression");
-                reference.value = DUMMY(Semantic.Types.ERROR(), reference.location);
-                return;
-            elif !reference.left.value? \/ !reference.left.value.type? then
-                _logger.poison(reference.left.location, "reference expression has no value");
-                reference.value = DUMMY(Semantic.Types.ERROR(), reference.location);
-                return;                
-            elif !reference.left.value.has_address then
-                _logger.warn(reference.left.location, "reference to an expression");                
-            fi
-
-            reference.left.value.check_is_consumable(_logger, reference.left.location);
-
-            reference.value = ADDRESS(reference.left.value, _innate_symbol_lookup.get_reference_type(reference.left.value.type));
-
-            // The callee reached through `x ref` may write the
-            // target, so treat the `ref` as a definite assignment.
-            let ref_target = try_get_narrowing_target(reference.left);
-
-            if ref_target? then
-                _flow.mark_assigned(ref_target);
-            fi
+            _access.visit_reference(reference);
         si
         
         visit(`null: Trees.Expressions.NULL) is
@@ -5117,36 +1687,13 @@ namespace Syntax.Process is
             // an `if`/`else` branch — so this one check covers every
             // such site. A warning during the migration; `T?` not
             // being assignment-compatible with `T` is the end state.
-            if _warn_non_optional /\ _is_non_optional_reference(`null.constraint) then
+            if !_build_flags.no_warn_non_optional /\ _is_non_optional_reference(`null.constraint) then
                 _logger.warn(`null.location, "null where a non-optional {`null.constraint} is expected");
             fi
         si
 
         visit(`default: Trees.Expressions.DEFAULT) is
-            // `default[T]` pins the type explicitly; a bare `default`
-            // takes the type pushed in by the parent context
-            // (assignment RHS, return position, typed `let`
-            // initializer, call argument) via set_constraint.
-            let type: Semantic.Types.Type mut = default;
-
-            if `default.type_expression? then
-                type = `default.type_expression.type;
-            elif `default.constraint? then
-                type = `default.constraint;
-            fi
-
-            if !type? then
-                _logger.error(`default.location, "cannot infer the type of default here");
-                `default.value = IR.Values.DUMMY(Semantic.Types.ERROR(), `default.location);
-                return;
-            fi
-
-            if type.is_error then
-                `default.value = IR.Values.DUMMY(type, `default.location);
-                return;
-            fi
-
-            `default.value = IR.Values.DEFAULT(type);
+            _literals.visit_default(`default);
         si
 
         pre(statement: Trees.Expressions.STATEMENT) -> bool is
@@ -5219,185 +1766,11 @@ namespace Syntax.Process is
 
         pre(`if: Trees.Statements.IF) -> bool is
             super.pre(`if);
-
-            if `if.want_value then
-                for i in `if.branches do
-                    i.body.want_value = true;
-                od
-            fi
-
-            // Open a flow frame for this IF. Each branch's controlled
-            // walk (pre(IF_BRANCH)) records its exit environment on
-            // the frame; visit(IF) joins them.
-            _if_flow_stack.add(IF_FLOW_FRAME(_flow.current_env.copy()));
-
-            return false;
+            return _conditionals.pre_if(`if);
         si
 
         visit(`if: Trees.Statements.IF) is
-            // Merge the branch exit environments into the environment
-            // in force after the IF. A branch whose body diverges
-            // contributes the bottom environment; with no else
-            // branch, the no-branch-taken fall-through contributes
-            // the trailing running-else environment.
-            let if_flow = _if_flow_stack[_if_flow_stack.count - 1];
-            _if_flow_stack.remove_at(_if_flow_stack.count - 1);
-
-            let after mut = NARROW_ENV.bottom();
-
-            for branch_exit in if_flow.branch_exits do
-                after = NARROW_ENV.join(after, branch_exit);
-            od
-
-            if !if_flow.has_else then
-                after = NARROW_ENV.join(after, if_flow.running_else);
-            fi
-
-            _flow.set_env(after);
-
-            for i in `if.branches do
-                if i.condition? then
-                    IR.Values.Value.check_is_consumable(_logger, i.condition.location, i.condition.value);
-                fi
-            od
-
-            if !`if.want_value then
-                return;
-            fi
-
-            if `if.is_poisoned then
-                // if the if is syntactically incomplete don't bother reporting any
-                // semantic errors:
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "if is poisoned");
-
-                return;
-            fi
-
-            if 
-                !`if.branches | .any(b => b? /\ !b.condition?) /\
-                (!`if.constraint? \/ !`if.constraint.is_void)
-            then
-                // if the if has no else branch, then don't bother reporting any
-                // semantic errors:
-                _logger.error(`if.location, "expected else in if expression");
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no else");
-                return;
-            fi
-
-            let type mut = `if.constraint;
-
-            let seen_any_values mut = false;
-            let seen_non_null_values mut = false;
-            let seen_null_values mut = false;
-            let all_tuple_literals mut = true;
-
-            let lub = LEAST_UPPER_BOUND_MAP();
-
-            for i in `if.branches do
-                let branch = i.body;
-
-                if !branch.value? then                    
-                    continue;
-                fi
-
-                if !branch.value.type? then
-                    continue;
-                fi
-
-                if `if.constraint? then
-                    if !branch.value.check_is_consumable_allow_void(_logger, branch.location) then
-                        continue;
-                    fi
-                else
-                    if !branch.value.check_is_consumable(_logger, branch.location) then
-                        continue;
-                    fi
-                fi
-
-                debug_indent();
-
-                if `if.constraint? then
-                    if !`if.constraint.is_void /\ !`if.constraint.is_assignable_from(branch.value.type) then
-                        _logger.error(branch.location, string.format(`if.constraint_error_message, branch.value.type, type));
-                    fi
-                elif branch.value.type.is_null then
-                    // could also be error
-                    seen_null_values = true;
-                else
-                    seen_non_null_values = true;
-
-                    if !branch.is_tuple_literal then
-                        all_tuple_literals = false;
-                    fi
-        
-                    lub.add(branch.value.type);
-                fi
-
-                seen_any_values = true;
-            od
-
-            if !`if.constraint? then
-                type = lub.get_result();
-
-                // FIXME factor this out - it's duplicated between here and list literal elements
-                if all_tuple_literals /\ seen_non_null_values /\ (!type? \/ !type.is_value_tuple) then
-                    let lubs = Collections.LIST[LEAST_UPPER_BOUND_MAP]();
-
-                    for i in `if.branches do
-                        let branch = i.body;
-
-                        if !branch.value? \/ !branch.value.type? then
-                            continue;
-                        fi
-
-                        for (index, e) in branch.value.type.arguments | .index() do
-                            if index >= lubs.count then
-                                lubs.add(LEAST_UPPER_BOUND_MAP());
-                            fi
-
-                            lubs[index].add(e);
-                        od
-                    od
-
-                    type = 
-                        _innate_symbol_lookup.get_tuple_type(
-                            lubs |
-                                .map(l => 
-                                    let r: Type = l.get_result() in if r? then r else _innate_symbol_lookup.get_object_type() fi) 
-                                .collect(),
-                            lub.element_names
-                        );
-                fi
-
-                if type? /\ type.is_value_type /\ seen_null_values then
-                    for i in `if.branches do
-                        let branch = i.body;
-        
-                        if !branch.value? \/ !branch.value.type? then
-                            continue;
-                        fi
-        
-                        if branch.value.type.is_null then
-                            _logger.error(branch.location, "incompatible types in if branches: {branch.value.type} and {type}");                                                    
-                        fi
-                    od
-                fi
-            fi
-
-            if !type? then
-                if seen_any_values then
-                    if seen_non_null_values then
-                        _logger.error(`if.location, "no type inferred for if expression");
-                    else
-                        _logger.error(`if.location, "all branch values are null");                        
-                    fi
-                fi
-
-                `if.value = DUMMY_BLOCK(Semantic.Types.ERROR(), `if.location, "no type inferred");
-                return;
-            else
-                `if.value = IR.Values.BLOCK(type);
-            fi
+            _conditionals.visit_if(`if);
         si
 
         // Do not descend into properties (otherwise accessor functions will be walked twice)
@@ -5405,138 +1778,5 @@ namespace Syntax.Process is
 
         visit(property: Trees.Definitions.PROPERTY) is
         si
-
-        specialize_type(location: Source.LOCATION, symbol: Semantic.Symbols.Symbol, arguments: Trees.TypeExpressions.LIST) -> Semantic.Types.Type is
-            if !isa Semantic.Symbols.Classy(symbol) then
-                _logger.error(location, "cannot supply type arguments here");
-                return Semantic.Types.ERROR();
-            fi
-
-            for a in arguments do
-                a.check_is_not_void(_logger, "cannot use void type here");
-
-                let t = a.type;
-
-                if t? /\ t.is_named /\ cast Semantic.Types.NAMED(t).symbol.is_unsafe_constraints then
-                    _logger.warn(a.location, "type {t} has unchecked constraints");
-                fi
-            od
-
-            let classy = symbol;
-
-            let actual_arguments = arguments | .map(
-                // FIXME type inference issue
-                a -> Type => if a? /\ a.type? then a.type else Semantic.Types.ERROR() fi
-            ).collect();
-
-            let result = Semantic.Types.GENERIC(location, classy, actual_arguments);
-
-            classy.check_argument_constraints(location, _logger, actual_arguments);
-
-            if symbol.is_unsafe_constraints then
-                _logger.warn(location, "type {result} has unchecked constraints");
-            fi
-
-            return result;
-        si
-
-        specialize_symbol(location: Source.LOCATION, symbol: Semantic.Symbols.Symbol, arguments: Trees.TypeExpressions.LIST) -> Semantic.Symbols.Symbol is
-            return 
-                symbol.try_specialize(
-                    location,
-                    _logger,
-                    arguments.elements | 
-                        .map(t => t.type).collect()
-                );
-        si
     si
-
-    // TODO move these into he runtime library
-    struct WHILE_ITERATOR[T]: Collections.Iterator[T] is
-        _generator: () -> T;
-        _predicate: (T) -> bool;
-
-        current: T;
-
-        init(generator: () -> T, predicate: T -> bool) is
-            _generator = generator;
-            _predicate = predicate;
-        si
-
-        move_next() -> bool is
-            current = _generator();
-
-            return _predicate(current);
-        si
-
-        reset() is
-            // should maybe throw, but Pipe[T] may
-            // call reset in circumstances where it
-            // would be better to just ignore it
-        si
-
-        dispose() is
-            // nothing to do
-        si        
-    si
-
-    struct WHILE_ITERABLE[T]: Collections.Iterable[T] is
-        _generator: () -> T;
-        _predicate: (T) -> bool;
-
-        iterator: Collections.Iterator[T] =>
-            WHILE_ITERATOR[T](_generator, _predicate);
-
-        init(generator: () -> T, predicate: T -> bool) is
-            _generator = generator;
-            _predicate = predicate;
-        si
-    si
-
-    struct WHILE_INDEXED_ITERATOR[T]: Collections.Iterator[T] is
-        _generator: (int) -> T;
-        _predicate: (T) -> bool;
-        _index: int;
-
-        current: T;
-
-        init(generator: (int) -> T, predicate: T -> bool) is
-            _index = -1;
-            _generator = generator;
-            _predicate = predicate;
-        si
-
-        move_next() -> bool is
-            _index = _index + 1;
-            current = _generator(_index);
-            return _predicate(current);
-        si
-
-        reset() is
-            _index = -1;
-        si
-
-        dispose() is
-            // nothing to do
-        si        
-    si
-
-    struct WHILE_INDEXED_ITERABLE[T]: Collections.Iterable[T] is
-        _generator: (int) -> T;
-        _predicate: (T) -> bool;
-
-        iterator: Collections.Iterator[T] =>
-            WHILE_INDEXED_ITERATOR[T](_generator, _predicate);
-
-        init(generator: (int) -> T, predicate: T -> bool) is
-            _generator = generator;
-            _predicate = predicate;
-        si
-    si
-
-    do_while[T](generator: () -> T, predicate: T -> bool) -> Collections.Iterable[T] =>
-        WHILE_ITERABLE[T](generator, predicate);
-
-    iter_while[T](generator: (int) -> T, predicate: T -> bool) -> Collections.Iterable[T] =>
-        WHILE_INDEXED_ITERABLE[T](generator, predicate);
 si
