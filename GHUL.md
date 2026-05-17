@@ -237,7 +237,7 @@ default:
 esac
 ```
 
-Each `when` label can list one or multiple literal values (comma-separated) to compare against the `case` expression. The `default` clause handles any value not matched by earlier cases. You terminate the construct with `esac` (“case” reversed). The `case` statement is useful for matching primitive values like numbers or enum constants. However, it **cannot deconstruct union types** – you cannot directly pattern-match a `Result.SUCCESS(...)` vs `Result.ERROR(...)` in a `case`. Instead, you would either use the `if/elif` style shown earlier or switch on an auxiliary tag (for example, you might switch on an enum inside your union). In summary, until pattern matching is added to the language, handling variant types involves manual tag checks. This is one area where ghūl’s syntax is still evolving.
+Each `when` label can list one or multiple literal values (comma-separated) to compare against the `case` expression. The `default` clause handles any value not matched by earlier cases. You terminate the construct with `esac` (“case” reversed). The `case` statement is useful for matching primitive values like numbers or enum constants. However, it **cannot deconstruct union types** – you cannot directly pattern-match a `Result.SUCCESS(...)` vs `Result.ERROR(...)` in a `case`. Instead, you would either use the `if/elif` style shown earlier or switch on an auxiliary tag (for example, you might switch on an enum inside your union). In summary, until pattern matching is added to the language, handling variant types involves manual tag checks.
 
 ## Control Flow Constructs
 
@@ -351,9 +351,6 @@ ghūl leverages .NET’s collection types and also has built-in literals for com
   Here `dict` is a mutable dictionary, and `readOnly` is typed as the interface. You can iterate a map with `for (key, value) in dict do ... od`, and there are methods like `.contains_key` or indexer access `dict["one"]`. Like lists, the naming convention is that uppercase `MAP` is the concrete type and capitalized `Map` is the interface. Similarly, `SET`/`Set` for hash sets, etc., following .NET’s generic collections.
 
 * **Option Type:**
-
-> **Note on Union Types:**
-> Union types in ghūl are a newly implemented feature and are reference types (not value types). The implementation is still evolving and may contain bugs or limitations. If you encounter existing code using unions, be aware that it may include workarounds for known or unknown issues in the union type system. When writing new code, use unions cautiously: if they are clearly the best fit for your use case, consider them, but be prepared to encounter and possibly work around implementation problems. Also, while an `Option[T]` union type is available for representing optional values, there is currently no real library support for unions—most of the underlying library is just .NET 8, which does not natively support these constructs.
 
 As discussed in the Types section, an `Option[T]` union can represent optional values. Rather than using `null` references, you can use `Option.NONE` or `Option.SOME(x)` to indicate missing or present values. For example:
 
@@ -479,6 +476,6 @@ Below is a concise summary of ghūl syntax, keywords, and type system features f
 * **Null and Option:** ghūl follows .NET’s model where reference types can be `null` by default (there’s no non-nullable reference type feature yet). Use the `obj?` syntax to check for null easily. For a safer alternative, wrap optional values in `Option[T]` and check `is_some`/`is_none` as described.
 * **Interoperability:** Because ghūl compiles to .NET IL, you can call into any .NET library. ghūl will map .NET names to its naming conventions: e.g. `System.Collections.Generic.List<T>` is `Collections.LIST[T]`, `IEnumerable<T>` is `Collections.Iterable[T]`, `System.String` is `string`, etc. When in doubt, refer to ghūl documentation for naming, or use your IDE (the ghūl VSCode extension) to find the correct name. You can also escape identifiers that are reserved keywords by enclosing in backticks (e.g. ``let `class` = "test";`` if you needed such a name).
 
-ghūl is still evolving, but this reference should give you a solid grasp of its syntax and semantics. With its mix of familiar .NET paradigms and new twists (like the keyword-based blocks and union types), ghūl enables a variety of programming styles. As you experiment, keep the official ghūl documentation handy – since “whatever the compiler accepts is the definitive reference” in this work-in-progress language. Enjoy exploring ghūl, and happy coding!
+This reference should give you a solid grasp of ghūl’s syntax and semantics. With its mix of familiar .NET paradigms and new twists (like the keyword-based blocks and union types), ghūl enables a variety of programming styles. Enjoy exploring ghūl, and happy coding!
 
 **Sources:** The ghūl language reference and examples are drawn from the official ghūl website and the ghūl compiler repository documentation, which provide further details and up-to-date information.
