@@ -17,9 +17,12 @@ cd "$(dirname "$0")"
 MODE="${1:-both}"
 WORKLOAD="${2:-}"
 
-# Have the spawned analyser emit its periodic per-command / per-pass TIMERS
-# dump — captured into the report's stderr appendix.
-export ANALYSER_EXTRA_ARGS="--show-analysis-stats"
+# --show-analysis-stats: have the spawned analyser emit its periodic
+#   per-command / per-pass TIMERS dump, captured into the report appendix.
+# --no-analysis-heap-watchdog: suppress the watchdog's post-compile heap
+#   sampling. It forces a full GC after every compile, which otherwise
+#   dominates the trace (≈37% of CPU) and masks the genuine hotspots.
+export ANALYSER_EXTRA_ARGS="--show-analysis-stats --no-analysis-heap-watchdog"
 
 echo "==> building analysis-profiler (and the compiler under test)"
 dotnet build analysis-profiler.ghulproj -c Debug
