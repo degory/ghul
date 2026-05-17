@@ -37,6 +37,7 @@ namespace Syntax.Process is
         _calls: COMPILE_CALLS;
         _conditionals: COMPILE_CONDITIONALS;
         _loops: COMPILE_LOOPS_AND_EXCEPTIONS;
+        _bindings: COMPILE_BINDINGS;
         _type_caster: Semantic.TYPE_CASTER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _value_converter: VALUE_CONVERTER;
@@ -193,6 +194,15 @@ namespace Syntax.Process is
                 _try_flow_stack,
                 _loop_kept_stack
             );
+
+            _bindings = COMPILE_BINDINGS(
+                logger,
+                symbol_table,
+                innate_symbol_lookup,
+                _flow,
+                _build_flags,
+                self
+            );
         si
 
         // If `expr` is an unqualified identifier resolving (in the
@@ -241,7 +251,7 @@ namespace Syntax.Process is
         // `--no-warn-non-optional` opts out. A warning, not an error,
         // during the migration; the end state is `T?` not
         // assignment-compatible with `T`.
-        _check_non_optional(target: Semantic.Types.Type, source: Trees.Expressions.Expression, location: Source.LOCATION) is
+        check_non_optional(target: Semantic.Types.Type, source: Trees.Expressions.Expression, location: Source.LOCATION) is
             if _build_flags.no_warn_non_optional \/ !target? \/ !source? then
                 return;
             fi
@@ -528,76 +538,12 @@ namespace Syntax.Process is
 
         pre(`let: Trees.Statements.LET) -> bool is
             super.pre(`let);
-
-            // Reset is_defined on each LHS variable at the start of
-            // every body-retry walk of the let. Without this reset,
-            // an earlier walk's define() call leaves is_defined=true,
-            // and check_is_defined in `load_captured_value` no longer
-            // fires for a forward self-reference inside the RHS
-            // lambda on subsequent walks (`let f = ... f ...` is the
-            // canonical case). The error gets rolled back per iter
-            // via mark_consumed_any rolling back diagnostics, but
-            // the final iter's error survives so the user-visible
-            // diagnostic is preserved.
-            if `let.variables? then
-                for v in `let.variables do
-                    if v.names? then
-                        for name in v.names do
-                            let symbol = find(name);
-                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                                let variable = symbol;
-                                variable.is_defined = false;
-                            fi
-                        od
-                    fi
-                od
-            fi
-
-            return false;
+            return _bindings.pre_let(`let);
         si
 
         visit(`let: Trees.Statements.LET) is
             super.visit(`let);
-
-            // Definite assignment: a `let` binding with no
-            // initializer introduces a deferred-init local. Until it
-            // is assigned, a read of it is a use-before-assignment.
-            if !_build_flags.no_warn_definite_assignment then
-                for v in `let.variables do
-                    if v? /\ !v.initializer? then
-                        for name in v.names do
-                            let symbol = find(name);
-
-                            if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                                _flow.track_deferred(symbol);
-                            fi
-                        od
-                    fi
-                od
-            fi
-
-            if `let.want_dispose then
-                let idisposable = _innate_symbol_lookup.get_idisposable_type();
-
-                for v in `let.variables do
-                    for name in v.names do
-                        let symbol = find(v.name);
-
-                        if symbol? /\ isa Semantic.Symbols.Variable(symbol) then
-                            let variable = symbol;
-                            variable.is_disposed = true;
-
-                            let type = variable.type;
-
-                            if !idisposable.is_assignable_from(type) then
-                                _logger.error(v.name.location, "not disposable");
-                            fi
-
-                            current_statement_list.add_variable_to_dispose(variable);
-                        fi
-                    od
-                od
-            fi
+            _bindings.visit_let(`let);
         si
         
         pre(`for: Trees.Statements.FOR) -> bool is
@@ -673,73 +619,17 @@ namespace Syntax.Process is
 
         pre(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) -> bool is
             super.pre(left);
-
-            if !left.value? then
-                return false;
-            fi
-
-            if !left.value.is_consumable then
-                _logger.error(left.location, "cannot use this here");
-                return false;
-            fi
-
-            left.expression.value = Need.STORE(left.value);
-            return false;
+            return _bindings.pre_simple_left(left);
         si
 
         visit(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) is
             super.visit(left);
-
-            if !left.value? \/ !left.value.type? \/ !left.expression.value? \/ !left.expression.value.type? then
-                return;
-            fi
-
-            if !left.expression.value.is_consumable then
-                // debug_always("cannot assign to {left} at {left.location} from AAA {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
-                _logger.error(left.location, "cannot assign to this");
-                return;
-            fi
-
-            // Bypass narrowing for assignability — the LHS value's
-            // type may be a narrowed view, but assignment must
-            // typecheck against the variable's declared type, or
-            // `if isa T(x) then x = wider_value` (idiomatic across
-            // the codebase) would fail at the narrow.
-            let target_variable = try_get_narrowing_target(left.expression);
-            let lhs_type =
-                if target_variable? then
-                    _flow.declared_type_of(target_variable)
-                else
-                    left.expression.value.type
-                fi;
-
-            if !lhs_type.is_assignable_from(left.value.type) then
-                _logger.error(left.assign_location, "{left.value.type} is not assignable to {lhs_type}");
-                return;
-            fi
-
-            left.value = left.expression.value;
-
-            // Reassignment invalidates any narrow for the target —
-            // the new value may not satisfy it, so subsequent reads
-            // observe the declared type — and makes the target
-            // definitely assigned from here on.
-            if target_variable? then
-                _flow.on_assignment(target_variable);
-                _flow.mark_assigned(target_variable);
-
-                // A non-optional RHS leaves the target known to hold
-                // a value — so `_field = arg; _field.method()` does
-                // not warn.
-                if _is_non_optional_value(left.value) then
-                    _flow.mark_non_null(target_variable);
-                fi
-            fi
+            _bindings.visit_simple_left(left);
         si
 
         // True iff `value` is statically known to hold a value — its
         // type is settled and is not an optional / null type.
-        _is_non_optional_value(value: IR.Values.Value) -> bool =>
+        is_non_optional_value(value: IR.Values.Value) -> bool =>
             value? /\ value.type? /\ value.type.is_settled /\
             !value.type.is_null /\ !value.type.is_optional;
         
@@ -875,190 +765,11 @@ namespace Syntax.Process is
 
         visit(let_in: Trees.Expressions.LET_IN) is
             super.visit(let_in);
-
-            if 
-                !let_in.expression.value? \/
-                !let_in.expression.value.check_is_consumable_allow_void(_logger, let_in.expression.location)
-            then
-                let_in.value = IR.Values.DUMMY(Semantic.Types.ERROR(), let_in.location);
-                return;
-            fi
-
-            let_in.value = let_in.expression.value;
+            _bindings.visit_let_in(let_in);
         si
         
-        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
-            // Push the LHS type down to the RHS as a constraint. The
-            // RHS expression node is responsible for either consuming
-            // it (FUNCTION uses it for argument-type inference,
-            // SEQUENCE / TUPLE forward to their elements) or ignoring
-            // it (literals, identifiers — Expression's default
-            // set_constraint is a no-op). The post-walk assignability
-            // check still verifies type correctness for the cases
-            // where the RHS doesn't act on the constraint.
-            //
-            // When the LHS is itself a not-yet-resolved placeholder
-            // (`let l; ...; l = X` shape), the LHS type is not
-            // useful as a constraint to push *down*. Instead, after
-            // walking the RHS, push the RHS's type back to the
-            // LHS variable's symbol via add_constraint — the
-            // existing iterative-inference machinery will collapse
-            // the LUB across all assignments on the next retry-
-            // loop iteration.
-            let lhs_type = _try_get_assignment_left_type(assignment.left);
-
-            // `!is_inferred` (not !is_sentinel or is_settled):
-            // we're asking "is the LHS anything other than a
-            // bare placeholder?". ERROR is pre-filtered by
-            // _try_get_assignment_left_type. A composite-with-
-            // placeholder LHS like Function[placeholder, int]
-            // *is* useful as an RHS constraint — the placeholder
-            // arg slot is filled by the lambda's body inference,
-            // and the return slot does its job.
-            if lhs_type? /\ !lhs_type.is_inferred /\ !lhs_type.is_error then
-                assignment.right.set_constraint(lhs_type, "{{0}} is not assignable to {{1}}");
-            fi
-
-            assignment.right.walk(self);
-
-            if !assignment.right.value? then
-                return true;
-            fi
-
-            if !assignment.right.value.is_consumable then
-                _logger.error(assignment.right.location, "cannot use this here");
-                assignment.left.value = IR.Values.DUMMY(Semantic.Types.ERROR(), assignment.right.location);
-            else
-                assignment.left.value = assignment.right.value;
-
-                _check_non_optional(lhs_type, assignment.right, assignment.right.location);
-            fi
-
-            // Back-feed the RHS type as a constraint onto a
-            // placeholder-typed LHS variable (`let l; l = X` etc.).
-            // The next retry-loop iteration of the enclosing
-            // function-body walk picks up the LUB via
-            // try_get_inferred_type at visit(SIMPLE_VARIABLE_LEFT).
-            //
-            // `!is_settled` (not is_inferred or contains_inferred): a
-            // provisional composite LHS like `Func[List[int],
-            // INFERED_RETURN_TYPE]` — recorded on an early iter when
-            // the lambda's body was walked before the return type
-            // resolved — still needs refining once the placeholder
-            // inside settles. Same goes for an ERROR-carrying
-            // composite like `(ERROR, int)` left over from an iter
-            // where a sub-expression poisoned to DUMMY(ERROR):
-            // a later iter may produce a clean `(int, int)` value,
-            // and without the back-feed the LUB never picks it up
-            // and the per-position merge prefers the stale ERROR
-            // slot. `is_settled` ("no placeholders, no errors")
-            // captures both senses in one predicate.
-            if
-                lhs_type? /\
-                !lhs_type.is_settled /\
-                assignment.right.value? /\
-                assignment.right.value.type? /\
-                _try_back_feed_assignment_lhs(assignment.left, assignment.right.value.type)
-            then
-                _logger.mark_consumed_any();
-            fi
-
-            assignment.left.assign_location = assignment.location;
-
-            assignment.left.walk(self);
-
-            assignment.value = assignment.left.value;
-
-            return true;
-        si
-
-        // If the assignment's LHS is a simple identifier referring
-        // to a Variable whose current type is an inference
-        // placeholder, push the supplied RHS type onto the
-        // variable's LUB accumulator. Returns true when a real
-        // constraint actually landed (so the caller can signal
-        // progress to the retry loop).
-        _try_back_feed_assignment_lhs(
-            left: Trees.Expressions.AssignmentLeftExpression,
-            rhs_type: Semantic.Types.Type
-        ) -> bool is
-            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
-
-            if !simple? \/ !simple.expression? then
-                return false;
-            fi
-
-            let identifier = cast Trees.Expressions.IDENTIFIER(simple.expression);
-
-            if !identifier? \/ !identifier.identifier? then
-                return false;
-            fi
-
-            let symbol = find(identifier.identifier);
-
-            if !symbol? \/ !isa Semantic.Symbols.Variable(symbol) then
-                return false;
-            fi
-
-            let variable = symbol;
-
-            return variable.add_constraint(rhs_type);
-        si
-
-        // Speculatively walk a SIMPLE_LEFT_EXPRESSION's inner expression
-        // as a regular load, read its type, and roll back the logger so
-        // the probe is invisible to later passes. Destructuring lefts
-        // are skipped — extracting their effective type is a follow-up
-        // that needs a tuple-shape construction we don't have yet.
-        // The probe walks the live expression rather than a copy: the
-        // subsequent normal walk through pre(SIMPLE_LEFT_EXPRESSION)
-        // overwrites the inner expression's value with the STORE form
-        // anyway, so the probe's read-form value never escapes.
-        _try_get_assignment_left_type(left: Trees.Expressions.AssignmentLeftExpression) -> Type? is
-            let simple = cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left);
-
-            if !simple? \/ !simple.expression? then
-                return null;
-            fi
-
-            let mark = _logger.mark();
-            let type: Type mut = default;
-
-            try
-                _logger.speculate();
-
-                simple.expression.walk(self);
-
-                // is_error left unfiltered here: an ERROR-bearing
-                // composite (e.g. `(ERROR, int)` set by an earlier
-                // iter on a delayed-init variable whose first-seen
-                // RHS poisoned to DUMMY(ERROR)) is exactly the case
-                // the assignment back-feed below needs to recognise
-                // — without the LHS type, the back-feed gate
-                // gets null, no refinement constraint lands, and
-                // the LUB stays frozen. Call sites that don't want
-                // to pass ERROR onward (the set_constraint push to
-                // RHS) gate it themselves.
-                if simple.expression.value? /\ simple.expression.value.type? then
-                    let target_variable = try_get_narrowing_target(simple.expression);
-
-                    type =
-                        if target_variable? then
-                            _flow.declared_type_of(target_variable)
-                        else
-                            simple.expression.value.type
-                        fi;
-                fi
-
-                _logger.roll_back();
-                _logger.release(mark);
-            catch e: Exception
-                _logger.release(mark);
-                return null;
-            yrt
-
-            return type;
-        si
+        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool =>
+            _bindings.pre_assignment(assignment);
 
         pre(expression: Trees.Statements.EXPRESSION) -> bool is
             super.pre(expression);
@@ -1068,128 +779,17 @@ namespace Syntax.Process is
 
         visit(expression: Trees.Statements.EXPRESSION) is
             super.visit(expression);
-
-            Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
-
-            if !expression.want_value then
-                if expression.expression.must_be_consumed then
-                    _logger.error(expression.expression.location, "{expression.expression.description} result is not used");
-                fi
-
-                return;
-            fi
-
-            expression.value = expression.expression.value;
+            _bindings.visit_expression_statement(expression);
         si
 
         pre(r: Trees.Statements.RETURN) -> bool is
             super.pre(r);
-
-            if !r.expression? then
-                return false;
-            fi
-
-            let function = current_function;
-
-            if
-                !function.return_type? \/ 
-                function.return_type.is_any \/ 
-                function.return_type =~ _innate_symbol_lookup.get_void_type()
-            then
-                return false;
-            fi
-
-            r.expression.set_constraint(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
-
-            return false;
+            return _bindings.pre_return(r);
         si
 
         visit(r: Trees.Statements.RETURN) is
             super.visit(r);
-
-            // Control does not fall through a return — the rest of
-            // the enclosing block is unreachable.
-            _flow.set_unreachable();
-
-            let function = current_function;
-
-            if !function? \/ !function.return_type? then
-                // FIXME: null function happens for properties, null return type happens for anonymous functions
-                return;
-            fi
-
-            if r.expression? then
-                if
-                    r.expression.value? /\
-                    r.expression.value.type? /\
-                    r.expression.value.check_is_consumable(_logger, r.expression.location)
-                then
-                    if function.return_type.is_inferred then
-                        // Filling in a previously-undeclared return
-                        // type from this return statement. is_inferred
-                        // (today only INFERED_RETURN_TYPE) rather than
-                        // is_any: a function whose return type was
-                        // already set to ERROR by an earlier failing
-                        // return shouldn't get silently overwritten
-                        // with a concrete type by a later (validly-
-                        // typed) return — the original error should
-                        // remain reported and the return-type contract
-                        // should stay ERROR until the user fixes the
-                        // source.
-                        function.set_return_type(r.expression.value.type);
-                    elif function.return_type =~ _innate_symbol_lookup.get_void_type() /\ !function.return_type.is_type_variable then
-                        _logger
-                            .error(
-                                r.expression.location,
-                                "cannot return value from function of void type"
-                            );
-                    elif !function.return_type.is_assignable_from(r.expression.value.type) then
-                        // Originally-inferred return type with a later
-                        // return that doesn't conform to the current
-                        // binding — widen via LUB rather than erroring
-                        // (#1173 checkbox "Inferring the return type
-                        // of function literals with multiple return
-                        // statements"). Covers both the narrower-first
-                        // / wider-second case and the siblings case.
-                        // For a declared return type the existing
-                        // error is correct.
-                        if function.return_type_was_inferred then
-                            let lub = Semantic.LEAST_UPPER_BOUND_MAP();
-                            lub.add(function.return_type);
-                            lub.add(r.expression.value.type);
-                            let widened = lub.get_result();
-
-                            if widened? then
-                                function.set_return_type(widened);
-                            else
-                                _logger
-                                    .error(
-                                        r.expression.location,
-                                        "cannot widen return type to common ancestor of {function.return_type} and {r.expression.value.type}"
-                                    );
-                            fi
-                        else
-                            _logger
-                                .error(
-                                    r.expression.location,
-                                    "cannot return value of type {r.expression.value.type} where {function.return_type} expected"
-                                );
-                        fi
-                    fi
-
-                    _check_non_optional(function.return_type, r.expression, r.expression.location);
-
-                    return;
-                fi
-            else
-                if function.return_type !~ _innate_symbol_lookup.get_void_type() then
-                    _logger
-                        .warn(
-                            r.location,
-                            "return without value from non void function returns default value of type {function.return_type}"
-                        );
-                fi
-            fi
+            _bindings.visit_return(r);
         si
 
         visit(`throw: Trees.Statements.THROW) is
@@ -1394,7 +994,7 @@ namespace Syntax.Process is
                 Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
             fi
 
-            _check_non_optional(function.return_type, expression.expression, expression.expression.location);
+            check_non_optional(function.return_type, expression.expression, expression.expression.location);
 
             super.visit(expression);
         si
@@ -1996,7 +1596,7 @@ namespace Syntax.Process is
                     // not warn.
                     if
                         isa Semantic.Symbols.Variable(symbol) /\
-                        _is_non_optional_value(left.right_value)
+                        is_non_optional_value(left.right_value)
                     then
                         _flow.mark_non_null(cast Semantic.Symbols.Variable(symbol));
                     fi
@@ -2147,7 +1747,7 @@ namespace Syntax.Process is
             // the declared type. An untyped `let` infers its type
             // from the initializer, so there is no slot to violate.
             if variable.type_expression? /\ variable.initializer? then
-                _check_non_optional(
+                check_non_optional(
                     variable.type_expression.type,
                     variable.initializer,
                     variable.initializer.location
