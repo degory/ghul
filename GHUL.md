@@ -131,6 +131,17 @@ ghūl is strongly typed and offers several ways to define your own types: **clas
 
   Unions enable algebraic data types similar to F# discriminated unions or Rust enums with data. ghūl doesn’t yet support pattern-matching syntax on unions (see **Pattern Matching** below), so code uses `if/elif` or `case` checks on the tag properties as shown. Union type names use `PascalCase`, and variant names use `MACRO_CASE`.
 
+  A union with exactly one data-carrying variant behaves like an option type: `u?` tests whether that variant is present and `u!` unwraps its value, with `u.has_value` and `u.value` as the named-property equivalents. For a union with several data-carrying variants, mark one with a trailing `default` to nominate it as the variant `?` and `!` act on:
+
+  ```ghul
+  union Result[T,E] is
+      OK(value: T) default;
+      ERROR(error: E);
+  si
+  ```
+
+  Here `r?` is true when `r` holds `OK`, and `r!` unwraps the `OK` payload (throwing if `r` holds `ERROR`). A default variant with a single field unwraps to that field; one with several fields unwraps to the variant itself.
+
   *Common use case:* A generic `Option[T]` union is provided (or can be user-defined) to represent optional values. For example, one could define:
 
   ```ghul
@@ -451,7 +462,7 @@ Below is a concise summary of ghūl syntax, keywords, and type system features f
   * `class NAME [ : Superclass, Trait, ... ] is ... si` – define class. Supports single inheritance and multiple traits. Use `init` methods for constructors. A class without a specified superclass implicitly inherits from `object` (System.Object).
   * `struct NAME [ : Trait, ... ] is ... si` – define struct (value type). Cannot have a superclass. Copying struct copies data, `==` is memberwise compare.
   * `trait Name [ : ParentTrait, ... ] is ... si` – define trait (interface). Members have no bodies (except possibly default implementations in future). Classes/structs implement traits by listing them after a colon.
-  * `union Name is VARIANT1(...); VARIANT2(...); ... si` – define union (discriminated union). Automatically gets `is_variant` tags and `.variant` accessors for payload. Use qualified name to construct, e.g. `Name.VARIANT1(data)`.
+  * `union Name is VARIANT1(...); VARIANT2(...); ... si` – define union (discriminated union). Automatically gets `is_variant` tags and `.variant` accessors for payload. Use qualified name to construct, e.g. `Name.VARIANT1(data)`. A trailing `default` on a variant makes it the one `?` and `!` test and unwrap.
   * `enum NAME is MEMBER1[,=value1], MEMBER2[,=value2], ... si` – define enum. Members are constants of that enum type. Backed by int (32-bit) by default.
 * **Generics Syntax:**
 
