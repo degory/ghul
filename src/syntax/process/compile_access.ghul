@@ -1,0 +1,603 @@
+namespace Syntax.Process is
+    use Logging;
+    use Source;
+
+    use Semantic.Types.Type;
+
+    use IR.Values;
+
+    // Compiles the member-access family of expressions: member access,
+    // identifier resolution, `?` (has-value), `!` (unwrap) and `ref`.
+    // Split out of COMPILE_EXPRESSIONS, which delegates the matching
+    // visit methods here. The exception-handling wrapper of
+    // visit(identifier) stays on the visitor; visit_identifier is the
+    // enclosed logic.
+    class COMPILE_ACCESS is
+        _logger: Logger;
+        _symbol_table: Semantic.SYMBOL_TABLE;
+        _symbol_loader: Semantic.SYMBOL_LOADER;
+        _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _overload_resolver: Semantic.OVERLOAD_RESOLVER;
+        _function_caller: Semantic.FUNCTION_CALLER;
+        _flow: NARROWING_FLOW;
+        _condition_analyzer: CONDITION_ANALYZER;
+        _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
+        _visitor: COMPILE_EXPRESSIONS;
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            symbol_loader: Semantic.SYMBOL_LOADER,
+            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
+            overload_resolver: Semantic.OVERLOAD_RESOLVER,
+            function_caller: Semantic.FUNCTION_CALLER,
+            flow: NARROWING_FLOW,
+            condition_analyzer: CONDITION_ANALYZER,
+            build_flags: Compiler.GLOBAL_BUILD_FLAGS,
+            visitor: COMPILE_EXPRESSIONS
+        ) is
+            super.init();
+
+            _logger = logger;
+            _symbol_table = symbol_table;
+            _symbol_loader = symbol_loader;
+            _symbol_use_locations = symbol_use_locations;
+            _innate_symbol_lookup = innate_symbol_lookup;
+            _overload_resolver = overload_resolver;
+            _function_caller = function_caller;
+            _flow = flow;
+            _condition_analyzer = condition_analyzer;
+            _build_flags = build_flags;
+            _visitor = visitor;
+        si
+
+        visit_member(member: Trees.Expressions.MEMBER) is
+            let need_store = member.value? /\ isa Need.STORE(member.value);
+            let need_deref mut = false;
+
+            if member.identifier == null then
+                member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                return;
+            fi
+
+            if member.left? /\ member.left.value? then
+                let type mut = member.left.value.type;
+
+                if type == null then
+                    _logger.poison(member.left.location, "member left has no type");
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
+                fi
+
+                _check_possible_null_dereference(member.left);
+
+                // TODO we could loop here to handle multiple levels of dereferencing
+                if type.is_ref then
+                    need_deref = true;
+                    type = type.get_element_type();
+
+                    member.left.value = DEREF(member.left.value, type);
+                fi
+
+                // Operation-constraint inference: when the receiver
+                // is an INFERRED_VARIABLE_TYPE placeholder, record a
+                // MEMBER_CONSTRAINT on the placeholder's origin so
+                // the constraint-aware LUB can later filter candidate
+                // types to those that actually expose this member.
+                // mark_consumed_any drives the retry loop to re-walk
+                // the body with the resolved type (if any).
+                if isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) then
+                    let placeholder = type;
+
+                    if placeholder.origin.add_constraint(Semantic.MEMBER_CONSTRAINT(member.identifier.name)) then
+                        _logger.mark_consumed_any();
+                    fi
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
+                fi
+
+                if !isa Semantic.Types.NAMED(type) then
+                    if !isa Semantic.Types.ERROR(type) /\ !type.is_inferred then
+                        // Suppress for ERROR (existing — error already
+                        // reported, the contract says don't pile on)
+                        // and for is_inferred placeholders (deferred-
+                        // inference: the lambda's arg type is awaiting
+                        // the call-site second-pass to fill it in,
+                        // and emitting a fatal "type has no members"
+                        // here breaks that flow). Both share the
+                        // intent of "don't surface a member-resolution
+                        // failure on a stand-in type".
+                        _logger.poison(member.left.location, "type has no members: {type}");
+                    fi
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
+                fi
+
+                let named_type = type;
+
+                if named_type.scope == null then
+                    _logger.poison(member.left.location, "member left type has no type: {type}");
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
+                fi
+
+                let symbol = named_type.scope.find_member(member.identifier.name);
+
+                if !symbol? then
+                    let hint = try_describe_intersection_miss(named_type, member.identifier.name);
+
+                    if hint? then
+                        _logger.error(member.identifier.location, hint);
+                    else
+                        _logger.error(member.identifier.location, "member {member.identifier.name} not found in {named_type}");
+                    fi
+
+                    member.value = DUMMY(Semantic.Types.ERROR(), member.location);
+                    return;
+                fi
+
+                _symbol_use_locations.add_symbol_use(member.identifier.right_location, symbol);
+
+                if symbol.is_instance /\ !member.left.value.is_consumable then
+                    _logger.error(member.identifier.location, "cannot access instance member {member.identifier.name} in {named_type}");
+                fi
+
+                _symbol_loader.find_symbol =
+                    (name: string) is
+                        let result = named_type.scope.find_member(name);
+
+                        return result;
+                    si;
+
+                let value: Value mut = default;
+
+                if need_store then
+                    let store_value = cast Need.STORE(member.value).value;
+
+                    if check_store_access(member.location, member.left.value, symbol, named_type) then
+                        value = symbol.store(member.location, member.left.value, store_value, _symbol_loader, false);
+                    fi
+                else
+                    if check_load_access(member.location, member.left.value, symbol, named_type) then
+                        value = symbol.load(member.location, member.left.value, _symbol_loader);
+                    fi
+                fi
+
+                member.value = value;
+
+                if !need_store /\ _condition_analyzer.is_variant_accessor_name(member.identifier.name) then
+                    if is_statically_false_is_accessor(named_type, member.identifier.name) then
+                        _logger.warn(
+                            member.location,
+                            "predicate {member.identifier.name} is always false: receiver narrowed to {named_type}"
+                        );
+                    fi
+                fi
+            fi
+        si
+
+        check_load_access(location: LOCATION, from: Value, symbol: Semantic.Symbols.Symbol, type: Type) -> bool is
+            if symbol.is_public_readable then
+                return true;
+            fi
+
+            if from? /\ from.is_self then
+                return true;
+            fi
+
+            let instance_context = _symbol_table.current_instance_context;
+
+            if instance_context? /\ instance_context.type.is_assignable_from(type) then
+                return true;
+            fi
+
+            _logger.error(location, "{symbol} is not publicly readable");
+
+            return false;
+        si
+
+        check_store_access(location: LOCATION, from: Value, symbol: Semantic.Symbols.Symbol, type: Type) -> bool is
+            if !symbol.is_private /\ !symbol.is_field then
+                return true;
+            fi
+
+            if from? /\ from.is_self then
+                return true;
+            fi
+
+            let instance_context = _symbol_table.current_instance_context;
+
+            if instance_context? /\ instance_context.type.is_assignable_from(type) then
+                return true;
+            fi
+
+            _logger.error(location, "{symbol} is not publicly assignable");
+
+            return false;
+        si
+
+        visit_identifier(identifier: Trees.Expressions.IDENTIFIER) is
+            let need_store = identifier.value? /\ isa Need.STORE(identifier.value);
+
+            let symbol = _visitor.find(identifier.identifier);
+
+            if symbol? then
+                if symbol.is_type then
+                    _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
+
+                    identifier.value = TYPE_EXPRESSION(symbol.type, identifier.location);
+
+                    // if need_store then
+                    //     debug_always("cannot assign to {identifier} at {identifier.location} from BBB {System.Diagnostics.StackTrace().to_string().replace_line_endings(" ")}");
+                    //     _logger.error(identifier.location, "cannot assign to this");
+                    // fi
+                else
+                    _symbol_loader.find_symbol = (name: string) => _visitor.find(name);
+
+                    if need_store then
+                        let store_value = cast Need.STORE(identifier.value).value;
+                        identifier.value = symbol.store(identifier.location, null, store_value, _symbol_loader, false);
+
+                        _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
+                    else
+                        identifier.value = symbol.load(identifier.location, null, _symbol_loader);
+
+                        // Optional-narrowing: when flow analysis has
+                        // established this variable is non-null here,
+                        // the load is of the non-optional type. Pin
+                        // that on the use-site node, matching how
+                        // `isa`-narrowing reaches the load via a
+                        // mutated `symbol.type`.
+                        if
+                            isa Semantic.Symbols.Variable(symbol) /\
+                            isa IR.Values.Load.SYMBOL(identifier.value) /\
+                            identifier.value.has_type /\
+                            identifier.value.type.is_optional
+                        then
+                            let variable = symbol;
+
+                            if _flow.is_non_null(variable) then
+                                let narrowed = identifier.value.type.as_non_optional();
+
+                                if narrowed? /\ !narrowed.is_optional then
+                                    (cast IR.Values.Load.SYMBOL(identifier.value)).narrow_snapshot_type(narrowed);
+                                fi
+                            fi
+                        fi
+
+                        // HOVER reads a narrowed local's type off
+                        // this use-site node, not the symbol — the
+                        // symbol's `type` is restored after the walk.
+                        _symbol_use_locations.add_variable_use(identifier.right_location, symbol, identifier.value);
+
+                        // Definite assignment: reading a tracked
+                        // deferred-init local before it is assigned
+                        // on every path reaching here.
+                        if !_build_flags.no_warn_definite_assignment /\ isa Semantic.Symbols.Variable(symbol) then
+                            let variable = symbol;
+
+                            if _flow.is_tracked(variable) /\ !_flow.is_assigned(variable) then
+                                _logger.warn(identifier.location, "{variable.name} may be used before it is assigned");
+                            fi
+                        fi
+                    fi
+                fi
+
+            else
+                identifier.value = DUMMY(Semantic.Types.ERROR(), identifier.location);
+            fi
+        si
+
+        visit_has_value(has_value: Trees.Expressions.HAS_VALUE) is
+
+            if !has_value.left? then
+                _logger.poison(has_value.location, "has value expression has no left expression");
+                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
+                return;
+            elif !has_value.left.value? then
+                _logger.poison(has_value.left.location, "has value expression has no value");
+                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
+                return;
+            fi
+
+            if
+                !has_value.left.value.check_is_consumable(_logger, has_value.left.location)
+            then
+                _logger.error(has_value.left.location, "cannot use this here");
+                has_value.value = DUMMY(_innate_symbol_lookup.get_bool_type(), has_value.location);
+                return;
+            fi
+
+            let has_value_member =
+                has_value.left.value.type.find_member("has_value");
+            let bool_type = _innate_symbol_lookup.get_bool_type();
+            let has_value_valid mut = false;
+
+            if has_value_member? then
+                if !isa Semantic.Symbols.Property(has_value_member) then
+                    _logger.error(
+                        has_value.left.location,
+                        "has_value member must be a bool property"
+                    );
+                elif has_value_member.type !~ bool_type then
+                    _logger.error(
+                        has_value.left.location,
+                        "has_value property must be bool"
+                    );
+                else
+                    has_value_valid = true;
+                fi
+            fi
+
+            if !has_value.left.value.type.is_value_type then
+                has_value.value =
+                    get_reference_has_value(
+                        has_value.location,
+                        has_value.left.value,
+                        if has_value_valid then has_value_member else null fi,
+                        bool_type
+                    );
+            elif has_value_member? then
+                if has_value_valid then
+                    has_value.value =
+                        has_value_member.load(
+                            has_value.location,
+                            has_value.left.value,
+                            _symbol_loader
+                        );
+                else
+                    has_value.value = DUMMY(bool_type, has_value.location);
+                fi
+            else
+                _logger.error(has_value.left.location, "must be a reference type or provide a has_value property");
+                has_value.value = DUMMY(bool_type, has_value.location);
+            fi
+        si
+
+        visit_unwrap(unwrap: Trees.Expressions.UNWRAP) is
+            if !unwrap.left? then
+                _logger.poison(unwrap.location, "unwrap expression has no left expression");
+                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
+                return;
+            elif !unwrap.left.value? then
+                _logger.poison(unwrap.left.location, "unwrap expression has no value");
+                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
+                return;
+            fi
+
+            if
+                !unwrap.left.value.check_is_consumable(_logger, unwrap.left.location)
+            then
+                _logger.error(unwrap.left.location, "cannot use this here");
+                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
+                return;
+            fi
+
+            let value_member = unwrap.left.value.type.find_member("value");
+
+            if !unwrap.left.value.type.is_value_type then
+                // on a reference type, it's a no-op
+                // TODO we could do an explicit null check here:
+                unwrap.value = unwrap.left.value;
+            elif value_member? then
+                // TODO we could do an explicit has-value check here:
+                unwrap.value = value_member.load(unwrap.location, unwrap.left.value, _symbol_loader);
+            else
+                _logger.error(unwrap.left.location, "must be a reference type or provide a value property");
+                unwrap.value = DUMMY(Semantic.Types.ERROR(), unwrap.location);
+            fi
+
+            // `x!` asserts `x` holds a value — record it, so a
+            // subsequent dereference of `x` is not flagged.
+            let target = _visitor.try_get_narrowing_target(unwrap.left);
+
+            if target? then
+                _flow.mark_non_null(target);
+            fi
+
+            // TODO, we could handle ref and ptr here as well
+        si
+
+        visit_reference(reference: Trees.Expressions.REFERENCE) is
+            if !reference.left? then
+                _logger.poison(reference.location, "reference expression has no left expression");
+                reference.value = DUMMY(Semantic.Types.ERROR(), reference.location);
+                return;
+            elif !reference.left.value? \/ !reference.left.value.type? then
+                _logger.poison(reference.left.location, "reference expression has no value");
+                reference.value = DUMMY(Semantic.Types.ERROR(), reference.location);
+                return;
+            elif !reference.left.value.has_address then
+                _logger.warn(reference.left.location, "reference to an expression");
+            fi
+
+            reference.left.value.check_is_consumable(_logger, reference.left.location);
+
+            reference.value = ADDRESS(reference.left.value, _innate_symbol_lookup.get_reference_type(reference.left.value.type));
+
+            // The callee reached through `x ref` may write the
+            // target, so treat the `ref` as a definite assignment.
+            let ref_target = _visitor.try_get_narrowing_target(reference.left);
+
+            if ref_target? then
+                _flow.mark_assigned(ref_target);
+            fi
+        si
+
+        get_reference_has_value(
+            location: LOCATION,
+            value: Value,
+            member: Semantic.Symbols.Symbol,
+            bool_type: Type
+        ) -> Value is
+            let null_check = HAS_VALUE(value, bool_type);
+
+            if member? then
+                let member_check = member.load(location, value, _symbol_loader);
+
+                let and_identifier = Trees.Identifiers.Identifier(location, "/\\");
+                let and_symbol = _visitor.find(and_identifier);
+
+                if and_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(and_symbol) then
+                    _symbol_loader.find_symbol = (name: string) => _visitor.find(name);
+
+                    let argument_types = Collections.LIST[Type]();
+                    argument_types.add(bool_type);
+                    argument_types.add(bool_type);
+
+                    let overload_result =
+                        _overload_resolver.resolve(
+                            location,
+                            and_symbol,
+                            argument_types,
+                            false,
+                            false,
+                            false
+                        );
+
+                    if overload_result? then
+                        let function = overload_result.function;
+                        if function.is_unsafe_constraints then
+                            _logger.warn(location, "call to {function} has unchecked constraints");
+                        fi
+
+                        let arguments = Collections.LIST[Value]();
+                        arguments.add(null_check);
+                        arguments.add(member_check);
+
+                        return function.call(
+                            location,
+                            null,
+                            arguments,
+                            bool_type,
+                            _function_caller
+                        );
+                    fi
+                fi
+            fi
+
+            return null_check;
+        si
+
+        // Warn when a value is dereferenced through a `T?` receiver —
+        // an optional reference or an OPTION[T] — that the flow
+        // analysis has not proven to hold a value here. Only a local
+        // variable's null-state is flow-tracked, so other receiver
+        // shapes (a field, a call result, an explicit `x!`) stay
+        // silent rather than risk a false positive. On by default;
+        // `--no-warn-null-deref` opts out.
+        _check_possible_null_dereference(receiver: Trees.Expressions.Expression) is
+            if _build_flags.no_warn_null_deref \/ !receiver? then
+                return;
+            fi
+
+            if
+                !receiver.value? \/ !receiver.value.type? \/
+                !receiver.value.type.is_optional
+            then
+                return;
+            fi
+
+            let target = _visitor.try_get_narrowing_target(receiver);
+
+            if !target? \/ _flow.is_non_null(target) then
+                return;
+            fi
+
+            _logger.warn(receiver.location, "{target.name} may not hold a value here");
+        si
+
+        // True iff the predicate `receiver.<member_name>` is
+        // statically false because the receiver is a ONE_OF and the
+        // matched variant is outside the narrowed set. Other "no
+        // match" reasons (not a variant accessor, not a union,
+        // variant doesn't exist at all) return false — those are
+        // either ill-formed (the existing find_member error reports
+        // them) or simply not a is_X predicate.
+        is_statically_false_is_accessor(
+            receiver_type: Type,
+            member_name: string
+        ) -> bool is
+            if !_condition_analyzer.is_variant_accessor_name(member_name) then
+                return false;
+            fi
+
+            if !isa Semantic.Types.ONE_OF(receiver_type) then
+                return false;
+            fi
+
+            let one_of = receiver_type;
+            let classy = _condition_analyzer.get_classy_for_narrowing(receiver_type);
+
+            if !classy? \/ !classy.is_union then
+                return false;
+            fi
+
+            let suffix = member_name.substring(3);
+
+            for s in classy.symbols do
+                if s? /\ s.is_variant /\ s.name? /\ s.name.to_lower_invariant() =~ suffix then
+                    let variant = cast Semantic.Symbols.Classy(s);
+
+                    return !one_of.contains_variant(variant);
+                fi
+            od
+
+            return false;
+        si
+
+        // Build a hinted "narrow further" message when a member
+        // access on a ONE_OF fails to find the member on the union
+        // but every in-set variant has a same-named member. Returns
+        // null when the hint doesn't apply (receiver isn't a ONE_OF,
+        // name is a is_<variant> accessor that has its own
+        // diagnostic, or the name is missing on at least one
+        // in-set variant). Variant-private fields can't be accessed
+        // through ONE_OF without IL-side variant-dispatching support
+        // — for now we just direct the user to narrow further.
+        try_describe_intersection_miss(
+            receiver_type: Type,
+            member_name: string
+        ) -> string? is
+            if !isa Semantic.Types.ONE_OF(receiver_type) then
+                return null;
+            fi
+
+            if _condition_analyzer.is_variant_accessor_name(member_name) then
+                return null;
+            fi
+
+            let one_of = receiver_type;
+
+            let any_variant mut = false;
+            for variant in one_of.variants do
+                if !variant? \/ !variant.find_member(member_name)? then
+                    return null;
+                fi
+                any_variant = true;
+            od
+
+            if !any_variant then
+                return null;
+            fi
+
+            let names = System.Text.StringBuilder();
+            let seen_any mut = false;
+            for variant in one_of.variants do
+                if seen_any then
+                    names.append(", ");
+                fi
+                names.append(variant.name);
+                seen_any = true;
+            od
+
+            return "member {member_name} is on every variant of \{{names}\} but not on the union — narrow further with `if v.is_<variant>` before access";
+        si
+    si
+si

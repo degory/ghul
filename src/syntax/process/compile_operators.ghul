@@ -1,0 +1,429 @@
+namespace Syntax.Process is
+    use Logging;
+    use Source;
+
+    use Semantic.Types.Type;
+
+    use IR.Values;
+
+    // Compiles unary, binary and index expressions. Split out of
+    // COMPILE_EXPRESSIONS, which delegates visit(unary), pre(binary),
+    // visit(binary) and visit(index) here. The exception-handling
+    // wrappers of visit(binary) / visit(index) stay on the visitor;
+    // visit_binary / visit_index are the enclosed logic.
+    class COMPILE_OPERATORS is
+        _logger: Logger;
+        _symbol_table: Semantic.SYMBOL_TABLE;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _overload_resolver: Semantic.OVERLOAD_RESOLVER;
+        _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _function_caller: Semantic.FUNCTION_CALLER;
+        _flow: NARROWING_FLOW;
+        _condition_analyzer: CONDITION_ANALYZER;
+        _visitor: ScopedVisitor;
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
+            overload_resolver: Semantic.OVERLOAD_RESOLVER,
+            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
+            function_caller: Semantic.FUNCTION_CALLER,
+            flow: NARROWING_FLOW,
+            condition_analyzer: CONDITION_ANALYZER,
+            visitor: ScopedVisitor
+        ) is
+            super.init();
+
+            _logger = logger;
+            _symbol_table = symbol_table;
+            _innate_symbol_lookup = innate_symbol_lookup;
+            _overload_resolver = overload_resolver;
+            _symbol_use_locations = symbol_use_locations;
+            _function_caller = function_caller;
+            _flow = flow;
+            _condition_analyzer = condition_analyzer;
+            _visitor = visitor;
+        si
+
+        visit_unary(unary: Trees.Expressions.UNARY) is
+            unary.value = null;
+
+            if unary.right.value? then
+                let arguments = Collections.LIST[Type]([unary.right.value.type]);
+
+                // TODO do we need to search members and globals like we do with binary operators
+                // or if not, can we simplify the binary operator function search to match this?
+
+                let function_group = _visitor.find(unary.operation);
+
+                if function_group == null \/ !isa Semantic.Symbols.FUNCTION_GROUP(function_group) then
+                    _logger.error(unary.operation.location, "no unary operator {unary.operation} found");
+
+                    unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
+                    return;
+                fi
+
+                let overload_result =
+                    _overload_resolver.resolve(
+                        unary.location,
+                        function_group,
+                        arguments,
+                        false,
+                        unary.right.value.is_consumable, // FIXME: this doesn't seem right
+                        false
+                    );
+
+                if overload_result == null then
+                    unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
+                    return;
+                fi
+
+                let function = overload_result!.function;
+
+                if function.is_unsafe_constraints then
+                    _logger.warn(unary.location, "call to {function} has unchecked constraints");
+                fi
+
+                _symbol_use_locations.add_symbol_use(unary.operation.location, function);
+
+                let value = function.call(unary.location, null, Collections.LIST[Value]([unary.right.value]), null, _function_caller);
+
+                unary.value = value;
+            fi
+        si
+
+        pre_binary(binary: Trees.Expressions.BINARY) -> bool is
+            // For `/\` / `\/`, walk the operands with the narrowing
+            // environment threaded so within-condition narrowing
+            // applies as the right operand compiles: in
+            // `isa T(x) /\ x.foo`, `x.foo` sees `x` as `T`. The
+            // `/\` right walks under the left's true edge, the `\/`
+            // right under its false edge. The BINARY as a whole
+            // leaves the ambient environment unchanged — the
+            // enclosing IF derives the overall narrowing from
+            // analyze_condition once the condition is fully walked.
+            if binary.operation? /\ binary.left? /\ binary.right? then
+                let op = binary.operation.name;
+
+                if op =~ "/\\" \/ op =~ "\\/" then
+                    let saved = _flow.current_env.copy();
+
+                    binary.left.walk(_visitor);
+
+                    let left_facts = _condition_analyzer.analyze_condition(binary.left, saved);
+
+                    _flow.set_env(
+                        if op =~ "/\\" then left_facts.then_env else left_facts.else_env fi
+                    );
+
+                    binary.right.walk(_visitor);
+
+                    _flow.set_env(saved);
+
+                    return true;
+                fi
+            fi
+
+            return false;
+        si
+
+        visit_binary(binary: Trees.Expressions.BINARY) is
+            binary.value = null;
+
+            if !binary.left? \/ !binary.left.value? \/ !binary.right? \/ !binary.right.value? then
+                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
+                return;
+            fi
+
+            let left_is_consumable = binary.left.value.check_is_consumable(_logger, binary.left.location);
+            let right_is_consumable = binary.right.value.check_is_consumable(_logger, binary.right.location);
+
+            let binary_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
+            let binary_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
+            let binary_errors: Logging.DIAGNOSTICS_STATE mut = default;
+
+            let binary_name = binary.operation.name.to_string();
+
+            let binary_function_symbol = _visitor.find(binary.operation.name);
+
+            if binary_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(binary_function_symbol) then
+                binary_function_group = binary_function_symbol;
+
+                let use logger_snapshot = _logger.speculate_then_backtrack();
+
+                binary_overload_result =
+                    _overload_resolver
+                        .resolve(
+                            binary.location,
+                            binary_function_group,
+                            Collections.LIST[Type]([binary.left.value.type, binary.right.value.type]),
+                            false,
+                            _symbol_table.current_instance_context?,
+                            false
+                        );
+
+                binary_errors = logger_snapshot.backtrack();
+            fi
+
+            let member_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
+            let member_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
+            let member_errors: Logging.DIAGNOSTICS_STATE mut = default;
+
+            if binary.left.value.type? then
+                let member_function_symbol =
+                    binary.left.value.type.find_member(binary.operation.name);
+
+                if member_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(member_function_symbol) then
+                    member_function_group = member_function_symbol;
+
+                    let use logger_snapshot = _logger.speculate_then_backtrack();
+
+                    member_overload_result =
+                        _overload_resolver
+                            .resolve(
+                                binary.location,
+                                cast Semantic.Symbols.FUNCTION_GROUP(member_function_group),
+                                Collections.LIST[Type]([binary.right.value.type]),
+                                false,
+                                binary.left.value.is_consumable,
+                                false
+                            );
+
+                    member_errors = logger_snapshot.backtrack();
+                fi
+            fi
+
+            let function: Semantic.Symbols.Function mut = default;
+
+            if member_overload_result? /\ binary_overload_result? then
+                if cast int(member_overload_result.score) <= cast int(binary_overload_result.score) then
+                    function = member_overload_result.function;
+                else
+                    function = binary_overload_result.function;
+                fi
+            elif member_overload_result? then
+                function = member_overload_result.function;
+            elif binary_overload_result? then
+                function = binary_overload_result.function;
+            fi
+
+            if function? then
+                _symbol_use_locations.add_symbol_use(binary.operation.location, function);
+
+                let force_type: Type mut = default;
+                let want_not mut = false;
+
+                if binary.operation.name =~ "<>" then
+                    if function.return_type !~ _innate_symbol_lookup.get_int_type() then
+                        // FIXME: do this check on the definition:
+                        _logger.error(binary.location, "<> order operator must return int");
+                    fi
+
+                    force_type = _innate_symbol_lookup.get_bool_type();
+                elif binary.operation.name =~ "==" then
+                    if
+                        left_is_consumable /\ right_is_consumable /\
+                        cast int(binary.left.value.type.compare(binary.right.value.type)) > cast int(Semantic.Types.MATCH.ASSIGNABLE) /\
+                        cast int(binary.right.value.type.compare(binary.left.value.type)) > cast int(Semantic.Types.MATCH.ASSIGNABLE)
+                    then
+                        if binary.actual_operation =~ "==" then
+                            _logger.error(binary.location, "== cannot be applied to values of non-assignable types");
+                        else
+                            _logger.error(binary.location, "!= cannot be applied to values of non-assignable types");
+                        fi
+                    fi
+                elif !function.is_innate /\ binary.actual_operation =~ "!~" then
+                    want_not = true;
+                fi
+
+                let value: Value mut;
+
+                if function.is_unsafe_constraints then
+                    _logger.warn(binary.location, "call to {function} has unchecked constraints");
+                fi
+
+                if function.is_instance then
+                    value = function.call(binary.location, binary.left.value, Collections.LIST[Value]([binary.right.value]), force_type,_function_caller);
+                else
+                    value = function.call(binary.location, null, Collections.LIST[Value]([binary.left.value, binary.right.value]), force_type,_function_caller);
+
+                    if isa Call.INNATE(value) then
+                        let innate_value = value;
+
+                        innate_value.actual_operation = binary.actual_operation;
+
+                        value = innate_value.lower();
+                    fi
+                fi
+
+                if !function.is_innate /\ binary.operation.name =~ "<>" then
+                    value = COMPARE_ORDER_TO_ZERO(value, binary.actual_operation, _innate_symbol_lookup.get_bool_type());
+                fi
+
+                if want_not then
+                    value = NOT(value);
+                fi
+
+                binary.value = value;
+            else
+                if binary_errors? /\ binary_errors.count > 0 then
+                    _logger.merge(binary_errors);
+                fi
+
+                if member_errors? /\ member_errors.count > 0 then
+                    _logger.merge(member_errors);
+                fi
+
+                if (!binary_errors? \/ binary_errors.count == 0) /\ (!member_errors? \/ member_errors.count == 0) then
+                    _logger.error(binary.operation.location, "operator {binary.left.value.type} {binary.operation} {binary.right.value.type} not found");
+                fi
+
+                // FIXME QQ should probably do this
+                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
+            fi
+        si
+
+        visit_index(index: Trees.Expressions.INDEX) is
+            let need_store = index.value? /\ index.value.is_need_store;
+
+            if index.left.value? /\ index.index.value? then
+                let type = index.left.value.type;
+
+                if type == null \/ type.is_error then
+                    _logger.poison(index.left.location, "index left has no type");
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
+                // Indexable inference: an `INFERRED_VARIABLE_TYPE`
+                // receiver records an INDEX_CONSTRAINT carrying the
+                // index expression's type, so the body-retry loop
+                // can filter candidates to indexable types. Skip
+                // the "cannot index" hard error path on placeholder
+                // — the existing speculate/roll-back would discard
+                // it on retry but emitting it is noise; soft-error
+                // out to DUMMY(ERROR) instead.
+                if
+                    isa Semantic.Types.INFERRED_VARIABLE_TYPE(type) /\
+                    index.index? /\
+                    index.index.value? /\
+                    index.index.value.type?
+                then
+                    let placeholder = type;
+                    let constraint = Semantic.INDEX_CONSTRAINT(index.index.value.type);
+
+                    if placeholder.origin.add_constraint(constraint) then
+                        _logger.mark_consumed_any();
+                    fi
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
+                if !isa Semantic.Types.NAMED(type) then
+                    _logger.error(index.left.location, "cannot index {type}");
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
+                let named_type = type;
+
+                let function_name: string mut;
+                let arguments: Collections.LIST[Value] mut;
+                let argument_types: Collections.LIST[Type] mut;
+
+                if need_store then
+                    function_name = "set_Item";
+
+                    let need_store_value = cast Need.STORE(index.value).value;
+
+                    arguments = Collections.LIST[Value]([index.index.value, need_store_value]);
+                    argument_types = Collections.LIST[Type]([index.index.value.type, need_store_value.type]);
+                else
+                    function_name = "get_Item";
+                    arguments = Collections.LIST[Value]([index.index.value]);
+                    argument_types = Collections.LIST[Type]([index.index.value.type]);
+                fi
+
+                let symbol = named_type.scope.find_member(function_name);
+
+                if symbol == null then
+                    if need_store then
+                        if named_type.scope.find_member("get_Item")? then
+                            _logger.error(index.location, "indexer is read-only in {type}");
+                        else
+                            _logger.error(index.location, "no indexer found in {type}");
+                        fi
+                    else
+                        _logger.error(index.location, "no indexer found in {type}");
+                    fi
+
+                    if isa Semantic.Symbols.GENERIC(named_type.scope) then
+                        let g = cast Semantic.Symbols.GENERIC(named_type.scope);
+                    fi
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
+                if !isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
+                    _logger.poison(index.index.location, "indexer is not a function group: {symbol}");
+                fi
+
+                let overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut;
+
+                let use logger_snapshot = _logger.speculate_then_backtrack();
+
+                overload_result =
+                    _overload_resolver.resolve(
+                        index.location,
+                        cast Semantic.Symbols.FUNCTION_GROUP(symbol),
+                        argument_types,
+                        false,
+                        true,
+                        false
+                    );
+
+                logger_snapshot.backtrack();
+
+                if overload_result == null then
+                    if need_store then
+                        _logger.error(index.location, "indexer [{argument_types[0]}] = {argument_types[1]} not found in {type}");
+                    else
+                        _logger.error(index.location, "indexer [{argument_types[0]}] not found in {type}");
+                    fi
+
+                    index.value = DUMMY(Semantic.Types.ERROR(), index.location);
+                    return;
+                fi
+
+                let function = overload_result.function;
+
+                _symbol_use_locations.add_symbol_use(
+                    LOCATION(
+                        index.left.location.file_name,
+                        index.left.location.end_line,
+                        index.left.location.end_column+1,
+                        index.index.location.start_line,
+                        index.index.location.end_column-1
+                    ), function);
+
+                if function.is_unsafe_constraints then
+                    _logger.warn(index.location, "call to {function} has unchecked constraints");
+                fi
+
+                if need_store then
+                    index.value =
+                    TYPE_WRAPPER(
+                        function.arguments[1],
+                        function.call(index.location, index.left.value, arguments, null, _function_caller));
+                else
+                    index.value = function.call(index.location, index.left.value, arguments, null, _function_caller);
+                fi
+            fi
+        si
+    si
+si
