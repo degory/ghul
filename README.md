@@ -83,4 +83,4 @@ For a short ghūl programming language tutorial and reference, see [GHUL.md](./G
 
 ## Gotchas
 
-The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. However, this is an _incomplete compiler_ for an _experimental programming language_: there will be [compiler bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug)!
+The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. Like any compiler it has [bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug) — issue reports are welcome.
