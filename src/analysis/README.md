@@ -10,3 +10,5 @@ The main components are:
 - `watchdog.ghul` – decides when the analyser should recycle: on a sustained burst of handler exceptions, or on managed-heap growth past a threshold. The heap is sampled on an explicit `#HEAPCHECK#` request (the IDE sends one during a lull in editing) and, as a fallback, periodically after compiles.
 
 Requests are written by the IDE as `#COMMAND#` followed by newline separated arguments. The compiler responds with a header line naming the command, optional result lines and finally a form feed character. The protocol is intentionally minimal but stable; if you extend it keep messages textual so older clients can ignore unknown lines.
+
+`#HOVERMAP#` is a batch variant of `#HOVER#`. Given a file path it dumps every recorded hover for that file as tab separated `startLine  startColumn  endLine  endColumn  description` rows — one row per source range — so a tool can collect a whole file's hovers in one frame instead of probing position by position. The caller is expected to have driven an `#EDIT#` (and/or `#COMPILE#`) first; unlike `#HOVER#` it never triggers a recompile of its own.
