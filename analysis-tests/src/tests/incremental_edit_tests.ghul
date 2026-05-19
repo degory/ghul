@@ -1,0 +1,525 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.RESPONSE;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Targeted coverage for the incremental body re-walk — the default
+    // analysis-mode EDIT path for an interface-preserving single-file edit
+    // (splice the new bodies onto the retained AST, re-walk only the edited
+    // file, never clear_symbols). The whole `analysis-tests` suite already
+    // runs through this path; these tests probe the cases the design called
+    // out as load-bearing: locations after a line-shifting edit, cross-file
+    // correctness, and property / trait-default-method body splices.
+    //
+    // See docs/claude/incremental-body-rewalk.md.
+    class INCREMENTAL_EDIT_TESTS is
+        @test()
+
+        init() is si
+
+        // shift.ghul before the edit — `beta`'s body sits at lines 6-9.
+        shift_baseline() -> string =>
+            "namespace IncShift is\n"
+            "    alpha() -> int is\n"
+            "        return 1;\n"
+            "    si\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        let value = 7;\n"
+            "        return value;\n"
+            "    si\n"
+            "si\n";
+
+        // shift.ghul after the edit — `alpha`'s body has grown by three
+        // lines, pushing `beta` down: `let value = 7;` is now line 10 and
+        // `return value;` line 11. The signatures are unchanged, so this is
+        // an interface-preserving edit and takes the incremental re-walk.
+        shift_edited() -> string =>
+            "namespace IncShift is\n"
+            "    alpha() -> int is\n"
+            "        let a = 1;\n"
+            "        let b = 2;\n"
+            "        let c = 3;\n"
+            "        return a + b + c;\n"
+            "    si\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        let value = 7;\n"
+            "        return value;\n"
+            "    si\n"
+            "si\n";
+
+        // HOVER inside a body that an earlier body's edit pushed down: the
+        // re-walk must record the use at its *new* line. `value` on line 11
+        // would have been line 8 before the edit — a non-empty hover there
+        // proves the spliced body's locations are current.
+        hover_in_a_body_below_an_edited_body_resolves_after_a_line_shift() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            edit_and_drain(analyser, "shift.ghul", shift_baseline());
+            edit_and_drain(analyser, "shift.ghul", shift_edited());
+
+            // `        return value;` — `value` spans cols 16-20; col 17 is
+            // inside it.
+            analyser.send_hover("shift.ghul", 11, 17);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("HOVER", response.header);
+
+            let lines = LIST[string](response.lines);
+            Assert.is_true(
+                lines.count > 0 /\ !string.is_null_or_white_space(lines[0]),
+                "HOVER on `value` at its post-shift line returned an empty "
+                "body — the incremental re-walk did not record the use at "
+                "its current coordinates.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        // DEFINITION across the same shifted body: jumping from the use of
+        // `value` to its `let` must land on the declaration's *post-shift*
+        // line (10), not its pre-edit line (7).
+        definition_in_a_body_below_an_edited_body_resolves_after_a_line_shift() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            edit_and_drain(analyser, "shift.ghul", shift_baseline());
+            edit_and_drain(analyser, "shift.ghul", shift_edited());
+
+            analyser.send_definition("shift.ghul", 11, 17);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("DEFINITION", response.header);
+
+            let lines = LIST[string](response.lines);
+            Assert.are_equal(
+                1,
+                lines.count,
+                "DEFINITION on `value` expected exactly one location, got "
+                "{lines.count}.\nlines: {lines}\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+
+            // <uri>\t<startLine>\t<startCol>\t<endLine>\t<endCol>
+            let fields = LIST[string](lines[0].split(['\t']));
+            Assert.is_true(
+                fields.count >= 2,
+                "malformed DEFINITION location line: '{lines[0]}'"
+            );
+            Assert.is_true(
+                fields[0].ends_with("shift.ghul"),
+                "DEFINITION should point into shift.ghul, got: '{lines[0]}'"
+            );
+            Assert.are_equal(
+                "10",
+                fields[1],
+                "DEFINITION on `value` should land on the post-shift "
+                "declaration line 10, got start line '{fields[1]}' — the "
+                "re-walked body's declaration kept a stale location.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        base_baseline() -> string =>
+            "namespace IncCross is\n"
+            "    class BASE is\n"
+            "        init() is si\n"
+            "\n"
+            "        value() -> int is\n"
+            "            return 1;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // BASE.value's body changed; its signature is not.
+        base_body_edited() -> string =>
+            "namespace IncCross is\n"
+            "    class BASE is\n"
+            "        init() is si\n"
+            "\n"
+            "        value() -> int is\n"
+            "            return 2;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // BASE.value gained a parameter — an interface change.
+        base_signature_edited() -> string =>
+            "namespace IncCross is\n"
+            "    class BASE is\n"
+            "        init() is si\n"
+            "\n"
+            "        value(n: int) -> int is\n"
+            "            return n;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        derived_source() -> string =>
+            "namespace IncCross is\n"
+            "    class DERIVED: BASE is\n"
+            "        init() is super.init(); si\n"
+            "\n"
+            "        doubled() -> int => value() * 2;\n"
+            "    si\n"
+            "si\n";
+
+        // A derived class in another file is unaffected by a body-only edit
+        // to its base — the incremental path does not re-walk it and its
+        // retained symbols stay valid — but an interface change to the base
+        // must re-surface in it on the next COMPILE.
+        body_only_edit_to_a_base_leaves_a_cross_file_derived_class_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("base.ghul", base_baseline()),
+                EDIT_FILE("derived.ghul", derived_source())
+            ]);
+            drain_edit(analyser);
+
+            // Body-only edit to base.ghul — interface-preserving, so the
+            // incremental re-walk runs and derived.ghul is left untouched
+            // and clean.
+            analyser.send_edit("base.ghul", base_body_edited());
+            Assert.are_equal(
+                0,
+                count_diagnostics_for(analyser, "derived.ghul"),
+                "a body-only edit to BASE should leave the cross-file "
+                "DERIVED clean\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+
+            // Signature edit to base.ghul — interface-affecting. The EDIT
+            // itself compiles expressions only for the edited file; the
+            // broken `value()` call in DERIVED surfaces on the COMPILE that
+            // follows (the EDIT's PARTIAL DONE reports COMPILE needed).
+            analyser.send_edit("base.ghul", base_signature_edited());
+            drain_edit(analyser);
+
+            analyser.send_compile();
+            Assert.is_true(
+                count_compile_diagnostics_for(analyser, "derived.ghul") > 0,
+                "a COMPILE after a signature edit to BASE should surface "
+                "the broken call in DERIVED\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        prop_baseline() -> string =>
+            "namespace IncProp is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "\n"
+            "        prefix() -> string => \"v\";\n"
+            "\n"
+            "        suffix() -> string => \"w\";\n"
+            "\n"
+            "        label: string => prefix();\n"
+            "    si\n"
+            "si\n";
+
+        // The property getter's expression body changed — it now calls a
+        // different sibling method. The property's name and type are not,
+        // so this is interface-preserving and the synthesised accessor's
+        // body must re-resolve the call through the splice.
+        prop_edited() -> string =>
+            "namespace IncProp is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "\n"
+            "        prefix() -> string => \"v\";\n"
+            "\n"
+            "        suffix() -> string => \"w\";\n"
+            "\n"
+            "        label: string => suffix();\n"
+            "    si\n"
+            "si\n";
+
+        // A property getter is a synthesised accessor function; editing its
+        // expression body must re-walk cleanly through the splice (the
+        // accessor body and the property's read_body are kept in sync).
+        property_getter_body_edit_re_walks_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("prop.ghul", prop_baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "prop.ghul");
+            Assert.are_equal(
+                0,
+                baseline_diagnostics.count,
+                "{diagnostics_summary("prop.ghul baseline EDIT", baseline_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            analyser.send_edit("prop.ghul", prop_edited());
+            let edited_diagnostics = diagnostics_for(analyser, "prop.ghul");
+            Assert.are_equal(
+                0,
+                edited_diagnostics.count,
+                "editing a property getter body should re-walk clean — the "
+                "call to `prefix()` inside it must still resolve.\n"
+                "{diagnostics_summary("prop.ghul after edit", edited_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        trait_baseline() -> string =>
+            "namespace IncTrait is\n"
+            "    trait GREETER is\n"
+            "        base_word() -> string => \"hi\";\n"
+            "\n"
+            "        greeting() -> string => base_word();\n"
+            "    si\n"
+            "\n"
+            "    class POLITE: GREETER is\n"
+            "        init() is si\n"
+            "    si\n"
+            "si\n";
+
+        // A trait default method's body changed; signatures are not.
+        trait_edited() -> string =>
+            "namespace IncTrait is\n"
+            "    trait GREETER is\n"
+            "        base_word() -> string => \"hello\";\n"
+            "\n"
+            "        greeting() -> string => base_word();\n"
+            "    si\n"
+            "\n"
+            "    class POLITE: GREETER is\n"
+            "        init() is si\n"
+            "    si\n"
+            "si\n";
+
+        // A trait default method is an ordinary FUNCTION with a body; an
+        // interface-preserving edit to one re-walks through the splice like
+        // any other method body.
+        trait_default_method_body_edit_re_walks_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            edit_and_drain(analyser, "trait.ghul", trait_baseline());
+
+            analyser.send_edit("trait.ghul", trait_edited());
+            Assert.are_equal(
+                0,
+                count_diagnostics_for(analyser, "trait.ghul"),
+                "editing a trait default method body should re-walk clean\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        index_baseline() -> string =>
+            "namespace IncIndex is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    class STORE is\n"
+            "        _items: LIST[int];\n"
+            "\n"
+            "        init() is\n"
+            "            _items = LIST[int]();\n"
+            "            _items.add(0);\n"
+            "        si\n"
+            "\n"
+            "        [i: int]: int is\n"
+            "            return _items[i];\n"
+            "        si,\n"
+            "        = v is\n"
+            "            _items[i] = v;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // The indexer getter body changed; the indexer signature
+        // (`[i: int]: int`) and the setter are not — interface-preserving.
+        index_getter_edited() -> string =>
+            "namespace IncIndex is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    class STORE is\n"
+            "        _items: LIST[int];\n"
+            "\n"
+            "        init() is\n"
+            "            _items = LIST[int]();\n"
+            "            _items.add(0);\n"
+            "        si\n"
+            "\n"
+            "        [i: int]: int is\n"
+            "            return _items[i] * 2;\n"
+            "        si,\n"
+            "        = v is\n"
+            "            _items[i] = v;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // The indexer setter body changed; the signature and getter are not.
+        index_setter_edited() -> string =>
+            "namespace IncIndex is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    class STORE is\n"
+            "        _items: LIST[int];\n"
+            "\n"
+            "        init() is\n"
+            "            _items = LIST[int]();\n"
+            "            _items.add(0);\n"
+            "        si\n"
+            "\n"
+            "        [i: int]: int is\n"
+            "            return _items[i] * 2;\n"
+            "        si,\n"
+            "        = v is\n"
+            "            _items[i] = v * 2;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // An indexer's getter and setter are each a synthesised accessor
+        // function — `add_accessors_for_properties` lifts them into sibling
+        // FUNCTION nodes, so they pair and splice like any method body.
+        // Editing each in turn must re-walk clean.
+        indexer_getter_and_setter_body_edits_re_walk_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("index.ghul", index_baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "index.ghul");
+            Assert.are_equal(
+                0,
+                baseline_diagnostics.count,
+                "{diagnostics_summary("index.ghul baseline (cold full build)", baseline_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            analyser.send_edit("index.ghul", index_getter_edited());
+            let getter_diagnostics = diagnostics_for(analyser, "index.ghul");
+            Assert.are_equal(
+                0,
+                getter_diagnostics.count,
+                "editing an indexer getter body should re-walk clean.\n"
+                "{diagnostics_summary("index.ghul after getter edit", getter_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            analyser.send_edit("index.ghul", index_setter_edited());
+            let setter_diagnostics = diagnostics_for(analyser, "index.ghul");
+            Assert.are_equal(
+                0,
+                setter_diagnostics.count,
+                "editing an indexer setter body should re-walk clean.\n"
+                "{diagnostics_summary("index.ghul after setter edit", setter_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Body-edit a plain method with an explicitly-typed argument. The
+        // re-walk must process the body only — re-resolving the retained
+        // argument declaration poisons it ("set type twice"). This is the
+        // case the pre-BODY_REWALKER suite never exercised, which is how the
+        // whole-file re-walk shipped broken.
+        method_with_typed_argument_body_edit_re_walks_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit(
+                "probe.ghul",
+                "namespace IncProbe is\n"
+                "    run(x: int) -> int is\n"
+                "        return x;\n"
+                "    si\n"
+                "si\n"
+            );
+            drain_edit(analyser);
+
+            analyser.send_edit(
+                "probe.ghul",
+                "namespace IncProbe is\n"
+                "    run(x: int) -> int is\n"
+                "        return x + 1;\n"
+                "    si\n"
+                "si\n"
+            );
+            let probe_diagnostics = diagnostics_for(analyser, "probe.ghul");
+            Assert.are_equal(
+                0,
+                probe_diagnostics.count,
+                "{diagnostics_summary("probe.ghul after typed-arg method body edit", probe_diagnostics)}"
+                "\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Send a single-file EDIT and discard its DIAGNOSTICS + PARTIAL DONE.
+        edit_and_drain(analyser: ANALYSER_PROCESS, path: string, source: string) is
+            analyser.send_edit(path, source);
+            drain_edit(analyser);
+        si
+
+        // Read an EDIT's DIAGNOSTICS + PARTIAL DONE frames, discarding both.
+        drain_edit(analyser: ANALYSER_PROCESS) is
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", diagnostics.header);
+
+            let partial_done = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", partial_done.header);
+        si
+
+        // Read an EDIT's DIAGNOSTICS + PARTIAL DONE; return the count of
+        // user diagnostics whose path ends with `file_name`.
+        count_diagnostics_for(analyser: ANALYSER_PROCESS, file_name: string) -> int =>
+            diagnostics_for(analyser, file_name).count;
+
+        // Read an EDIT's DIAGNOSTICS + PARTIAL DONE; return the user
+        // diagnostics whose path ends with `file_name`.
+        diagnostics_for(analyser: ANALYSER_PROCESS, file_name: string) -> LIST[DIAGNOSTIC] is
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", diagnostics.header);
+
+            let result = LIST[DIAGNOSTIC]();
+
+            for d in diagnostics.user_diagnostics do
+                if d.path.ends_with(file_name) then
+                    result.add(d);
+                fi
+            od
+
+            let partial_done = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", partial_done.header);
+
+            return result;
+        si
+
+        // Read a COMPILE's DIAGNOSTICS + FULL DONE; return the count of
+        // user diagnostics whose path ends with `file_name`.
+        count_compile_diagnostics_for(analyser: ANALYSER_PROCESS, file_name: string) -> int is
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", diagnostics.header);
+
+            let count mut = 0;
+
+            for d in diagnostics.user_diagnostics do
+                if d.path.ends_with(file_name) then
+                    count = count + 1;
+                fi
+            od
+
+            let full_done = analyser.read_response();
+            Assert.are_equal("FULL DONE", full_done.header);
+
+            return count;
+        si
+    si
+si

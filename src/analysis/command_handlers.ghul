@@ -347,6 +347,12 @@ namespace Analysis is
 
         _is_interface_changed: bool;
 
+        // The pre-edit SOURCE_FILE of the most recent parse, stashed by
+        // parse_and_add_file. For an interface-preserving single-file EDIT the
+        // incremental body re-walk splices the new bodies onto it (its symbols
+        // are still valid). Null on a cold / first-parse EDIT.
+        _retained: SOURCE_FILE?;
+
         file_names: Iterable[string] => _source_files_by_path.keys;
 
         iterator: Collections.Iterator[SOURCE_FILE]
@@ -382,6 +388,8 @@ namespace Analysis is
 
             let previous = find_source_file(path);
 
+            _retained = previous;
+
             let source_file = _compiler.parse(path, reader, _build_flags.want_compile_up_to_expressions, _build_flags.want_compile_expressions, is_internal_file);
             _source_files_by_path[path] = source_file;
 
@@ -401,11 +409,58 @@ namespace Analysis is
                 _is_interface_changed = true;
             fi
         si
-        
+
+        // The incremental body re-walk for an interface-preserving single-file
+        // EDIT: keep the retained AST registered, splice the freshly-parsed
+        // bodies onto it, refresh its locations from the fresh parse, and
+        // re-walk only the edited file. Returns false — restoring the fresh
+        // parse as the registered file — if the parses do not pair or the
+        // location refresh desyncs, so the caller falls back to a full rebuild.
+        try_incremental_build(writer: IO.TextWriter) -> bool is
+            let retained = _retained;
+
+            if !retained? then
+                return false;
+            fi
+
+            let edited_path = retained.file_name;
+            let donor = _source_files_by_path[edited_path];
+
+            // Keep the retained AST as the registered file; the fresh parse is
+            // only a body donor.
+            _source_files_by_path[edited_path] = retained;
+
+            let pairing = Syntax.FUNCTION_PAIRING(retained.definition, donor.definition);
+
+            let pairs = pairing.pairs;
+
+            if !pairs? then
+                _source_files_by_path[edited_path] = donor;
+                return false;
+            fi
+
+            Syntax.BODY_SPLICE.apply(pairs);
+
+            if !Syntax.Process.LOCATION_REFRESH.apply(retained.definition, donor.definition) then
+                _source_files_by_path[edited_path] = donor;
+                return false;
+            fi
+
+            IoC.CONTAINER.instance.logger.clear(edited_path, true);
+            IoC.CONTAINER.instance.logger.start_analysis();
+
+            _compiler.rewalk_bodies(retained);
+
+            IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+
+            return true;
+        si
+
         handle(reader: IO.TextReader, writer: IO.TextWriter) is
             IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
 
             _is_interface_changed = false;
+            _retained = null;
 
             for i in _source_files_by_path.values do
                 i.want_compile_expressions = false;
@@ -458,25 +513,35 @@ namespace Analysis is
                 _timers.start(edit_class_timer);
             fi
 
+            // An interface-preserving single-file EDIT takes the incremental
+            // body re-walk instead of the whole-project rebuild.
+            let incremental_eligible =
+                !_is_interface_changed /\
+                paths.count == 1 /\
+                _retained? /\
+                _retained.interface_signature?;
+
             try
                 writer.write_line("DIAGNOSTICS");
 
                 Semantic.Types.NAMED.clear_cache();
 
                 if !_watchdog.want_restart then
-                    for i in _source_files_by_path.values do
-                        i.want_compile_up_to_expressions = true;
+                    if !(incremental_eligible /\ try_incremental_build(writer)) then
+                        for i in _source_files_by_path.values do
+                            i.want_compile_up_to_expressions = true;
 
-                        IoC.CONTAINER.instance.logger.clear_global_declaration_diagnostics(i.file_name);
-                    od
+                            IoC.CONTAINER.instance.logger.clear_global_declaration_diagnostics(i.file_name);
+                        od
 
-                    IoC.CONTAINER.instance.logger.start_analysis();
+                        IoC.CONTAINER.instance.logger.start_analysis();
 
-                    _compiler.clear_symbols();
-                    _compiler.queue(self);
-                    _compiler.build();
+                        _compiler.clear_symbols();
+                        _compiler.queue(self);
+                        _compiler.build();
 
-                    IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                        IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                    fi
                 fi
 
             catch ex: Exception
