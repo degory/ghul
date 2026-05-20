@@ -1,8 +1,15 @@
 namespace Analysis.Tests is
+    use System.Exception;
+
+    use IO.Directory;
+    use IO.Path;
+
     use Collections.LIST;
     use Collections.SET;
 
     use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.CORPUS;
+    use Analysis.Protocol.DIAGNOSTIC;
     use Analysis.Protocol.EDIT_FILE;
     use Analysis.Protocol.RENAME_EDIT;
     use Analysis.Protocol.RESPONSE;
@@ -444,113 +451,179 @@ namespace Analysis.Tests is
             );
         si
 
-        // --- repro: spurious errors after a space-only interface edit ------
+        // --- real-source repro: space-only interface edit in compile_expressions
 
-        space_baseline() -> string =>
-            "namespace SpEdit is\n"
-            "    use Collections.LIST;\n"
-            "\n"
-            "    trait Base is\n"
-            "        kind() -> string;\n"
-            "    si\n"
-            "\n"
-            "    class Var: Base is\n"
-            "        init() is si\n"
-            "        kind() -> string => \"var\";\n"
-            "        inferred_type() -> string => \"int\";\n"
-            "    si\n"
-            "\n"
-            "    find(name: string) -> Base? => Var();\n"
-            "\n"
-            "    // Body mixes narrowing of a retained parameter with a\n"
-            "    // generic constructor whose type-arg is inferred from\n"
-            "    // later usage — this triggers compile-expressions'\n"
-            "    // iterative body-retry path (`_logger.has_consumed_any`).\n"
-            "    // It is the combination of the retry path with the\n"
-            "    // double-walk in BODY_REWALKER that surfaces the bug.\n"
-            "    process(name: string) -> string is\n"
-            "        let xs = LIST();\n"
-            "        let symbol = find(name);\n"
-            "        if symbol? /\\ isa Var(symbol) then\n"
-            "            let variable = symbol;\n"
-            "            xs.add(variable);\n"
-            "            for v in xs do\n"
-            "                return v.inferred_type();\n"
-            "            od\n"
-            "        fi\n"
-            "        return \"none\";\n"
-            "    si\n"
-            "si\n";
-
-        // Identical AST, identical interface — a single extra space inside
-        // the `process` signature, between `:` and `Base`. Line count and
-        // body content unchanged.
-        space_edited() -> string =>
-            "namespace SpEdit is\n"
-            "    use Collections.LIST;\n"
-            "\n"
-            "    trait Base is\n"
-            "        kind() -> string;\n"
-            "    si\n"
-            "\n"
-            "    class Var: Base is\n"
-            "        init() is si\n"
-            "        kind() -> string => \"var\";\n"
-            "        inferred_type() -> string => \"int\";\n"
-            "    si\n"
-            "\n"
-            "    find(name: string) -> Base? => Var();\n"
-            "\n"
-            "    process(name:  string) -> string is\n"
-            "        let xs = LIST();\n"
-            "        let symbol = find(name);\n"
-            "        if symbol? /\\ isa Var(symbol) then\n"
-            "            let variable = symbol;\n"
-            "            xs.add(variable);\n"
-            "            for v in xs do\n"
-            "                return v.inferred_type();\n"
-            "            od\n"
-            "        fi\n"
-            "        return \"none\";\n"
-            "    si\n"
-            "si\n";
-
-        // A space-only edit inside the interface portion of a file —
-        // signature unchanged, body unchanged — should produce no
-        // diagnostics. The body re-walk re-resolves `process`'s body and
-        // its narrowing (`isa Var(s); let v = s; v.inferred_type()`)
-        // should still see `v` as `Var`.
-        space_only_interface_edit_emits_no_diagnostics() is
+        // Drive the analyser against the compiler's own `src/` corpus —
+        // exactly what the user's VS Code session does — and assert a
+        // single-space edit inside an interface signature line of
+        // `compile_expressions.ghul` introduces no new diagnostics.
+        //
+        // Synthetic small fixtures do not catch the double-body-walk class
+        // of bug — compile-expressions' iterative body retry only kicks in
+        // on real code with inference / placeholder consumption. This test
+        // therefore loads the whole compiler `src/` (~380 files, ~58 k
+        // lines) and is slower than other tests; the speed is the price of
+        // catching a regression class that synthetic fixtures cannot.
+        space_only_interface_edit_in_compile_expressions_introduces_no_new_diagnostics() is
             @test()
+
+            let src_dir = locate_compiler_src();
+            let corpus = CORPUS(src_dir);
+
+            Assert.is_true(
+                corpus.file_count > 100,
+                "compiler src corpus should be sizeable, got {corpus.file_count} "
+                "files from {src_dir}"
+            );
+
+            let target_suffix = "compile_expressions.ghul";
+            let target = corpus.find_by_suffix(target_suffix);
+
+            Assert.is_not_null(
+                target,
+                "expected the corpus to contain {target_suffix} under {src_dir}"
+            );
+
+            // The signature we'll add one space to. Picked because the
+            // surrounding method body has the narrowing /
+            // INFERRED_VARIABLE_TYPE pattern that exercises the iterative
+            // body retry — the path that surfaces the double-body-walk
+            // failure.
+            let anchor = "visit(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) is";
+            let edited_anchor = "visit(left:  Trees.Variables.SIMPLE_VARIABLE_LEFT) is";
+
+            Assert.is_true(
+                target.source.contains(anchor),
+                "expected to find signature anchor in {target.path}"
+            );
 
             let use analyser = ANALYSER_PROCESS();
 
-            analyser.send_edit("sp.ghul", space_baseline());
-            let baseline = analyser.read_response();
-            Assert.are_equal("DIAGNOSTICS", baseline.header);
-            let baseline_diags = LIST(baseline.user_diagnostics);
-            let _partial = analyser.read_response();
-            Assert.are_equal("PARTIAL DONE", _partial.header);
+            // Cold multi-file EDIT — the analyser's normal startup path.
+            analyser.send_edit_files(corpus.files);
+
+            let cold_response = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", cold_response.header);
+            let cold_diags = diagnostics_set(cold_response);
+            let cold_partial = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", cold_partial.header);
+
+            // Single-file EDIT with one extra space in the interface.
+            let edited_source = replace_first(target.source, anchor, edited_anchor);
+
+            Assert.is_true(
+                edited_source !~ target.source,
+                "the space-only edit should change the source"
+            );
+
+            analyser.send_edit(target.path, edited_source);
+
+            let after_response = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", after_response.header);
+            let after_diags = diagnostics_set(after_response);
+            let after_partial = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", after_partial.header);
+
+            // What the edit introduced (post-edit minus cold) — should be
+            // empty. Anything here is a diagnostic the body re-walk
+            // produced that a full rebuild would not.
+            let introduced = LIST[string]();
+            for d in after_diags do
+                if !cold_diags.contains(d) then
+                    introduced.add(d);
+                fi
+            od
 
             Assert.are_equal(
                 0,
-                baseline_diags.count,
-                "the cold baseline must compile clean — fixture problem.\n"
-                "{baseline_diags}\n--- analyser stderr ---\n{analyser.stderr_capture}"
+                introduced.count,
+                "a space-only edit in the interface portion of "
+                "compile_expressions.ghul must not introduce new "
+                "diagnostics; got {introduced.count}:\n"
+                "{describe(introduced)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
             );
+        si
 
-            analyser.send_edit("sp.ghul", space_edited());
-            let after = analyser.read_response();
-            Assert.are_equal("DIAGNOSTICS", after.header);
-            let after_diags = LIST(after.user_diagnostics);
+        // Walk up from the running assembly to the compiler `src/`
+        // directory. The first ancestor with a .ghulproj is this test
+        // project; its parent (the compiler's project root) has src/ next
+        // to its own ghul.ghulproj.
+        locate_compiler_src() -> string static is
+            let dir mut = Path.get_directory_name(System.Reflection.Assembly.get_executing_assembly().location);
 
-            Assert.are_equal(
-                0,
-                after_diags.count,
-                "a space-only edit in the interface portion of a file must "
-                "not introduce diagnostics — got {after_diags.count}:\n"
-                "{after_diags}\n--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+            do
+                if !dir? then
+                    throw Exception("could not locate compiler src — walked off the filesystem");
+                fi
+
+                if Directory.get_files(dir, "*.ghulproj").count > 0 then
+                    let parent = Path.get_directory_name(dir);
+
+                    if !parent? then
+                        throw Exception("the test project directory has no parent: {dir}");
+                    fi
+
+                    let src = Path.combine(parent, "src");
+
+                    if !Directory.exists(src) then
+                        throw Exception("expected compiler src at {src}, but it does not exist");
+                    fi
+
+                    return src;
+                fi
+
+                dir = Path.get_directory_name(dir);
+            od
+        si
+
+        // Collect a DIAGNOSTICS response's user diagnostics into a set of
+        // formatted strings (`path:startLine:startCol severity message`)
+        // for cheap, order-independent set comparison.
+        diagnostics_set(response: RESPONSE) -> SET[string] is
+            let result = SET[string]();
+
+            for d in response.user_diagnostics do
+                result.add("{d.path}:{d.start_line}:{d.start_col} sev={d.severity} {d.message}");
+            od
+
+            return result;
+        si
+
+        describe(diagnostics: LIST[string]) -> string is
+            let result = System.Text.StringBuilder();
+
+            let shown mut = 0;
+            for d in diagnostics do
+                if shown < 30 then
+                    result.append("  ");
+                    result.append(d);
+                    result.append('\n');
+                fi
+                shown = shown + 1;
+            od
+
+            if diagnostics.count > 30 then
+                result.append("  ... and {diagnostics.count - 30} more\n");
+            fi
+
+            return result.to_string();
+        si
+
+        // Replace the first occurrence of `needle` in `source` with
+        // `replacement`. `string.replace` substitutes every occurrence; we
+        // only want the one signature to change.
+        replace_first(source: string, needle: string, replacement: string) -> string static is
+            let index = source.index_of(needle);
+
+            if index < 0 then
+                return source;
+            fi
+
+            let before = source.substring(0, index);
+            let after = source.substring(index + needle.length);
+
+            return "{before}{replacement}{after}";
         si
 
         // --- helpers --------------------------------------------------------
