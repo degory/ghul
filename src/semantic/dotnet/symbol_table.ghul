@@ -87,23 +87,167 @@ namespace Semantic.DotNet is
 
         get_symbol(ghul_name: string) -> Symbols.Scoped? is
             let result: Symbols.Scoped mut = default;
-            
+
             if _symbol_store.try_get_symbol(ghul_name, result ref) then
                 return result;
             fi
 
             let type_name = TYPE_NAME(ghul_name);
 
-            let type_details = _type_details_lookup.get_type_details_by_ghul_namespace_and_symbol_name(type_name.namespace_name, type_name.name);
+            // Single-pass scan: track the first matching TYPE_DETAILS
+            // without allocating; only build a LIST when a second
+            // match shows up (the rare multi-generic-count case). Keeps
+            // the common one-match path allocation-free, matching the
+            // pre-argument-count-overloading cost profile.
+            let search_list = _type_details_lookup.get_all_type_details_in_ghul_namespace(type_name.namespace_name);
+            let first: TYPE_DETAILS? = null;
+            let all: Collections.LIST[TYPE_DETAILS]? = null;
 
-            if type_details? then
-                assert type_details.assembly_name? /\ type_details.assembly_name.length > 0 else " invalid assembly name: {type_details}";
-                
-                return create_symbol(type_details);
+            if search_list? then
+                for details in search_list do
+                    if details.matches(type_name.namespace_name, type_name.name) then
+                        if !first? then
+                            first = details;
+                        elif !all? then
+                            all = Collections.LIST[TYPE_DETAILS]();
+                            all.add(first);
+                            all.add(details);
+                        else
+                            all.add(details);
+                        fi
+                    fi
+                od
             fi
-            
+
+            if all? then
+                return materialize_type_group(ghul_name, type_name, all);
+            elif first? then
+                assert first.assembly_name? /\ first.assembly_name.length > 0 else " invalid assembly name: {first}";
+
+                return create_symbol(first);
+            fi
+
+            // Backtick-suffix fallback: compiler source still spells
+            // reflected names with the .NET `\`N` suffix (e.g.
+            // `Collections.KeyValuePair\`2`). After import strips the
+            // suffix, look up the base name, then pick the member with
+            // N generic arguments out of whatever shape comes back (a
+            // single Classy if no siblings, a TYPE_GROUP if siblings).
+            let backtick_match = try_backtick_count_fallback(ghul_name, type_name);
+
+            if backtick_match? then
+                return backtick_match;
+            fi
+
             _symbol_store.cache_no_result(ghul_name);
             return null;
+        si
+
+        try_backtick_count_fallback(ghul_name: string, type_name: TYPE_NAME) -> Symbols.Scoped? is
+            let count = parse_trailing_count_suffix(type_name.name);
+
+            if count < 0 then
+                return null;
+            fi
+
+            let backtick = type_name.name.last_index_of('`');
+            let stripped = type_name.name.substring(0, backtick);
+
+            let fallback_details = _type_details_lookup.find_all_type_details_by_ghul_namespace_and_symbol_name(type_name.namespace_name, stripped);
+
+            if fallback_details.count == 0 then
+                return null;
+            fi
+
+            for details in fallback_details do
+                let dotnet_type = details.dotnet_type;
+                let dotnet_count mut = 0;
+
+                if dotnet_type.is_generic_type \/ dotnet_type.is_generic_type_definition then
+                    for _ in dotnet_type.get_generic_arguments() do
+                        dotnet_count = dotnet_count + 1;
+                    od
+                fi
+
+                if dotnet_count == count then
+                    let cached = _symbol_store.get_symbol(dotnet_type);
+
+                    if cached? then
+                        return cached;
+                    fi
+
+                    return create_symbol(details);
+                fi
+            od
+
+            return null;
+        si
+
+        // Returns the trailing-`\`N` count when name ends `<bare>``digits`,
+        // else -1. The mid-name backtick case (`Dictionary\`2_ValueCollection`)
+        // returns -1 because the suffix isn't pure digits.
+        parse_trailing_count_suffix(name: string) -> int is
+            let backtick = name.last_index_of('`');
+
+            if backtick <= 0 \/ backtick >= name.length - 1 then
+                return -1;
+            fi
+
+            let result mut = 0;
+
+            for i in (backtick + 1)..name.length do
+                let c = name.get_chars(i);
+
+                if c < '0' \/ c > '9' then
+                    return -1;
+                fi
+
+                result = result * 10 + (cast int(c) - cast int('0'));
+            od
+
+            return result;
+        si
+
+        materialize_type_group(ghul_name: string, type_name: TYPE_NAME, all_details: Collections.LIST[TYPE_DETAILS]) -> Symbols.Scoped? is
+            // The string-keyed cache holds the group itself after all
+            // members materialize, so subsequent bare-name lookups skip
+            // the multi-materialize cost. Each member's by-dotnet-type
+            // cache entry still points to that member; only the bare
+            // ghul_name key gets replaced.
+            let owner = EMPTY_SCOPE(type_name.namespace_name);
+            let group = Symbols.TYPE_GROUP(Source.LOCATION.reflected, owner, type_name.name);
+
+            for details in all_details do
+                assert details.assembly_name? /\ details.assembly_name.length > 0 else " invalid assembly name: {details}";
+
+                // The .NET type may already have been materialized via
+                // `get_symbol(TYPE)` — reuse the cached Classy rather
+                // than creating a parallel one with a fresh EMPTY_SCOPE
+                // owner.
+                let cached = _symbol_store.get_symbol(details.dotnet_type);
+                let member: Symbols.Scoped? = if cached? then cached else create_symbol(details) fi;
+
+                if isa Symbols.Classy(member) then
+                    group.add(member);
+                fi
+            od
+
+            if group.count == 0 then
+                return null;
+            fi
+
+            if group.count == 1 then
+                // Defensive: if only one of the materializations stuck,
+                // return the bare Classy and avoid IL-mangling it as if
+                // it had sibling generic-argument counts.
+                let only = group.classies[0];
+                only.has_argument_count_siblings = false;
+                return only;
+            fi
+
+            _symbol_store.set_name_symbol(ghul_name, group);
+
+            return group;
         si
         
         get_symbol(type: TYPE) -> Symbols.Scoped? is
