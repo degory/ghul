@@ -1,0 +1,494 @@
+namespace Syntax.Process is
+    use Logging;
+    use Source;
+
+    use Semantic.Types.Type;
+
+    use System.Text.StringBuilder;
+
+    // Resolves an attribute pragma — a pragma whose name is not a built-in
+    // compiler pragma — to a .NET attribute type and constructor, formats
+    // its arguments into the ilasm textual custom-attribute form, and
+    // attaches the resolved CUSTOM_ATTRIBUTE to the target symbol so the
+    // IL generator can emit a `.custom` directive.
+    class ATTRIBUTE_RESOLVER is
+        _logger: Logger;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _overload_resolver: Semantic.OVERLOAD_RESOLVER;
+        _visitor: ScopedVisitor;
+
+        init(
+            logger: Logger,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
+            overload_resolver: Semantic.OVERLOAD_RESOLVER,
+            visitor: ScopedVisitor
+        ) is
+            super.init();
+
+            _logger = logger;
+            _innate_symbol_lookup = innate_symbol_lookup;
+            _overload_resolver = overload_resolver;
+            _visitor = visitor;
+        si
+
+        // A built-in pragma is handled by the compiler itself; anything
+        // else is taken to name a .NET attribute.
+        is_built_in(name: string) -> bool =>
+            name.starts_with("IL.") \/
+            name.starts_with("IF.") \/
+            name =~ "precedence" \/
+            name =~ "KEEP" \/
+            name =~ "test" \/
+            name =~ "test_class" \/
+            name =~ "test_method" \/
+            name =~ "entry";
+
+        resolve(pragma: Trees.Pragmas.PRAGMA, target: Semantic.Symbols.Symbol) is
+            if !pragma? \/ !pragma.name? \/ !target? then
+                return;
+            fi
+
+            let name = pragma.name.to_string();
+
+            if is_built_in(name) then
+                return;
+            fi
+
+            let attribute_type = resolve_attribute_type(pragma.name);
+
+            if !attribute_type? then
+                _logger.error(pragma.name.location, "unknown attribute `{name}`");
+                return;
+            fi
+
+            let positional = gather_positional_arguments(pragma);
+
+            let constructor = resolve_constructor(pragma, attribute_type, positional);
+
+            if !constructor? then
+                return;
+            fi
+
+            let arguments_text = format_arguments(pragma, attribute_type, constructor, positional);
+
+            if !arguments_text? then
+                return;
+            fi
+
+            if !target.custom_attributes? then
+                target.custom_attributes = Collections.LIST[Semantic.CUSTOM_ATTRIBUTE]();
+            fi
+
+            target.custom_attributes.add(Semantic.CUSTOM_ATTRIBUTE(constructor, arguments_text));
+        si
+
+        // Resolve the pragma name to a .NET attribute class, accepting the
+        // `Foo` short form for an unqualified `FooAttribute`.
+        resolve_attribute_type(name: Trees.Identifiers.Identifier) -> Semantic.Symbols.Classy? is
+            let direct = as_classy(_visitor.try_find(name));
+
+            if direct? then
+                return direct;
+            fi
+
+            if !isa Trees.Identifiers.QUALIFIED(name) then
+                return as_classy(_visitor.find("{name.to_string()}Attribute"));
+            fi
+
+            return null;
+        si
+
+        as_classy(symbol: Semantic.Symbols.Symbol?) -> Semantic.Symbols.Classy? is
+            if !symbol? then
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Classy(symbol);
+        si
+
+        gather_positional_arguments(pragma: Trees.Pragmas.PRAGMA) -> Collections.LIST[IR.Values.Value] is
+            let result = Collections.LIST[IR.Values.Value]();
+
+            if pragma.arguments? then
+                for argument in pragma.arguments.expressions do
+                    if argument? /\ argument.value? then
+                        result.add(argument.value);
+                    fi
+                od
+            fi
+
+            return result;
+        si
+
+        resolve_constructor(
+            pragma: Trees.Pragmas.PRAGMA,
+            attribute_type: Semantic.Symbols.Classy,
+            positional: Collections.List[IR.Values.Value]
+        ) -> Semantic.Symbols.Function? is
+            let init_group = cast Semantic.Symbols.FUNCTION_GROUP(attribute_type.find_member("init"));
+
+            if !init_group? then
+                _logger.error(pragma.location, "attribute `{attribute_type.name}` has no usable constructor");
+                return null;
+            fi
+
+            let argument_types = Collections.LIST[Type]();
+
+            for argument in positional do
+                if argument.type? then
+                    argument_types.add(argument.type);
+                else
+                    argument_types.add(Semantic.Types.ERROR());
+                fi
+            od
+
+            let overload_result = _overload_resolver.resolve(pragma.location, init_group, argument_types, false, true, true);
+
+            if !overload_result? then
+                _logger.error(pragma.location, "no constructor of attribute `{attribute_type.name}` matches the supplied arguments");
+                return null;
+            fi
+
+            return overload_result!.function;
+        si
+
+        // The ilasm textual custom-attribute body: `( 01 00 00 00 )` when
+        // there are no arguments at all, otherwise `{ <fixed>... <named>... }`.
+        // Returns null if any argument is not a compile-time constant.
+        format_arguments(
+            pragma: Trees.Pragmas.PRAGMA,
+            attribute_type: Semantic.Symbols.Classy,
+            constructor: Semantic.Symbols.Function,
+            positional: Collections.List[IR.Values.Value]
+        ) -> string? is
+            let named = pragma.named_arguments;
+            let have_named = named? /\ named.count > 0;
+
+            if positional.count == 0 /\ !have_named then
+                return "( 01 00 00 00 )";
+            fi
+
+            let parameter_types = constructor.arguments;
+
+            let buffer = StringBuilder();
+
+            buffer.append("{{");
+
+            for i in 0..positional.count do
+                let parameter_type =
+                    if parameter_types? /\ i < parameter_types.count then
+                        parameter_types[i];
+                    else
+                        cast Type(null);
+                    fi;
+
+                let formatted = format_argument(parameter_type, positional[i]);
+
+                if !formatted? then
+                    _logger.error(pragma.location, "attribute argument {i + 1} is not a compile-time constant");
+                    return null;
+                fi
+
+                buffer.append(" ").append(formatted);
+            od
+
+            if have_named then
+                for named_argument in named do
+                    let formatted = format_named_argument(attribute_type, named_argument);
+
+                    if !formatted? then
+                        return null;
+                    fi
+
+                    buffer.append(" ").append(formatted);
+                od
+            fi
+
+            buffer.append(" }}");
+
+            return buffer.to_string();
+        si
+
+        // One `name = value` argument in the ilasm textual form —
+        // `property <type> 'Name' = <value>` or `field <type> 'Name' = ...`.
+        // Returns null (after logging) if the name does not resolve to a
+        // field or property of the attribute, or the value is unsupported.
+        format_named_argument(
+            attribute_type: Semantic.Symbols.Classy,
+            named_argument: Trees.Pragmas.NAMED_ARGUMENT
+        ) -> string? is
+            let name = named_argument.name.to_string();
+
+            let member = attribute_type.find_member(name);
+
+            if !member? then
+                _logger.error(named_argument.name.location, "attribute `{attribute_type.name}` has no field or property `{name}`");
+                return null;
+            fi
+
+            let keyword: string mut = default;
+
+            if member.symbol_kind == Semantic.Symbols.SYMBOL_KIND.PROPERTY then
+                keyword = "property";
+            elif member.symbol_kind == Semantic.Symbols.SYMBOL_KIND.FIELD then
+                keyword = "field";
+            else
+                _logger.error(named_argument.name.location, "`{name}` is not a field or property of attribute `{attribute_type.name}`");
+                return null;
+            fi
+
+            let member_type = member.type;
+
+            let type_token = named_argument_type_token(member_type);
+
+            if !type_token? then
+                _logger.error(named_argument.name.location, "attribute argument `{name}` has an unsupported type");
+                return null;
+            fi
+
+            let formatted_value = format_argument(member_type, named_argument.value.value);
+
+            if !formatted_value? then
+                _logger.error(named_argument.value.location, "attribute argument `{name}` is not a compile-time constant");
+                return null;
+            fi
+
+            return "{keyword} {type_token} '{name}' = {formatted_value}";
+        si
+
+        // One positional or named-value argument in the ilasm textual
+        // form, or null if `value` is not a supported compile-time
+        // constant — a string, a number (optionally negated), a bool, an
+        // enum member, `null`, or an array of those.
+        format_argument(parameter_type: Type, value: IR.Values.Value) -> string? is
+            if isa IR.Values.NULL(value) then
+                if parameter_type? /\ parameter_type =~ _innate_symbol_lookup.get_string_type() then
+                    return "string(nullref)";
+                fi
+
+                return null;
+            fi
+
+            if let string_value: IR.Values.Literal.STRING = value then
+                return "string({quote(string_value.value)})";
+            fi
+
+            let number_text = try_get_number_text(value);
+
+            if number_text? then
+                let keyword = serialization_keyword(parameter_type);
+
+                if keyword =~ "bool" then
+                    return "bool({number_text_to_bool(number_text)})";
+                fi
+
+                return "{keyword}({number_text})";
+            fi
+
+            if let sequence: IR.Values.SEQUENCE = value then
+                return format_array(sequence);
+            fi
+
+            if let typeof_value: IR.Values.TYPEOF = value then
+                if !typeof_value.typeof_type? then
+                    return null;
+                fi
+
+                return "type({typeof_value.typeof_type.get_il_class_name().trim()})";
+            fi
+
+            return null;
+        si
+
+        // The ilasm `<element>[N](e0 e1 ...)` form for an array argument.
+        format_array(sequence: IR.Values.SEQUENCE) -> string? is
+            let element_token = named_argument_type_token(sequence.element_type);
+
+            if !element_token? then
+                return null;
+            fi
+
+            let buffer = StringBuilder();
+
+            buffer
+                .append(element_token)
+                .append("[")
+                .append(sequence.values.count)
+                .append("](");
+
+            for i in 0..sequence.values.count do
+                if i > 0 then
+                    buffer.append(" ");
+                fi
+
+                let element = format_array_element(sequence.element_type, sequence.values[i]);
+
+                if !element? then
+                    return null;
+                fi
+
+                buffer.append(element);
+            od
+
+            buffer.append(")");
+
+            return buffer.to_string();
+        si
+
+        // A single array element — the bare form, without the
+        // `keyword(...)` wrapper that a scalar argument carries.
+        format_array_element(element_type: Type, value: IR.Values.Value) -> string? is
+            if let string_value: IR.Values.Literal.STRING = value then
+                return quote(string_value.value);
+            fi
+
+            let number_text = try_get_number_text(value);
+
+            if number_text? then
+                if serialization_keyword(element_type) =~ "bool" then
+                    return number_text_to_bool(number_text);
+                fi
+
+                return number_text;
+            fi
+
+            return null;
+        si
+
+        // The numeric text of a NUMBER literal, or of a unary minus
+        // applied to one — `-5` parses as a `-` innate over `5`, not as a
+        // negative literal — or null if `value` is not a numeric constant.
+        try_get_number_text(value: IR.Values.Value) -> string? is
+            if let number: IR.Values.Literal.NUMBER = value then
+                return number.value;
+            fi
+
+            if let innate_call: IR.Values.Call.INNATE = value then
+                if
+                    innate_call.function.name =~ "-" /\
+                    innate_call.arguments? /\ innate_call.arguments.count == 1
+                then
+                    if let number: IR.Values.Literal.NUMBER = innate_call.arguments[0] then
+                        return "-{number.value}";
+                    fi
+                fi
+            fi
+
+            return null;
+        si
+
+        number_text_to_bool(number_text: string) -> string =>
+            if number_text =~ "0" then "false" else "true" fi;
+
+        // The ilasm type token for a named-argument member, an array
+        // member, or an array element — a primitive keyword, `string`,
+        // `enum <name>`, or `<element>[]`; null if the type cannot be
+        // encoded into a custom-attribute blob from a textual literal.
+        named_argument_type_token(type: Type) -> string? is
+            if !type? then
+                return null;
+            fi
+
+            if type =~ _innate_symbol_lookup.get_string_type() then
+                return "string";
+            fi
+
+            if type =~ _innate_symbol_lookup.get_type_type() then
+                return "type";
+            fi
+
+            let primitive = try_primitive_keyword(type);
+
+            if primitive? then
+                return primitive;
+            fi
+
+            if let array: Semantic.Types.ARRAY = type then
+                let element_token = named_argument_type_token(array.arguments[0]);
+
+                if element_token? then
+                    return "{element_token}[]";
+                fi
+
+                return null;
+            fi
+
+            if type.symbol? /\ type.symbol.symbol_kind == Semantic.Symbols.SYMBOL_KIND.ENUM then
+                if let classy: Semantic.Symbols.Classy = type.symbol then
+                    if classy.il_assembly_name? then
+                        return "enum [{classy.il_assembly_name}]{classy.qualified_name}";
+                    fi
+
+                    return "enum {classy.qualified_name}";
+                fi
+            fi
+
+            return null;
+        si
+
+        // The IL keyword for a primitive value type — the literal token
+        // ilasm expects in a custom-attribute blob — or null for anything
+        // that is not a primitive.
+        try_primitive_keyword(type: Type) -> string? is
+            if !type? then
+                return null;
+            fi
+
+            let il = type.get_il_type().trim();
+
+            if
+                il =~ "bool" \/ il =~ "char" \/
+                il =~ "int8" \/ il =~ "uint8" \/
+                il =~ "int16" \/ il =~ "uint16" \/
+                il =~ "int32" \/ il =~ "uint32" \/
+                il =~ "int64" \/ il =~ "uint64" \/
+                il =~ "float32" \/ il =~ "float64"
+            then
+                return il;
+            fi
+
+            return null;
+        si
+
+        // The ilasm serialization keyword for a numeric or bool value:
+        // the parameter type's primitive keyword, or `int32` for an enum,
+        // whose fixed-argument form encodes the underlying value.
+        serialization_keyword(parameter_type: Type) -> string is
+            let primitive = try_primitive_keyword(parameter_type);
+
+            if primitive? then
+                return primitive;
+            fi
+
+            return "int32";
+        si
+
+        // A single-quoted ilasm string literal with the characters that
+        // would otherwise break the literal escaped.
+        quote(value: string) -> string is
+            let buffer = StringBuilder();
+
+            buffer.append("'");
+
+            for c in value do
+                if c == '\\' then
+                    buffer.append("\\\\");
+                elif c == '\'' then
+                    buffer.append("\\'");
+                elif c == '\n' then
+                    buffer.append("\\n");
+                elif c == '\r' then
+                    buffer.append("\\r");
+                elif c == '\t' then
+                    buffer.append("\\t");
+                else
+                    buffer.append(c);
+                fi
+            od
+
+            buffer.append("'");
+
+            return buffer.to_string();
+        si
+    si
+si
