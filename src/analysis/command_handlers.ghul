@@ -144,15 +144,18 @@ namespace Analysis is
     class SEMANTICTOKENS_HANDLER: CommandHandler is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _full_compiler: FULL_COMPILER;
         _classifier: SEMANTIC_TOKEN_CLASSIFIER;
 
         init(
             watchdog: WATCHDOG,
-            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS
+            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
+            full_compiler: FULL_COMPILER
         )
         is
             _watchdog = watchdog;
             _symbol_use_locations = symbol_use_locations;
+            _full_compiler = full_compiler;
             _classifier = SEMANTIC_TOKEN_CLASSIFIER();
         si
 
@@ -165,10 +168,38 @@ namespace Analysis is
 
             try
                 if !_watchdog.want_restart then
+                    let uses mut = _symbol_use_locations.hover_uses_in_file(path);
+
+                    // Unlike HOVERMAP (built for the offline ghul.dev pipeline
+                    // that explicitly drives EDIT + COMPILE), SEMANTICTOKENS
+                    // serves a live IDE that asks for tokens whenever a
+                    // document opens. The hover map is only populated by a
+                    // whole-project compile; on first open we get nothing
+                    // back. Fall back like HOVER does and force one — the
+                    // user otherwise sees TextMate-only coloring until the
+                    // first edit triggers a debounced compile.
+                    if uses.count == 0 then
+                        _full_compiler.compile_all(writer, path);
+
+                        uses = _symbol_use_locations.hover_uses_in_file(path);
+                    fi
+
                     writer.write_line("SEMANTICTOKENS");
                     written_header = true;
 
-                    for entry in _symbol_use_locations.hover_uses_in_file(path) do
+                    // Discard wide spans that strictly contain another
+                    // recorded use on the same line. Desugared expressions
+                    // (e.g. `let await x = e;` rewritten to a synthesized
+                    // `unwrap(...)` call) register a hover use whose
+                    // location is the original source span — useful for
+                    // HOVER, since the IDE can show the desugared meaning
+                    // anywhere on the statement, but for semantic tokens
+                    // it produces a giant token covering identifiers and
+                    // operators. The strict-containment filter drops the
+                    // outer use while keeping every inner identifier.
+                    let useful = _filter_outer_spans(uses);
+
+                    for entry in useful do
                         let symbol = entry.value.symbol;
                         let token_type = _classifier.token_type(symbol);
 
@@ -198,6 +229,52 @@ namespace Analysis is
 
             writer.write("{cast char(12)}");
             writer.flush();
+        si
+
+        _filter_outer_spans(
+            uses: Collections.List[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]]
+        ) -> Collections.Iterable[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]] is
+            let result = Collections.LIST[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]]();
+
+            for outer in uses do
+                let contains_other mut = false;
+
+                for inner in uses do
+                    if _strictly_contains(outer.location, inner.location) then
+                        contains_other = true;
+                        break;
+                    fi
+                od
+
+                if !contains_other then
+                    result.add(outer);
+                fi
+            od
+
+            return result;
+        si
+
+        _strictly_contains(outer: Source.LOCATION, inner: Source.LOCATION) -> bool is
+            // Identifier-only filter: we only consider hover uses that fit
+            // on a single line (multi-line spans get dropped by the VSCE
+            // anyway), and "strictly contains" means outer covers inner
+            // and is wider — same span on both sides is NOT containment.
+            if outer.start_line != outer.end_line \/ inner.start_line != inner.end_line then
+                return false;
+            fi
+
+            if outer.start_line != inner.start_line then
+                return false;
+            fi
+
+            if outer.start_column > inner.start_column \/ outer.end_column < inner.end_column then
+                return false;
+            fi
+
+            // Reject equal-extent overlap so two uses recorded at the same
+            // identifier location (overload-group + resolved member) both
+            // survive; one of them will then win on the merge step.
+            return outer.start_column < inner.start_column \/ outer.end_column > inner.end_column;
         si
     si
 
@@ -248,8 +325,10 @@ namespace Analysis is
             esac
         si
 
-        // Comma-separated LSP modifiers, possibly empty. Only `static`
-        // is emitted for v1 — derived from concrete subclass.
+        // Comma-separated LSP modifiers, possibly empty. Currently
+        // emits `static` for STATIC_* subclasses and `readonly` for
+        // immutable bindings — bare `let` (no `mut`) and captured
+        // values, both of which the user cannot reassign.
         modifiers(symbol: Semantic.Symbols.Symbol) -> string is
             if !symbol? then
                 return "";
@@ -257,15 +336,27 @@ namespace Analysis is
 
             let s = symbol.collapse_group_if_single_member();
 
+            let parts = Collections.LIST[string]();
+
             if
                 isa Semantic.Symbols.STATIC_METHOD(s) \/
                 isa Semantic.Symbols.STATIC_PROPERTY(s) \/
                 isa Semantic.Symbols.STATIC_FIELD(s)
             then
-                return "static";
+                parts.add("static");
             fi
 
-            return "";
+            if isa Semantic.Symbols.Variable(s) then
+                if !s.is_mutable_marked \/ s.is_captured then
+                    parts.add("readonly");
+                fi
+            fi
+
+            if parts.count == 0 then
+                return "";
+            fi
+
+            return string.join(",", parts);
         si
     si
 
