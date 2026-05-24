@@ -18,15 +18,23 @@ namespace Syntax.Process is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _task_conversion: Semantic.TASK_CONVERSION;
         _flow: NARROWING_FLOW;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
         _value_boxer: IR.VALUE_BOXER;
         _visitor: COMPILE_EXPRESSIONS;
 
+        // Read-only accessor: COMPILE_EXPRESSIONS (the
+        // expression-body return path) goes through `_bindings` as
+        // its single shared facade and reaches the TASK helpers
+        // via this property.
+        task_conversion: Semantic.TASK_CONVERSION => _task_conversion;
+
         init(
             logger: Logger,
             symbol_table: Semantic.SYMBOL_TABLE,
             innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
+            task_conversion: Semantic.TASK_CONVERSION,
             flow: NARROWING_FLOW,
             build_flags: Compiler.GLOBAL_BUILD_FLAGS,
             value_boxer: IR.VALUE_BOXER,
@@ -37,6 +45,7 @@ namespace Syntax.Process is
             _logger = logger;
             _symbol_table = symbol_table;
             _innate_symbol_lookup = innate_symbol_lookup;
+            _task_conversion = task_conversion;
             _flow = flow;
             _build_flags = build_flags;
             _value_boxer = value_boxer;
@@ -444,7 +453,7 @@ namespace Syntax.Process is
                             function.wrap_inferred_return_as_task /\
                             value_type? /\
                             value_type.is_settled /\
-                            !is_task_type(value_type)
+                            !_task_conversion.is_task_type(value_type)
                         then
                             let task_type = _innate_symbol_lookup.get_task_type(value_type);
 
@@ -452,9 +461,10 @@ namespace Syntax.Process is
                             // `Tasks.TASK.from_result(orig)` so the
                             // IL returns a Task[T] (not a boxed T)
                             // matching the closure's declared
-                            // return slot. try_wrap_task_return
-                            // mutates r.expression in place and
-                            // refreshes its value/type. Guarded on
+                            // return slot.
+                            // try_wrap_value_as_task_return mutates
+                            // r.expression in place and refreshes
+                            // its value/type. Guarded on
                             // `value_type.is_settled` so we don't
                             // fire during early iterative-inference
                             // walks where the body type is still
@@ -462,7 +472,7 @@ namespace Syntax.Process is
                             // `Tasks.TASK` before its argument
                             // pins) — those would over-wrap to
                             // `Task[Task[?]]`.
-                            if task_type? /\ try_wrap_task_return(r, task_type) then
+                            if task_type? /\ _task_conversion.try_wrap_value_as_task_return(r, task_type, _visitor) then
                                 value_type = r.expression.value.type;
                             fi
                         fi
@@ -481,7 +491,7 @@ namespace Syntax.Process is
                         // original expression and re-resolves the wrapper.
                         // Restricted to return position — variable init /
                         // argument passing slot boundaries don't widen this way.
-                        if try_wrap_task_return(r, function.return_type) then
+                        if _task_conversion.try_wrap_value_as_task_return(r, function.return_type, _visitor) then
                             // wrap succeeded — type now matches
                         elif function.return_type_was_inferred then
                             let lub = Semantic.LEAST_UPPER_BOUND_MAP();
@@ -519,14 +529,7 @@ namespace Syntax.Process is
                 // through normal compile-expressions and produces a
                 // Task value of the right shape.
                 if function.is_void_async then
-                    let loc = r.location;
-                    let tasks_id = Trees.Expressions.IDENTIFIER(loc, Trees.Identifiers.Identifier(loc, "Tasks"));
-                    let task_member =
-                        Trees.Expressions.MEMBER(loc, tasks_id, Trees.Identifiers.Identifier(loc, "TASK"), loc);
-                    let completed_member =
-                        Trees.Expressions.MEMBER(loc, task_member, Trees.Identifiers.Identifier(loc, "completed_task"), loc);
-
-                    r.expression = completed_member;
+                    r.expression = Semantic.TASK_CONVERSION.build_completed_task_expression(r.location);
                     r.expression.walk(_visitor);
 
                     return;
@@ -542,141 +545,5 @@ namespace Syntax.Process is
             fi
         si
 
-        // True iff `type` is the Task class (constructed or bare
-        // unspecialized form). Used to gate the
-        // implicit-return-wrap on let-await inferred-return
-        // lambdas so we don't double-wrap a body that already
-        // produces a Task[?] result (and don't wrap a bare
-        // partially-resolved `Tasks.TASK` either — those need a
-        // later inference iteration to settle to Task[?] before
-        // the wrap-or-not decision).
-        is_task_type(type: Semantic.Types.Type) -> bool is
-            if !type? then
-                return false;
-            fi
-
-            if try_get_task_element_type(type)? then
-                return true;
-            fi
-
-            let unspec = _innate_symbol_lookup.get_unspecialized_task_type();
-
-            if !unspec? \/ !unspec.symbol? \/ !type.symbol? then
-                return false;
-            fi
-
-            let unspec_classy mut = unspec.symbol;
-
-            if let g: Semantic.Symbols.GENERIC = unspec_classy then
-                unspec_classy = g.symbol;
-            fi
-
-            let value_classy mut = type.symbol;
-
-            if let g: Semantic.Symbols.GENERIC = value_classy then
-                value_classy = g.symbol;
-            fi
-
-            return value_classy =~ unspec_classy \/ value_classy.qualified_name =~ unspec_classy.qualified_name;
-        si
-
-        // Detect a constructed TASK[T] target type and return its element type T.
-        // Compares the underlying Classy symbol against the innate-known open
-        // System.Threading.Tasks.Task`1 — name-based comparison wouldn't survive
-        // the namespace remap.
-        try_get_task_element_type(type: Semantic.Types.Type) -> Semantic.Types.Type? is
-            if !type? then
-                return null;
-            fi
-
-            let task_unspec = _innate_symbol_lookup.get_unspecialized_task_type();
-
-            if !task_unspec? then
-                return null;
-            fi
-
-            if !isa Semantic.Types.GENERIC(type) \/ !isa Semantic.Types.GENERIC(task_unspec) then
-                return null;
-            fi
-
-            let constructed = type;
-            let unspec = task_unspec;
-
-            let constructed_sym = cast Semantic.Symbols.GENERIC(constructed.symbol);
-            let unspec_sym = cast Semantic.Symbols.GENERIC(unspec.symbol);
-
-            if !constructed_sym? \/ !unspec_sym? then
-                return null;
-            fi
-
-            if constructed_sym.symbol !~ unspec_sym.symbol then
-                return null;
-            fi
-
-            if constructed.arguments.count != 1 then
-                return null;
-            fi
-
-            return constructed.arguments[0];
-        si
-
-        // Implicit T → TASK[T] widening at return position. Synthesises
-        // `Tasks.TASK.from_result(orig)` around the original expression
-        // and re-walks through compile-expressions so the new call gets a
-        // resolved value of type TASK[T]. Returns the wrap call on
-        // success; null when the target isn't TASK[T] or the element
-        // type doesn't match.
-        try_wrap_task_expression(orig: Trees.Expressions.Expression, target_type: Semantic.Types.Type) -> Trees.Expressions.Expression? is
-            if !orig? \/ !orig.value? \/ !orig.value.type? then
-                return null;
-            fi
-
-            let element_type = try_get_task_element_type(target_type);
-
-            if !element_type? then
-                return null;
-            fi
-
-            if !element_type.is_assignable_from(orig.value.type) then
-                return null;
-            fi
-
-            let loc = orig.location;
-
-            let tasks_id =
-                Trees.Expressions.IDENTIFIER(loc, Trees.Identifiers.Identifier(loc, "Tasks"));
-            let task_member =
-                Trees.Expressions.MEMBER(loc, tasks_id, Trees.Identifiers.Identifier(loc, "TASK"), loc);
-            let from_result_member =
-                Trees.Expressions.MEMBER(loc, task_member, Trees.Identifiers.Identifier(loc, "from_result"), loc);
-
-            let wrap_args =
-                Trees.Expressions.LIST(
-                    loc,
-                    Collections.LIST[Trees.Expressions.Expression]([orig]: Trees.Expressions.Expression)
-                );
-
-            let wrap_call = Trees.Expressions.CALL(loc, from_result_member, wrap_args);
-
-            wrap_call.walk(_visitor);
-
-            if !wrap_call.value? \/ !wrap_call.value.type? \/ !target_type.is_assignable_from(wrap_call.value.type) then
-                return null;
-            fi
-
-            return wrap_call;
-        si
-
-        try_wrap_task_return(r: Trees.Statements.RETURN, target_type: Semantic.Types.Type) -> bool is
-            let wrapped = try_wrap_task_expression(r.expression, target_type);
-
-            if !wrapped? then
-                return false;
-            fi
-
-            r.expression = wrapped;
-
-            return true;
-        si
     si
 si

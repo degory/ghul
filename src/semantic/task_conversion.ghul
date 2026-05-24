@@ -1,0 +1,214 @@
+namespace Semantic is
+    use Source;
+    use Trees = Syntax.Trees;
+
+    use Types.Type;
+
+    // Owns the implicit T → TASK[T] / void → TASK conversion
+    // machinery used by the let-await desugaring and the inferred-
+    // return paths. Concentrates dispersed predicates and AST
+    // builders in one place so the rules are easy to read and the
+    // mechanism is easy to extend.
+    //
+    // Predicates:
+    //   `is_task_type`               — type is non-generic Task or constructed Task[T]
+    //   `try_get_task_element_type`  — returns T for constructed Task[T], null otherwise
+    //
+    // Conversion attempts:
+    //   `try_wrap_value_as_task_expression` — wrap bare-T expression as Tasks.TASK.from_result(orig)
+    //   `try_wrap_value_as_task_return`     — same, but applied to a RETURN statement's expression
+    //
+    // AST builders (static — also callable from parser paths):
+    //   `build_completed_task_expression`   — `Tasks.TASK.completed_task` (void async terminator)
+    //   `build_from_result_expression`      — `Tasks.TASK.from_result(arg)`
+    //
+    // See `docs/claude/let-await-task-conversion.md` for the rule
+    // table — when each conversion fires and what shape it produces.
+    class TASK_CONVERSION is
+        _innate_symbol_lookup: Lookups.InnateSymbolLookup;
+
+        init(innate_symbol_lookup: Lookups.InnateSymbolLookup) is
+            _innate_symbol_lookup = innate_symbol_lookup;
+        si
+
+        // True iff `type` is the Task class — constructed Task[T]
+        // or bare unspecialized Task (the latter shows up during
+        // iterative inference before the element argument settles).
+        // Used to gate the inferred-return wrap so we don't double-
+        // wrap a body that already produces a Task.
+        is_task_type(type: Type) -> bool is
+            if !type? then
+                return false;
+            fi
+
+            if try_get_task_element_type(type)? then
+                return true;
+            fi
+
+            let unspec = _innate_symbol_lookup.get_unspecialized_task_type();
+
+            if !unspec? \/ !unspec.symbol? \/ !type.symbol? then
+                return false;
+            fi
+
+            let unspec_classy mut = unspec.symbol;
+
+            if let g: Symbols.GENERIC = unspec_classy then
+                unspec_classy = g.symbol;
+            fi
+
+            let value_classy mut = type.symbol;
+
+            if let g: Symbols.GENERIC = value_classy then
+                value_classy = g.symbol;
+            fi
+
+            return value_classy =~ unspec_classy \/ value_classy.qualified_name =~ unspec_classy.qualified_name;
+        si
+
+        // For a constructed `Tasks.TASK[T]` return T; null otherwise.
+        // Compares the underlying Classy symbol against the
+        // innate-known open `System.Threading.Tasks.Task`1` — name-
+        // based comparison wouldn't survive the namespace remap.
+        try_get_task_element_type(type: Type) -> Type? is
+            if !type? then
+                return null;
+            fi
+
+            let task_unspec = _innate_symbol_lookup.get_unspecialized_task_type();
+
+            if !task_unspec? then
+                return null;
+            fi
+
+            if !isa Types.GENERIC(type) \/ !isa Types.GENERIC(task_unspec) then
+                return null;
+            fi
+
+            let constructed = type;
+            let unspec = task_unspec;
+
+            let constructed_sym = cast Symbols.GENERIC(constructed.symbol);
+            let unspec_sym = cast Symbols.GENERIC(unspec.symbol);
+
+            if !constructed_sym? \/ !unspec_sym? then
+                return null;
+            fi
+
+            if constructed_sym.symbol !~ unspec_sym.symbol then
+                return null;
+            fi
+
+            if constructed.arguments.count != 1 then
+                return null;
+            fi
+
+            return constructed.arguments[0];
+        si
+
+        // Attempt to wrap `orig` as `Tasks.TASK.from_result(orig)`.
+        // Fires when `target_type` is a constructed `Task[T]` AND T
+        // is assignable from `orig`'s type. The synthesised wrap
+        // call is walked via `visitor` so its value/type fields get
+        // populated before being returned. Returns the wrap
+        // expression on success; null otherwise (target not Task[?],
+        // element type mismatch, or post-walk resolution failure).
+        try_wrap_value_as_task_expression(
+            orig: Trees.Expressions.Expression,
+            target_type: Type,
+            visitor: Syntax.Visitor
+        ) -> Trees.Expressions.Expression? is
+            if !orig? \/ !orig.value? \/ !orig.value.type? then
+                return null;
+            fi
+
+            let element_type = try_get_task_element_type(target_type);
+
+            if !element_type? then
+                return null;
+            fi
+
+            if !element_type.is_assignable_from(orig.value.type) then
+                return null;
+            fi
+
+            let wrap_call = build_from_result_expression(orig.location, orig);
+
+            wrap_call.walk(visitor);
+
+            if !wrap_call.value? \/ !wrap_call.value.type? \/ !target_type.is_assignable_from(wrap_call.value.type) then
+                return null;
+            fi
+
+            return wrap_call;
+        si
+
+        // Convenience: attempt the wrap and mutate `r.expression` in
+        // place. Returns true on success.
+        try_wrap_value_as_task_return(
+            r: Trees.Statements.RETURN,
+            target_type: Type,
+            visitor: Syntax.Visitor
+        ) -> bool is
+            let wrapped = try_wrap_value_as_task_expression(r.expression, target_type, visitor);
+
+            if !wrapped? then
+                return false;
+            fi
+
+            r.expression = wrapped;
+
+            return true;
+        si
+
+        // `Tasks.TASK.completed_task` member-access AST. Used as the
+        // return value for void async bodies — bare `return;` is
+        // rewritten to `return Tasks.TASK.completed_task;` and a
+        // synthesised continuation lambda's end-of-body fallthrough
+        // appends the same.
+        //
+        // Outer nodes carry `loc` so resolver diagnostics anchor on
+        // the user's source. Inner identifiers (`Tasks`, `TASK`,
+        // `completed_task`) use `LOCATION.internal` so the analyser's
+        // hover suppression drops them — the user didn't type them.
+        build_completed_task_expression(loc: LOCATION) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+
+            let tasks_id =
+                Trees.Expressions.IDENTIFIER(loc, Trees.Identifiers.Identifier(internal_loc, "Tasks"));
+            let task_member =
+                Trees.Expressions.MEMBER(loc, tasks_id, Trees.Identifiers.Identifier(internal_loc, "TASK"), loc);
+            let completed_member =
+                Trees.Expressions.MEMBER(loc, task_member, Trees.Identifiers.Identifier(internal_loc, "completed_task"), loc);
+
+            return completed_member;
+        si
+
+        // `Tasks.TASK.from_result(arg)` member-access + call AST.
+        // Used internally by `try_wrap_value_as_task_expression`; also
+        // exposed so paths that synthesise the wrap without going
+        // through the assignability check (rare) can share the same
+        // builder shape and hover-suppression conventions.
+        build_from_result_expression(
+            loc: LOCATION,
+            arg: Trees.Expressions.Expression
+        ) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+
+            let tasks_id =
+                Trees.Expressions.IDENTIFIER(loc, Trees.Identifiers.Identifier(internal_loc, "Tasks"));
+            let task_member =
+                Trees.Expressions.MEMBER(loc, tasks_id, Trees.Identifiers.Identifier(internal_loc, "TASK"), loc);
+            let from_result_member =
+                Trees.Expressions.MEMBER(loc, task_member, Trees.Identifiers.Identifier(internal_loc, "from_result"), loc);
+
+            let wrap_args =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]([arg]: Trees.Expressions.Expression)
+                );
+
+            return Trees.Expressions.CALL(loc, from_result_member, wrap_args);
+        si
+    si
+si
