@@ -53,8 +53,8 @@ namespace Syntax.Process is
         // optional-by-default flow warnings are read straight off it.
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
 
-        _stub_depth: int;
-        _keep_depth: int;
+        _pragma_scope_stack: PRAGMA_SCOPE_STACK;
+        _attribute_resolver: ATTRIBUTE_RESOLVER;
 
         // Flow-sensitive narrowing — holds the narrowing environment
         // in force at the current walk point and keeps each narrowed
@@ -202,6 +202,7 @@ namespace Syntax.Process is
                 innate_symbol_lookup,
                 _flow,
                 _build_flags,
+                value_boxer,
                 self
             );
 
@@ -216,6 +217,9 @@ namespace Syntax.Process is
                 _build_flags,
                 self
             );
+
+            _pragma_scope_stack = PRAGMA_SCOPE_STACK();
+            _attribute_resolver = ATTRIBUTE_RESOLVER(logger, innate_symbol_lookup, overload_resolver, self);
         si
 
         // If `expr` is an unqualified identifier resolving (in the
@@ -287,8 +291,7 @@ namespace Syntax.Process is
         si
 
         apply(root: Trees.Node) is
-            assert _keep_depth == 0;
-            assert _stub_depth == 0;
+            assert _pragma_scope_stack.is_balanced;
 
             IR.LABEL.reset_id();
             IR.LABEL.set_pass("E");
@@ -319,8 +322,7 @@ namespace Syntax.Process is
 
             root.walk(self);
 
-            assert _keep_depth == 0;
-            assert _stub_depth == 0;
+            assert _pragma_scope_stack.is_balanced;
             assert _if_flow_stack.count == 0
                 else "if-flow frame stack leaked: {_if_flow_stack.count} unreleased";
             assert _loop_kept_stack.count == 0
@@ -329,7 +331,7 @@ namespace Syntax.Process is
                 else "try-flow frame stack leaked: {_try_flow_stack.count} unreleased";
         si
 
-        should_skip(node: Trees.Node) -> bool => _stub_depth > 0 \/ is_stable(node);
+        should_skip(node: Trees.Node) -> bool => _pragma_scope_stack.in_stub \/ is_stable(node);
 
         get_zero_argument_function(type: Type, name: string) -> Semantic.Symbols.Function? is
             let symbol = type.find_member(name);
@@ -390,43 +392,35 @@ namespace Syntax.Process is
             return false;
         si
 
-        // FIXME: #500 Pragma handling code is duplicated across multiple visitors
         pre(pragma: Trees.Definitions.PRAGMA) -> bool is
-            if !pragma.pragma? then
-                return false;
-            fi
+            _pragma_scope_stack.enter(pragma.pragma);
 
-            let p = pragma.pragma;
-
-            let name = p.name.to_string();
-
-            if name =~ "IL.stub" then
-                _stub_depth = _stub_depth + 1;
-            elif name =~ "KEEP" then
-                _keep_depth = _keep_depth + 1;
-            fi
             return false;
         si
 
         visit(pragma: Trees.Definitions.PRAGMA) is
-            if !pragma.pragma? then
-                return;
-            fi
+            _pragma_scope_stack.leave(pragma.pragma);
 
-            let p = pragma.pragma;
+            resolve_attribute(pragma);
+        si
 
-            let name = p.name.to_string();
+        // An attribute pragma applies to the definition it wraps; unwrap
+        // any nested pragmas to reach that definition's symbol.
+        resolve_attribute(pragma: Trees.Definitions.PRAGMA) is
+            let definition: Trees.Definitions.Definition mut = pragma.definition;
 
-            if name =~ "IL.stub" then
-                _stub_depth = _stub_depth - 1;
-            elif name =~ "KEEP" then
-                _keep_depth = _keep_depth - 1;
+            while isa Trees.Definitions.PRAGMA(definition) do
+                definition = cast Trees.Definitions.PRAGMA(definition).definition;
+            od
+
+            if definition? then
+                _attribute_resolver.resolve(pragma.pragma, symbol_for(definition));
             fi
         si
 
         pre(`namespace: Trees.Definitions.NAMESPACE) -> bool is
             super.pre(`namespace);
-            return _stub_depth > 0;
+            return _pragma_scope_stack.in_stub;
         si
 
         pre(`class: Trees.Definitions.CLASS) -> bool is
@@ -913,11 +907,19 @@ namespace Syntax.Process is
                         );                        
                 fi
             elif !function.return_type.is_assignable_from(expression.expression.value.type) then
-                _logger
-                    .error(
-                        expression.location,
-                        "cannot return value of type {expression.expression.value.type} where {function.return_type} expected"
-                    );
+                // Implicit T → TASK[T] widening at expression-body return
+                // position. Same mechanism as visit_return: synthesise
+                // Tasks.TASK.from_result(orig) and re-resolve.
+                let wrapped = _bindings.try_wrap_task_expression(expression.expression, function.return_type);
+                if wrapped? then
+                    expression.expression = wrapped;
+                else
+                    _logger
+                        .error(
+                            expression.location,
+                            "cannot return value of type {expression.expression.value.type} where {function.return_type} expected"
+                        );
+                fi
             else
                 Value.check_is_consumable_allow_void(_logger, expression.expression.location, expression.expression.value);
             fi
@@ -1127,7 +1129,7 @@ namespace Syntax.Process is
         visit(`cast: Trees.Expressions.CAST) is
             `cast.value = null;
 
-            let type = `cast.type_expression.type;
+            let type mut = `cast.type_expression.type;
 
             if !type? then
                 `cast.value = DUMMY(Semantic.Types.ERROR(), `cast.location);
@@ -1147,6 +1149,13 @@ namespace Syntax.Process is
                 _logger.poison(`cast.right.location, "cast has no value");
 
                 return;
+            fi
+
+            if `cast.right.value.type? then
+                type = _condition_analyzer.specialize_variant_for_receiver(
+                    `cast.right.value.type,
+                    type
+                );
             fi
 
             // just check the cast is possible at this stage
@@ -1190,12 +1199,19 @@ namespace Syntax.Process is
         visit(`isa: Trees.Expressions.ISA) is
             `isa.value = null;
 
-            let isa_type = `isa.type_expression.type;
+            let isa_type mut = `isa.type_expression.type;
 
             if isa_type == null then
                 _logger.error(`isa.type_expression.location, "isa has no type");
                 `isa.value = DUMMY(Semantic.Types.ERROR(), `isa.location);
                 return;
+            fi
+
+            if `isa.right? /\ `isa.right.value? /\ `isa.right.value.type? then
+                isa_type = _condition_analyzer.specialize_variant_for_receiver(
+                    `isa.right.value.type,
+                    isa_type
+                );
             fi
 
             let bool_type = _innate_symbol_lookup.get_bool_type();
@@ -1353,7 +1369,7 @@ namespace Syntax.Process is
                         !left.explicit_type.is_assignable_from(left.right_value.type)
                     then
                         _logger.error(
-                            left.variable_location, 
+                            left.variable_location,
                             "{left.right_value.type} is not assignable to {left.explicit_type}");
                     fi
                 fi
@@ -1504,7 +1520,7 @@ namespace Syntax.Process is
                 !variable.is_explicit_type /\
                 variable.left.is_simple_name;
 
-            if variable.initializer? /\ !bare_default then
+            if variable.initializer? /\ !bare_default /\ !variable.is_argument then
                 if variable.type_expression? /\ variable.type_expression.type? /\ !isa Trees.TypeExpressions.INFER(variable.type_expression) then
                     // if we have both an explicit type and an initializer, we
                     // can push a type constraint down into the initializer

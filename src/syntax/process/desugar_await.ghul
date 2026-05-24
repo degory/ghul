@@ -1,0 +1,260 @@
+namespace Syntax.Process is
+    use Source;
+    use Trees;
+    use Logging;
+
+    // Rewrites `let await x = e;` / `await e;` statement-list tails to a
+    // `Tasks.TaskExtensions.unwrap(e.continue_with(t -> { ... }))` chain.
+    // The expression-form `let await x = e in body` calls `build_await_call`
+    // directly from the parsers.
+    class DESUGAR_AWAIT: Visitor is
+        _counter: int static;
+
+        // Stack of enclosing functions' declared return-type AST
+        // nodes. Pushed when entering a function definition or lambda,
+        // popped when leaving. The synthesised continuation lambda for
+        // a statement-position let-await inherits the enclosing
+        // function's return type from the top of this stack, so its
+        // returns participate in the same `T → TASK[T]` auto-wrap rule
+        // as a hand-written async function. Empty outside any function
+        // frame — those callers fall back to an inferred return type.
+        _enclosing_return_types: Collections.LIST[TypeExpressions.TypeExpression];
+
+        init() is
+            super.init();
+            _enclosing_return_types = Collections.LIST[TypeExpressions.TypeExpression]();
+        si
+
+        apply(root: Node) is
+            root.walk(self);
+        si
+
+        pre(function: Definitions.FUNCTION) -> bool is
+            _enclosing_return_types.add(function.type_expression);
+            return false;
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
+        si
+
+        pre(function: Expressions.FUNCTION) -> bool is
+            _enclosing_return_types.add(function.type_expression);
+            return false;
+        si
+
+        visit(function: Expressions.FUNCTION) is
+            _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
+        si
+
+        _current_return_type(loc: LOCATION) -> TypeExpressions.TypeExpression is
+            if _enclosing_return_types.count == 0 then
+                return TypeExpressions.INFER(loc);
+            fi
+
+            let top = _enclosing_return_types[_enclosing_return_types.count - 1];
+
+            if !top? then
+                return TypeExpressions.INFER(loc);
+            fi
+
+            return top.copy();
+        si
+
+        pre(stmt_list: Statements.LIST) -> bool is
+            let stmts = Collections.LIST[Statements.Statement]();
+            let await_index mut = -1;
+            let i mut = 0;
+
+            for s in stmt_list do
+                stmts.add(s);
+
+                if await_index < 0 then
+                    if isa Statements.LET(s) then
+                        let let_stmt = cast Statements.LET(s);
+
+                        if let_stmt.is_await then
+                            await_index = i;
+                        fi
+                    elif isa Statements.AWAIT(s) then
+                        await_index = i;
+                    fi
+                fi
+
+                i = i + 1;
+            od
+
+            if await_index < 0 then
+                return false;
+            fi
+
+            _rewrite(stmt_list, stmts, await_index);
+
+            // Re-walk so any nested awaits in the new lambda body are
+            // also rewritten.
+            for s in stmt_list do
+                s.walk(self);
+            od
+
+            return true;
+        si
+
+        _rewrite(stmt_list: Statements.LIST, stmts: Collections.List[Statements.Statement], index: int) is
+            let stmt = stmts[index];
+            let loc = stmt.location;
+
+            let e: Expressions.Expression mut = default;
+            let bound_name: Identifiers.Identifier mut = default;
+
+            if isa Statements.LET(stmt) then
+                let let_stmt = cast Statements.LET(stmt);
+
+                let var_count mut = 0;
+                for v in let_stmt.variables.variables do
+                    if var_count == 0 then
+                        bound_name = v.name;
+                        e = v.initializer;
+                    fi
+                    var_count = var_count + 1;
+                od
+
+                assert var_count == 1 else "let await must bind exactly one variable";
+                assert bound_name? else "let await variable must have a name";
+                assert e? else "let await variable must have an initializer";
+            else
+                let await_stmt = cast Statements.AWAIT(stmt);
+
+                e = await_stmt.expression;
+            fi
+
+            let post_statements = Collections.LIST[Statements.Statement]();
+
+            let j mut = index + 1;
+            while j < stmts.count do
+                post_statements.add(stmts[j]);
+                j = j + 1;
+            od
+
+            let call = build_await_call(loc, e, bound_name, post_statements, _current_return_type(loc));
+
+            let new_statements = Collections.LIST[Statements.Statement]();
+
+            let k mut = 0;
+            while k < index do
+                new_statements.add(stmts[k]);
+                k = k + 1;
+            od
+
+            new_statements.add(Statements.RETURN(loc, call));
+
+            stmt_list.replace_all(new_statements);
+        si
+
+        // Build the desugared
+        // `Tasks.TaskExtensions.unwrap(e.continue_with($await_t_N is
+        //   let bound_name = $await_t_N.result;  // omitted when bound_name is null
+        //   <post_body_statements>
+        // si))`
+        // call. Shared by the statement-form rewrite and the
+        // expression-form `let await x = e in body` parser paths.
+        build_await_call(
+            loc: LOCATION,
+            e: Expressions.Expression,
+            bound_name: Identifiers.Identifier,
+            post_body_statements: Collections.List[Statements.Statement],
+            lambda_return_type: TypeExpressions.TypeExpression
+        ) -> Expressions.Expression
+        static
+        is
+            _counter = _counter + 1;
+            let arg_name_str = "$await_t_{_counter}";
+
+            let lambda_body_statements = Collections.LIST[Statements.Statement]();
+
+            if bound_name? then
+                let result_access =
+                    Expressions.MEMBER(
+                        loc,
+                        Expressions.IDENTIFIER(loc, Identifiers.Identifier(loc, arg_name_str)),
+                        Identifiers.Identifier(loc, "result"),
+                        loc
+                    );
+
+                let inner_let_var =
+                    Variables.VARIABLE(
+                        loc,
+                        bound_name.copy(),
+                        TypeExpressions.INFER(loc),
+                        false,
+                        false,
+                        result_access
+                    );
+
+                let inner_let_vars =
+                    Variables.LIST(
+                        loc,
+                        Collections.LIST[Variables.VARIABLE]([inner_let_var]: Variables.VARIABLE)
+                    );
+
+                lambda_body_statements.add(Statements.LET(loc, false, inner_let_vars));
+            fi
+
+            for s in post_body_statements do
+                lambda_body_statements.add(s);
+            od
+
+            let lambda_body_list = Statements.LIST(loc, lambda_body_statements);
+            let lambda_body = Bodies.BLOCK(loc, lambda_body_list);
+
+            let lambda_arg_id =
+                Expressions.IDENTIFIER(loc, Identifiers.Identifier(loc, arg_name_str));
+
+            let lambda_args =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]([lambda_arg_id]: Expressions.Expression)
+                );
+
+            let lambda =
+                Expressions.FUNCTION(
+                    loc,
+                    lambda_args,
+                    lambda_return_type,
+                    lambda_body,
+                    false
+                );
+
+            // e.continue_with(lambda)
+            let continue_with_member =
+                Expressions.MEMBER(
+                    loc,
+                    e,
+                    Identifiers.Identifier(loc, "continue_with"),
+                    loc
+                );
+
+            let continue_with_args =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]([lambda]: Expressions.Expression)
+                );
+
+            let continue_with_call =
+                Expressions.CALL(loc, continue_with_member, continue_with_args);
+
+            let tasks_id = Expressions.IDENTIFIER(loc, Identifiers.Identifier(loc, "Tasks"));
+            let task_extensions_member =
+                Expressions.MEMBER(loc, tasks_id, Identifiers.Identifier(loc, "TaskExtensions"), loc);
+            let unwrap_member =
+                Expressions.MEMBER(loc, task_extensions_member, Identifiers.Identifier(loc, "unwrap"), loc);
+
+            let unwrap_args =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]([continue_with_call]: Expressions.Expression)
+                );
+
+            return Expressions.CALL(loc, unwrap_member, unwrap_args);
+        si
+    si
+si

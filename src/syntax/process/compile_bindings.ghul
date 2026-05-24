@@ -20,6 +20,7 @@ namespace Syntax.Process is
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
         _flow: NARROWING_FLOW;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
+        _value_boxer: IR.VALUE_BOXER;
         _visitor: COMPILE_EXPRESSIONS;
 
         init(
@@ -28,6 +29,7 @@ namespace Syntax.Process is
             innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup,
             flow: NARROWING_FLOW,
             build_flags: Compiler.GLOBAL_BUILD_FLAGS,
+            value_boxer: IR.VALUE_BOXER,
             visitor: COMPILE_EXPRESSIONS
         ) is
             super.init();
@@ -37,6 +39,7 @@ namespace Syntax.Process is
             _innate_symbol_lookup = innate_symbol_lookup;
             _flow = flow;
             _build_flags = build_flags;
+            _value_boxer = value_boxer;
             _visitor = visitor;
         si
 
@@ -429,16 +432,15 @@ namespace Syntax.Process is
                                 "cannot return value from function of void type"
                             );
                     elif !function.return_type.is_assignable_from(r.expression.value.type) then
-                        // Originally-inferred return type with a later
-                        // return that doesn't conform to the current
-                        // binding — widen via LUB rather than erroring
-                        // (#1173 checkbox "Inferring the return type
-                        // of function literals with multiple return
-                        // statements"). Covers both the narrower-first
-                        // / wider-second case and the siblings case.
-                        // For a declared return type the existing
-                        // error is correct.
-                        if function.return_type_was_inferred then
+                        // Implicit T → TASK[T] widening at return position
+                        // (the C# `async` return-rewrap rule applied to ghūl).
+                        // Synthesises Tasks.TASK.from_result(orig) around the
+                        // original expression and re-resolves the wrapper.
+                        // Restricted to return position — variable init /
+                        // argument passing slot boundaries don't widen this way.
+                        if try_wrap_task_return(r, function.return_type) then
+                            // wrap succeeded — type now matches
+                        elif function.return_type_was_inferred then
                             let lub = Semantic.LEAST_UPPER_BOUND_MAP();
                             lub.add(function.return_type);
                             lub.add(r.expression.value.type);
@@ -475,6 +477,105 @@ namespace Syntax.Process is
                         );
                 fi
             fi
+        si
+
+        // Detect a constructed TASK[T] target type and return its element type T.
+        // Compares the underlying Classy symbol against the innate-known open
+        // System.Threading.Tasks.Task`1 — name-based comparison wouldn't survive
+        // the namespace remap.
+        try_get_task_element_type(type: Semantic.Types.Type) -> Semantic.Types.Type? is
+            if !type? then
+                return null;
+            fi
+
+            let task_unspec = _innate_symbol_lookup.get_unspecialized_task_type();
+
+            if !task_unspec? then
+                return null;
+            fi
+
+            if !isa Semantic.Types.GENERIC(type) \/ !isa Semantic.Types.GENERIC(task_unspec) then
+                return null;
+            fi
+
+            let constructed = type;
+            let unspec = task_unspec;
+
+            let constructed_sym = cast Semantic.Symbols.GENERIC(constructed.symbol);
+            let unspec_sym = cast Semantic.Symbols.GENERIC(unspec.symbol);
+
+            if !constructed_sym? \/ !unspec_sym? then
+                return null;
+            fi
+
+            if constructed_sym.symbol !~ unspec_sym.symbol then
+                return null;
+            fi
+
+            if constructed.arguments.count != 1 then
+                return null;
+            fi
+
+            return constructed.arguments[0];
+        si
+
+        // Implicit T → TASK[T] widening at return position. Synthesises
+        // `Tasks.TASK.from_result(orig)` around the original expression
+        // and re-walks through compile-expressions so the new call gets a
+        // resolved value of type TASK[T]. Returns the wrap call on
+        // success; null when the target isn't TASK[T] or the element
+        // type doesn't match.
+        try_wrap_task_expression(orig: Trees.Expressions.Expression, target_type: Semantic.Types.Type) -> Trees.Expressions.Expression? is
+            if !orig? \/ !orig.value? \/ !orig.value.type? then
+                return null;
+            fi
+
+            let element_type = try_get_task_element_type(target_type);
+
+            if !element_type? then
+                return null;
+            fi
+
+            if !element_type.is_assignable_from(orig.value.type) then
+                return null;
+            fi
+
+            let loc = orig.location;
+
+            let tasks_id =
+                Trees.Expressions.IDENTIFIER(loc, Trees.Identifiers.Identifier(loc, "Tasks"));
+            let task_member =
+                Trees.Expressions.MEMBER(loc, tasks_id, Trees.Identifiers.Identifier(loc, "TASK"), loc);
+            let from_result_member =
+                Trees.Expressions.MEMBER(loc, task_member, Trees.Identifiers.Identifier(loc, "from_result"), loc);
+
+            let wrap_args =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]([orig]: Trees.Expressions.Expression)
+                );
+
+            let wrap_call = Trees.Expressions.CALL(loc, from_result_member, wrap_args);
+
+            wrap_call.walk(_visitor);
+
+            if !wrap_call.value? \/ !wrap_call.value.type? \/ !target_type.is_assignable_from(wrap_call.value.type) then
+                return null;
+            fi
+
+            return wrap_call;
+        si
+
+        try_wrap_task_return(r: Trees.Statements.RETURN, target_type: Semantic.Types.Type) -> bool is
+            let wrapped = try_wrap_task_expression(r.expression, target_type);
+
+            if !wrapped? then
+                return false;
+            fi
+
+            r.expression = wrapped;
+
+            return true;
         si
     si
 si

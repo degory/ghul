@@ -130,6 +130,213 @@ namespace Analysis is
         si
     si
 
+    // Whole-file semantic-token dump for VS Code's semantic-tokens
+    // provider. Output is the same shape as HOVERMAP — one row per
+    // recorded HOVER_USE — but each row carries an LSP token-type
+    // string and a comma-separated modifiers string instead of the
+    // hover description:
+    //
+    //   startLine  startColumn  endLine  endColumn  tokenType  modifiers
+    //
+    // A symbol with no LSP-mappable kind contributes no row. Like
+    // HOVERMAP this never triggers a recompile of its own; the caller
+    // has just driven an EDIT (or COMPILE).
+    class SEMANTICTOKENS_HANDLER: CommandHandler is
+        _watchdog: WATCHDOG;
+        _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _full_compiler: FULL_COMPILER;
+        _classifier: SEMANTIC_TOKEN_CLASSIFIER;
+
+        init(
+            watchdog: WATCHDOG,
+            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
+            full_compiler: FULL_COMPILER
+        )
+        is
+            _watchdog = watchdog;
+            _symbol_use_locations = symbol_use_locations;
+            _full_compiler = full_compiler;
+            _classifier = SEMANTIC_TOKEN_CLASSIFIER();
+        si
+
+        handle(reader: IO.TextReader, writer: IO.TextWriter) is
+            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+
+            let path = reader.read_line();
+
+            let written_header mut = false;
+
+            try
+                if !_watchdog.want_restart then
+                    let uses mut = _symbol_use_locations.hover_uses_in_file(path);
+
+                    // Unlike HOVERMAP (built for the offline ghul.dev pipeline
+                    // that explicitly drives EDIT + COMPILE), SEMANTICTOKENS
+                    // serves a live IDE that asks for tokens whenever a
+                    // document opens. The hover map is only populated by a
+                    // whole-project compile; on first open we get nothing
+                    // back. Fall back like HOVER does and force one — the
+                    // user otherwise sees TextMate-only coloring until the
+                    // first edit triggers a debounced compile.
+                    if uses.count == 0 then
+                        _full_compiler.compile_all(writer, path);
+
+                        uses = _symbol_use_locations.hover_uses_in_file(path);
+                    fi
+
+                    writer.write_line("SEMANTICTOKENS");
+                    written_header = true;
+
+                    // Discard wide spans that strictly contain another
+                    // recorded use on the same line. Desugared expressions
+                    // (e.g. `let await x = e;` rewritten to a synthesized
+                    // `unwrap(...)` call) register a hover use whose
+                    // location is the original source span — useful for
+                    // HOVER, since the IDE can show the desugared meaning
+                    // anywhere on the statement, but for semantic tokens
+                    // it produces a giant token covering identifiers and
+                    // operators. The strict-containment filter drops the
+                    // outer use while keeping every inner identifier.
+                    let useful = _filter_outer_spans(uses);
+
+                    for entry in useful do
+                        let symbol = entry.value.symbol;
+                        let token_type = _classifier.token_type(symbol);
+
+                        if token_type? then
+                            let location = entry.location;
+                            let modifiers = _classifier.modifiers(symbol);
+
+                            writer.write_line(
+                                "{location.start_line}\t{location.start_column}\t"
+                                "{location.end_line}\t{location.end_column}\t"
+                                "{token_type}\t{modifiers}"
+                            );
+                        fi
+                    od
+                fi
+            catch ex: Exception
+                debug_always("SEMANTICTOKENS caught: {ex.get_type()} {ex.message}");
+
+                _watchdog.request_restart();
+
+                if !written_header then
+                    writer.write_line("SEMANTICTOKENS");
+                fi
+            yrt
+
+            Std.error.flush();
+
+            writer.write("{cast char(12)}");
+            writer.flush();
+        si
+
+        _filter_outer_spans(
+            uses: Collections.List[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]]
+        ) -> Collections.Iterable[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]] is
+            let result = Collections.LIST[Semantic.LOCATION_SEARCH_RESULT[Semantic.HOVER_USE]]();
+
+            for outer in uses do
+                let contains_other mut = false;
+
+                for inner in uses do
+                    if outer.location.strictly_contains(inner.location) then
+                        contains_other = true;
+                        break;
+                    fi
+                od
+
+                if !contains_other then
+                    result.add(outer);
+                fi
+            od
+
+            return result;
+        si
+    si
+
+    // Maps a Symbol to the LSP semantic-token type and modifier strings
+    // the VS Code client expects. Returns null token_type for kinds
+    // VS Code has no slot for (UNDEFINED, MODULE, PACKAGE, CONSTANT,
+    // STRING, …); the handler then skips emitting a row.
+    class SEMANTIC_TOKEN_CLASSIFIER is
+        init() is si
+
+        token_type(symbol: Semantic.Symbols.Symbol) -> string? is
+            if !symbol? then
+                return null;
+            fi
+
+            let s = symbol.collapse_group_if_single_member();
+
+            case s.symbol_kind
+            when Semantic.Symbols.SYMBOL_KIND.NAMESPACE:
+                return "namespace";
+            when Semantic.Symbols.SYMBOL_KIND.CLASS:
+                return "class";
+            when Semantic.Symbols.SYMBOL_KIND.INTERFACE:
+                return "interface";
+            when Semantic.Symbols.SYMBOL_KIND.STRUCT:
+                return "struct";
+            when Semantic.Symbols.SYMBOL_KIND.ENUM:
+                return "enum";
+            when Semantic.Symbols.SYMBOL_KIND.ENUM_MEMBER:
+                return "enumMember";
+            when Semantic.Symbols.SYMBOL_KIND.TYPE_PARAMETER:
+                return "typeParameter";
+            when Semantic.Symbols.SYMBOL_KIND.METHOD:
+                return "method";
+            when Semantic.Symbols.SYMBOL_KIND.FUNCTION:
+                return "function";
+            when Semantic.Symbols.SYMBOL_KIND.PROPERTY:
+                return "property";
+            when Semantic.Symbols.SYMBOL_KIND.FIELD:
+                return "property";
+            when Semantic.Symbols.SYMBOL_KIND.VARIABLE:
+                if s.is_argument then
+                    return "parameter";
+                fi
+                return "variable";
+            default
+                return null;
+            esac
+        si
+
+        // Comma-separated LSP modifiers, possibly empty. Currently
+        // emits `static` for STATIC_* subclasses and `readonly` for
+        // immutable bindings — bare `let` (no `mut`) and captured
+        // values, both of which the user cannot reassign.
+        modifiers(symbol: Semantic.Symbols.Symbol) -> string is
+            if !symbol? then
+                return "";
+            fi
+
+            let s = symbol.collapse_group_if_single_member();
+
+            let parts = Collections.LIST[string]();
+
+            if
+                isa Semantic.Symbols.STATIC_METHOD(s) \/
+                isa Semantic.Symbols.STATIC_PROPERTY(s) \/
+                isa Semantic.Symbols.STATIC_FIELD(s)
+            then
+                parts.add("static");
+            fi
+
+            if isa Semantic.Symbols.Variable(s) then
+                if !s.is_mutable_marked \/ s.is_captured then
+                    parts.add("readonly");
+                fi
+            fi
+
+            if parts.count == 0 then
+                return "";
+            fi
+
+            return string.join(",", parts);
+        si
+    si
+
     class DEFINITION_HANDLER: SymbolLocationHandler is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
@@ -647,6 +854,10 @@ namespace Analysis is
                             writer.write_line("{pair.key}\t{cast int(pair.value.completion_kind)}\t{pair.value.description}");
                         od
                     fi
+
+                    for keyword in _completer.keyword_results do
+                        writer.write_line("{keyword}\t{cast int(Semantic.Symbols.COMPLETION_KIND.KEYWORD)}\tkeyword");
+                    od
                 fi
             catch ex: Exception
                 debug_always("COMPLETION caught: {ex.get_type()} {ex.message}");

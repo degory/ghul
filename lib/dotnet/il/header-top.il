@@ -1,6 +1,6 @@
 .assembly extern 'System.Runtime'
 {
-  auto
+  .ver 8:0:0:0
 }
 .assembly '${0}'
 {
