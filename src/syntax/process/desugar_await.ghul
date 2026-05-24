@@ -134,7 +134,283 @@ namespace Syntax.Process is
             return top.copy();
         si
 
+        // Walk `stmt_list` looking for FOR or DO statements whose
+        // body contains let-await. Each such loop is replaced with
+        //   let await $lr_N = Ghul.Async.for_each_async(
+        //                         INTERNAL_ENSURE_ITERATOR(<source>),
+        //                         (<var>) is <body with returns LOOP_RESULT-wrapped> si
+        //                     );
+        //   if $lr_N.type == LOOP_RESULT_TYPE.RETURN then return $lr_N.value; fi
+        // and the existing let-await scan in `pre(stmt_list)` then
+        // picks up the new let-await statement.
+        _expand_async_loops(stmt_list: Statements.LIST) is
+            let new_statements = Collections.LIST[Statements.Statement]();
+            let any_expanded mut = false;
+
+            for s in stmt_list do
+                if isa Statements.FOR(s) then
+                    let for_stmt = cast Statements.FOR(s);
+                    if for_stmt.body? /\ _stmt_list_has_let_await(for_stmt.body) then
+                        _expand_for_loop(new_statements, for_stmt);
+                        any_expanded = true;
+                        continue;
+                    fi
+                fi
+                new_statements.add(s);
+            od
+
+            if any_expanded then
+                stmt_list.replace_all(new_statements);
+            fi
+        si
+
+        // True iff `stmts` (a Statements.LIST) directly contains a
+        // `let await` or bare `await e;` statement (not descending
+        // into nested closures).
+        _stmt_list_has_let_await(stmts: Statements.LIST) -> bool is
+            let scanner = LET_AWAIT_SCANNER();
+            stmts.walk(scanner);
+            return scanner.found;
+        si
+
+        // Expand one `for x in xs do BODY od` (async body) into
+        // its desugared statement sequence, appending to `out`.
+        _expand_for_loop(
+            out: Collections.LIST[Statements.Statement],
+            for_stmt: Statements.FOR
+        ) is
+            let loc = for_stmt.location;
+            let internal_loc = LOCATION.internal;
+            let enclosing_return = _current_return_type(loc);
+            let t_ret = Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(enclosing_return);
+
+            // 1. Wrap the user's returns inside the for-body and append
+            //    the synthesised CONTINUE return at end of body.
+            let conversion = Semantic.LOOP_RESULT_CONVERSION();
+            conversion.wrap_returns_in_body(for_stmt.body, t_ret);
+
+            // 2. Build the body lambda: `(var) is <rewritten body> si`.
+            let body_lambda = _build_for_body_lambda(for_stmt, t_ret);
+
+            // 3. Source expression's iterator. v1 only supports
+            //    Iterable[T] sources (calls `.iterator` to get the
+            //    iterator). Iterator[T] direct sources are deferred —
+            //    INTERNAL_ENSURE_ITERATOR AST node exists for that
+            //    future refinement, but compile-expressions lowering
+            //    isn't implemented yet.
+            let iterator_access =
+                Expressions.MEMBER(
+                    loc,
+                    for_stmt.expression,
+                    Identifiers.Identifier(internal_loc, "iterator"),
+                    loc
+                );
+
+            // 4. Build the call: Ghul.Async.for_each_async(iterator, body_lambda).
+            let call = _build_for_each_async_call(loc, iterator_access, body_lambda);
+
+            // 5. Fresh `$lr_N` name for the let-await.
+            _counter = _counter + 1;
+            let lr_name = "$lr_{_counter}";
+            let lr_id_local = Identifiers.Identifier(internal_loc, lr_name);
+
+            // 6. Emit: let await $lr_N = call;
+            out.add(_build_let_await_statement(loc, lr_id_local, call));
+
+            // 7. Emit: if $lr_N.type == LOOP_RESULT_TYPE.RETURN then return [$lr_N.value]; fi
+            out.add(_build_post_loop_return_check(loc, lr_id_local, t_ret));
+        si
+
+        // `(var) is <body with returns wrapped + CONTINUE appended> si`
+        // The body is `for_stmt.body` (already rewritten in place by
+        // `wrap_returns_in_body`). The lambda's variable is the
+        // for-loop's induction variable.
+        _build_for_body_lambda(
+            for_stmt: Statements.FOR,
+            t_ret: TypeExpressions.TypeExpression?
+        ) -> Expressions.Expression is
+            let loc = for_stmt.location;
+
+            // Lambda parameter list — Expressions.LIST of IDENTIFIER
+            // expressions. The for-loop variable's identifier becomes
+            // the lambda parameter.
+            let var_name = for_stmt.variable.name;
+            let arg_id_expr =
+                Expressions.IDENTIFIER(loc, var_name.copy());
+            let arg_list =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]([arg_id_expr]: Expressions.Expression)
+                );
+
+            let body_block = Bodies.BLOCK(loc, for_stmt.body);
+
+            let lambda =
+                Expressions.FUNCTION(
+                    loc,
+                    arg_list,
+                    TypeExpressions.INFER(loc),
+                    body_block,
+                    false
+                );
+
+            // The body contains let-await (we wouldn't be here
+            // otherwise), so flag it for the existing closure
+            // classification path. `is_void_async` stays false: the
+            // body always returns LOOP_RESULT[T_ret] (or LOOP_RESULT)
+            // — never bare void.
+            lambda.contains_let_await = true;
+
+            return lambda;
+        si
+
+        // `Ghul.Async.for_each_async(wrapped_source, body_lambda)`
+        _build_for_each_async_call(
+            loc: LOCATION,
+            wrapped_source: Expressions.Expression,
+            body_lambda: Expressions.Expression
+        ) -> Expressions.Expression is
+            let internal_loc = LOCATION.internal;
+
+            let ghul_id =
+                Expressions.IDENTIFIER(
+                    loc,
+                    Identifiers.Identifier(internal_loc, "Ghul")
+                );
+            let async_member =
+                Expressions.MEMBER(
+                    loc,
+                    ghul_id,
+                    Identifiers.Identifier(internal_loc, "Async"),
+                    loc
+                );
+            let for_each_member =
+                Expressions.MEMBER(
+                    loc,
+                    async_member,
+                    Identifiers.Identifier(internal_loc, "for_each_async"),
+                    loc
+                );
+
+            let args = Collections.LIST[Expressions.Expression]();
+            args.add(wrapped_source);
+            args.add(body_lambda);
+
+            return Expressions.CALL(loc, for_each_member, Expressions.LIST(loc, args));
+        si
+
+        // `let await $lr_N = call;` — a Statements.LET with is_await
+        // set so the existing let-await scan picks it up.
+        _build_let_await_statement(
+            loc: LOCATION,
+            lr_id: Identifiers.Identifier,
+            call: Expressions.Expression
+        ) -> Statements.Statement is
+            let lr_var =
+                Variables.VARIABLE(
+                    loc,
+                    lr_id,
+                    TypeExpressions.INFER(loc),
+                    false,
+                    false,
+                    call
+                );
+            let var_list =
+                Variables.LIST(
+                    loc,
+                    Collections.LIST[Variables.VARIABLE]([lr_var]: Variables.VARIABLE)
+                );
+            let let_stmt = Statements.LET(loc, false, var_list);
+            let_stmt.mark_await();
+            return let_stmt;
+        si
+
+        // `if $lr_N.type == LOOP_RESULT_TYPE.RETURN then return [$lr_N.value]; fi`
+        // For void-async enclosing the inner return has no value;
+        // for value-async it's `return $lr_N.value;`.
+        _build_post_loop_return_check(
+            loc: LOCATION,
+            lr_id: Identifiers.Identifier,
+            t_ret: TypeExpressions.TypeExpression?
+        ) -> Statements.Statement is
+            let internal_loc = LOCATION.internal;
+
+            // $lr_N.type
+            let lr_ref =
+                Expressions.IDENTIFIER(loc, lr_id.copy());
+            let lr_type =
+                Expressions.MEMBER(
+                    loc,
+                    lr_ref,
+                    Identifiers.Identifier(internal_loc, "type"),
+                    loc
+                );
+
+            // Ghul.Async.LOOP_RESULT_TYPE.RETURN
+            let ghul_id =
+                Expressions.IDENTIFIER(
+                    loc,
+                    Identifiers.Identifier(internal_loc, "Ghul")
+                );
+            let async_member =
+                Expressions.MEMBER(
+                    loc,
+                    ghul_id,
+                    Identifiers.Identifier(internal_loc, "Async"),
+                    loc
+                );
+            let lrt_member =
+                Expressions.MEMBER(
+                    loc,
+                    async_member,
+                    Identifiers.Identifier(internal_loc, "LOOP_RESULT_TYPE"),
+                    loc
+                );
+            let return_member =
+                Expressions.MEMBER(
+                    loc,
+                    lrt_member,
+                    Identifiers.Identifier(internal_loc, "RETURN"),
+                    loc
+                );
+
+            // $lr_N.type == ...RETURN
+            let eq_op = Identifiers.Identifier(internal_loc, "==");
+            let condition =
+                Expressions.BINARY(loc, eq_op, "==", lr_type, return_member);
+
+            // return [$lr_N.value]; — inside the `then` branch
+            let return_expr: Expressions.Expression? mut = null;
+            if t_ret? then
+                return_expr =
+                    Expressions.MEMBER(
+                        loc,
+                        Expressions.IDENTIFIER(loc, lr_id.copy()),
+                        Identifiers.Identifier(internal_loc, "value"),
+                        loc
+                    );
+            fi
+
+            let return_stmt = Statements.RETURN(loc, return_expr);
+            let then_list =
+                Statements.LIST(
+                    loc,
+                    Collections.LIST[Statements.Statement]([return_stmt]: Statements.Statement)
+                );
+
+            let branch = Statements.IF_BRANCH(loc, condition, then_list);
+            let branches = Collections.LIST[Statements.IF_BRANCH]([branch]: Statements.IF_BRANCH);
+            return Statements.IF(loc, branches);
+        si
+
         pre(stmt_list: Statements.LIST) -> bool is
+            // First, expand any FOR/DO loops whose body contains
+            // let-await into helper calls + let-await + post-loop
+            // RETURN check. This must run before the let-await scan
+            // below, because the expansion can produce new let-await
+            // statements that the scan must then pick up.
+            _expand_async_loops(stmt_list);
+
             let stmts = Collections.LIST[Statements.Statement]();
             let await_index mut = -1;
             let i mut = 0;
