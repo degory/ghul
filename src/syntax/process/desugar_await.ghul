@@ -3,6 +3,26 @@ namespace Syntax.Process is
     use Trees;
     use Logging;
 
+    // One stack frame for `DESUGAR_AWAIT._enclosing_frames`. Tracks
+    // the enclosing function/lambda's return-type AST + the two
+    // boolean classification flags the desugar reads off the stack
+    // top.
+    struct ENCLOSING_FUNCTION_FRAME is
+        return_type: TypeExpressions.TypeExpression;
+        is_void_async: bool;
+        is_async_loop_body: bool;
+
+        init(
+            return_type: TypeExpressions.TypeExpression,
+            is_void_async: bool,
+            is_async_loop_body: bool
+        ) is
+            self.return_type = return_type;
+            self.is_void_async = is_void_async;
+            self.is_async_loop_body = is_async_loop_body;
+        si
+    si
+
     // Rewrites `let await x = e;` / `await e;` statement-list tails to a
     // `Tasks.TaskExtensions.unwrap(e.continue_with(t -> { ... }))` chain.
     // The expression-form `let await x = e in body` calls `build_await_call`
@@ -10,38 +30,20 @@ namespace Syntax.Process is
     class DESUGAR_AWAIT: Visitor is
         _counter: int static;
 
-        // Stack of enclosing functions' declared return-type AST
-        // nodes. Pushed when entering a function definition or lambda,
-        // popped when leaving. The synthesised continuation lambda for
-        // a statement-position let-await inherits the enclosing
-        // function's return type from the top of this stack, so its
-        // returns participate in the same `T → TASK[T]` auto-wrap rule
-        // as a hand-written async function. Empty outside any function
-        // frame — those callers fall back to an inferred return type.
-        _enclosing_return_types: Collections.LIST[TypeExpressions.TypeExpression];
-
-        // Parallel stack to `_enclosing_return_types`: top entry is
-        // `true` when the most-immediate enclosing function/lambda
-        // is a void async (let-await body with no value-returning
-        // `return X;`). `_rewrite` reads the top to decide whether
-        // a synthesised continuation lambda needs its end-of-body
-        // terminated with `return Tasks.TASK.completed_task;`.
-        _enclosing_is_void_async: Collections.LIST[bool];
-
-        // Parallel stack — top entry is `true` when the most-
-        // immediate enclosing function is a synthesised async-loop
-        // body lambda (see `Expressions.FUNCTION.is_async_loop_body`).
-        // Used by the async-loop desugar's post-loop RETURN check
-        // builder to decide whether to wrap propagated values in
-        // _LOOP_RESULT (nested-loop case) or pass them bare (outer
-        // user-function case).
-        _enclosing_is_async_loop_body: Collections.LIST[bool];
+        // Stack of enclosing function/lambda frames. One frame is
+        // pushed per `pre(function)` and popped per `visit(function)`.
+        // The desugar reads the top frame to decide:
+        //   - what return-type the synthesised continuation lambda
+        //     inherits (so `T → TASK[T]` auto-wrap fires correctly),
+        //   - whether to terminate void-async continuations with
+        //     `return Tasks.TASK.completed_task;`,
+        //   - whether a nested async-loop's post-loop RETURN check
+        //     should LOOP_RESULT-wrap the propagated value.
+        _enclosing_frames: Collections.LIST[ENCLOSING_FUNCTION_FRAME];
 
         init() is
             super.init();
-            _enclosing_return_types = Collections.LIST[TypeExpressions.TypeExpression]();
-            _enclosing_is_void_async = Collections.LIST[bool]();
-            _enclosing_is_async_loop_body = Collections.LIST[bool]();
+            _enclosing_frames = Collections.LIST[ENCLOSING_FUNCTION_FRAME]();
         si
 
         apply(root: Node) is
@@ -57,55 +59,52 @@ namespace Syntax.Process is
             let scan = _scan_body(function.body);
             function.contains_let_await = function.contains_let_await \/ scan.found;
             function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
-            _enclosing_return_types.add(function.type_expression);
-            _enclosing_is_void_async.add(function.is_void_async);
-            _enclosing_is_async_loop_body.add(false);
+            _enclosing_frames.add(
+                ENCLOSING_FUNCTION_FRAME(
+                    function.type_expression,
+                    function.is_void_async,
+                    false
+                )
+            );
             return false;
         si
 
         visit(function: Definitions.FUNCTION) is
-            _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
-            _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
-            _enclosing_is_async_loop_body.remove_at(_enclosing_is_async_loop_body.count - 1);
+            _enclosing_frames.remove_at(_enclosing_frames.count - 1);
         si
 
         pre(function: Expressions.FUNCTION) -> bool is
             let scan = _scan_body(function.body);
             function.contains_let_await = function.contains_let_await \/ scan.found;
             function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
-            _enclosing_return_types.add(function.type_expression);
-            _enclosing_is_void_async.add(function.is_void_async);
-            _enclosing_is_async_loop_body.add(function.is_async_loop_body);
+            _enclosing_frames.add(
+                ENCLOSING_FUNCTION_FRAME(
+                    function.type_expression,
+                    function.is_void_async,
+                    function.is_async_loop_body
+                )
+            );
             return false;
         si
 
         visit(function: Expressions.FUNCTION) is
-            _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
-            _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
-            _enclosing_is_async_loop_body.remove_at(_enclosing_is_async_loop_body.count - 1);
+            _enclosing_frames.remove_at(_enclosing_frames.count - 1);
         si
 
         // True when the most-immediate enclosing function is a
         // synthesised async-loop body lambda.
         _current_is_async_loop_body: bool is
-            if _enclosing_is_async_loop_body.count == 0 then
+            if _enclosing_frames.count == 0 then
                 return false;
             fi
-            return _enclosing_is_async_loop_body[_enclosing_is_async_loop_body.count - 1];
+            return _enclosing_frames[_enclosing_frames.count - 1].is_async_loop_body;
         si
 
-        // True when the most-immediate enclosing function/lambda has
-        // `is_void_async` set. Used in `_rewrite` to decide whether
-        // to terminate a synthesised continuation lambda's body with
-        // `return Tasks.TASK.completed_task;` (the void-async case
-        // needs the inner to return Task rather than fall off the
-        // end). Empty stack → false (top-level statements don't get
-        // the void-async treatment).
         _current_is_void_async: bool is
-            if _enclosing_is_void_async.count == 0 then
+            if _enclosing_frames.count == 0 then
                 return false;
             fi
-            return _enclosing_is_void_async[_enclosing_is_void_async.count - 1];
+            return _enclosing_frames[_enclosing_frames.count - 1].is_void_async;
         si
 
         // True iff the function/lambda's body contains a statement-form
@@ -144,11 +143,11 @@ namespace Syntax.Process is
         si
 
         _current_return_type(loc: LOCATION) -> TypeExpressions.TypeExpression is
-            if _enclosing_return_types.count == 0 then
+            if _enclosing_frames.count == 0 then
                 return TypeExpressions.INFER(loc);
             fi
 
-            let top = _enclosing_return_types[_enclosing_return_types.count - 1];
+            let top = _enclosing_frames[_enclosing_frames.count - 1].return_type;
 
             if !top? then
                 return TypeExpressions.INFER(loc);
@@ -216,9 +215,9 @@ namespace Syntax.Process is
         // non-generic) or when there's no async-classified
         // enclosing function at all.
         _effective_t_ret(loc: LOCATION) -> TypeExpressions.TypeExpression? is
-            let i mut = _enclosing_return_types.count - 1;
+            let i mut = _enclosing_frames.count - 1;
             while i >= 0 do
-                let candidate = _enclosing_return_types[i];
+                let candidate = _enclosing_frames[i].return_type;
                 let extracted =
                     Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(candidate);
                 if extracted? then
@@ -393,27 +392,8 @@ namespace Syntax.Process is
             condition_lambda: Expressions.Expression,
             body_lambda: Expressions.Expression
         ) -> Expressions.Expression is
-            let internal_loc = LOCATION.internal;
-
-            let ghul_id =
-                Expressions.IDENTIFIER(
-                    loc,
-                    Identifiers.Identifier(internal_loc, "Ghul")
-                );
-            let async_member =
-                Expressions.MEMBER(
-                    loc,
-                    ghul_id,
-                    Identifiers.Identifier(internal_loc, "Async"),
-                    loc
-                );
             let while_member =
-                Expressions.MEMBER(
-                    loc,
-                    async_member,
-                    Identifiers.Identifier(internal_loc, "_while_async"),
-                    loc
-                );
+                Semantic.LOOP_RESULT_CONVERSION.build_ghul_async_member(loc, "_while_async");
 
             let args = Collections.LIST[Expressions.Expression]();
             args.add(condition_lambda);
@@ -475,33 +455,14 @@ namespace Syntax.Process is
             wrapped_source: Expressions.Expression,
             body_lambda: Expressions.Expression
         ) -> Expressions.Expression is
-            let internal_loc = LOCATION.internal;
-
-            let ghul_id =
-                Expressions.IDENTIFIER(
-                    loc,
-                    Identifiers.Identifier(internal_loc, "Ghul")
-                );
-            let async_member =
-                Expressions.MEMBER(
-                    loc,
-                    ghul_id,
-                    Identifiers.Identifier(internal_loc, "Async"),
-                    loc
-                );
-            let for_each_member =
-                Expressions.MEMBER(
-                    loc,
-                    async_member,
-                    Identifiers.Identifier(internal_loc, "_for_async"),
-                    loc
-                );
+            let for_member =
+                Semantic.LOOP_RESULT_CONVERSION.build_ghul_async_member(loc, "_for_async");
 
             let args = Collections.LIST[Expressions.Expression]();
             args.add(wrapped_source);
             args.add(body_lambda);
 
-            return Expressions.CALL(loc, for_each_member, Expressions.LIST(loc, args));
+            return Expressions.CALL(loc, for_member, Expressions.LIST(loc, args));
         si
 
         // `let await $lr_N = call;` — a Statements.LET with is_await
@@ -552,32 +513,8 @@ namespace Syntax.Process is
                 );
 
             // Ghul.Async._LOOP_RESULT_TYPE.RETURN
-            let ghul_id =
-                Expressions.IDENTIFIER(
-                    loc,
-                    Identifiers.Identifier(internal_loc, "Ghul")
-                );
-            let async_member =
-                Expressions.MEMBER(
-                    loc,
-                    ghul_id,
-                    Identifiers.Identifier(internal_loc, "Async"),
-                    loc
-                );
-            let lrt_member =
-                Expressions.MEMBER(
-                    loc,
-                    async_member,
-                    Identifiers.Identifier(internal_loc, "_LOOP_RESULT_TYPE"),
-                    loc
-                );
             let return_member =
-                Expressions.MEMBER(
-                    loc,
-                    lrt_member,
-                    Identifiers.Identifier(internal_loc, "RETURN"),
-                    loc
-                );
+                Semantic.LOOP_RESULT_CONVERSION.build_loop_result_type_value(loc, "RETURN");
 
             // $lr_N.type == ...RETURN
             let eq_op = Identifiers.Identifier(internal_loc, "==");
