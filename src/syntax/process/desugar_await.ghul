@@ -20,9 +20,18 @@ namespace Syntax.Process is
         // frame — those callers fall back to an inferred return type.
         _enclosing_return_types: Collections.LIST[TypeExpressions.TypeExpression];
 
+        // Parallel stack to `_enclosing_return_types`: top entry is
+        // `true` when the most-immediate enclosing function/lambda
+        // is a void async (let-await body with no value-returning
+        // `return X;`). `_rewrite` reads the top to decide whether
+        // a synthesised continuation lambda needs its end-of-body
+        // terminated with `return Tasks.TASK.completed_task;`.
+        _enclosing_is_void_async: Collections.LIST[bool];
+
         init() is
             super.init();
             _enclosing_return_types = Collections.LIST[TypeExpressions.TypeExpression]();
+            _enclosing_is_void_async = Collections.LIST[bool]();
         si
 
         apply(root: Node) is
@@ -31,26 +40,49 @@ namespace Syntax.Process is
 
         pre(function: Definitions.FUNCTION) -> bool is
             // OR rather than overwrite: synthesised continuation
-            // lambdas built by `build_await_call` already set this flag
-            // (their own body no longer contains the desugared let-await
-            // but they ARE still part of an async chain).
-            function.contains_let_await = function.contains_let_await \/ _body_has_let_await(function.body);
+            // lambdas built by `build_await_call` already set
+            // `contains_let_await` and `is_void_async` (their own
+            // body no longer contains the desugared let-await but
+            // they ARE still part of an async chain).
+            let scan = _scan_body(function.body);
+            function.contains_let_await = function.contains_let_await \/ scan.found;
+            function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
             _enclosing_return_types.add(function.type_expression);
+            _enclosing_is_void_async.add(function.is_void_async);
             return false;
         si
 
         visit(function: Definitions.FUNCTION) is
             _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
+            _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
         si
 
         pre(function: Expressions.FUNCTION) -> bool is
-            function.contains_let_await = function.contains_let_await \/ _body_has_let_await(function.body);
+            let scan = _scan_body(function.body);
+            function.contains_let_await = function.contains_let_await \/ scan.found;
+            function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
             _enclosing_return_types.add(function.type_expression);
+            _enclosing_is_void_async.add(function.is_void_async);
             return false;
         si
 
         visit(function: Expressions.FUNCTION) is
             _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
+            _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
+        si
+
+        // True when the most-immediate enclosing function/lambda has
+        // `is_void_async` set. Used in `_rewrite` to decide whether
+        // to terminate a synthesised continuation lambda's body with
+        // `return Tasks.TASK.completed_task;` (the void-async case
+        // needs the inner to return Task rather than fall off the
+        // end). Empty stack → false (top-level statements don't get
+        // the void-async treatment).
+        _current_is_void_async: bool is
+            if _enclosing_is_void_async.count == 0 then
+                return false;
+            fi
+            return _enclosing_is_void_async[_enclosing_is_void_async.count - 1];
         si
 
         // True iff the function/lambda's body contains a statement-form
@@ -68,13 +100,24 @@ namespace Syntax.Process is
         // surrounding `Tasks.TaskExtensions.unwrap(... continue_with ...)`
         // call rejects the `T`-typed `continue_with` result.
         _body_has_let_await(body: Bodies.Body) -> bool is
+            return _scan_body(body).found;
+        si
+
+        // Single-pass scan recording both let-await presence and
+        // whether any value-returning return statements appear in
+        // the body. The caller combines these to decide whether
+        // the enclosing function is async-with-value (settles
+        // inferred return as `Tasks.TASK[T]`) or async-without-value
+        // (settles inferred return as the non-generic `Tasks.TASK`).
+        _scan_body(body: Bodies.Body) -> LET_AWAIT_SCANNER is
+            let scanner = LET_AWAIT_SCANNER();
+
             if !body? then
-                return false;
+                return scanner;
             fi
 
-            let scanner = LET_AWAIT_SCANNER();
             body.walk(scanner);
-            return scanner.found;
+            return scanner;
         si
 
         _current_return_type(loc: LOCATION) -> TypeExpressions.TypeExpression is
@@ -165,7 +208,7 @@ namespace Syntax.Process is
                 j = j + 1;
             od
 
-            let call = build_await_call(loc, e, bound_name, post_statements, _current_return_type(loc));
+            let call = build_await_call(loc, e, bound_name, post_statements, _current_return_type(loc), _current_is_void_async);
 
             let new_statements = Collections.LIST[Statements.Statement]();
 
@@ -192,7 +235,8 @@ namespace Syntax.Process is
             e: Expressions.Expression,
             bound_name: Identifiers.Identifier,
             post_body_statements: Collections.List[Statements.Statement],
-            lambda_return_type: TypeExpressions.TypeExpression
+            lambda_return_type: TypeExpressions.TypeExpression,
+            is_void_async: bool
         ) -> Expressions.Expression
         static
         is
@@ -249,6 +293,20 @@ namespace Syntax.Process is
                 lambda_body_statements.add(s);
             od
 
+            // Void async: terminate the inner lambda's body with
+            // `return Tasks.TASK.completed_task;` so it returns a
+            // Task (non-generic) rather than falling off the end.
+            // continue_with on a Task-returning lambda picks the
+            // Func<Task<X>, Task> overload, producing Task<Task>,
+            // which `TaskExtensions.unwrap` reduces back to Task.
+            // For value-async the post-body is expected to end with
+            // a value-returning `return X;` (PRs #1385/#1388/#1392
+            // auto-wrap the bare-T return as `Task.from_result(X)`).
+            if is_void_async then
+                let completed = Semantic.TASK_CONVERSION.build_completed_task_expression(loc);
+                lambda_body_statements.add(Statements.RETURN(loc, completed));
+            fi
+
             let lambda_body_list = Statements.LIST(loc, lambda_body_statements);
             let lambda_body = Bodies.BLOCK(loc, lambda_body_list);
 
@@ -278,8 +336,11 @@ namespace Syntax.Process is
             // bare INFER return-type plus a `return T_value;` body
             // would settle inference on plain T and the surrounding
             // `unwrap(... continue_with ...)` chain would reject the
-            // T-typed continue_with result.
+            // T-typed continue_with result. For void async, also
+            // propagate `is_void_async` so compile-lambdas pins the
+            // inner's return type as the non-generic `Tasks.TASK`.
             lambda.contains_let_await = true;
+            lambda.is_void_async = is_void_async;
 
             // e.continue_with(lambda)
             let continue_with_member =
@@ -313,14 +374,20 @@ namespace Syntax.Process is
 
             return Expressions.CALL(loc, unwrap_member, unwrap_args);
         si
+
     si
 
     // Walks a function or lambda body looking for any statement-form
-    // `let await` (or bare `await` statement). Stops descending into
-    // nested function definitions / lambdas — their own let-awaits
-    // make *those* nested closures async, not the enclosing one.
+    // `let await` (or bare `await` statement) and any value-returning
+    // `return X;`. Stops descending into nested function definitions
+    // / lambdas — their own let-awaits and returns belong to *those*
+    // closures, not the enclosing one. The combination of flags is
+    // what distinguishes a value-returning async (settles inferred
+    // return as `Tasks.TASK[T]`) from a void async (settles inferred
+    // return as the non-generic `Tasks.TASK`).
     class LET_AWAIT_SCANNER: Visitor is
         found: bool public;
+        found_value_return: bool public;
 
         init() is
             super.init();
@@ -337,6 +404,13 @@ namespace Syntax.Process is
         pre(await_stmt: Statements.AWAIT) -> bool is
             found = true;
             return true;
+        si
+
+        pre(return_stmt: Statements.RETURN) -> bool is
+            if return_stmt.expression? then
+                found_value_return = true;
+            fi
+            return false;
         si
 
         pre(function: Definitions.FUNCTION) -> bool is
