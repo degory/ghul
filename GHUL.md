@@ -56,11 +56,20 @@ let j: int;            // explicit type, no initializer
 let k: int = 5678;     // both
 ```
 
-With an initializer the type is inferred from it; without one a type is required. A variable declared without an initializer takes the default value of its type (zero, `false`, or `null`). Reassignment is allowed, but a variable cannot change type. A single `let` can declare several variables, mixing the three forms:
+With an initializer the type is inferred from it; without one a type is required. A variable declared without an initializer takes the default value of its type (zero, `false`, or `null`). A single `let` can declare several variables, mixing the three forms:
 
 ```ghul
 let first = 1, second: int, third = "three";
 ```
+
+A bare `let` is immutable. To reassign, the declaration takes a trailing `mut`:
+
+```ghul
+let counter mut = 0;
+counter = counter + 1;
+```
+
+A `mut` variable still cannot change type. Either form can also take its value from a `default` expression — `let i = default` initializes to the default value of the type that the surrounding context expects, with `default[T]` to pin the type explicitly.
 
 The name `_` is a discard placeholder: it stands in for a variable name, but the value that would be assigned to it is discarded. It is accepted in `let` definitions, tuple destructuring, lambda parameters, and `for` loop variables.
 
@@ -136,7 +145,7 @@ A named function's signature is fully explicit: every argument has a written typ
 
 Functions are declared at namespace scope — there are no nested function definitions — and may be overloaded on their argument types. There are no default argument values. Execution of a program begins at a parameterless function named `entry`.
 
-Functions are first-class values. A function literal has the same shape without a name, but its argument and return types are generally *inferred* — from the body and from the context the literal is used in — so they are usually written without annotations (though either can be given explicitly). With a single argument the parentheses are optional. `A -> B` is the type of a function from `A` to `B`. Function literals capture values from the enclosing scope, forming closures — a closure captures the *value* a variable holds at the point the literal is created. An anonymous function refers to itself through the `rec` keyword:
+Functions are first-class values. A function literal has the same shape without a name, but its argument and return types are generally *inferred* — from the body and from the context the literal is used in — so they are usually written without annotations (though either can be given explicitly). With a single argument the parentheses are optional. `A -> B` is the type of a function from `A` to `B`. Function literals capture references from the enclosing scope, forming closures: an immutable `let` is captured by value (a snapshot at the point the literal is constructed); a `let mut` is captured by reference, so the closure and the outer scope share one live variable that either side can read or reassign. An anonymous function refers to itself through the `rec` keyword:
 
 ```ghul
 let twice = x => x * 2;
@@ -286,7 +295,7 @@ if name? then
 fi
 ```
 
-Optionals cover reference and value types alike (an optional value type is backed by `OPTION[T]`, the .NET `Nullable[T]`). Assigning a possibly-absent value where a non-optional type is expected produces a warning, which clears once the value is known to be present.
+Optionals cover reference and value types alike — an optional value type is backed by the .NET `Nullable[T]`. A non-optional `T` is assignable to a `T?` without ceremony; the other direction needs the value to be known present. Assigning a possibly-absent value where a non-optional type is expected produces a warning, which clears once the value is known to be present.
 
 ## control flow
 
@@ -411,6 +420,22 @@ assert index < array.count else "index out of range";
 ```
 
 `return value;` returns from a block-body function, `return;` from a void one.
+
+### asynchronous code
+
+A function is asynchronous when its declared return type is `Tasks.TASK[T]` (the .NET `Task<T>`) or `Tasks.TASK` (the non-generic `Task`). Inside such a function, `let await x = e;` waits for the task `e` to complete; `x` is then initialized to its result and the rest of the function continues:
+
+```ghul
+compute() -> Tasks.TASK[int] is
+    let await a = double_async(10);
+    let await b = add_async(a, 1);
+    return b;
+si
+```
+
+The source reads top-to-bottom even though execution suspends at each `let await`. `await e;` is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T` and the compiler wraps it as `Tasks.TASK.from_result(...)` automatically.
+
+`let await` and `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch` surrounding code that awaits is not yet supported; wrap the call at the call site — reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 
 ## collections and pipes
 
