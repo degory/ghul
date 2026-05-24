@@ -28,10 +28,20 @@ namespace Syntax.Process is
         // terminated with `return Tasks.TASK.completed_task;`.
         _enclosing_is_void_async: Collections.LIST[bool];
 
+        // Parallel stack — top entry is `true` when the most-
+        // immediate enclosing function is a synthesised async-loop
+        // body lambda (see `Expressions.FUNCTION.is_async_loop_body`).
+        // Used by the async-loop desugar's post-loop RETURN check
+        // builder to decide whether to wrap propagated values in
+        // LOOP_RESULT (nested-loop case) or pass them bare (outer
+        // user-function case).
+        _enclosing_is_async_loop_body: Collections.LIST[bool];
+
         init() is
             super.init();
             _enclosing_return_types = Collections.LIST[TypeExpressions.TypeExpression]();
             _enclosing_is_void_async = Collections.LIST[bool]();
+            _enclosing_is_async_loop_body = Collections.LIST[bool]();
         si
 
         apply(root: Node) is
@@ -49,12 +59,14 @@ namespace Syntax.Process is
             function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
             _enclosing_return_types.add(function.type_expression);
             _enclosing_is_void_async.add(function.is_void_async);
+            _enclosing_is_async_loop_body.add(false);
             return false;
         si
 
         visit(function: Definitions.FUNCTION) is
             _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
             _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
+            _enclosing_is_async_loop_body.remove_at(_enclosing_is_async_loop_body.count - 1);
         si
 
         pre(function: Expressions.FUNCTION) -> bool is
@@ -63,12 +75,23 @@ namespace Syntax.Process is
             function.is_void_async = function.is_void_async \/ (scan.found /\ !scan.found_value_return);
             _enclosing_return_types.add(function.type_expression);
             _enclosing_is_void_async.add(function.is_void_async);
+            _enclosing_is_async_loop_body.add(function.is_async_loop_body);
             return false;
         si
 
         visit(function: Expressions.FUNCTION) is
             _enclosing_return_types.remove_at(_enclosing_return_types.count - 1);
             _enclosing_is_void_async.remove_at(_enclosing_is_void_async.count - 1);
+            _enclosing_is_async_loop_body.remove_at(_enclosing_is_async_loop_body.count - 1);
+        si
+
+        // True when the most-immediate enclosing function is a
+        // synthesised async-loop body lambda.
+        _current_is_async_loop_body: bool is
+            if _enclosing_is_async_loop_body.count == 0 then
+                return false;
+            fi
+            return _enclosing_is_async_loop_body[_enclosing_is_async_loop_body.count - 1];
         si
 
         // True when the most-immediate enclosing function/lambda has
@@ -180,6 +203,39 @@ namespace Syntax.Process is
             return scanner.found;
         si
 
+        // Return the effective T_ret for a desugar happening at the
+        // current point in the visitor walk. Walks the enclosing-
+        // function stack from top down looking for the first
+        // type-expression node that's a concrete `Tasks.TASK[T]`
+        // (GENERIC node whose identifier ends in "TASK"). Synthesised
+        // intermediate body lambdas have INFER return types and get
+        // skipped — the T_ret we want is the user's outermost
+        // async-classified function's, since the entire chain of
+        // nested async loops propagates RETURN values back up to it.
+        // Returns null when the enclosing is void-async (Tasks.TASK
+        // non-generic) or when there's no async-classified
+        // enclosing function at all.
+        _effective_t_ret(loc: LOCATION) -> TypeExpressions.TypeExpression? is
+            let i mut = _enclosing_return_types.count - 1;
+            while i >= 0 do
+                let candidate = _enclosing_return_types[i];
+                let extracted =
+                    Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(candidate);
+                if extracted? then
+                    return extracted;
+                fi
+                // If the candidate is the non-generic Tasks.TASK
+                // (void async), stop searching — going further up
+                // could find an unrelated function whose T_ret
+                // doesn't apply to the current async chain.
+                if Semantic.LOOP_RESULT_CONVERSION.is_void_async_return_type(candidate) then
+                    return null;
+                fi
+                i = i - 1;
+            od
+            return null;
+        si
+
         // Expand one `for x in xs do BODY od` (async body) into
         // its desugared statement sequence, appending to `out`.
         _expand_for_loop(
@@ -188,8 +244,7 @@ namespace Syntax.Process is
         ) is
             let loc = for_stmt.location;
             let internal_loc = LOCATION.internal;
-            let enclosing_return = _current_return_type(loc);
-            let t_ret = Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(enclosing_return);
+            let t_ret = _effective_t_ret(loc);
 
             // 1. Wrap the user's returns inside the for-body and append
             //    the synthesised CONTINUE return at end of body.
@@ -244,8 +299,7 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let enclosing_return = _current_return_type(loc);
-            let t_ret = Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(enclosing_return);
+            let t_ret = _effective_t_ret(loc);
 
             // 1. Wrap the user's returns inside the while-body.
             let conversion = Semantic.LOOP_RESULT_CONVERSION();
@@ -301,6 +355,7 @@ namespace Syntax.Process is
                     false
                 );
             lambda.contains_let_await = true;
+            lambda.is_async_loop_body = true;
             return lambda;
         si
 
@@ -412,6 +467,10 @@ namespace Syntax.Process is
             // body always returns LOOP_RESULT[T_ret] (or LOOP_RESULT)
             // — never bare void.
             lambda.contains_let_await = true;
+
+            // Marker so nested-loop expansions inside this body
+            // know to LOOP_RESULT-wrap their post-loop RETURN check.
+            lambda.is_async_loop_body = true;
 
             return lambda;
         si
@@ -531,15 +590,39 @@ namespace Syntax.Process is
             let condition =
                 Expressions.BINARY(loc, eq_op, "==", lr_type, return_member);
 
-            // return [$lr_N.value]; — inside the `then` branch
-            let return_expr: Expressions.Expression? mut = null;
+            // return [$lr_N.value]; — inside the `then` branch.
+            //
+            // Three shapes:
+            //  - Enclosing is a user function returning Tasks.TASK[T]:
+            //      return $lr_N.value;  (Conversion 1 wraps as
+            //                            Tasks.TASK.from_result)
+            //  - Enclosing is a user function returning Tasks.TASK
+            //    (void async): return;
+            //  - Enclosing is another async-loop body lambda
+            //    (nested-loop case): return LOOP_RESULT[T_outer](RETURN,
+            //    $lr_N.value); so the outer loop's RETURN
+            //    propagation chain stays consistent.
+            let lr_value: Expressions.Expression? mut = null;
             if t_ret? then
-                return_expr =
+                lr_value =
                     Expressions.MEMBER(
                         loc,
                         Expressions.IDENTIFIER(loc, lr_id.copy()),
                         Identifiers.Identifier(internal_loc, "value"),
                         loc
+                    );
+            fi
+
+            let return_expr: Expressions.Expression? mut = lr_value;
+            if _current_is_async_loop_body /\ t_ret? then
+                return_expr =
+                    Semantic.LOOP_RESULT_CONVERSION.build_return_expression(
+                        loc, t_ret, lr_value
+                    );
+            elif _current_is_async_loop_body /\ !t_ret? then
+                return_expr =
+                    Semantic.LOOP_RESULT_CONVERSION.build_return_expression(
+                        loc, null, null
                     );
             fi
 
