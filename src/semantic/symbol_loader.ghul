@@ -134,8 +134,12 @@ namespace Semantic is
 
                 return result;
             fi
-            
-            return Load.LOCAL_VARIABLE(symbol);            
+
+            if symbol.is_boxed then
+                return _load_boxed_local(location, symbol);
+            fi
+
+            return Load.LOCAL_VARIABLE(symbol);
         si
 
         load_outer_local_variable(location: Source.LOCATION, symbol: Symbols.Variable) -> Value is
@@ -148,8 +152,19 @@ namespace Semantic is
 
                 return result;
             fi
-            
-            return Load.LOCAL_VARIABLE(symbol);            
+
+            let raw = Load.LOCAL_VARIABLE(symbol);
+
+            if symbol.is_boxed then
+                // The slot value IS the BOX[T] reference; tell the
+                // IR layer its type is BOX[T] rather than T (the
+                // load IR derives its type from `symbol.type`).
+                // Used by `closure.find_or_add_capture` -> frame
+                // construction at closure-build time.
+                return TYPE_WRAPPER(symbol.storage_type, raw);
+            fi
+
+            return raw;
         si
 
         store_local_variable(location: Source.LOCATION, symbol: Symbols.Variable, value: Value, is_initialize: bool) -> Value is
@@ -157,14 +172,142 @@ namespace Semantic is
 
             if !is_initialize then
                 // FIXME: need proper dataflow analyis
-                if symbol.is_captured \/ symbol.owner != function then
-                    IoC.CONTAINER.instance.logger.error(location, "captured value may not be assigned to; wrap it in `Ghul.BOX[T]` and assign to `.value` to share mutable state with a closure");
+                if symbol.is_boxed then
+                    // Captured-mutable assignment IS supported via
+                    // the BOX[T] cell — fall through to the boxed
+                    // store path below. No diagnostic.
+                elif symbol.is_captured \/ symbol.owner != function then
+                    IoC.CONTAINER.instance.logger.error(location, "captured value may not be assigned to; declare it with trailing `mut` to share mutable state with a closure");
                 elif symbol.is_disposed then
                     IoC.CONTAINER.instance.logger.error(location, "scoped disposal value may not be assigned to");
                 fi
             fi
 
+            // Boxed store from inside the closure body that
+            // captured this local: route through the closure's
+            // frame so we hit the shared BOX[T] cell, not the
+            // (invisible-from-here) outer slot.
+            if symbol.is_boxed /\ !is_initialize /\ function? /\ symbol.owner != function then
+                let result = function.store_captured_value(location, symbol, value, self);
+
+                assert result? else "store captured value did not return a value: {function} {symbol}";
+
+                return result;
+            fi
+
+            if symbol.is_boxed then
+                return _store_boxed_local(location, symbol, value, is_initialize);
+            fi
+
             return Store.LOCAL_VARIABLE(symbol, _value_boxer.box_if_needed(value, symbol.type));
+        si
+
+        // Boxed-local read: load slot (gives BOX[T] reference)
+        // and field-load `.value`. The TYPE_WRAPPER re-types the
+        // slot load as BOX[T] for the benefit of the follow-on
+        // instance-field access; emitted IL is just ldloc.
+        // The `.value` access goes through `member.load`
+        // polymorphically — works whether the resolved member
+        // is a Field, INSTANCE_FIELD, or auto-generated property
+        // shape that wraps a public field.
+        _load_boxed_local(location: Source.LOCATION, symbol: Symbols.Variable) -> Value is
+            let member = resolve_box_value_member(symbol);
+
+            if !member? then
+                return Load.LOCAL_VARIABLE(symbol);
+            fi
+
+            let raw_load = Load.LOCAL_VARIABLE(symbol);
+            let typed_box = TYPE_WRAPPER(symbol.storage_type, raw_load);
+
+            return member.load(location, typed_box, self);
+        si
+
+        // Boxed-local write: on declaration init, construct a
+        // fresh `Ghul.BOX[T](value)` and store the reference;
+        // on reassignment, load the slot's BOX[T] and field-store
+        // to `.value`.
+        _store_boxed_local(location: Source.LOCATION, symbol: Symbols.Variable, value: Value, is_initialize: bool) -> Value is
+            if is_initialize then
+                // `box_type.symbol` is the specialised
+                // Symbols.GENERIC (BOX[T]), constructed by
+                // `Types.GENERIC.init`. find_member on it
+                // returns the specialised init constructor(s)
+                // with the concrete T substituted in — but
+                // BOX has two overloads (`init()` and
+                // `init(value: T)`), so we get a
+                // FUNCTION_GROUP back. Pick the unary form.
+                let box_type = symbol.storage_type;
+                let ctor = _resolve_box_constructor(box_type);
+                let arguments = Collections.LIST[Value]([value]);
+                let new_box = NEW(box_type, ctor, arguments);
+
+                return Store.LOCAL_VARIABLE(symbol, new_box);
+            fi
+
+            let member = resolve_box_value_member(symbol);
+
+            if !member? then
+                return Store.LOCAL_VARIABLE(symbol, _value_boxer.box_if_needed(value, symbol.type));
+            fi
+
+            let raw_load = Load.LOCAL_VARIABLE(symbol);
+            let typed_box = TYPE_WRAPPER(symbol.storage_type, raw_load);
+
+            return member.store(location, typed_box, value, self, false);
+        si
+
+        // The `(T) -> BOX[T]` constructor of `Ghul.BOX[T]`.
+        // `find_member("init")` on the specialised GENERIC
+        // returns a FUNCTION_GROUP (BOX has both a no-arg and a
+        // single-arg overload); pick the single-arg one.
+        _resolve_box_constructor(box_type: Type) -> Symbols.Function is
+            if !box_type? \/ !box_type.symbol? then
+                return null;
+            fi
+
+            let member = box_type.symbol.find_member("init");
+
+            if !member? then
+                return null;
+            fi
+
+            let direct = cast Symbols.Function(member);
+
+            if direct? then
+                return direct;
+            fi
+
+            let group = cast Symbols.FUNCTION_GROUP(member);
+
+            if !group? then
+                return null;
+            fi
+
+            for f in group.functions do
+                if f.arguments? /\ f.arguments.count == 1 then
+                    return f;
+                fi
+            od
+
+            return null;
+        si
+
+        // The `value` member of `Ghul.BOX[T]` — what reads and
+        // writes ultimately touch when `symbol.is_boxed`.
+        // Returned as a generic Symbol so polymorphic
+        // `.load(location, from, loader)` /
+        // `.store(location, from, value, loader, is_initialize)`
+        // dispatch handles Field vs INSTANCE_FIELD vs
+        // auto-generated property shapes uniformly.
+        resolve_box_value_member(symbol: Symbols.Variable) -> Symbols.Symbol is
+            let box_type = symbol.storage_type;
+
+            if !box_type? \/ !box_type.symbol? then
+                return null;
+            fi
+
+            return box_type.symbol.find_direct("value");
         si
 
         load_local_argument(location: Source.LOCATION, symbol: Symbols.Variable) -> Value is
@@ -200,7 +343,7 @@ namespace Semantic is
 
             if !is_initialize /\ (symbol.is_captured \/ symbol.owner != function) then
                 // FIXME: need proper dataflow analyis
-                IoC.CONTAINER.instance.logger.error(location, "captured value may not be assigned to; wrap it in `Ghul.BOX[T]` and assign to `.value` to share mutable state with a closure");
+                IoC.CONTAINER.instance.logger.error(location, "captured argument may not be assigned to; copy it into a `let mut` local first");
             fi
 
             return Store.LOCAL_ARGUMENT(symbol, _value_boxer.box_if_needed(value, symbol.type));
