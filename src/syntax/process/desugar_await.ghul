@@ -155,6 +155,13 @@ namespace Syntax.Process is
                         any_expanded = true;
                         continue;
                     fi
+                elif isa Statements.DO(s) then
+                    let do_stmt = cast Statements.DO(s);
+                    if do_stmt.body? /\ _stmt_list_has_let_await(do_stmt.body) then
+                        _expand_do_loop(new_statements, do_stmt);
+                        any_expanded = true;
+                        continue;
+                    fi
                 fi
                 new_statements.add(s);
             od
@@ -219,6 +226,159 @@ namespace Syntax.Process is
 
             // 7. Emit: if $lr_N.type == LOOP_RESULT_TYPE.RETURN then return [$lr_N.value]; fi
             out.add(_build_post_loop_return_check(loc, lr_id_local, t_ret));
+        si
+
+        // Expand one `while cond do BODY od` or `do BODY od` (async
+        // body) into its desugared statement sequence. DO without
+        // condition + async body is rejected — there's no way to
+        // terminate an infinite-loop async chain in v1 (break inside
+        // async loops is forbidden).
+        _expand_do_loop(
+            out: Collections.LIST[Statements.Statement],
+            do_stmt: Statements.DO
+        ) is
+            let loc = do_stmt.location;
+            let internal_loc = LOCATION.internal;
+
+            if !do_stmt.condition? then
+                // Infinite-loop async chain has no termination path
+                // in v1. Leave the loop in place — subsequent passes
+                // will surface the misuse via the existing
+                // let-await-inside-loop-body short-circuit semantics.
+                // A focused diagnostic here would be cleaner but
+                // requires Logger wiring through the IoC container
+                // (deferred follow-up).
+                out.add(do_stmt);
+                return;
+            fi
+
+            let enclosing_return = _current_return_type(loc);
+            let t_ret = Semantic.LOOP_RESULT_CONVERSION.try_extract_t_ret(enclosing_return);
+
+            // 1. Wrap the user's returns inside the while-body.
+            let conversion = Semantic.LOOP_RESULT_CONVERSION();
+            conversion.wrap_returns_in_body(do_stmt.body, t_ret);
+
+            // 2. Build the body lambda: `() is <rewritten body> si`.
+            let body_lambda = _build_do_body_lambda(do_stmt, t_ret);
+
+            // 3. Build the condition lambda: `() => Tasks.TASK.from_result(cond)`.
+            //    Always wraps the condition with from_result. A condition
+            //    that's already Tasks.TASK[bool]-typed isn't legal in
+            //    `while cond do` source anyway — while expects bool.
+            let condition_lambda = _build_do_condition_lambda(do_stmt);
+
+            // 4. Build the call: Ghul.Async.while_async(cond_lambda, body_lambda).
+            let call = _build_while_async_call(loc, condition_lambda, body_lambda);
+
+            // 5. Fresh `$lr_N` name.
+            _counter = _counter + 1;
+            let lr_name = "$lr_{_counter}";
+            let lr_id_local = Identifiers.Identifier(internal_loc, lr_name);
+
+            // 6. Emit: let await $lr_N = call;
+            out.add(_build_let_await_statement(loc, lr_id_local, call));
+
+            // 7. Emit: if $lr_N.type == RETURN then return [$lr_N.value]; fi
+            out.add(_build_post_loop_return_check(loc, lr_id_local, t_ret));
+        si
+
+        // `() is <rewritten body> si` — zero-arg lambda whose body is
+        // the user's while-body (already rewritten in place by
+        // wrap_returns_in_body).
+        _build_do_body_lambda(
+            do_stmt: Statements.DO,
+            t_ret: TypeExpressions.TypeExpression?
+        ) -> Expressions.Expression is
+            let loc = do_stmt.location;
+
+            let arg_list =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]()
+                );
+
+            let body_block = Bodies.BLOCK(loc, do_stmt.body);
+
+            let lambda =
+                Expressions.FUNCTION(
+                    loc,
+                    arg_list,
+                    TypeExpressions.INFER(loc),
+                    body_block,
+                    false
+                );
+            lambda.contains_let_await = true;
+            return lambda;
+        si
+
+        // `() => Tasks.TASK.from_result(cond)`
+        _build_do_condition_lambda(
+            do_stmt: Statements.DO
+        ) -> Expressions.Expression is
+            let loc = do_stmt.location;
+
+            let wrapped =
+                Semantic.TASK_CONVERSION.build_from_result_expression(
+                    loc, do_stmt.condition
+                );
+
+            let body_stmts =
+                Collections.LIST[Statements.Statement](
+                    [Statements.RETURN(loc, wrapped)]: Statements.Statement
+                );
+            let body_list = Statements.LIST(loc, body_stmts);
+            let body_block = Bodies.BLOCK(loc, body_list);
+
+            let arg_list =
+                Expressions.LIST(
+                    loc,
+                    Collections.LIST[Expressions.Expression]()
+                );
+
+            return
+                Expressions.FUNCTION(
+                    loc,
+                    arg_list,
+                    TypeExpressions.INFER(loc),
+                    body_block,
+                    false
+                );
+        si
+
+        // `Ghul.Async.while_async(condition_lambda, body_lambda)`
+        _build_while_async_call(
+            loc: LOCATION,
+            condition_lambda: Expressions.Expression,
+            body_lambda: Expressions.Expression
+        ) -> Expressions.Expression is
+            let internal_loc = LOCATION.internal;
+
+            let ghul_id =
+                Expressions.IDENTIFIER(
+                    loc,
+                    Identifiers.Identifier(internal_loc, "Ghul")
+                );
+            let async_member =
+                Expressions.MEMBER(
+                    loc,
+                    ghul_id,
+                    Identifiers.Identifier(internal_loc, "Async"),
+                    loc
+                );
+            let while_member =
+                Expressions.MEMBER(
+                    loc,
+                    async_member,
+                    Identifiers.Identifier(internal_loc, "while_async"),
+                    loc
+                );
+
+            let args = Collections.LIST[Expressions.Expression]();
+            args.add(condition_lambda);
+            args.add(body_lambda);
+
+            return Expressions.CALL(loc, while_member, Expressions.LIST(loc, args));
         si
 
         // `(var) is <body with returns wrapped + CONTINUE appended> si`
