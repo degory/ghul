@@ -10,6 +10,22 @@ namespace Syntax.Process is
     use IR;
     use IR.Values;
 
+    // Holds a generator function whose state-machine class hasn't
+    // been emitted yet — its MoveNext block was filled in while
+    // walking the function's body, but the wrapping `.class` lives
+    // outside the enclosing user class in IL. Flushed by
+    // `emit_pending_state_machines` at the tail of the enclosing
+    // class / namespace visit.
+    class PENDING_STATE_MACHINE is
+        state_machine: Semantic.Symbols.STATE_MACHINE;
+        move_next_block: IR.Values.BLOCK;
+
+        init(state_machine: Semantic.Symbols.STATE_MACHINE, move_next_block: IR.Values.BLOCK) is
+            self.state_machine = state_machine;
+            self.move_next_block = move_next_block;
+        si
+    si
+
     class GENERATE_IL: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -45,6 +61,15 @@ namespace Syntax.Process is
         _append_formatted_generic_alignment_format: Semantic.Symbols.Function;
         _to_string_and_clear: Semantic.Symbols.Function;
         _dispose: Semantic.Symbols.Function;
+
+        // Generators whose state-machine class IL emission has been
+        // deferred until the enclosing class/namespace closes. The
+        // outer function method is emitted inline; the state-machine
+        // class needs to land as a SIBLING of the user's class, not
+        // inside it (CIL has no nested-class-in-method form). Mirrors
+        // the existing closure-FRAME emission pattern (see
+        // gen_closures called from visit(`class)).
+        _pending_state_machines: Collections.LIST[PENDING_STATE_MACHINE];
 
         current_block: Values.BLOCK => _block_context.current_block;
 
@@ -82,6 +107,7 @@ namespace Syntax.Process is
             _boxer = boxer;
 
             _loops = LOOP_LABEL_STACK();
+            _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
         si
 
         ensure_runtime_symbols_are_materialized() is
@@ -230,6 +256,8 @@ namespace Syntax.Process is
             gen_anon_functions(context.get_closures());
             gen_closures(context.get_closures());
 
+            emit_pending_state_machines();
+
             super.visit(`namespace);
         si
         
@@ -283,6 +311,8 @@ namespace Syntax.Process is
 
             gen_anon_functions(closures);
             gen_closures(closures);
+
+            emit_pending_state_machines();
         si
 
         pre(`trait: Definitions.TRAIT) -> bool is
@@ -542,6 +572,19 @@ namespace Syntax.Process is
         pre(function: Definitions.FUNCTION) -> bool is
             let symbol = function_for(function);
 
+            // Generator branch: a `*_GENERATOR_*` function expands
+            // into TWO IL methods (the outer stub returning a fresh
+            // state-machine instance + the state machine class with
+            // its MoveNext / get_Current / GetEnumerator / Dispose /
+            // Reset implementations). The split is handled by the
+            // gen-generator-function path so the rest of generate_il
+            // doesn't need to know.
+            let state_machine = Semantic.Symbols.state_machine_for(cast Semantic.Symbols.Function(symbol));
+
+            if state_machine? then
+                return _pre_generator_function(function, cast Semantic.Symbols.Function(symbol), state_machine);
+            fi
+
             if let global_function: Semantic.Symbols.GLOBAL_FUNCTION = symbol then
                 gen_globals_class_open(cast Semantic.Symbols.NAMESPACE(global_function.owner));
             fi
@@ -629,6 +672,14 @@ namespace Syntax.Process is
         visit(function: Definitions.FUNCTION) is
             let symbol = symbol_for(function);
 
+            let state_machine = Semantic.Symbols.state_machine_for(cast Semantic.Symbols.Function(symbol));
+
+            if state_machine? then
+                _visit_generator_function(function, cast Semantic.Symbols.Function(symbol), state_machine);
+
+                return;
+            fi
+
             current_block.gen(_context);
             leave_block();
 
@@ -659,6 +710,260 @@ namespace Syntax.Process is
             if isa Semantic.Symbols.GLOBAL_FUNCTION(symbol) then
                 gen_globals_class_close();
             fi
+        si
+
+        // Generator IL emission:
+        //
+        //   1. The outer user-facing method gets a stub body
+        //      (`newobj $StateMachine.ctor(); ret`) emitted inline,
+        //      so the AST visit order is unchanged for the caller.
+        //   2. The function body is walked here (recursively, via
+        //      self) into a fresh IR.Values.BLOCK that represents
+        //      MoveNext's body. Yield statements emit their state-
+        //      machine IL into this block as they are walked.
+        //   3. The state-machine class itself is deferred — captured
+        //      in `_pending_state_machines` and emitted at the SAME
+        //      level as the user's class (after `visit(`class)`
+        //      closes the user class), since CIL doesn't allow
+        //      classes nested inside method bodies.
+        _pre_generator_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, state_machine: Semantic.Symbols.STATE_MACHINE) -> bool is
+            let frame = state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "cannot emit state-machine for {symbol}: return type is not Iterable[T] or Iterator[T]");
+
+                return true;
+            fi
+
+            // Realise the frame's symbol-level declarations (fields
+            // + ctor) once. Required for both the outer method's
+            // newobj reference and the state-machine class itself.
+            frame.declare();
+
+            let owner_is_global = isa Semantic.Symbols.GLOBAL_FUNCTION(symbol);
+
+            if owner_is_global then
+                gen_globals_class_open(cast Semantic.Symbols.NAMESPACE(symbol.owner));
+            fi
+
+            // --- Outer user-facing method ---
+            println_comment("define {symbol.description}");
+
+            let outer_buffer = StringBuilder();
+            symbol.gen_definition_header(outer_buffer);
+            println(outer_buffer);
+
+            println("{{");
+            _context.indent();
+
+            gen_tuple_element_name_attributes(symbol);
+            gen_custom_attributes(symbol);
+
+            symbol.gen_body_header(_context);
+
+            _context.write_line(".maxstack 1");
+            _context.write_line("newobj {frame.constructor.get_il_reference()}");
+            _context.write_line("ret");
+
+            _context.outdent();
+            println("}}");
+
+            if owner_is_global then
+                gen_globals_class_close();
+            fi
+
+            // --- Walk the body into MoveNext's block ---
+            //
+            // The block lands captured on PENDING_STATE_MACHINE
+            // alongside the state machine; `_emit_pending_state_
+            // machines` writes it out inside the class definition
+            // once the enclosing user class has closed.
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            // `.maxstack` must precede any IL opcodes in the
+            // method body. Add it before the dispatch placeholder
+            // so the populated dispatch IL lands after the
+            // directive at the start of MoveNext.
+            add(".maxstack 64");
+
+            // Entry-dispatch placeholder. Yield IL recorded
+            // `(state, label)` pairs on the state machine as it
+            // ran; we fill the placeholder out below.
+            let dispatch = Values.BLOCK();
+            add(dispatch);
+
+            // Walk the body. Visitors fire pre/visit on every
+            // node; visit(YIELD) is the interesting one — it
+            // appends state-machine IL into current_block
+            // (which IS move_next_block).
+            if function.body? then
+                function.body.walk(self);
+            fi
+
+            // Trailer: fell off the end. Mark done and return false.
+            let state_field_ref = frame.state_field.get_il_reference();
+
+            add("ldarg.0");
+            add("ldc.i4.m1");
+            add("stfld {state_field_ref}");
+            add("ldc.i4.0");
+            add("ret");
+
+            // Populate the entry-dispatch placeholder. State 0
+            // (initial entry) falls through to the body's natural
+            // top; each recorded yield label gets a beq jump.
+            // _state is reloaded per comparison to keep the
+            // stack empty at every jump target (IL verifier
+            // requires consistent stack height at labels).
+            for sl in state_machine.yield_labels do
+                dispatch.add("ldarg.0");
+                dispatch.add("ldfld {state_field_ref}");
+                dispatch.add("ldc.i4 {sl.state}");
+                dispatch.add("beq {sl.label}");
+            od
+
+            leave_block();
+            leave_scope(function);
+
+            _pending_state_machines.add(PENDING_STATE_MACHINE(state_machine, move_next_block));
+
+            // Skip the framework's default body walk + the framework's
+            // visit(function) close-out path. Our visit(function)
+            // sees the state-machine and returns early.
+            return true;
+        si
+
+        _visit_generator_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, state_machine: Semantic.Symbols.STATE_MACHINE) is
+            // _pre_generator_function emitted the outer method and
+            // captured the move_next block onto _pending_state_machines.
+            // Nothing more to do at AST visit time.
+        si
+
+        // Emit all pending state-machine classes accumulated during
+        // the walk of an enclosing class or namespace. Called at the
+        // tail of visit(`class) / visit(`namespace) so the classes
+        // land at namespace scope, parallel to the user's class.
+        emit_pending_state_machines() is
+            if !_pending_state_machines? \/ _pending_state_machines.count == 0 then
+                return;
+            fi
+
+            let pending = _pending_state_machines;
+            _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
+
+            for psm in pending do
+                _emit_state_machine_class(psm.state_machine, psm.move_next_block);
+            od
+        si
+
+        _emit_state_machine_class(state_machine: Semantic.Symbols.STATE_MACHINE, move_next_block: Values.BLOCK) is
+            let frame = state_machine.frame;
+
+            println_comment("define state-machine class for {state_machine.function.description}");
+
+            let class_buffer = StringBuilder();
+            frame.gen_definition_header(class_buffer);
+            println(class_buffer);
+
+            println("{{");
+            _context.indent();
+
+            // Fields.
+            let state_buf = StringBuilder();
+            frame.state_field.gen_definition_header(state_buf);
+            println(state_buf);
+
+            let current_buf = StringBuilder();
+            frame.current_field.gen_definition_header(current_buf);
+            println(current_buf);
+
+            // .ctor — parameterless, chains to Object::.ctor.
+            _gen_state_machine_ctor(frame);
+
+            // MoveNext — populated during the body walk.
+            println(".method public final hidebysig newslot virtual instance default bool 'MoveNext'() cil managed");
+            println("{{");
+            _context.indent();
+            move_next_block.gen(_context);
+            _context.outdent();
+            println("}}");
+
+            // Other Iterator[T] / IDisposable members.
+            _gen_state_machine_accessors(frame);
+
+            gen_ienumerable_boilerplate(frame);
+            gen_ienumerator_boilerplate(frame);
+
+            _context.outdent();
+            println("}}");
+        si
+
+        _gen_state_machine_ctor(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let ctor_buf = StringBuilder();
+            frame.constructor.gen_definition_header(ctor_buf);
+            println(ctor_buf);
+
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 1");
+            _context.write_line("ldarg.0");
+            _context.write_line("call instance void ['System.Runtime']'System'.'Object'::'.ctor'()");
+            _context.write_line("ret");
+            _context.outdent();
+            println("}}");
+        si
+
+        _gen_state_machine_accessors(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let element_il = StringBuilder();
+            frame.element_type.gen_type(element_il);
+            let element_il_text = element_il.to_string();
+
+            let current_field_ref = frame.current_field.get_il_reference();
+
+            // get_Current — IEnumerator<T>.get_Current
+            println(".method public final hidebysig newslot virtual specialname instance default {element_il_text} 'get_Current'() cil managed");
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 1");
+            _context.write_line("ldarg.0");
+            _context.write_line("ldfld {current_field_ref}");
+            _context.write_line("ret");
+            _context.outdent();
+            println("}}");
+
+            // GetEnumerator — IEnumerable<T>.GetEnumerator returns
+            // self (we implement IEnumerator<T> directly).
+            println(".method public final hidebysig newslot virtual specialname instance default class ['System.Runtime']'System'.'Collections'.'Generic'.'IEnumerator`1'<{element_il_text}> 'GetEnumerator'() cil managed");
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 1");
+            _context.write_line("ldarg.0");
+            _context.write_line("ret");
+            _context.outdent();
+            println("}}");
+
+            // Dispose — no-op for v1.
+            println(".method public final hidebysig newslot virtual instance default void 'Dispose'() cil managed");
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 1");
+            _context.write_line("ret");
+            _context.outdent();
+            println("}}");
+
+            // Reset — matches C#'s unsupported-iterator semantics.
+            println(".method public final hidebysig newslot virtual instance default void 'Reset'() cil managed");
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 1");
+            _context.write_line("newobj instance void class [System.Runtime]System.NotSupportedException::'.ctor'()");
+            _context.write_line("throw");
+            _context.outdent();
+            println("}}");
         si
 
         pre(body: Bodies.BLOCK) -> bool is
@@ -1086,13 +1391,13 @@ namespace Syntax.Process is
 
             if current_try? then
                 if value? then
-                    current_try.return_value.store(value);                    
+                    current_try.return_value.store(value);
                 fi
 
                 current_try.return_needed.store(Literal.NUMBER("1", _innate_symbol_lookup.get_bool_type(), "i4"));
 
                 let brancher = get_brancher_for_block();
-                
+
                 if current_try.is_in_finally then
                     brancher.branch(current_try.middle);
                 else
@@ -1104,7 +1409,73 @@ namespace Syntax.Process is
                 fi
 
                 add("ret");
-            fi            
+            fi
+        si
+
+        // Generator yield IL emission:
+        //
+        //     ldarg.0
+        //     <X's IR>           // expression value (boxed-if-needed
+        //                        // against the element type)
+        //     stfld _current
+        //     ldarg.0
+        //     ldc.i4 N           // freshly-allocated state number
+        //     stfld _state
+        //     ldc.i4.1
+        //     ret
+        //     Label_N:           // resumption point recorded so the
+        //                        // entry dispatch can jump here on
+        //                        // a subsequent MoveNext call
+        //
+        // The state number / label pair is recorded on the enclosing
+        // generator function's STATE_MACHINE so `_visit_generator_
+        // function` can populate the entry-dispatch placeholder
+        // after the body walk completes.
+        visit(`yield: Statements.YIELD) is
+            super.visit(`yield);
+
+            let function = current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if !state_machine? then
+                return;
+            fi
+
+            let frame = state_machine.frame;
+            let state = state_machine.allocate_state();
+            let resume = LABEL();
+
+            state_machine.record_label(state, resume);
+
+            let current_field_ref = frame.current_field.get_il_reference();
+            let state_field_ref = frame.state_field.get_il_reference();
+
+            // Store yielded value into _current.
+            add("ldarg.0");
+
+            if `yield.expression? /\ `yield.expression.value? then
+                let value =
+                    _boxer.box_if_needed(
+                        `yield.expression.value,
+                        frame.element_type
+                    );
+
+                add(value);
+            fi
+
+            add("stfld {current_field_ref}");
+
+            // Stamp the resumption state.
+            add("ldarg.0");
+            add("ldc.i4 {state}");
+            add("stfld {state_field_ref}");
+
+            // Suspend — return true; MoveNext re-enters at the
+            // recorded label on the next call.
+            add("ldc.i4.1");
+            add("ret");
+
+            add("{resume}:");
         si
 
         visit(`throw: Statements.THROW) is
