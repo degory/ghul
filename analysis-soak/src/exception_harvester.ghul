@@ -1,0 +1,305 @@
+namespace Analysis.Soak is
+    use Collections.LIST;
+    use Collections.MAP;
+    use Collections.Iterable;
+
+    // One compiler-internal exception harvested from analyser stderr — an
+    // AssertFailedException, NullReferenceException, parser progress
+    // failure, or similar — with a canonical signature used to dedup.
+    //
+    // The signature aims to identify the *bug*, not the occurrence: two
+    // different perturbed source files hitting the same assertion site share
+    // a signature and dedup into one fingerprint with N hits in the report.
+    class COMPILER_EXCEPTION is
+        // Verbatim stderr line as captured.
+        raw: string public;
+        // High-level kind: "assert" | "nre" | "parser-no-progress" |
+        // "parser-backtrack" | "other".
+        kind: string public;
+        // Canonical signature — file:line:col for assertions, first
+        // user-code frame for NREs, etc.
+        signature: string public;
+        // What the analyser was processing when this fired, when available
+        // (it logs the source file + range as the prefix for caught
+        // exceptions).
+        processing_at: string public;
+
+        init(raw: string, kind: string, signature: string, processing_at: string) is
+            self.raw = raw;
+            self.kind = kind;
+            self.signature = signature;
+            self.processing_at = processing_at;
+        si
+
+        to_string() -> string => "[{kind}] {signature}";
+    si
+
+    // Streaming parser over analyser stderr. Callers pump fresh text into
+    // harvest() between requests; results are de-duplicated and tagged with
+    // the perturbation that was in flight when the exception fired.
+    class EXCEPTION_HARVESTER is
+        // Caller's tracked offset into the analyser's stderr buffer — they
+        // pass us "new since last call" text on each harvest.
+        init() is si
+
+        harvest(new_text: string) -> LIST[COMPILER_EXCEPTION] is
+            let result = LIST[COMPILER_EXCEPTION]();
+            if new_text.length == 0 then
+                return result;
+            fi
+
+            for raw_line in new_text.split(['\n']) do
+                let line = raw_line.trim();
+                if line.length == 0 then
+                    continue;
+                fi
+
+                let parsed = _parse_line(line);
+                if parsed? then
+                    result.add(parsed!);
+                fi
+            od
+
+            return result;
+        si
+
+        _parse_line(line: string) -> COMPILER_EXCEPTION? static is
+            // "no progress parsing <kind> at <file>.ghul <pos>..<pos>"
+            if line.starts_with("no progress parsing") then
+                return _parse_no_progress(line);
+            fi
+
+            // "possible speculative parsing loop backtracking ..."
+            if line.starts_with("possible speculative parsing loop") then
+                return COMPILER_EXCEPTION(
+                    line,
+                    "parser-backtrack",
+                    "speculative-parsing-loop-backtrack",
+                    ""
+                );
+            fi
+
+            // Caught exceptions logged by the analyser look like:
+            //   <file>.ghul <range> exception: <Type>: <details>    at <frame> ...
+            let marker = " exception: ";
+            let marker_at = line.index_of(marker);
+            if marker_at >= 0 then
+                return _parse_caught_exception(line, marker_at, marker.length);
+            fi
+
+            return null;
+        si
+
+        _parse_no_progress(line: string) -> COMPILER_EXCEPTION static is
+            // Drop the trailing " at <file>.ghul <pos>..<pos>" so the
+            // signature focuses on the kind of construct, not the location
+            // (the location is encoded in processing_at).
+            let at_index = line.index_of(" at ");
+            let kind_phrase =
+                if at_index > 0 then
+                    line.substring(0, at_index)
+                else
+                    line
+                fi;
+
+            let processing_at =
+                if at_index > 0 /\ at_index + 4 < line.length then
+                    line.substring(at_index + 4)
+                else
+                    ""
+                fi;
+
+            return COMPILER_EXCEPTION(
+                line,
+                "parser-no-progress",
+                kind_phrase,
+                processing_at
+            );
+        si
+
+        _parse_caught_exception(line: string, marker_at: int, marker_len: int) -> COMPILER_EXCEPTION static is
+            let processing_at = line.substring(0, marker_at).trim();
+            let after_marker = line.substring(marker_at + marker_len);
+
+            // after_marker now starts with "<Type>: <details>    at <frame> ..."
+            let colon_at = after_marker.index_of(": ");
+            if colon_at < 0 then
+                return COMPILER_EXCEPTION(
+                    line,
+                    "other",
+                    "unrecognised-exception-shape: {after_marker}",
+                    processing_at
+                );
+            fi
+
+            let exception_type = after_marker.substring(0, colon_at);
+            let details = after_marker.substring(colon_at + 2);
+
+            if exception_type =~ "Ghul.AssertFailedException" then
+                return _parse_assert(line, details, processing_at);
+            fi
+
+            if exception_type.ends_with("NullReferenceException") then
+                return _parse_nre(line, details, processing_at);
+            fi
+
+            // Unknown exception type — keep it, attribute to type + first frame.
+            let first_frame = _first_frame(details);
+            return COMPILER_EXCEPTION(
+                line,
+                "other",
+                "{exception_type}@{first_frame}",
+                processing_at
+            );
+        si
+
+        _parse_assert(line: string, details: string, processing_at: string) -> COMPILER_EXCEPTION static is
+            // details = "<file>.ghul <a>,<b>..<c>,<d>: <condition>    at <frame> ..."
+            // Take everything up to (but not including) the "    at " of the
+            // first frame; that's the assertion site + message.
+            let at_at = details.index_of("    at ");
+            let site_and_message =
+                if at_at > 0 then
+                    details.substring(0, at_at)
+                else
+                    details
+                fi;
+
+            // Strip the assert's source-path prefix so two checkouts at
+            // different paths still dedup. The site is what matters — we
+            // keep the last 3 path components plus the line:col + message.
+            let trimmed = _strip_path_prefix(site_and_message);
+
+            return COMPILER_EXCEPTION(
+                line,
+                "assert",
+                "assert:{trimmed}",
+                processing_at
+            );
+        si
+
+        _parse_nre(line: string, details: string, processing_at: string) -> COMPILER_EXCEPTION static is
+            // For an NRE the message is uninformative ("Object reference
+            // not set..."). The first user-code frame is the signature.
+            let first_frame = _first_frame(details);
+            return COMPILER_EXCEPTION(
+                line,
+                "nre",
+                "nre:{first_frame}",
+                processing_at
+            );
+        si
+
+        // Extract the first `at <Method>(...)` frame from a flattened
+        // stack-trace tail. Strips arguments to keep the signature stable.
+        _first_frame(details: string) -> string static is
+            let at_at = details.index_of("    at ");
+            if at_at < 0 then
+                return "<no-frame>";
+            fi
+
+            let after_at = details.substring(at_at + 7);
+            let paren_at = after_at.index_of("(");
+            if paren_at < 0 then
+                // No "(" — take up to the next "    at" instead.
+                let next_at = after_at.index_of("    at ");
+                if next_at > 0 then
+                    return after_at.substring(0, next_at).trim();
+                fi
+                return after_at.trim();
+            fi
+
+            return after_at.substring(0, paren_at);
+        si
+
+        // For an absolute path like
+        //   /home/degory/src/ghul-language/worktrees/ghul/<wt>/src/ir/values/call/instance.ghul
+        // keep the suffix "ir/values/call/instance.ghul" — that's enough to
+        // identify the site and stays stable across checkouts. We use
+        // last_index_of so we drop the workspace-rooted `~/src/` prefix
+        // (which would otherwise be the first `/src/` hit) and land on
+        // the project's `src/`.
+        _strip_path_prefix(text: string) -> string static is
+            let src_marker = "/src/";
+            let src_at = text.last_index_of(src_marker);
+            if src_at < 0 then
+                return text;
+            fi
+            return text.substring(src_at + src_marker.length);
+        si
+    si
+
+    // De-duplicated tally of compiler exceptions seen across the run.
+    class FINGERPRINT is
+        signature: string public;
+        kind: string public;
+        count: int public;
+        first_iteration: int public;
+        first_perturbation: PERTURBATION_RECORD? public;
+        first_processing_at: string public;
+        first_raw: string public;
+        repro_path: string public;
+
+        init(signature: string, kind: string, iteration: int, perturbation: PERTURBATION_RECORD?, processing_at: string, raw: string) is
+            self.signature = signature;
+            self.kind = kind;
+            self.count = 1;
+            self.first_iteration = iteration;
+            self.first_perturbation = perturbation;
+            self.first_processing_at = processing_at;
+            self.first_raw = raw;
+            self.repro_path = "";
+        si
+
+        record_hit() is
+            count = count + 1;
+        si
+    si
+
+    class FINGERPRINTS is
+        _order: LIST[string];
+        _by_signature: MAP[string, FINGERPRINT];
+
+        init() is
+            _order = LIST[string]();
+            _by_signature = MAP[string, FINGERPRINT]();
+        si
+
+        // Add a hit. Returns the FINGERPRINT (newly-created or existing) so
+        // the caller can attach a repro path on first sight.
+        add(exception: COMPILER_EXCEPTION, iteration: int, perturbation: PERTURBATION_RECORD?) -> FINGERPRINT is
+            let sig = exception.signature;
+            if _by_signature.contains_key(sig) then
+                let existing = _by_signature[sig];
+                existing.record_hit();
+                return existing;
+            fi
+
+            let fp = FINGERPRINT(
+                sig,
+                exception.kind,
+                iteration,
+                perturbation,
+                exception.processing_at,
+                exception.raw
+            );
+            _by_signature[sig] = fp;
+            _order.add(sig);
+            return fp;
+        si
+
+        all: Iterable[FINGERPRINT] =>
+            _order | .map(s => _by_signature[s]);
+
+        count: int => _order.count;
+
+        // Total hits across all signatures.
+        total_hits: int is
+            let total mut = 0;
+            for s in _order do
+                total = total + _by_signature[s].count;
+            od
+            return total;
+        si
+    si
+si

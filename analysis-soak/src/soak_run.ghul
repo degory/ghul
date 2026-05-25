@@ -26,6 +26,7 @@ namespace Analysis.Soak is
         progress_every: int public;
         out_path: string public;
         exit_on_failure: bool public;       // stop the soak the first time a hang / death / exception lands
+        repros_dir: string public;          // where to write minimal-repro files (empty = disable)
 
         init() is
             corpus_dir = "";
@@ -40,6 +41,7 @@ namespace Analysis.Soak is
             progress_every = 100;
             out_path = "";
             exit_on_failure = false;
+            repros_dir = "";
         si
     si
 
@@ -69,6 +71,14 @@ namespace Analysis.Soak is
         _stats: STATS;
         _anomalies: ANOMALIES;
 
+        // v2 — surface compiler internal failures directly rather than only
+        // via the "process died" funnel.
+        _harvester: EXCEPTION_HARVESTER;
+        _fingerprints: FINGERPRINTS;
+        _repro_writer: REPRO_WRITER?;
+        _stderr_offset: int;
+        _last_perturbation: PERTURBATION_RECORD?;
+
         _started: System.DateTime;
         _iteration: int;
         _respawns: int;
@@ -81,13 +91,21 @@ namespace Analysis.Soak is
             _perturber = PERTURBER(_rng, config.edit_mode);
             _stats = STATS();
             _anomalies = ANOMALIES();
+            _harvester = EXCEPTION_HARVESTER();
+            _fingerprints = FINGERPRINTS();
+            _stderr_offset = 0;
             _iteration = 0;
             _respawns = 0;
             _compiler_version = "unknown";
+
+            if config.repros_dir.length > 0 then
+                _repro_writer = REPRO_WRITER(config.repros_dir);
+            fi
         si
 
         stats: STATS => _stats;
         anomalies: ANOMALIES => _anomalies;
+        fingerprints: FINGERPRINTS => _fingerprints;
         iterations_completed: int => _iteration;
         respawns: int => _respawns;
         compiler_version: string => _compiler_version;
@@ -122,7 +140,7 @@ namespace Analysis.Soak is
             od
 
             _log_progress();
-            _log("done: {_iteration} iterations, {_respawns} respawns, {_anomalies.count} anomalies");
+            _log("done: {_iteration} iterations, {_respawns} respawns, {_anomalies.count} anomalies, {_fingerprints.count} compiler-exception fingerprints ({_fingerprints.total_hits} hits)");
 
             let a = _analyser;
             if a? then
@@ -186,6 +204,10 @@ namespace Analysis.Soak is
 
             _corpus.set_current(path, after);
 
+            _last_perturbation = PERTURBATION_RECORD(
+                _iteration, path, _perturber.last_mode, before, after!
+            );
+
             let started = System.DateTime.now;
 
             try
@@ -199,12 +221,14 @@ namespace Analysis.Soak is
             // Two frames: DIAGNOSTICS + PARTIAL DONE.
             let diagnostics = _read_with_timeout("EDIT (diagnostics)", path, "");
             if !diagnostics? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
 
             let done = _read_with_timeout("EDIT (done)", path, "");
             if !done? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
@@ -216,6 +240,8 @@ namespace Analysis.Soak is
                     path, ""
                 );
             fi
+
+            _harvest_stderr_exceptions();
 
             _stats["EDIT — random single-file perturbation"].record(_elapsed_ms(started));
         si
@@ -262,6 +288,7 @@ namespace Analysis.Soak is
 
             let response = _read_query_with_timeout(kind, path, position_string);
             if !response? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
@@ -270,6 +297,8 @@ namespace Analysis.Soak is
             // specific headers (DEFINITION, HOVER, COMPLETE, etc.) and a
             // legitimate empty result is fine. We're only checking the
             // request didn't hang / crash / throw.
+
+            _harvest_stderr_exceptions();
 
             _stats["{kind} — query"].record(_elapsed_ms(started));
         si
@@ -337,15 +366,19 @@ namespace Analysis.Soak is
 
             let diagnostics = _read_with_timeout("COMPILE (diagnostics)", "", "");
             if !diagnostics? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
 
             let done = _read_with_timeout("COMPILE (done)", "", "");
             if !done? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
+
+            _harvest_stderr_exceptions();
 
             _stats["COMPILE — periodic"].record(_elapsed_ms(started));
         si
@@ -368,15 +401,19 @@ namespace Analysis.Soak is
 
             let response = _read_with_timeout("HEAPCHECK", "", "");
             if !response? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
 
             if response.header =~ "RESTART" then
                 _log("analyser asked to RESTART after #HEAPCHECK# — respawning");
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
+
+            _harvest_stderr_exceptions();
 
             _stats["HEAPCHECK — periodic"].record(_elapsed_ms(started));
         si
@@ -414,19 +451,45 @@ namespace Analysis.Soak is
                 si
             );
 
-            if !task.wait(timeout_ms) then
-                _record_anomaly("hang", "{label} did not respond within {timeout_ms}ms", path, position);
-                return null;
-            fi
-
+            // Both task.wait(int) and task.result throw AggregateException if
+            // the task faulted (e.g. the analyser closed stdin during the
+            // read). Both calls live inside the try so the catch sees the
+            // unwrapped failure.
             try
+                if !task.wait(timeout_ms) then
+                    _record_anomaly("hang", "{label} did not respond within {timeout_ms}ms", path, position);
+                    return null;
+                fi
                 return task.result;
             catch ex: Exception
                 let inner = ex.inner_exception;
                 let message = if inner? then inner!.message else ex.message fi;
-                _record_anomaly("process-died", "{label} read failed: {message}", path, position);
+                let stderr_tail = _capture_stderr_tail();
+                let detail =
+                    if stderr_tail.length > 0 then
+                        "{label} read failed: {message}; stderr tail: {stderr_tail}"
+                    else
+                        "{label} read failed: {message}"
+                    fi;
+                _record_anomaly("process-died", detail, path, position);
                 return null;
             yrt
+        si
+
+        // Grab the analyser's recent stderr — anomalies on a dying analyser
+        // are far more useful with the compiler exception that triggered the
+        // recycle. We truncate to keep the report bounded.
+        _capture_stderr_tail() -> string is
+            let a = _analyser;
+            if !a? then
+                return "";
+            fi
+            let captured = a!.stderr_capture;
+            let max = 400;
+            if captured.length <= max then
+                return captured;
+            fi
+            return "...{captured.substring(captured.length - max)}";
         si
 
         _cold_edit() is
@@ -447,15 +510,19 @@ namespace Analysis.Soak is
 
             let diagnostics = _read_with_timeout("cold EDIT (diagnostics)", "", "");
             if !diagnostics? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
 
             let done = _read_with_timeout("cold EDIT (done)", "", "");
             if !done? then
+                _harvest_stderr_exceptions();
                 _respawn_analyser();
                 return;
             fi
+
+            _harvest_stderr_exceptions();
 
             _stats["EDIT — cold, whole project"].record(_elapsed_ms(started));
         si
@@ -463,6 +530,7 @@ namespace Analysis.Soak is
         _spawn_analyser() is
             let new_analyser = ANALYSER_PROCESS();
             _analyser = new_analyser;
+            _stderr_offset = 0;
 
             try
                 _compiler_version = new_analyser.await_compiler_version();
@@ -478,6 +546,10 @@ namespace Analysis.Soak is
         _respawn_analyser() is
             let old = _analyser;
             if old? then
+                // One last harvest of anything the analyser logged on its
+                // way out — RESTART is normally the watchdog after a
+                // visible exception lower in the buffer.
+                _harvest_stderr_exceptions();
                 try
                     old.dispose();
                 catch ex: Exception
@@ -498,6 +570,43 @@ namespace Analysis.Soak is
             od
 
             _cold_edit();
+        si
+
+        // Pull any new analyser stderr since we last looked, parse it for
+        // compiler-internal exceptions / parser progress failures, dedup by
+        // signature, and (on first sight of a signature) save the
+        // perturbation that triggered it as a minimal repro on disk.
+        _harvest_stderr_exceptions() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let captured = a!.stderr_capture;
+            if captured.length <= _stderr_offset then
+                return;
+            fi
+
+            let new_text = captured.substring(_stderr_offset);
+            _stderr_offset = captured.length;
+
+            let exceptions = _harvester.harvest(new_text);
+            if exceptions.count == 0 then
+                return;
+            fi
+
+            for exc in exceptions do
+                let fp = _fingerprints.add(exc, _iteration, _last_perturbation);
+
+                // First-sight: log and save repro.
+                if fp.count == 1 then
+                    _log("FINGERPRINT [{exc.kind}] {exc.signature}");
+                    let writer = _repro_writer;
+                    if writer? then
+                        writer!.save(fp, _last_perturbation);
+                    fi
+                fi
+            od
         si
 
         _record_anomaly(kind: string, detail: string, path: string, position: string) is
