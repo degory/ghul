@@ -3,6 +3,20 @@ namespace Semantic is
     use Logging;
     use Trees = Syntax.Trees;
 
+    // One entry on the GENERATOR_REWRITER's loop-context stack.
+    // Pushed on entry to a state-split loop, popped on exit.
+    // `break;` TRANSITIONs to `exit_state`; `continue;` TRANSITIONs
+    // to `header_state`.
+    struct GENERATOR_LOOP_FRAME is
+        header_state: int;
+        exit_state: int;
+
+        init(header_state: int, exit_state: int) is
+            self.header_state = header_state;
+            self.exit_state = exit_state;
+        si
+    si
+
     // Rewrites a generator-function body into a list of state-handler
     // lambdas + a final `Ghul.Generators._gen_pipe(states)` return.
     // Invoked by DESUGAR_YIELD on every function whose
@@ -59,6 +73,11 @@ namespace Semantic is
         _current_state_index: int;
         _next_state_index: int;
 
+        // Stack of (header_state, exit_state) frames — one entry
+        // per enclosing state-split loop. Top of stack is the
+        // innermost loop. `break;` / `continue;` read from the top.
+        _loop_context: Collections.LIST[GENERATOR_LOOP_FRAME];
+
         init(logger: Logger, t: Trees.TypeExpressions.TypeExpression) is
             _logger = logger;
             _t = t;
@@ -66,6 +85,7 @@ namespace Semantic is
             _current_body = Collections.LIST[Trees.Statements.Statement]();
             _current_state_index = 0;
             _next_state_index = 1;
+            _loop_context = Collections.LIST[GENERATOR_LOOP_FRAME]();
         si
 
         // Rewrite the body in place.
@@ -128,6 +148,12 @@ namespace Semantic is
                 _process_return(cast Trees.Statements.RETURN(s));
             elif isa Trees.Statements.IF(s) then
                 _process_if(cast Trees.Statements.IF(s));
+            elif isa Trees.Statements.DO(s) then
+                _process_do(cast Trees.Statements.DO(s));
+            elif isa Trees.Statements.BREAK(s) then
+                _process_break(cast Trees.Statements.BREAK(s));
+            elif isa Trees.Statements.CONTINUE(s) then
+                _process_continue(cast Trees.Statements.CONTINUE(s));
             else
                 _current_body.add(s);
             fi
@@ -276,6 +302,167 @@ namespace Semantic is
             _start_new_state(state_J);
         si
 
+        _process_do(do_stmt: Trees.Statements.DO) is
+            if !_do_needs_split(do_stmt) then
+                _current_body.add(do_stmt);
+                return;
+            fi
+
+            if !do_stmt.condition? then
+                // Infinite loop (`do BODY od`) with a yield inside.
+                // The natural rewrite is "header state has no
+                // condition — always TRANSITION to body". Same shape
+                // as while-true; handled below by treating a null
+                // condition as "always true" when synthesising the
+                // header.
+                _process_infinite_do(do_stmt);
+                return;
+            fi
+
+            let loc = do_stmt.location;
+
+            // The state currently being built TRANSITIONs to the
+            // loop header. Allocate header + exit before processing
+            // the body so break/continue targets are known.
+            let state_H = _allocate_state();
+            let state_E = _allocate_state();
+
+            // Close current state with TRANSITION(state_H).
+            _close_current_with(
+                loc,
+                GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_H)
+            );
+
+            // Body's first state.
+            let state_body_first = _allocate_state();
+
+            // Header: if cond then TRANSITION(body_first) else TRANSITION(exit) fi.
+            _start_new_state(state_H);
+            let header_if = _build_dispatch_if(
+                loc,
+                do_stmt.condition,
+                state_body_first,
+                state_E
+            );
+            _current_body.add(header_if);
+            _emit_state(state_H, _current_body);
+
+            // Process body — yields/transitions inside refer to
+            // state_H (continue) and state_E (break) via the loop
+            // context.
+            _loop_context.add(GENERATOR_LOOP_FRAME(state_H, state_E));
+            _start_new_state(state_body_first);
+            _process_statement_list(do_stmt.body);
+            // Body's trailing state TRANSITIONs back to header.
+            _close_current_with(
+                loc,
+                GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_H)
+            );
+            _loop_context.remove_at(_loop_context.count - 1);
+
+            // Continue after the loop.
+            _start_new_state(state_E);
+        si
+
+        _process_infinite_do(do_stmt: Trees.Statements.DO) is
+            let loc = do_stmt.location;
+
+            let state_H = _allocate_state();
+            let state_E = _allocate_state();
+
+            _close_current_with(
+                loc,
+                GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_H)
+            );
+
+            let state_body_first = _allocate_state();
+
+            // Header state for an infinite loop: just TRANSITION
+            // straight into the body. (state_E is only reachable
+            // via break — and break inside an infinite loop is the
+            // only way for the loop to terminate.)
+            _start_new_state(state_H);
+            _current_body.add(
+                Trees.Statements.RETURN(
+                    loc,
+                    GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_body_first)
+                )
+            );
+            _emit_state(state_H, _current_body);
+
+            _loop_context.add(GENERATOR_LOOP_FRAME(state_H, state_E));
+            _start_new_state(state_body_first);
+            _process_statement_list(do_stmt.body);
+            _close_current_with(
+                loc,
+                GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_H)
+            );
+            _loop_context.remove_at(_loop_context.count - 1);
+
+            _start_new_state(state_E);
+        si
+
+        _process_break(b: Trees.Statements.BREAK) is
+            if _loop_context.count == 0 then
+                _logger.error(
+                    b.location,
+                    "break outside a loop is not allowed in a generator function"
+                );
+                return;
+            fi
+            let exit_state = _loop_context[_loop_context.count - 1].exit_state;
+            _close_current_with(
+                b.location,
+                GEN_STEP_CONVERSION.build_transition(b.location, _t.copy(), exit_state)
+            );
+            _start_new_state(_allocate_state());
+        si
+
+        _process_continue(c: Trees.Statements.CONTINUE) is
+            if _loop_context.count == 0 then
+                _logger.error(
+                    c.location,
+                    "continue outside a loop is not allowed in a generator function"
+                );
+                return;
+            fi
+            let header_state = _loop_context[_loop_context.count - 1].header_state;
+            _close_current_with(
+                c.location,
+                GEN_STEP_CONVERSION.build_transition(c.location, _t.copy(), header_state)
+            );
+            _start_new_state(_allocate_state());
+        si
+
+        // Single-branch `if cond then return TRANSITION(a) else return TRANSITION(b) fi`.
+        _build_dispatch_if(
+            loc: LOCATION,
+            condition: Trees.Expressions.Expression,
+            target_then: int,
+            target_else: int
+        ) -> Trees.Statements.Statement is
+            let then_body =
+                _build_single_statement_list(
+                    loc,
+                    Trees.Statements.RETURN(
+                        loc,
+                        GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), target_then)
+                    )
+                );
+            let else_body =
+                _build_single_statement_list(
+                    loc,
+                    Trees.Statements.RETURN(
+                        loc,
+                        GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), target_else)
+                    )
+                );
+            let branches = Collections.LIST[Trees.Statements.IF_BRANCH]();
+            branches.add(Trees.Statements.IF_BRANCH(loc, condition, then_body));
+            branches.add(Trees.Statements.IF_BRANCH(loc, null, else_body));
+            return Trees.Statements.IF(loc, branches);
+        si
+
         // ---- state-machine bookkeeping ----
 
         _allocate_state() -> int is
@@ -321,11 +508,19 @@ namespace Semantic is
         si
 
         _is_state_affecting(s: Trees.Statements.Statement) -> bool is
-            if isa Trees.Statements.YIELD(s) \/ isa Trees.Statements.RETURN(s) then
+            if
+                isa Trees.Statements.YIELD(s) \/
+                isa Trees.Statements.RETURN(s) \/
+                isa Trees.Statements.BREAK(s) \/
+                isa Trees.Statements.CONTINUE(s)
+            then
                 return true;
             fi
             if isa Trees.Statements.IF(s) then
                 return _if_needs_split(cast Trees.Statements.IF(s));
+            fi
+            if isa Trees.Statements.DO(s) then
+                return _do_needs_split(cast Trees.Statements.DO(s));
             fi
             return false;
         si
@@ -337,6 +532,10 @@ namespace Semantic is
                 fi
             od
             return false;
+        si
+
+        _do_needs_split(do_stmt: Trees.Statements.DO) -> bool is
+            return _stmt_list_contains_state_affecting(do_stmt.body);
         si
 
         _stmt_list_contains_state_affecting(stmt_list: Trees.Statements.LIST) -> bool is
