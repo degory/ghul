@@ -34,7 +34,7 @@ If you create a new GitHub repo from the [ghūl repository template](https://git
 
 ### Use a dev container
 
-The repository ships a `.devcontainer` configured to use a standard .NET 8 dev container image — for example [`mcr.microsoft.com/devcontainers/dotnet:8.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Open the repo in VS Code with the Dev Containers extension (or in a GitHub Codespace) and run `dotnet tool restore` to install the compiler from the local tool manifest.
+Any dev container image with the .NET 8 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:8.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
 
 ### Install the compiler as a local or global .NET tool
 
