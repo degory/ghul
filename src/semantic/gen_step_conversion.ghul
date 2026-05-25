@@ -1,0 +1,200 @@
+namespace Semantic is
+    use Source;
+    use Trees = Syntax.Trees;
+
+    // Sibling of LOOP_RESULT_CONVERSION. Concentrates AST builders
+    // and walk-and-rewrite helpers for the synchronous-generator
+    // desugar — the rewriter that turns `yield X;` bodies into a
+    // `Ghul.Generators._gen_pipe(states)` call with the body sliced
+    // into state-handler lambdas.
+    //
+    // Used by `DESUGAR_YIELD` (see `docs/claude/generators-yield.md`).
+    // All operations are syntactic and run pre-resolution; nothing
+    // here queries the symbol table.
+    //
+    // AST builders (static):
+    //   `build_done(loc, t)`
+    //       — `Ghul.Generators._GEN_STEP[T]()` (struct default-init
+    //         lands on kind=DONE since DONE is the first enum value).
+    //   `build_yield(loc, t, value, next_state)`
+    //       — `Ghul.Generators._GEN_STEP[T](_GEN_STEP_KIND.YIELD, value, next_state)`.
+    //   `build_transition(loc, t, next_state)`
+    //       — `Ghul.Generators._GEN_STEP[T](_GEN_STEP_KIND.TRANSITION, default[T], next_state)`.
+    //
+    // Type-expression predicates:
+    //   `try_extract_generator_t(return_type)`
+    //       — extract T from `Iterable[T]` / `Iterator[T]` /
+    //         `Collections.Iterable[T]` / `Collections.Iterator[T]`;
+    //         null if the return type isn't a generator-supporting
+    //         shape. The check is syntactic on the trailing
+    //         identifier of the generic name, matching the existing
+    //         `try_extract_t_ret` style used by LOOP_RESULT_CONVERSION.
+    class GEN_STEP_CONVERSION is
+        init() is
+        si
+
+        // Extract T syntactically from a generator function's return
+        // type. Returns the inner type argument when the expression
+        // is `Iterable[T]` or `Iterator[T]` (matching unqualified or
+        // `Collections.`-qualified forms); null otherwise. Used by
+        // DESUGAR_YIELD's `pre(function)` to decide whether a
+        // yield-containing body is a generator (Iterable/Iterator
+        // return) or a misuse (any other return type).
+        try_extract_generator_t(
+            return_type: Trees.TypeExpressions.TypeExpression?
+        ) -> Trees.TypeExpressions.TypeExpression? static is
+            if !return_type? then
+                return null;
+            fi
+
+            if let g: Trees.TypeExpressions.GENERIC = return_type then
+                if
+                    g.name? /\
+                    (g.name.name =~ "Iterable" \/ g.name.name =~ "Iterator") /\
+                    g.arguments? /\
+                    g.arguments.count == 1
+                then
+                    let arg = g.arguments.elements[0];
+                    if arg? then
+                        return arg;
+                    fi
+                fi
+            fi
+
+            return null;
+        si
+
+        // True iff the return type is `Iterable[T]` / `Iterator[T]`
+        // (or `Collections.`-qualified). Convenience predicate built
+        // on top of `try_extract_generator_t`.
+        is_generator_return_type(
+            return_type: Trees.TypeExpressions.TypeExpression?
+        ) -> bool static =>
+            try_extract_generator_t(return_type)?;
+
+        // `Ghul.Generators._GEN_STEP[t]()` — struct default-init,
+        // lands on kind=DONE (the first enum value). Emitted for
+        // generator state handlers that complete the generator.
+        build_done(
+            loc: LOCATION,
+            t: Trees.TypeExpressions.TypeExpression
+        ) -> Trees.Expressions.Expression static =>
+            _build_gen_step_call(loc, t, Collections.LIST[Trees.Expressions.Expression]());
+
+        // `Ghul.Generators._GEN_STEP[t](_GEN_STEP_KIND.YIELD, value, next_state)`
+        build_yield(
+            loc: LOCATION,
+            t: Trees.TypeExpressions.TypeExpression,
+            value: Trees.Expressions.Expression,
+            next_state: int
+        ) -> Trees.Expressions.Expression static is
+            let args = Collections.LIST[Trees.Expressions.Expression]();
+            args.add(_build_gen_step_kind_value(loc, "YIELD"));
+            args.add(value);
+            args.add(_build_int_literal(loc, next_state));
+            return _build_gen_step_call(loc, t, args);
+        si
+
+        // `Ghul.Generators._GEN_STEP[t](_GEN_STEP_KIND.TRANSITION, default[t], next_state)`
+        // — emitted at the close of a state that hands off to another
+        // state without producing a value (loop header → body, body
+        // → header, if-join, etc).
+        build_transition(
+            loc: LOCATION,
+            t: Trees.TypeExpressions.TypeExpression,
+            next_state: int
+        ) -> Trees.Expressions.Expression static is
+            let args = Collections.LIST[Trees.Expressions.Expression]();
+            args.add(_build_gen_step_kind_value(loc, "TRANSITION"));
+            args.add(Trees.Expressions.DEFAULT(loc, t.copy()));
+            args.add(_build_int_literal(loc, next_state));
+            return _build_gen_step_call(loc, t, args);
+        si
+
+        // Public: synthesise a `Ghul.Generators.<name>` member-access
+        // AST. Used by DESUGAR_YIELD for the final `_gen_pipe(states)`
+        // call site, and internally for the `_GEN_STEP_KIND.<variant>`
+        // chain. Hover-suppression: inner `Ghul` / `Generators` /
+        // `<name>` identifiers use `LOCATION.internal` so the analyser
+        // drops them from hover output.
+        build_ghul_generators_member(
+            loc: LOCATION,
+            name: string
+        ) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+            return
+                Trees.Expressions.MEMBER(
+                    loc,
+                    _build_ghul_generators(loc),
+                    Trees.Identifiers.Identifier(internal_loc, name),
+                    loc
+                );
+        si
+
+        // Public: `Ghul.Generators._GEN_STEP_KIND.<variant>` chain.
+        // Used by DESUGAR_YIELD when constructing state handlers
+        // directly (outside the YIELD/TRANSITION builders above).
+        build_gen_step_kind_value(
+            loc: LOCATION,
+            variant_name: string
+        ) -> Trees.Expressions.Expression static =>
+            _build_gen_step_kind_value(loc, variant_name);
+
+        // ---- internal AST builders ----
+
+        // `Ghul.Generators._GEN_STEP[t](args...)`
+        _build_gen_step_call(
+            loc: LOCATION,
+            t: Trees.TypeExpressions.TypeExpression,
+            args: Collections.LIST[Trees.Expressions.Expression]
+        ) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+            let callable =
+                Trees.Expressions.GENERIC_APPLICATION(
+                    loc,
+                    _build_ghul_generators(loc),
+                    Trees.Identifiers.Identifier(internal_loc, "_GEN_STEP"),
+                    Trees.TypeExpressions.LIST(
+                        loc,
+                        Collections.LIST[Trees.TypeExpressions.TypeExpression]([t.copy()]: Trees.TypeExpressions.TypeExpression)
+                    )
+                );
+            return Trees.Expressions.CALL(loc, callable, Trees.Expressions.LIST(loc, args));
+        si
+
+        // `Ghul.Generators._GEN_STEP_KIND.<variant>` member-access chain.
+        _build_gen_step_kind_value(
+            loc: LOCATION,
+            variant_name: string
+        ) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+            return
+                Trees.Expressions.MEMBER(
+                    loc,
+                    build_ghul_generators_member(loc, "_GEN_STEP_KIND"),
+                    Trees.Identifiers.Identifier(internal_loc, variant_name),
+                    loc
+                );
+        si
+
+        // `Ghul.Generators` two-level identifier chain.
+        _build_ghul_generators(loc: LOCATION) -> Trees.Expressions.Expression static is
+            let internal_loc = LOCATION.internal;
+            let ghul_id =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    Trees.Identifiers.Identifier(internal_loc, "Ghul")
+                );
+            return
+                Trees.Expressions.MEMBER(
+                    loc,
+                    ghul_id,
+                    Trees.Identifiers.Identifier(internal_loc, "Generators"),
+                    loc
+                );
+        si
+
+        _build_int_literal(loc: LOCATION, value: int) -> Trees.Expressions.Expression static =>
+            Trees.Expressions.Literals.INTEGER(loc, "{value}");
+    si
+si
