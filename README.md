@@ -32,10 +32,6 @@ If you initialize your project using one of the [ghūl .NET project templates](h
 
 If you create a new GitHub repo from the [ghūl repository template](https://github.com/degory/ghul-repository-template), then the compiler will be pre-configured as a local .NET tool in your project folder - run `dotnet tool restore` to restore it.
 
-### Use a dev container
-
-Any dev container image with the .NET 8 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:8.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
-
 ### Install the compiler as a local or global .NET tool
 
 You can manually install the compiler from the [ghūl compiler .NET tool package](https://www.nuget.org/packages/ghul.compiler/)
@@ -75,7 +71,13 @@ Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.co
 
 ## Development environment
 
+### Visual Studio Code
+
 [Visual Studio Code](https://code.visualstudio.com) will give you rich language support via the [ghūl VSCode language extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul).
+
+### Dev container
+
+Any dev container image with the .NET 8 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:8.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
 
 ## Basic ghūl language tutorial
 
