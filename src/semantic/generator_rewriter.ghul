@@ -8,34 +8,44 @@ namespace Semantic is
     // Invoked by DESUGAR_YIELD on every function whose
     // `is_generator_function` flag is true.
     //
-    // Algorithm (v1 — linear yields only):
+    // Algorithm:
     //   1. Split body.statements at the first state-affecting
-    //      statement (yield, return). Everything before is "prelude"
+    //      statement (yield, return, or if/while/for whose body
+    //      contains one of those). Everything before is "prelude"
     //      — it stays at function scope and runs once when the
     //      generator is constructed. Function-scope `let`s captured
     //      by state lambdas get the usual BOX[T] treatment from the
     //      `mark-boxed-locals` pass.
-    //   2. From the first yield onwards, walk statements slicing on
-    //      every yield or return:
-    //        `yield X;`    → close state with `return _GEN_STEP[T](YIELD, X, next_idx);`
-    //                        start a fresh state for what follows.
-    //        `return;`     → close state with `return _GEN_STEP[T]();` (DONE).
-    //                        Subsequent statements are dead — they
-    //                        still slot into the next state, but the
-    //                        state machine reaches DONE before
-    //                        executing them.
-    //        `return X;`   → diagnostic; generators emit via yield.
+    //   2. Walk statements from the first state-affecting point,
+    //      slicing into states per the design's D3 rules:
+    //        yield X;   →  close state with `return YIELD(X, next);`
+    //        return;    →  close state with `return DONE;`
+    //        return X;  →  diagnostic
+    //        if/then/else (with yield inside any branch) →
+    //                       allocate first-states for each branch +
+    //                       a join state; close dispatch state with
+    //                       `if cond then TRANSITION(A_first) else
+    //                       TRANSITION(B_first) fi`; recursively
+    //                       process branches; each branch's tail
+    //                       TRANSITIONs to the join state.
     //        anything else → append to current state's body.
-    //   3. Close the trailing state with DONE.
+    //   3. Close trailing state with DONE.
     //   4. Replace body with:
     //        <prelude>
     //        let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
-    //        __gen_states.add(state_0_lambda);
-    //        ...
+    //        __gen_states.add(state_0); __gen_states.add(state_1); ...
     //        return Ghul.Generators._gen_pipe(__gen_states);
     //
-    // Not handled in v1 (will be added later):
-    //   - control flow (if/while/for/break/continue with yields inside)
+    // State-index allocation. States receive indices via
+    // `_allocate_state()` in dependency order (a TRANSITION must
+    // reference an index that's already allocated, but the state at
+    // that index may not yet have a body). The `_states` map is
+    // keyed by index; lambdas are emitted as states close. Final
+    // assembly walks `0..._next_state_index`.
+    //
+    // Not handled yet:
+    //   - while / for with yields inside
+    //   - break / continue
     //   - try/catch across yields
     //   - yield inside nested lambdas
     //
@@ -44,19 +54,21 @@ namespace Semantic is
         _logger: Logger;
         _t: Trees.TypeExpressions.TypeExpression;
 
-        _states: Collections.LIST[Trees.Expressions.Expression];
+        _states: Collections.MAP[int, Trees.Expressions.Expression];
         _current_body: Collections.LIST[Trees.Statements.Statement];
+        _current_state_index: int;
+        _next_state_index: int;
 
         init(logger: Logger, t: Trees.TypeExpressions.TypeExpression) is
             _logger = logger;
             _t = t;
-            _states = Collections.LIST[Trees.Expressions.Expression]();
+            _states = Collections.MAP[int, Trees.Expressions.Expression]();
             _current_body = Collections.LIST[Trees.Statements.Statement]();
+            _current_state_index = 0;
+            _next_state_index = 1;
         si
 
-        // Rewrite the body in place. Returns silently — the only
-        // side effect is `body.replace_all(...)` with the new
-        // statement sequence.
+        // Rewrite the body in place.
         rewrite(body: Trees.Statements.LIST) is
             assert body? else "body cannot be null";
 
@@ -66,28 +78,23 @@ namespace Semantic is
             od
 
             let prelude = Collections.LIST[Trees.Statements.Statement]();
-            let split_index = _find_first_state_affecting(original);
+            let split_index = _find_first_state_affecting_index(original);
 
-            // Statements before any yield/return stay at function
-            // scope. State lambdas close over their locals via the
-            // normal capture path (with BOX[T] applied as needed).
             let i mut = 0;
             while i < split_index do
                 prelude.add(original[i]);
                 i = i + 1;
             od
 
-            // Statements from the first yield onwards slice into states.
             while i < original.count do
                 _process_statement(original[i]);
                 i = i + 1;
             od
 
-            // Close trailing state with DONE.
+            // Trailing state — fall-through, DONE.
             _close_state_with_done(body.location);
 
-            // Build the new body: prelude + state list construction
-            // + _gen_pipe(states) return.
+            // Build the new body.
             let new_statements = Collections.LIST[Trees.Statements.Statement]();
 
             for s in prelude do
@@ -97,18 +104,16 @@ namespace Semantic is
             let internal_loc = LOCATION.internal;
             let loc = body.location;
 
-            // let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
-            let states_decl = _build_states_declaration(loc, internal_loc);
-            new_statements.add(states_decl);
+            new_statements.add(_build_states_declaration(loc, internal_loc));
 
-            // __gen_states.add(state_K_lambda);  for each state K.
             let k mut = 0;
-            while k < _states.count do
-                new_statements.add(_build_states_add_call(loc, internal_loc, _states[k]));
+            while k < _next_state_index do
+                let lambda = _states[k];
+                assert lambda? else "generator state {k} was never closed — internal rewriter bug";
+                new_statements.add(_build_states_add_call(loc, internal_loc, lambda));
                 k = k + 1;
             od
 
-            // return Ghul.Generators._gen_pipe(__gen_states);
             new_statements.add(_build_gen_pipe_return(loc, internal_loc));
 
             body.replace_all(new_statements);
@@ -121,21 +126,28 @@ namespace Semantic is
                 _process_yield(cast Trees.Statements.YIELD(s));
             elif isa Trees.Statements.RETURN(s) then
                 _process_return(cast Trees.Statements.RETURN(s));
+            elif isa Trees.Statements.IF(s) then
+                _process_if(cast Trees.Statements.IF(s));
             else
                 _current_body.add(s);
             fi
         si
 
+        _process_statement_list(stmt_list: Trees.Statements.LIST) is
+            for s in stmt_list do
+                _process_statement(s);
+            od
+        si
+
         _process_yield(y: Trees.Statements.YIELD) is
             let loc = y.location;
-            // Next state's index is the count after we close this one.
-            let next_idx = _states.count + 1;
+            let next_idx = _allocate_state();
             let yield_expr =
                 GEN_STEP_CONVERSION.build_yield(
                     loc, _t.copy(), y.expression, next_idx
                 );
-            _current_body.add(Trees.Statements.RETURN(loc, yield_expr));
-            _close_current_state(loc);
+            _close_current_with(loc, yield_expr);
+            _start_new_state(next_idx);
         si
 
         _process_return(r: Trees.Statements.RETURN) is
@@ -148,17 +160,159 @@ namespace Semantic is
             fi
             let loc = r.location;
             let done_expr = GEN_STEP_CONVERSION.build_done(loc, _t.copy());
-            _current_body.add(Trees.Statements.RETURN(loc, done_expr));
-            _close_current_state(loc);
+            _close_current_with(loc, done_expr);
+            // Subsequent statements collect into a fresh state but
+            // are dead — the state machine never reaches them. We
+            // still allocate the index so subsequent yields produce
+            // a contiguous state list.
+            _start_new_state(_allocate_state());
         si
 
-        // ---- state-list management ----
+        _process_if(if_stmt: Trees.Statements.IF) is
+            if !_if_needs_split(if_stmt) then
+                _current_body.add(if_stmt);
+                return;
+            fi
 
-        _find_first_state_affecting(stmts: Collections.LIST[Trees.Statements.Statement]) -> int is
+            let loc = if_stmt.location;
+
+            // Save the dispatch state's accumulator. We'll close it
+            // last (after we know branch-first indices and state_J).
+            let dispatch_state_index = _current_state_index;
+            let dispatch_body = _current_body;
+
+            // Allocate a first-state index for each branch and
+            // process the branches. After each branch's recursive
+            // walk, save the trailing (open) state for the
+            // post-loop TRANSITION-to-J patch.
+            let branch_first_indices = Collections.LIST[int]();
+            let branch_last_indices = Collections.LIST[int]();
+            let branch_last_bodies =
+                Collections.LIST[Collections.LIST[Trees.Statements.Statement]]();
+
+            let has_else mut = false;
+
+            for branch in if_stmt.branches do
+                if !branch.condition? then
+                    has_else = true;
+                fi
+
+                let branch_first = _allocate_state();
+                branch_first_indices.add(branch_first);
+                _start_new_state(branch_first);
+                _process_statement_list(branch.body);
+                branch_last_indices.add(_current_state_index);
+                branch_last_bodies.add(_current_body);
+            od
+
+            // Join state.
+            let state_J = _allocate_state();
+
+            // Build and emit the dispatch if.
+            let new_branches = Collections.LIST[Trees.Statements.IF_BRANCH]();
+            let branches_iter = if_stmt.branches.iterator;
+            let bf_i mut = 0;
+            while branches_iter.move_next() do
+                let original_branch = branches_iter.current;
+                let target = branch_first_indices[bf_i];
+                let transition_body =
+                    _build_single_statement_list(
+                        original_branch.location,
+                        Trees.Statements.RETURN(
+                            original_branch.location,
+                            GEN_STEP_CONVERSION.build_transition(
+                                original_branch.location, _t.copy(), target
+                            )
+                        )
+                    );
+                new_branches.add(
+                    Trees.Statements.IF_BRANCH(
+                        original_branch.location,
+                        original_branch.condition,
+                        original_branch.binding,
+                        transition_body
+                    )
+                );
+                bf_i = bf_i + 1;
+            od
+
+            // If the original if has no else, add one that
+            // TRANSITIONs directly to state_J — control fell through
+            // the if without entering any branch.
+            if !has_else then
+                let else_body =
+                    _build_single_statement_list(
+                        loc,
+                        Trees.Statements.RETURN(
+                            loc,
+                            GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_J)
+                        )
+                    );
+                new_branches.add(
+                    Trees.Statements.IF_BRANCH(loc, null, else_body)
+                );
+            fi
+
+            dispatch_body.add(Trees.Statements.IF(loc, new_branches));
+            _emit_state(dispatch_state_index, dispatch_body);
+
+            // Close each branch's trailing state with
+            // TRANSITION(state_J).
+            let bl_i mut = 0;
+            while bl_i < branch_last_indices.count do
+                let last_idx = branch_last_indices[bl_i];
+                let last_body = branch_last_bodies[bl_i];
+                last_body.add(
+                    Trees.Statements.RETURN(
+                        loc,
+                        GEN_STEP_CONVERSION.build_transition(loc, _t.copy(), state_J)
+                    )
+                );
+                _emit_state(last_idx, last_body);
+                bl_i = bl_i + 1;
+            od
+
+            // Continue at the join state.
+            _start_new_state(state_J);
+        si
+
+        // ---- state-machine bookkeeping ----
+
+        _allocate_state() -> int is
+            let i = _next_state_index;
+            _next_state_index = i + 1;
+            return i;
+        si
+
+        _start_new_state(index: int) is
+            _current_state_index = index;
+            _current_body = Collections.LIST[Trees.Statements.Statement]();
+        si
+
+        _close_current_with(loc: LOCATION, final_expr: Trees.Expressions.Expression) is
+            _current_body.add(Trees.Statements.RETURN(loc, final_expr));
+            _emit_state(_current_state_index, _current_body);
+        si
+
+        _close_state_with_done(loc: LOCATION) is
+            let done_expr = GEN_STEP_CONVERSION.build_done(loc, _t.copy());
+            _close_current_with(loc, done_expr);
+        si
+
+        _emit_state(
+            index: int,
+            body_statements: Collections.LIST[Trees.Statements.Statement]
+        ) is
+            let lambda = _build_state_lambda(body_statements);
+            _states[index] = lambda;
+        si
+
+        // ---- classification helpers ----
+
+        _find_first_state_affecting_index(stmts: Collections.LIST[Trees.Statements.Statement]) -> int is
             let i mut = 0;
             while i < stmts.count do
-                let s = stmts[i];
-                if isa Trees.Statements.YIELD(s) \/ isa Trees.Statements.RETURN(s) then
+                if _is_state_affecting(stmts[i]) then
                     return i;
                 fi
                 i = i + 1;
@@ -166,26 +320,59 @@ namespace Semantic is
             return stmts.count;
         si
 
-        _close_current_state(loc: LOCATION) is
-            let lambda = _build_state_lambda(loc, _current_body);
-            _states.add(lambda);
-            _current_body = Collections.LIST[Trees.Statements.Statement]();
+        _is_state_affecting(s: Trees.Statements.Statement) -> bool is
+            if isa Trees.Statements.YIELD(s) \/ isa Trees.Statements.RETURN(s) then
+                return true;
+            fi
+            if isa Trees.Statements.IF(s) then
+                return _if_needs_split(cast Trees.Statements.IF(s));
+            fi
+            return false;
         si
 
-        _close_state_with_done(loc: LOCATION) is
-            let done_expr = GEN_STEP_CONVERSION.build_done(loc, _t.copy());
-            _current_body.add(Trees.Statements.RETURN(loc, done_expr));
-            _close_current_state(loc);
+        _if_needs_split(if_stmt: Trees.Statements.IF) -> bool is
+            for branch in if_stmt.branches do
+                if _stmt_list_contains_state_affecting(branch.body) then
+                    return true;
+                fi
+            od
+            return false;
+        si
+
+        _stmt_list_contains_state_affecting(stmt_list: Trees.Statements.LIST) -> bool is
+            if !stmt_list? then
+                return false;
+            fi
+            for s in stmt_list do
+                if _is_state_affecting(s) then
+                    return true;
+                fi
+            od
+            return false;
         si
 
         // ---- AST builders ----
 
+        _build_single_statement_list(
+            loc: LOCATION,
+            s: Trees.Statements.Statement
+        ) -> Trees.Statements.LIST is
+            let list = Collections.LIST[Trees.Statements.Statement]();
+            list.add(s);
+            return Trees.Statements.LIST(loc, list);
+        si
+
         // `() -> _GEN_STEP[T] is <body> si` lambda.
         _build_state_lambda(
-            loc: LOCATION,
             body_statements: Collections.LIST[Trees.Statements.Statement]
         ) -> Trees.Expressions.Expression is
             let internal_loc = LOCATION.internal;
+            let loc =
+                if body_statements.count > 0 then
+                    body_statements[0].location
+                else
+                    internal_loc
+                fi;
 
             let body_list = Trees.Statements.LIST(loc, body_statements);
             let body_block = Trees.Bodies.BLOCK(loc, body_list);
@@ -196,9 +383,6 @@ namespace Semantic is
                     Collections.LIST[Trees.Expressions.Expression]()
                 );
 
-            // Return type: Ghul.Generators._GEN_STEP[T] — match the
-            // helper class. Built as a GENERIC type-expression on
-            // the qualified name.
             let gen_step_id =
                 Trees.Identifiers.QUALIFIED(
                     internal_loc,
@@ -236,35 +420,8 @@ namespace Semantic is
             loc: LOCATION,
             internal_loc: LOCATION
         ) -> Trees.Statements.Statement is
-            // Element type: `() -> _GEN_STEP[T]` function-type expression.
             let element_type = _build_state_function_type(loc, internal_loc);
 
-            // Generic type: `Collections.LIST[<element_type>]`.
-            let collections_id =
-                Trees.Identifiers.Identifier(internal_loc, "Collections");
-            let list_qualified =
-                Trees.Identifiers.QUALIFIED(
-                    internal_loc,
-                    collections_id,
-                    "LIST",
-                    internal_loc,
-                    internal_loc
-                );
-            let list_type_args =
-                Trees.TypeExpressions.LIST(
-                    loc,
-                    Collections.LIST[Trees.TypeExpressions.TypeExpression]([element_type]: Trees.TypeExpressions.TypeExpression)
-                );
-            let list_type =
-                Trees.TypeExpressions.GENERIC(loc, list_qualified, list_type_args);
-
-            // Constructor call: `Collections.LIST[() -> _GEN_STEP[T]]()`.
-            // CALL on the type expression treated as a callable —
-            // ghūl uses TYPE_EXPRESSION_CALL for this pattern. Look
-            // at how Collections.LIST[int]() is built elsewhere.
-            // For now we build a GENERIC_APPLICATION + CALL chain
-            // mirroring how the type-as-constructor pattern is
-            // emitted by the parser for `T[U]()` source.
             let list_ctor_callable =
                 _build_list_constructor_callable(loc, internal_loc, element_type);
 
@@ -276,13 +433,11 @@ namespace Semantic is
             let ctor_call =
                 Trees.Expressions.CALL(loc, list_ctor_callable, ctor_args);
 
-            // `let __gen_states = <ctor_call>;`
             let var_id =
                 Trees.Identifiers.Identifier(internal_loc, "__gen_states");
             return _build_let(loc, var_id, ctor_call);
         si
 
-        // `Collections.LIST[() -> _GEN_STEP[T]]` as a callable.
         _build_list_constructor_callable(
             loc: LOCATION,
             internal_loc: LOCATION,
@@ -309,7 +464,6 @@ namespace Semantic is
                 );
         si
 
-        // `() -> _GEN_STEP[T]` function-type expression.
         _build_state_function_type(
             loc: LOCATION,
             internal_loc: LOCATION
@@ -345,7 +499,6 @@ namespace Semantic is
             return Trees.TypeExpressions.FUNCTION(loc, empty_args, gen_step_type);
         si
 
-        // `__gen_states.add(<state_lambda>);`
         _build_states_add_call(
             loc: LOCATION,
             internal_loc: LOCATION,
@@ -372,7 +525,6 @@ namespace Semantic is
             return Trees.Statements.EXPRESSION(loc, call);
         si
 
-        // `return Ghul.Generators._gen_pipe(__gen_states);`
         _build_gen_pipe_return(
             loc: LOCATION,
             internal_loc: LOCATION
@@ -393,7 +545,6 @@ namespace Semantic is
             return Trees.Statements.RETURN(loc, call);
         si
 
-        // `let <var> = <value>;` statement — immutable binding.
         _build_let(
             loc: LOCATION,
             var_id: Trees.Identifiers.Identifier,
