@@ -1,0 +1,252 @@
+namespace Semantic.Symbols is
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+
+    use IoC;
+    use Logging;
+    use Source;
+
+    use IR.Values.Value;
+
+    use Types.Type;
+
+    // Per-yield bookkeeping recorded by yield IL emission.
+    // The resumption label is placed immediately after the
+    // `ret` that suspends the generator; entry-dispatch jumps
+    // here when MoveNext re-enters in this state.
+    class STATE_LABEL is
+        state: int;
+        label: IR.LABEL;
+
+        init(state: int, label: IR.LABEL) is
+            self.state = state;
+            self.label = label;
+        si
+    si
+
+    // State held on a generator function symbol: the synthesised
+    // frame class, the running state-number counter, the recorded
+    // (state, resumption-label) pairs for entry-dispatch emission.
+    // Lives as a non-null field on each *_GENERATOR_* function;
+    // checked-for via `state_machine_for(...)`.
+    class STATE_MACHINE is
+        function: Function public;
+        frame: STATE_MACHINE_FRAME public;
+
+        _next_state: int;
+        _yield_labels: Collections.LIST[STATE_LABEL];
+
+        init(function: Function) is
+            self.function = function;
+
+            _next_state = 1;
+            _yield_labels = Collections.LIST[STATE_LABEL]();
+        si
+
+        allocate_state() -> int is
+            let n = _next_state;
+
+            _next_state = _next_state + 1;
+
+            return n;
+        si
+
+        record_label(state: int, label: IR.LABEL) is
+            _yield_labels.add(STATE_LABEL(state, label));
+        si
+
+        yield_labels: Collections.Iterable[STATE_LABEL] => _yield_labels;
+    si
+
+    // Synthesised class that holds a generator's state machine. One
+    // per generator function. Implements `Iterator[T]` (which extends
+    // `Iterable[T]`), so the existing ienumerable/ienumerator boiler-
+    // plate emitters fire automatically for the non-generic bridges.
+    //
+    // Members:
+    //   - `_state: int`        — current state number (0 = initial,
+    //                            -1 = done, N > 0 = resumption point).
+    //   - `_current: T`        — last value pushed by `yield`.
+    //   - `_outer_self`        — (instance form only) the user's
+    //                            enclosing-instance reference. Wired
+    //                            in a later PR; the field is provisioned
+    //                            now so the IL shape carries forward.
+    //   - `init()`             — parameterless ctor (static-method form).
+    //
+    // No ghūl-side method declarations: the IL is hand-written in
+    // `gen_state_machine` (in generate_il), using the canonical .NET
+    // member names (`GetEnumerator`, `get_Current`, `MoveNext`,
+    // `Dispose`, `Reset`). The ghūl reflection mapping makes them
+    // visible to ghūl callers as `iterator`, `current`, `move_next`,
+    // `dispose`, `reset`.
+    class STATE_MACHINE_FRAME: Classy is
+        _next_id: int static;
+
+        _owning_function: Function;
+        _element_type: Type;
+
+        _state_field: Field;
+        _current_field: Field;
+        _constructor: Method;
+
+        owning_function: Function => _owning_function;
+        element_type: Type => _element_type;
+        state_field: Field => _state_field;
+        current_field: Field => _current_field;
+        constructor: Method => _constructor;
+
+        next_id: int static is
+            let result = _next_id;
+            _next_id = _next_id + 1;
+            return result;
+        si
+
+        init(owner: Scope, owning_function: Function, element_type: Type) is
+            let owner_owner: Scope mut;
+
+            if isa Symbol(owner) then
+                let owner_symbol = owner;
+                owner_owner = owner_symbol.owner;
+            else
+                owner_owner = owner;
+            fi
+
+            super.init(
+                LOCATION.internal,
+                LOCATION.internal,
+                owner_owner,
+                "$StateMachine_{owning_function.name}_{next_id}",
+                System.Array.empty[string](),
+                owner
+            );
+
+            _owning_function = owning_function;
+            _element_type = element_type;
+
+            set_type(Types.NAMED(self));
+        si
+
+        // Declare the frame's members lazily — called by IL emission.
+        // Fields and constructor get real Symbol entities so reference
+        // emission (ldfld, stfld, newobj) routes through the existing
+        // SYMBOL_LOADER paths. The Iterator[T] / Iterable[T] methods
+        // are NOT declared as ghūl symbols — their IL is emitted by
+        // hand in `gen_all` using the canonical .NET names.
+        declare() is
+            if _state_field? then
+                return;
+            fi
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let int_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type();
+
+            _state_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_state");
+            _state_field.set_type(int_type);
+            declare(LOCATION.internal, _state_field, listener);
+
+            _current_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_current");
+            _current_field.set_type(_element_type);
+            declare(LOCATION.internal, _current_field, listener);
+
+            _constructor = Symbols.INSTANCE_METHOD(LOCATION.internal, LOCATION.internal, self, "init", self);
+            _constructor.set_arguments(Collections.LIST[string](), Collections.LIST[Type]());
+            _constructor.set_void_return_type();
+            declare(LOCATION.internal, _constructor, listener);
+
+            // Wire the Iterator[T] ancestor so the standard ghūl
+            // type-system machinery (is_derived_from_iterator_trait,
+            // ienumerable/ienumerator boilerplate emitters, the
+            // implements-clause IL emission via gen_extends/
+            // gen_implements) treats this class as an Iterator[T].
+            let unspecialized_iterator = IoC.CONTAINER.instance.innate_symbol_lookup.get_unspecialized_iterator_type();
+
+            let iterator_symbol mut = unspecialized_iterator.symbol;
+
+            if let g: Symbols.GENERIC = iterator_symbol then
+                iterator_symbol = g.symbol;
+            fi
+
+            let iterator_classy = cast Symbols.Classy(iterator_symbol);
+
+            let element_args = Collections.LIST[Type]();
+            element_args.add(_element_type);
+
+            let iterator_specialised = Types.GENERIC(LOCATION.internal, iterator_classy, element_args);
+
+            add_ancestor(iterator_specialised);
+        si
+
+        gen_access(buffer: StringBuilder) is
+            buffer.append("private ");
+        si
+
+        gen_type_prefix(buffer: StringBuilder) is
+            buffer.append("class ");
+        si
+    si
+
+    // Free helper: returns the STATE_MACHINE held by any of the three
+    // generator function forms, or null if `f` is a plain function.
+    state_machine_for(f: Function) -> STATE_MACHINE? is
+        if !f? then
+            return null;
+        fi
+
+        if isa STATIC_GENERATOR_METHOD(f) then
+            return (cast STATIC_GENERATOR_METHOD(f)).state_machine;
+        fi
+
+        if isa INSTANCE_GENERATOR_METHOD(f) then
+            return (cast INSTANCE_GENERATOR_METHOD(f)).state_machine;
+        fi
+
+        if isa GLOBAL_GENERATOR_FUNCTION(f) then
+            return (cast GLOBAL_GENERATOR_FUNCTION(f)).state_machine;
+        fi
+
+        return null;
+    si
+
+    // Concrete generator-function forms — thin extensions of the
+    // existing function/method classes that additionally carry a
+    // STATE_MACHINE bookkeeping object. Each form differs only in
+    // its CLR-level signature shape (instance, static, global).
+
+    class STATIC_GENERATOR_METHOD: STATIC_METHOD is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator (static)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+    si
+
+    class INSTANCE_GENERATOR_METHOD: INSTANCE_METHOD is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+    si
+
+    class GLOBAL_GENERATOR_FUNCTION: GLOBAL_FUNCTION is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator (global)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+    si
+si
