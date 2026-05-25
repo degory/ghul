@@ -1,0 +1,163 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use IO.File;
+    use IO.Path;
+    use IO.Directory;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // EDIT + COMPILE + HOVER coverage for an out-of-project fixture
+    // whose path walks through a directory name that the synthesized-
+    // namespace pass's identifier filter drops to the empty string.
+    //
+    // Pre-fix, EXPAND_NAMESPACES.convert_file_name_to_identifier read
+    // past the end of the empty string and threw
+    // IndexOutOfRangeException, escaping through the
+    // rewrite-syntax-trees pass and leaving the AST half-rewritten so
+    // every later pass cascaded into NullReferenceExceptions on the
+    // same file. HOVER (and completion, and go-to-definition) then
+    // returned nothing for any position in the file.
+    //
+    // The post-parse pass walks up parent directories until it finds
+    // a ghul.json / *.ghulproj project marker. A file under a
+    // directory whose name filters to empty (e.g. "$$$") hits the
+    // crash before reaching any marker.
+    class EXPAND_NAMESPACES_CRASH_TESTS is
+        @test()
+
+        init() is si
+
+        // A minimum source that exercises the same shape as
+        // ghul-examples/examples/functional/functional.ghul: top-level
+        // definitions with no `namespace` declaration, plus an
+        // if-expression in a lambda body (where the user first noticed
+        // the broken HOVER).
+        FIXTURE_SOURCE: string static =>
+            "classify(n: int) -> string =>\n"
+            "    if n == 0 then\n"
+            "        \"zero\"\n"
+            "    elif n > 0 then\n"
+            "        \"positive\"\n"
+            "    else\n"
+            "        \"negative\"\n"
+            "    fi;\n"
+            "\n"
+            "entry() is\n"
+            "    let label = classify(0);\n"
+            "si\n";
+
+        // Write the fixture under a directory whose name is composed
+        // entirely of characters the identifier filter drops (no
+        // letters, digits, or underscores). The post-parse walk-up
+        // hits this directory, calls convert_file_name_to_identifier
+        // with its name, and pre-fix crashed reading get_chars(0) on
+        // the filter's empty output.
+        //
+        // The unique suffix is on the inner directory so the OUTER
+        // path component remains all-punctuation, which is what
+        // triggers the filter-to-empty path. The outer directory is
+        // re-used across parallel test runs (with the same name);
+        // create_directory is idempotent so the re-entry is harmless.
+        make_isolated_fixture_path() -> string is
+            let outer = Path.combine(Path.get_temp_path(), "+++");
+            Directory.create_directory(outer);
+
+            let inner = Path.combine(outer, "ghul-expand-namespaces-crash-{System.Guid.new_guid()}");
+            Directory.create_directory(inner);
+
+            let fixture_path = Path.combine(inner, "isolated.ghul");
+            File.write_all_text(fixture_path, FIXTURE_SOURCE);
+
+            return fixture_path;
+        si
+
+        // EDIT + COMPILE on an isolated-path fixture must not surface
+        // any `internal` exception diagnostic in COMPILE's output.
+        // Pre-fix the first such diagnostic was an
+        // IndexOutOfRangeException out of
+        // EXPAND_NAMESPACES.convert_file_name_to_identifier; the seven
+        // NullReferenceExceptions that followed were collateral from
+        // the half-rewritten AST. Asserting the "internal" file is
+        // clean catches both the original failure and any
+        // re-introduction of the same shape.
+        edit_then_compile_isolated_file_should_not_throw_in_passes() is
+            @test()
+
+            let fixture_path = make_isolated_fixture_path();
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit(fixture_path, FIXTURE_SOURCE);
+
+            let edit_diag = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", edit_diag.header);
+
+            let edit_done = analyser.read_response();
+            Assert.are_equal("PARTIAL DONE", edit_done.header);
+
+            analyser.send_compile();
+
+            let compile_diag = analyser.read_response();
+            Assert.are_equal("DIAGNOSTICS", compile_diag.header);
+
+            let internal_diagnostics =
+                LIST[DIAGNOSTIC](
+                    compile_diag.parse_diagnostics()
+                        | .filter(d => d.is_internal)
+                );
+
+            Assert.are_equal(
+                0,
+                internal_diagnostics.count,
+                "{diagnostics_summary("COMPILE surfaced internal/reflected exceptions — the rewrite-syntax-trees pass crashed", internal_diagnostics)}\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let compile_done = analyser.read_response();
+            Assert.are_equal("FULL DONE", compile_done.header);
+        si
+
+        // HOVER on an identifier inside the if-expression's body must
+        // return a non-empty description after EDIT + COMPILE on the
+        // isolated-path fixture. Pre-fix the cascade left
+        // SYMBOL_USE_LOCATIONS empty for the affected file, so every
+        // HOVER fell through to the fallback compile_all and (because
+        // the same crash re-ran) still returned an empty body.
+        hover_inside_if_expression_body_should_work_after_isolated_compile() is
+            @test()
+
+            let fixture_path = make_isolated_fixture_path();
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit(fixture_path, FIXTURE_SOURCE);
+            let _edit_diag = analyser.read_response();
+            let _edit_done = analyser.read_response();
+
+            analyser.send_compile();
+            let _compile_diag = analyser.read_response();
+            let _compile_done = analyser.read_response();
+
+            // Line 4, column 10: the `n` in `elif n > 0 then`.
+            // Inside an if-expression body (the body of `classify`'s
+            // arrow lambda), referencing the lambda's parameter.
+            analyser.send_hover(fixture_path, 4, 10);
+            let hover = analyser.read_query_response();
+            Assert.are_equal("HOVER", hover.header);
+
+            let lines = LIST[string](hover.lines);
+            Assert.is_true(
+                lines.count > 0 /\ lines[0].length > 0,
+                "HOVER on `n` inside if-expression body returned empty — the rewrite-syntax-trees crash may have re-emerged.\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.is_true(
+                lines[0].contains("n: Ghul.int"),
+                "HOVER on `n` expected to mention the parameter type, got '{lines[0]}'.\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+    si
+si
