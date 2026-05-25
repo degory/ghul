@@ -116,6 +116,48 @@ namespace Semantic.Symbols is
         si
 
         yield_labels: Collections.Iterable[STATE_LABEL] => _yield_labels;
+
+        // For a generic generator, install gen_type_override on
+        // each of the function's type-parameter symbols so that any
+        // remaining function-T references inside MoveNext's body
+        // (built by compile-expressions before the frame's class-T
+        // existed) render as `!N` (class-level) rather than `!!N`
+        // (method-level — MoveNext has no method-level T of its own).
+        // Field/ctor argument types are already class-T-typed via
+        // the substitution in STATE_MACHINE_FRAME.declare(); this
+        // override catches IR.Values whose function-T types were
+        // baked in during compile-expressions (e.g. callvirt owner
+        // types on the for-each iterator dispatch).
+        install_body_emission_overrides() is
+            if !function? \/ !function.generic_argument_names? then
+                return;
+            fi
+
+            let i mut = 0;
+            for name in function.generic_argument_names do
+                let arg = function.find_direct(name);
+                if arg? then
+                    let index = i;
+                    arg.gen_type_override((s, buffer) is
+                        buffer.append("!{index} ");
+                    si);
+                fi
+                i = i + 1;
+            od
+        si
+
+        uninstall_body_emission_overrides() is
+            if !function? \/ !function.generic_argument_names? then
+                return;
+            fi
+
+            for name in function.generic_argument_names do
+                let arg = function.find_direct(name);
+                if arg? then
+                    arg.gen_type_override(null);
+                fi
+            od
+        si
     si
 
     // Synthesised class that holds a generator's state machine. One
@@ -152,6 +194,13 @@ namespace Semantic.Symbols is
 
         owning_function: Function => _owning_function;
         element_type: Type => _element_type;
+
+        // The element type rewritten into the frame class's scope —
+        // for use when hand-emitting IL strings that reference the
+        // element type inside the class body (e.g. accessor method
+        // signatures). Renders as `!N` (class-level) for a generic
+        // generator, same as `_element_type` for a non-generic one.
+        class_element_type: Type => _class_relative(_element_type);
         state_field: Field => _state_field;
         current_field: Field => _current_field;
         outer_self_field: Field => _outer_self_field;
@@ -225,6 +274,16 @@ namespace Semantic.Symbols is
         // counter keeps the IL diff easy to read).
         _next_local_id: int;
 
+        // Substitution map keyed on the function's generic-argument
+        // names; values are the class-level CLASSY_GENERIC_ARGUMENT
+        // types for the frame. Used to specialize body/field/ctor
+        // types so they reference the frame's own T instead of the
+        // function's T — matches the shape of user-defined generic
+        // classes (where field types use class-T as `!N`).
+        _function_to_class_type_map: Collections.MAP[string, Type];
+
+        function_to_class_type_map: Collections.Map[string, Type] => _function_to_class_type_map;
+
         // Declare the frame's members lazily — called by IL emission.
         // Fields and constructor get real Symbol entities so reference
         // emission (ldfld, stfld, newobj) routes through the existing
@@ -236,6 +295,31 @@ namespace Semantic.Symbols is
                 return;
             fi
 
+            let listener_for_types = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            // Generic generator: declare a class-level type-parameter
+            // on the frame for each of the function's type-parameters,
+            // and build a substitution map so the body's function-T
+            // types (FUNCTION_GENERIC_ARGUMENT, renders `!!N`) can be
+            // specialized to the frame's class-T (CLASSY_GENERIC_
+            // ARGUMENT, renders `!N`) when used as field / ctor /
+            // local types. Mirrors the natural shape of user-defined
+            // generic classes — Box[T]'s ctor argument is typed `T`
+            // (the class's T), not bound to any outer scope.
+            _function_to_class_type_map = Collections.MAP[string, Type]();
+
+            if _owning_function.is_generic /\ _owning_function.generic_argument_names? then
+                let names = _owning_function.generic_argument_names;
+                argument_names = names;
+                let i mut = 0;
+
+                for name in names do
+                    let class_type_arg = declare_type(LOCATION.internal, name, i, listener_for_types);
+                    _function_to_class_type_map[name] = cast Types.Typed(class_type_arg).type;
+                    i = i + 1;
+                od
+            fi
+
             let listener = IoC.CONTAINER.instance.symbol_definition_locations;
 
             let int_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type();
@@ -245,7 +329,7 @@ namespace Semantic.Symbols is
             declare(LOCATION.internal, _state_field, listener);
 
             _current_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_current");
-            _current_field.set_type(_element_type);
+            _current_field.set_type(_class_relative(_element_type));
             declare(LOCATION.internal, _current_field, listener);
 
             // Per-argument fields. The owning function's LOCAL_ARGUMENT
@@ -283,8 +367,10 @@ namespace Semantic.Symbols is
                         continue;
                     fi
 
+                    let arg_field_type = _class_relative(local.type);
+
                     let arg_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_arg_{arg_name}");
-                    arg_field.set_type(local.type);
+                    arg_field.set_type(arg_field_type);
                     declare(LOCATION.internal, arg_field, listener);
 
                     _argument_fields.add(arg_field);
@@ -292,7 +378,7 @@ namespace Semantic.Symbols is
                     local.state_machine_field = arg_field;
 
                     ctor_argument_names.add(arg_name);
-                    ctor_argument_types.add(local.type);
+                    ctor_argument_types.add(arg_field_type);
                 od
             fi
 
@@ -313,11 +399,16 @@ namespace Semantic.Symbols is
             //     the returned state machine.
             //   - Iterator[T] so the state machine can itself
             //     answer MoveNext / get_Current / Dispose / Reset.
+            //
+            // The interface arguments use the class's own T
+            // (via _class_relative) so the implements clause emits
+            // `IEnumerable<!N>` rather than `IEnumerable<!!N>`.
             let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let class_relative_element = _class_relative(_element_type);
 
             add_ancestor(lookup.get_object_type());
-            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterable_type(), _element_type));
-            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterator_type(), _element_type));
+            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterable_type(), class_relative_element));
+            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterator_type(), class_relative_element));
         si
 
         _construct_specialised(unspecialized: Type, type_arg: Type) -> Type is
@@ -351,7 +442,7 @@ namespace Semantic.Symbols is
             let listener = IoC.CONTAINER.instance.symbol_definition_locations;
 
             let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_local_{local.name}_{id}");
-            `field.set_type(local.storage_type);
+            `field.set_type(_class_relative(local.storage_type));
             declare(LOCATION.internal, `field, listener);
 
             _local_fields.add(`field);
@@ -359,6 +450,26 @@ namespace Semantic.Symbols is
             local.state_machine_field = `field;
 
             return `field;
+        si
+
+        // Populate this Classy's argument_names so the emitted
+        // class header is generic in the named type-parameters.
+        // Mirrors `Classy.FRAME.set_type_arguments` — placed here
+        // directly because Classy doesn't define one at the base
+        // level (only FRAME does).
+        populate_argument_names(arguments: Collections.Iterable[Symbol]) is
+            argument_names = arguments | .map(a => a.name) .collect();
+        si
+
+        // Declare a class-level generic type-parameter on the frame.
+        // CLASS/TRAIT/STRUCT each define their own declare_type;
+        // Classy at the base level falls through to declare_undefined
+        // ("cannot declare type here"). Mirror the CLASS shape so
+        // generic generators can install their type parameters.
+        declare_type(location: LOCATION, name: string, index: int, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.CLASSY_GENERIC_ARGUMENT(location, self, name, index);
+            declare(location, result, symbol_definition_listener);
+            return result;
         si
 
         // Declare an anonymous frame field — used by code paths that
@@ -373,12 +484,32 @@ namespace Semantic.Symbols is
             let listener = IoC.CONTAINER.instance.symbol_definition_locations;
 
             let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_{prefix}_{id}");
-            `field.set_type(type);
+            `field.set_type(_class_relative(type));
             declare(LOCATION.internal, `field, listener);
 
             _local_fields.add(`field);
 
             return `field;
+        si
+
+        // Rewrite a type from the function's generic-parameter scope
+        // into the frame class's scope. For a non-generic generator
+        // this is a no-op; for a generic generator each FUNCTION_
+        // GENERIC_ARGUMENT referenced inside `t` becomes the parallel
+        // CLASSY_GENERIC_ARGUMENT declared on the frame, so the
+        // field/ctor/local types emit `!N` (class level) rather than
+        // `!!N` (method level) — matching the shape of user-defined
+        // generic classes.
+        _class_relative(t: Type) -> Type is
+            if !t? then
+                return t;
+            fi
+
+            if !_function_to_class_type_map? \/ _function_to_class_type_map.count == 0 then
+                return t;
+            fi
+
+            return t.specialize(_function_to_class_type_map);
         si
 
         gen_access(buffer: StringBuilder) is
