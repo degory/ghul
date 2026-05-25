@@ -1,0 +1,421 @@
+namespace Semantic is
+    use Source;
+    use Logging;
+    use Trees = Syntax.Trees;
+
+    // Rewrites a generator-function body into a list of state-handler
+    // lambdas + a final `Ghul.Generators._gen_pipe(states)` return.
+    // Invoked by DESUGAR_YIELD on every function whose
+    // `is_generator_function` flag is true.
+    //
+    // Algorithm (v1 — linear yields only):
+    //   1. Split body.statements at the first state-affecting
+    //      statement (yield, return). Everything before is "prelude"
+    //      — it stays at function scope and runs once when the
+    //      generator is constructed. Function-scope `let`s captured
+    //      by state lambdas get the usual BOX[T] treatment from the
+    //      `mark-boxed-locals` pass.
+    //   2. From the first yield onwards, walk statements slicing on
+    //      every yield or return:
+    //        `yield X;`    → close state with `return _GEN_STEP[T](YIELD, X, next_idx);`
+    //                        start a fresh state for what follows.
+    //        `return;`     → close state with `return _GEN_STEP[T]();` (DONE).
+    //                        Subsequent statements are dead — they
+    //                        still slot into the next state, but the
+    //                        state machine reaches DONE before
+    //                        executing them.
+    //        `return X;`   → diagnostic; generators emit via yield.
+    //        anything else → append to current state's body.
+    //   3. Close the trailing state with DONE.
+    //   4. Replace body with:
+    //        <prelude>
+    //        let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
+    //        __gen_states.add(state_0_lambda);
+    //        ...
+    //        return Ghul.Generators._gen_pipe(__gen_states);
+    //
+    // Not handled in v1 (will be added later):
+    //   - control flow (if/while/for/break/continue with yields inside)
+    //   - try/catch across yields
+    //   - yield inside nested lambdas
+    //
+    // See `docs/claude/generators-yield.md`.
+    class GENERATOR_REWRITER is
+        _logger: Logger;
+        _t: Trees.TypeExpressions.TypeExpression;
+
+        _states: Collections.LIST[Trees.Expressions.Expression];
+        _current_body: Collections.LIST[Trees.Statements.Statement];
+
+        init(logger: Logger, t: Trees.TypeExpressions.TypeExpression) is
+            _logger = logger;
+            _t = t;
+            _states = Collections.LIST[Trees.Expressions.Expression]();
+            _current_body = Collections.LIST[Trees.Statements.Statement]();
+        si
+
+        // Rewrite the body in place. Returns silently — the only
+        // side effect is `body.replace_all(...)` with the new
+        // statement sequence.
+        rewrite(body: Trees.Statements.LIST) is
+            assert body? else "body cannot be null";
+
+            let original = Collections.LIST[Trees.Statements.Statement]();
+            for s in body do
+                original.add(s);
+            od
+
+            let prelude = Collections.LIST[Trees.Statements.Statement]();
+            let split_index = _find_first_state_affecting(original);
+
+            // Statements before any yield/return stay at function
+            // scope. State lambdas close over their locals via the
+            // normal capture path (with BOX[T] applied as needed).
+            let i mut = 0;
+            while i < split_index do
+                prelude.add(original[i]);
+                i = i + 1;
+            od
+
+            // Statements from the first yield onwards slice into states.
+            while i < original.count do
+                _process_statement(original[i]);
+                i = i + 1;
+            od
+
+            // Close trailing state with DONE.
+            _close_state_with_done(body.location);
+
+            // Build the new body: prelude + state list construction
+            // + _gen_pipe(states) return.
+            let new_statements = Collections.LIST[Trees.Statements.Statement]();
+
+            for s in prelude do
+                new_statements.add(s);
+            od
+
+            let internal_loc = LOCATION.internal;
+            let loc = body.location;
+
+            // let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
+            let states_decl = _build_states_declaration(loc, internal_loc);
+            new_statements.add(states_decl);
+
+            // __gen_states.add(state_K_lambda);  for each state K.
+            let k mut = 0;
+            while k < _states.count do
+                new_statements.add(_build_states_add_call(loc, internal_loc, _states[k]));
+                k = k + 1;
+            od
+
+            // return Ghul.Generators._gen_pipe(__gen_states);
+            new_statements.add(_build_gen_pipe_return(loc, internal_loc));
+
+            body.replace_all(new_statements);
+        si
+
+        // ---- statement processing ----
+
+        _process_statement(s: Trees.Statements.Statement) is
+            if isa Trees.Statements.YIELD(s) then
+                _process_yield(cast Trees.Statements.YIELD(s));
+            elif isa Trees.Statements.RETURN(s) then
+                _process_return(cast Trees.Statements.RETURN(s));
+            else
+                _current_body.add(s);
+            fi
+        si
+
+        _process_yield(y: Trees.Statements.YIELD) is
+            let loc = y.location;
+            // Next state's index is the count after we close this one.
+            let next_idx = _states.count + 1;
+            let yield_expr =
+                GEN_STEP_CONVERSION.build_yield(
+                    loc, _t.copy(), y.expression, next_idx
+                );
+            _current_body.add(Trees.Statements.RETURN(loc, yield_expr));
+            _close_current_state(loc);
+        si
+
+        _process_return(r: Trees.Statements.RETURN) is
+            if r.expression? then
+                _logger.error(
+                    r.location,
+                    "return with a value is not allowed in a generator function — use `yield` to emit values"
+                );
+                return;
+            fi
+            let loc = r.location;
+            let done_expr = GEN_STEP_CONVERSION.build_done(loc, _t.copy());
+            _current_body.add(Trees.Statements.RETURN(loc, done_expr));
+            _close_current_state(loc);
+        si
+
+        // ---- state-list management ----
+
+        _find_first_state_affecting(stmts: Collections.LIST[Trees.Statements.Statement]) -> int is
+            let i mut = 0;
+            while i < stmts.count do
+                let s = stmts[i];
+                if isa Trees.Statements.YIELD(s) \/ isa Trees.Statements.RETURN(s) then
+                    return i;
+                fi
+                i = i + 1;
+            od
+            return stmts.count;
+        si
+
+        _close_current_state(loc: LOCATION) is
+            let lambda = _build_state_lambda(loc, _current_body);
+            _states.add(lambda);
+            _current_body = Collections.LIST[Trees.Statements.Statement]();
+        si
+
+        _close_state_with_done(loc: LOCATION) is
+            let done_expr = GEN_STEP_CONVERSION.build_done(loc, _t.copy());
+            _current_body.add(Trees.Statements.RETURN(loc, done_expr));
+            _close_current_state(loc);
+        si
+
+        // ---- AST builders ----
+
+        // `() -> _GEN_STEP[T] is <body> si` lambda.
+        _build_state_lambda(
+            loc: LOCATION,
+            body_statements: Collections.LIST[Trees.Statements.Statement]
+        ) -> Trees.Expressions.Expression is
+            let internal_loc = LOCATION.internal;
+
+            let body_list = Trees.Statements.LIST(loc, body_statements);
+            let body_block = Trees.Bodies.BLOCK(loc, body_list);
+
+            let arg_list =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]()
+                );
+
+            // Return type: Ghul.Generators._GEN_STEP[T] — match the
+            // helper class. Built as a GENERIC type-expression on
+            // the qualified name.
+            let gen_step_id =
+                Trees.Identifiers.QUALIFIED(
+                    internal_loc,
+                    Trees.Identifiers.QUALIFIED(
+                        internal_loc,
+                        Trees.Identifiers.Identifier(internal_loc, "Ghul"),
+                        "Generators",
+                        internal_loc,
+                        internal_loc
+                    ),
+                    "_GEN_STEP",
+                    internal_loc,
+                    internal_loc
+                );
+            let type_args =
+                Trees.TypeExpressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.TypeExpressions.TypeExpression]([_t.copy()]: Trees.TypeExpressions.TypeExpression)
+                );
+            let return_type =
+                Trees.TypeExpressions.GENERIC(loc, gen_step_id, type_args);
+
+            return
+                Trees.Expressions.FUNCTION(
+                    loc,
+                    arg_list,
+                    return_type,
+                    body_block,
+                    false
+                );
+        si
+
+        // `let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();`
+        _build_states_declaration(
+            loc: LOCATION,
+            internal_loc: LOCATION
+        ) -> Trees.Statements.Statement is
+            // Element type: `() -> _GEN_STEP[T]` function-type expression.
+            let element_type = _build_state_function_type(loc, internal_loc);
+
+            // Generic type: `Collections.LIST[<element_type>]`.
+            let collections_id =
+                Trees.Identifiers.Identifier(internal_loc, "Collections");
+            let list_qualified =
+                Trees.Identifiers.QUALIFIED(
+                    internal_loc,
+                    collections_id,
+                    "LIST",
+                    internal_loc,
+                    internal_loc
+                );
+            let list_type_args =
+                Trees.TypeExpressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.TypeExpressions.TypeExpression]([element_type]: Trees.TypeExpressions.TypeExpression)
+                );
+            let list_type =
+                Trees.TypeExpressions.GENERIC(loc, list_qualified, list_type_args);
+
+            // Constructor call: `Collections.LIST[() -> _GEN_STEP[T]]()`.
+            // CALL on the type expression treated as a callable —
+            // ghūl uses TYPE_EXPRESSION_CALL for this pattern. Look
+            // at how Collections.LIST[int]() is built elsewhere.
+            // For now we build a GENERIC_APPLICATION + CALL chain
+            // mirroring how the type-as-constructor pattern is
+            // emitted by the parser for `T[U]()` source.
+            let list_ctor_callable =
+                _build_list_constructor_callable(loc, internal_loc, element_type);
+
+            let ctor_args =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]()
+                );
+            let ctor_call =
+                Trees.Expressions.CALL(loc, list_ctor_callable, ctor_args);
+
+            // `let __gen_states = <ctor_call>;`
+            let var_id =
+                Trees.Identifiers.Identifier(internal_loc, "__gen_states");
+            return _build_let(loc, var_id, ctor_call);
+        si
+
+        // `Collections.LIST[() -> _GEN_STEP[T]]` as a callable.
+        _build_list_constructor_callable(
+            loc: LOCATION,
+            internal_loc: LOCATION,
+            element_type: Trees.TypeExpressions.TypeExpression
+        ) -> Trees.Expressions.Expression is
+            let collections_id =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    Trees.Identifiers.Identifier(internal_loc, "Collections")
+                );
+
+            let type_args =
+                Trees.TypeExpressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.TypeExpressions.TypeExpression]([element_type.copy()]: Trees.TypeExpressions.TypeExpression)
+                );
+
+            return
+                Trees.Expressions.GENERIC_APPLICATION(
+                    loc,
+                    collections_id,
+                    Trees.Identifiers.Identifier(internal_loc, "LIST"),
+                    type_args
+                );
+        si
+
+        // `() -> _GEN_STEP[T]` function-type expression.
+        _build_state_function_type(
+            loc: LOCATION,
+            internal_loc: LOCATION
+        ) -> Trees.TypeExpressions.TypeExpression is
+            let gen_step_id =
+                Trees.Identifiers.QUALIFIED(
+                    internal_loc,
+                    Trees.Identifiers.QUALIFIED(
+                        internal_loc,
+                        Trees.Identifiers.Identifier(internal_loc, "Ghul"),
+                        "Generators",
+                        internal_loc,
+                        internal_loc
+                    ),
+                    "_GEN_STEP",
+                    internal_loc,
+                    internal_loc
+                );
+            let gen_step_type_args =
+                Trees.TypeExpressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.TypeExpressions.TypeExpression]([_t.copy()]: Trees.TypeExpressions.TypeExpression)
+                );
+            let gen_step_type =
+                Trees.TypeExpressions.GENERIC(loc, gen_step_id, gen_step_type_args);
+
+            let empty_args =
+                Trees.TypeExpressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.TypeExpressions.TypeExpression]()
+                );
+
+            return Trees.TypeExpressions.FUNCTION(loc, empty_args, gen_step_type);
+        si
+
+        // `__gen_states.add(<state_lambda>);`
+        _build_states_add_call(
+            loc: LOCATION,
+            internal_loc: LOCATION,
+            state_lambda: Trees.Expressions.Expression
+        ) -> Trees.Statements.Statement is
+            let states_id =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    Trees.Identifiers.Identifier(internal_loc, "__gen_states")
+                );
+            let add_member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    states_id,
+                    Trees.Identifiers.Identifier(internal_loc, "add"),
+                    loc
+                );
+            let args =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]([state_lambda]: Trees.Expressions.Expression)
+                );
+            let call = Trees.Expressions.CALL(loc, add_member, args);
+            return Trees.Statements.EXPRESSION(loc, call);
+        si
+
+        // `return Ghul.Generators._gen_pipe(__gen_states);`
+        _build_gen_pipe_return(
+            loc: LOCATION,
+            internal_loc: LOCATION
+        ) -> Trees.Statements.Statement is
+            let gen_pipe_member =
+                GEN_STEP_CONVERSION.build_ghul_generators_member(loc, "_gen_pipe");
+            let states_id =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    Trees.Identifiers.Identifier(internal_loc, "__gen_states")
+                );
+            let args =
+                Trees.Expressions.LIST(
+                    loc,
+                    Collections.LIST[Trees.Expressions.Expression]([states_id]: Trees.Expressions.Expression)
+                );
+            let call = Trees.Expressions.CALL(loc, gen_pipe_member, args);
+            return Trees.Statements.RETURN(loc, call);
+        si
+
+        // `let <var> = <value>;` statement — immutable binding.
+        _build_let(
+            loc: LOCATION,
+            var_id: Trees.Identifiers.Identifier,
+            value: Trees.Expressions.Expression
+        ) -> Trees.Statements.Statement is
+            let variable =
+                Trees.Variables.VARIABLE(
+                    loc,
+                    var_id,
+                    Trees.TypeExpressions.INFER(loc),
+                    false,
+                    false,
+                    value
+                );
+            let variable_list =
+                Trees.Variables.LIST(
+                    loc,
+                    Collections.LIST[Trees.Variables.VARIABLE](
+                        [variable]: Trees.Variables.VARIABLE
+                    )
+                );
+            return Trees.Statements.LET(loc, false, variable_list);
+        si
+    si
+si
