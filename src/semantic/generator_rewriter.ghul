@@ -46,9 +46,9 @@ namespace Semantic is
     //   3. Close trailing state with DONE.
     //   4. Replace body with:
     //        <prelude>
-    //        let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
-    //        __gen_states.add(state_0); __gen_states.add(state_1); ...
-    //        return Ghul.Generators._gen_pipe(__gen_states);
+    //        let $gen_states = Collections.LIST[() -> _GEN_STEP[T]]();
+    //        $gen_states.add(state_0); $gen_states.add(state_1); ...
+    //        return Ghul.Generators._gen_pipe($gen_states);
     //
     // State-index allocation. States receive indices via
     // `_allocate_state()` in dependency order (a TRANSITION must
@@ -80,13 +80,13 @@ namespace Semantic is
 
         // Extra statements that need to live at function scope
         // alongside the user-written prelude — currently used for
-        // `let __iter_N = xs.iterator;` injected when expanding a
+        // `let $iter_N = xs.iterator;` injected when expanding a
         // state-splitting `for x in xs do BODY od`. Appended after
         // the user-written prelude and before the state-list
         // construction.
         _extra_prelude: Collections.LIST[Trees.Statements.Statement];
 
-        // Counter for synthesised names (__iter_N, etc).
+        // Counter for synthesised names ($iter_N, etc).
         _synth_counter: int;
 
         init(logger: Logger, t: Trees.TypeExpressions.TypeExpression) is
@@ -427,19 +427,94 @@ namespace Semantic is
                 return;
             fi
 
-            // for-each with yields inside isn't supported by the
-            // rewriter yet — the loop variable's element type isn't
-            // available at this pass, so we can't safely hoist it
-            // to function scope (needed for cross-state visibility
-            // after a yield). Workaround: write the equivalent
-            // explicit while-loop.
-            _logger.error(
-                for_stmt.location,
-                "for-each with `yield` inside the body is not supported yet — rewrite as `let __iter = xs.iterator; while __iter.move_next() do let x = __iter.current; ... od`"
+            let loc = for_stmt.location;
+            let internal_loc = LOCATION.internal;
+
+            // Synthesise a unique iterator variable name. The iter
+            // declaration is hoisted to function scope so every
+            // state lambda captures the same iterator instance.
+            _synth_counter = _synth_counter + 1;
+            let iter_name = "$iter_{_synth_counter}";
+            let iter_id =
+                Trees.Identifiers.Identifier(internal_loc, iter_name);
+
+            // let $iter_N = xs.iterator;
+            let xs_iterator_expr =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    for_stmt.expression,
+                    Trees.Identifiers.Identifier(internal_loc, "iterator"),
+                    loc
+                );
+            _extra_prelude.add(_build_let(loc, iter_id, xs_iterator_expr));
+
+            // The for-loop variable is hoisted to function scope so
+            // every state lambda inside the loop body can read it
+            // across yield-induced state transitions. mark-boxed-
+            // locals promotes it to Ghul.BOX[T] when captured. The
+            // initial value is `INTERNAL_DEFAULT_OF_ITERABLE_ELEMENT`
+            // — compile-expressions lowers it to `default(T)` where
+            // T is `xs`'s element type. The value is overwritten in
+            // the iteration prologue (an assignment from
+            // `$iter_N.current`) before any user code reads it.
+            let placeholder_init =
+                Trees.Expressions.INTERNAL_DEFAULT_OF_ITERABLE_ELEMENT(
+                    loc, for_stmt.expression
+                );
+            _extra_prelude.add(
+                _build_let_mut(loc, for_stmt.variable.name, placeholder_init)
             );
-            // Still slot a placeholder state so subsequent code
-            // doesn't read uninitialised state indices.
-            _current_body.add(for_stmt);
+
+            // condition: $iter_N.move_next()
+            let iter_ref =
+                Trees.Expressions.IDENTIFIER(loc, iter_id);
+            let move_next_member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    iter_ref,
+                    Trees.Identifiers.Identifier(internal_loc, "move_next"),
+                    loc
+                );
+            let condition =
+                Trees.Expressions.CALL(
+                    loc,
+                    move_next_member,
+                    Trees.Expressions.LIST(
+                        loc,
+                        Collections.LIST[Trees.Expressions.Expression]()
+                    )
+                );
+
+            // body prefix: <var> = $iter_N.current;
+            let iter_ref_2 = Trees.Expressions.IDENTIFIER(loc, iter_id);
+            let current_member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    iter_ref_2,
+                    Trees.Identifiers.Identifier(internal_loc, "current"),
+                    loc
+                );
+            let var_ref =
+                Trees.Expressions.IDENTIFIER(loc, for_stmt.variable.name);
+            let assign_left =
+                Trees.Expressions.SIMPLE_LEFT_EXPRESSION(loc, var_ref);
+            let assign_var =
+                Trees.Statements.ASSIGNMENT(loc, assign_left, current_member);
+
+            let new_body_statements =
+                Collections.LIST[Trees.Statements.Statement]();
+            new_body_statements.add(assign_var);
+            if for_stmt.body? then
+                for s in for_stmt.body do
+                    new_body_statements.add(s);
+                od
+            fi
+            let new_body =
+                Trees.Statements.LIST(loc, new_body_statements);
+
+            // Equivalent while-loop; process via existing _process_do.
+            let do_stmt = Trees.Statements.DO(loc, condition, new_body);
+            _process_do(do_stmt);
         si
 
         _process_break(b: Trees.Statements.BREAK) is
@@ -661,7 +736,7 @@ namespace Semantic is
                 );
         si
 
-        // `let __gen_states = Collections.LIST[() -> _GEN_STEP[T]]();`
+        // `let $gen_states = Collections.LIST[() -> _GEN_STEP[T]]();`
         _build_states_declaration(
             loc: LOCATION,
             internal_loc: LOCATION
@@ -680,7 +755,7 @@ namespace Semantic is
                 Trees.Expressions.CALL(loc, list_ctor_callable, ctor_args);
 
             let var_id =
-                Trees.Identifiers.Identifier(internal_loc, "__gen_states");
+                Trees.Identifiers.Identifier(internal_loc, "$gen_states");
             return _build_let(loc, var_id, ctor_call);
         si
 
@@ -753,7 +828,7 @@ namespace Semantic is
             let states_id =
                 Trees.Expressions.IDENTIFIER(
                     loc,
-                    Trees.Identifiers.Identifier(internal_loc, "__gen_states")
+                    Trees.Identifiers.Identifier(internal_loc, "$gen_states")
                 );
             let add_member =
                 Trees.Expressions.MEMBER(
@@ -780,7 +855,7 @@ namespace Semantic is
             let states_id =
                 Trees.Expressions.IDENTIFIER(
                     loc,
-                    Trees.Identifiers.Identifier(internal_loc, "__gen_states")
+                    Trees.Identifiers.Identifier(internal_loc, "$gen_states")
                 );
             let args =
                 Trees.Expressions.LIST(
