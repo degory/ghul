@@ -1,0 +1,520 @@
+namespace Analysis.Soak is
+    use System.Exception;
+
+    use Collections.LIST;
+    use Collections.Iterable;
+
+    use IO.Std;
+    use IO.File;
+    use IO.Path;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.RESPONSE;
+
+    // Configuration for one soak run.
+    class CONFIG is
+        corpus_dir: string public;
+        seed: int public;
+        iterations: int public;             // 0 = no limit (run forever / until duration / Ctrl-C)
+        duration_seconds: int public;       // 0 = no limit
+        read_timeout_ms: int public;
+        edit_mode: string public;           // whitespace | noise | all
+        compile_every: int public;          // send #COMPILE# every N iterations (0 = never)
+        heapcheck_every: int public;        // send #HEAPCHECK# every N iterations (0 = never)
+        stress_position_chance: int public; // 1-in-N iterations use a random out-of-bounds position
+        progress_every: int public;
+        out_path: string public;
+        exit_on_failure: bool public;       // stop the soak the first time a hang / death / exception lands
+
+        init() is
+            corpus_dir = "";
+            seed = 0;
+            iterations = 0;
+            duration_seconds = 0;
+            read_timeout_ms = 30000;
+            edit_mode = "whitespace";
+            compile_every = 50;
+            heapcheck_every = 200;
+            stress_position_chance = 10;
+            progress_every = 100;
+            out_path = "";
+            exit_on_failure = false;
+        si
+    si
+
+    // Names of every query command the analyser exposes. The soak loop
+    // selects one at random for each query-phase iteration.
+    QUERIES: LIST[string] => LIST[string]([
+        "HOVER",
+        "DEFINITION",
+        "DECLARATION",
+        "IMPLEMENTATION",
+        "TYPEDEFINITION",
+        "REFERENCES",
+        "COMPLETE",
+        "SIGNATURE",
+        "HOVERMAP",
+        "SEMANTICTOKENS",
+        "SYMBOLS",
+        "RENAMEREQUEST"
+    ]);
+
+    class SOAK_RUN is
+        _config: CONFIG;
+        _corpus: CORPUS;
+        _rng: System.Random;
+        _perturber: PERTURBER;
+        _analyser: ANALYSER_PROCESS?;
+        _stats: STATS;
+        _anomalies: ANOMALIES;
+
+        _started: System.DateTime;
+        _iteration: int;
+        _respawns: int;
+        _compiler_version: string;
+
+        init(config: CONFIG, corpus: CORPUS) is
+            _config = config;
+            _corpus = corpus;
+            _rng = System.Random(config.seed);
+            _perturber = PERTURBER(_rng, config.edit_mode);
+            _stats = STATS();
+            _anomalies = ANOMALIES();
+            _iteration = 0;
+            _respawns = 0;
+            _compiler_version = "unknown";
+        si
+
+        stats: STATS => _stats;
+        anomalies: ANOMALIES => _anomalies;
+        iterations_completed: int => _iteration;
+        respawns: int => _respawns;
+        compiler_version: string => _compiler_version;
+
+        execute() is
+            _started = System.DateTime.now;
+
+            _spawn_analyser();
+
+            _log("cold initial EDIT — {_corpus.file_count} files, {_corpus.total_lines} lines");
+            _cold_edit();
+
+            _log("starting soak loop: edit-mode={_config.edit_mode}, seed={_config.seed}, read-timeout={_config.read_timeout_ms}ms");
+
+            do
+                _iteration = _iteration + 1;
+
+                if _is_done() then
+                    break;
+                fi
+
+                _one_iteration();
+
+                if _iteration % _config.progress_every == 0 then
+                    _log_progress();
+                fi
+
+                if _config.exit_on_failure /\ _anomalies.has_serious_failure then
+                    _log("exit-on-failure: stopping after {_iteration} iterations");
+                    break;
+                fi
+            od
+
+            _log_progress();
+            _log("done: {_iteration} iterations, {_respawns} respawns, {_anomalies.count} anomalies");
+
+            let a = _analyser;
+            if a? then
+                try
+                    a.dispose();
+                catch ex: Exception
+                yrt
+            fi
+        si
+
+        _is_done() -> bool is
+            if _config.iterations > 0 /\ _iteration > _config.iterations then
+                return true;
+            fi
+
+            if _config.duration_seconds > 0 then
+                let elapsed = System.DateTime.now.subtract(_started).total_seconds;
+                if elapsed >= cast double(_config.duration_seconds) then
+                    return true;
+                fi
+            fi
+
+            return false;
+        si
+
+        // One iteration: perturb a random file, send EDIT, then send a random
+        // query at a random position. Periodic COMPILE / HEAPCHECK on the
+        // configured cadence.
+        _one_iteration() is
+            _do_random_edit();
+
+            // If the analyser died/hung during EDIT we'll already have
+            // respawned and re-cold-edited; skip the query so the next
+            // iteration starts fresh.
+            if _analyser? then
+                _do_random_query();
+            fi
+
+            if _config.compile_every > 0 /\ _iteration % _config.compile_every == 0 /\ _analyser? then
+                _do_compile();
+            fi
+
+            if _config.heapcheck_every > 0 /\ _iteration % _config.heapcheck_every == 0 /\ _analyser? then
+                _do_heap_check();
+            fi
+        si
+
+        _do_random_edit() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let path = _corpus.random_path(_rng);
+            let before = _corpus.current(path);
+            let after = _perturber.perturb(before);
+
+            if !after? then
+                return;   // perturber found no suitable site; skip this EDIT
+            fi
+
+            _corpus.set_current(path, after);
+
+            let started = System.DateTime.now;
+
+            try
+                a.send_edit(path, after);
+            catch ex: Exception
+                _record_anomaly("exception", "send_edit failed: {ex.message}", path, "");
+                _respawn_analyser();
+                return;
+            yrt
+
+            // Two frames: DIAGNOSTICS + PARTIAL DONE.
+            let diagnostics = _read_with_timeout("EDIT (diagnostics)", path, "");
+            if !diagnostics? then
+                _respawn_analyser();
+                return;
+            fi
+
+            let done = _read_with_timeout("EDIT (done)", path, "");
+            if !done? then
+                _respawn_analyser();
+                return;
+            fi
+
+            if done.header !~ "PARTIAL DONE" /\ done.header !~ "FULL DONE" then
+                _record_anomaly(
+                    "unexpected-header",
+                    "EDIT done frame header was '{done.header}', expected PARTIAL DONE",
+                    path, ""
+                );
+            fi
+
+            _stats["EDIT — random single-file perturbation"].record(_elapsed_ms(started));
+        si
+
+        _do_random_query() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let path = _corpus.random_path(_rng);
+            let source = _corpus.current(path);
+            let kind = _pick_query_kind();
+
+            let line mut = 1;
+            let column mut = 1;
+
+            if _rng.next(_config.stress_position_chance) == 0 then
+                // Stress mode: random line/col, possibly out of bounds.
+                line = 1 + _rng.next(2000);
+                column = 1 + _rng.next(200);
+            else
+                let positions = QUERY_POSITIONS.scan(source);
+                let chosen = _sample_position(positions, kind);
+                if chosen? then
+                    line = chosen.line;
+                    column = chosen.column;
+                else
+                    line = 1 + _rng.next(50);
+                    column = 1 + _rng.next(40);
+                fi
+            fi
+
+            let position_string = "{line}:{column}";
+            let started = System.DateTime.now;
+
+            try
+                _send_query(a, kind, path, line, column);
+            catch ex: Exception
+                _record_anomaly("exception", "send {kind} failed: {ex.message}", path, position_string);
+                _respawn_analyser();
+                return;
+            yrt
+
+            let response = _read_query_with_timeout(kind, path, position_string);
+            if !response? then
+                _respawn_analyser();
+                return;
+            fi
+
+            // No specific header check here — the analyser uses command-
+            // specific headers (DEFINITION, HOVER, COMPLETE, etc.) and a
+            // legitimate empty result is fine. We're only checking the
+            // request didn't hang / crash / throw.
+
+            _stats["{kind} — query"].record(_elapsed_ms(started));
+        si
+
+        _pick_query_kind() -> string =>
+            QUERIES[_rng.next(QUERIES.count)];
+
+        _sample_position(positions: QUERY_POSITIONS, kind: string) -> POSITION? is
+            if kind =~ "COMPLETE" /\ positions.member_accesses.count > 0 then
+                return positions.member_accesses[_rng.next(positions.member_accesses.count)];
+            elif kind =~ "SIGNATURE" /\ positions.call_arguments.count > 0 then
+                return positions.call_arguments[_rng.next(positions.call_arguments.count)];
+            elif positions.identifiers.count > 0 then
+                return positions.identifiers[_rng.next(positions.identifiers.count)];
+            fi
+
+            return null;
+        si
+
+        // Dispatch a query to the right send_* method on the analyser. path-
+        // only commands ignore line/column.
+        _send_query(a: ANALYSER_PROCESS, kind: string, path: string, line: int, column: int) is
+            if kind =~ "HOVER" then
+                a.send_hover(path, line, column);
+            elif kind =~ "DEFINITION" then
+                a.send_definition(path, line, column);
+            elif kind =~ "DECLARATION" then
+                a.send_declaration(path, line, column);
+            elif kind =~ "IMPLEMENTATION" then
+                a.send_implementation(path, line, column);
+            elif kind =~ "TYPEDEFINITION" then
+                a.send_type_definition(path, line, column);
+            elif kind =~ "REFERENCES" then
+                a.send_references(path, line, column);
+            elif kind =~ "COMPLETE" then
+                a.send_completion(path, line, column);
+            elif kind =~ "SIGNATURE" then
+                a.send_signature(path, line, column);
+            elif kind =~ "HOVERMAP" then
+                a.send_hover_map(path);
+            elif kind =~ "SEMANTICTOKENS" then
+                a.send_semantic_tokens(path);
+            elif kind =~ "SYMBOLS" then
+                a.send_symbols(path);
+            elif kind =~ "RENAMEREQUEST" then
+                a.send_rename_request(path, line, column, "renamed_id_{_iteration}");
+            fi
+        si
+
+        _do_compile() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let started = System.DateTime.now;
+
+            try
+                a.send_compile();
+            catch ex: Exception
+                _record_anomaly("exception", "send_compile failed: {ex.message}", "", "");
+                _respawn_analyser();
+                return;
+            yrt
+
+            let diagnostics = _read_with_timeout("COMPILE (diagnostics)", "", "");
+            if !diagnostics? then
+                _respawn_analyser();
+                return;
+            fi
+
+            let done = _read_with_timeout("COMPILE (done)", "", "");
+            if !done? then
+                _respawn_analyser();
+                return;
+            fi
+
+            _stats["COMPILE — periodic"].record(_elapsed_ms(started));
+        si
+
+        _do_heap_check() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let started = System.DateTime.now;
+
+            try
+                a.send_heap_check();
+            catch ex: Exception
+                _record_anomaly("exception", "send_heap_check failed: {ex.message}", "", "");
+                _respawn_analyser();
+                return;
+            yrt
+
+            let response = _read_with_timeout("HEAPCHECK", "", "");
+            if !response? then
+                _respawn_analyser();
+                return;
+            fi
+
+            if response.header =~ "RESTART" then
+                _log("analyser asked to RESTART after #HEAPCHECK# — respawning");
+                _respawn_analyser();
+                return;
+            fi
+
+            _stats["HEAPCHECK — periodic"].record(_elapsed_ms(started));
+        si
+
+        // Read with a timeout — wraps ANALYSER_PROCESS.read_response in a
+        // Task and waits up to _config.read_timeout_ms. Returns null on
+        // timeout, after recording the anomaly. The caller treats a null
+        // result as a hang/death signal and respawns.
+        _read_with_timeout(label: string, path: string, position: string) -> RESPONSE? =>
+            _do_read_with_timeout(false, label, path, position);
+
+        _read_query_with_timeout(label: string, path: string, position: string) -> RESPONSE? =>
+            _do_read_with_timeout(true, label, path, position);
+
+        _do_read_with_timeout(is_query: bool, label: string, path: string, position: string) -> RESPONSE? is
+            if !_analyser? then
+                _record_anomaly("process-died", "{label} — no analyser", path, position);
+                return null;
+            fi
+
+            let timeout_ms = _config.read_timeout_ms;
+            let captured_is_query = is_query;
+
+            // The closure captures `self` (so `_analyser!` resolves at call
+            // time) plus the local `captured_is_query`. We use `_analyser!`
+            // — narrowed locals are unreliable through closure boundaries
+            // (project_nullable_dogfood_pass), and at this point we've
+            // verified _analyser is non-null.
+            let task = Tasks.TASK.run(
+                () -> RESPONSE is
+                    if captured_is_query then
+                        return _analyser!.read_query_response();
+                    fi
+                    return _analyser!.read_response();
+                si
+            );
+
+            if !task.wait(timeout_ms) then
+                _record_anomaly("hang", "{label} did not respond within {timeout_ms}ms", path, position);
+                return null;
+            fi
+
+            try
+                return task.result;
+            catch ex: Exception
+                let inner = ex.inner_exception;
+                let message = if inner? then inner!.message else ex.message fi;
+                _record_anomaly("process-died", "{label} read failed: {message}", path, position);
+                return null;
+            yrt
+        si
+
+        _cold_edit() is
+            let a = _analyser;
+            if !a? then
+                return;
+            fi
+
+            let started = System.DateTime.now;
+
+            try
+                a.send_edit_files(_corpus.cold_edit_files);
+            catch ex: Exception
+                _record_anomaly("exception", "cold send_edit_files failed: {ex.message}", "", "");
+                _respawn_analyser();
+                return;
+            yrt
+
+            let diagnostics = _read_with_timeout("cold EDIT (diagnostics)", "", "");
+            if !diagnostics? then
+                _respawn_analyser();
+                return;
+            fi
+
+            let done = _read_with_timeout("cold EDIT (done)", "", "");
+            if !done? then
+                _respawn_analyser();
+                return;
+            fi
+
+            _stats["EDIT — cold, whole project"].record(_elapsed_ms(started));
+        si
+
+        _spawn_analyser() is
+            let new_analyser = ANALYSER_PROCESS();
+            _analyser = new_analyser;
+
+            try
+                _compiler_version = new_analyser.await_compiler_version();
+                _log("analyser ready: ghūl compiler {_compiler_version}");
+            catch ex: Exception
+                _log("compiler version banner not seen: {ex.message}");
+            yrt
+        si
+
+        // Respawn after a hang / death — dispose the existing analyser, start
+        // a new one, and re-send the cold EDIT so subsequent perturbations
+        // are applied to a known state.
+        _respawn_analyser() is
+            let old = _analyser;
+            if old? then
+                try
+                    old.dispose();
+                catch ex: Exception
+                yrt
+                _analyser = null;
+            fi
+
+            _respawns = _respawns + 1;
+            _log("respawning analyser (#{_respawns}) — re-sending cold EDIT");
+
+            _spawn_analyser();
+
+            // Reset corpus state so the analyser's view matches the on-disk
+            // tree — otherwise the resumed soak would diverge cumulatively
+            // from the cold state we just sent.
+            for path in _corpus.paths do
+                _corpus.set_current(path, _corpus.initial(path));
+            od
+
+            _cold_edit();
+        si
+
+        _record_anomaly(kind: string, detail: string, path: string, position: string) is
+            _anomalies.record(_iteration, kind, detail, path, position);
+            _log("ANOMALY #{_anomalies.count} [{kind}] iter={_iteration}: {detail}");
+        si
+
+        _log_progress() is
+            let elapsed = System.DateTime.now.subtract(_started).total_seconds;
+            _log("iter={_iteration} elapsed={elapsed.to_string("F1")}s respawns={_respawns} anomalies={_anomalies.count}");
+        si
+
+        _elapsed_ms(started: System.DateTime) -> double static =>
+            System.DateTime.now.subtract(started).total_milliseconds;
+
+        _log(message: string) static is
+            Std.error.write_line("[soak] {message}");
+        si
+    si
+si
