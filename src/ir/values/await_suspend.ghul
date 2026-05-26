@@ -1,0 +1,157 @@
+namespace IR.Values is
+    use TypeTyped = Semantic.Types.Typed;
+    use Semantic.Types.Type;
+
+    // Per-`await` IL emission inside MoveNext. Stashes the awaiter
+    // to a frame field, IsCompleted-short-circuits when the awaited
+    // task is already done, otherwise records the state, calls
+    // `AwaitUnsafeOnCompleted` and `leave`s out of MoveNext. The
+    // entry-dispatch placeholder at the top of MoveNext routes
+    // re-entry back to `cold_resume_label`, where state is cleared
+    // and execution falls through to `hot_resume_label` to call
+    // `GetResult` and leave T on the stack (or stack-effect 0 for
+    // void-async).
+    //
+    // ghūl uses CLASS-based state machines (matches the generator
+    // shape) — `ldarg.0` is the SM instance and `ldarga.s 0` is the
+    // byref needed for `ref TStateMachine`. C# Release uses STRUCT-
+    // based for performance; the CLASS path costs one alloc per
+    // async call.
+    class AWAIT_SUSPEND: Value, TypeTyped is
+        has_type: bool => type?;
+        type: Type;
+
+        awaited: Value;
+        awaited_type: Type;
+        awaiter_type: Type;
+        state_number: int;
+        cold_resume_label: IR.LABEL;
+        hot_resume_label: IR.LABEL;
+        end_of_movenext_label: IR.LABEL;
+        state_machine_type: Type;
+        state_field: Semantic.Symbols.Field;
+        awaiter_field: Semantic.Symbols.Field;
+        builder_field: Semantic.Symbols.Field;
+
+        // Open-class-T form — same purpose as in ASYNC_METHOD_LAUNCH.
+        unspecialized_awaiter_type: Type;
+
+        init(
+            type: Type,
+            awaited: Value,
+            awaited_type: Type,
+            awaiter_type: Type,
+            unspecialized_awaiter_type: Type,
+            state_number: int,
+            cold_resume_label: IR.LABEL,
+            hot_resume_label: IR.LABEL,
+            end_of_movenext_label: IR.LABEL,
+            state_machine_type: Type,
+            state_field: Semantic.Symbols.Field,
+            awaiter_field: Semantic.Symbols.Field,
+            builder_field: Semantic.Symbols.Field
+        ) is
+            super.init();
+
+            assert type?;
+            assert awaited?;
+            assert awaited_type?;
+            assert awaiter_type?;
+            assert cold_resume_label?;
+            assert hot_resume_label?;
+            assert end_of_movenext_label?;
+            assert state_machine_type?;
+            assert state_field?;
+            assert awaiter_field?;
+            assert builder_field?;
+
+            self.type = type;
+            self.awaited = awaited;
+            self.awaited_type = awaited_type;
+            self.awaiter_type = awaiter_type;
+            self.unspecialized_awaiter_type = unspecialized_awaiter_type;
+            self.state_number = state_number;
+            self.cold_resume_label = cold_resume_label;
+            self.hot_resume_label = hot_resume_label;
+            self.end_of_movenext_label = end_of_movenext_label;
+            self.state_machine_type = state_machine_type;
+            self.state_field = state_field;
+            self.awaiter_field = awaiter_field;
+            self.builder_field = builder_field;
+        si
+
+        gen(context: IR.CONTEXT) is
+            let awaiter_il = awaiter_type.get_il_type();
+            let awaited_il = awaited_type.get_il_type();
+            let sm_il = state_machine_type.get_il_type();
+            let builder_ref = builder_field.get_il_reference();
+            let awaiter_ref = awaiter_field.get_il_reference();
+            let state_ref = state_field.get_il_reference();
+
+            // Open-class-T form of the awaiter — needed for the
+            // GetAwaiter / get_IsCompleted / GetResult methodref
+            // signatures (CLR fails the lookup if the signature
+            // uses the substituted concrete T).
+            let open_awaiter_il =
+                if unspecialized_awaiter_type? then
+                    unspecialized_awaiter_type.get_il_type();
+                else
+                    awaiter_il;
+                fi;
+
+            // Capture the awaiter into the frame.
+            context.write_line("ldarg.0");
+            gen(awaited, context);
+            context.write_line("callvirt instance {open_awaiter_il} {awaited_il}::'GetAwaiter'()");
+            context.write_line("stfld {awaiter_ref}");
+
+            // Hot-resume short-circuit.
+            context.write_line("ldarg.0");
+            context.write_line("ldflda {awaiter_ref}");
+            context.write_line("call instance bool {awaiter_il}::'get_IsCompleted'()");
+            context.write_line("brtrue {hot_resume_label}");
+
+            // Cold suspension: mark state, register the continuation,
+            // leave MoveNext. The builder re-enters when the awaiter
+            // completes; the entry-dispatch sees state == N and jumps
+            // to ${cold_resume_label}.
+            context.write_line("ldarg.0");
+            context.write_line("ldc.i4 {state_number}");
+            context.write_line("stfld {state_ref}");
+
+            context.write_line("ldarg.0");
+            context.write_line("ldflda {builder_ref}");
+            context.write_line("ldarg.0");
+            context.write_line("ldflda {awaiter_ref}");
+            context.write_line("ldarga.s 0");
+            let builder_il = builder_field.type.get_il_type();
+            context.write_line(
+                "call instance void {builder_il}::'AwaitUnsafeOnCompleted'<{awaiter_il}, {sm_il}>(!!0&, !!1&)"
+            );
+            context.write_line("leave {end_of_movenext_label}");
+
+            // Resume label — entry-dispatch jumps here when state == N.
+            context.write_line("{cold_resume_label}:");
+            context.write_line("ldarg.0");
+            context.write_line("ldc.i4.m1");
+            context.write_line("stfld {state_ref}");
+
+            // Hot path — fall through from cold-resume, or jumped to
+            // by the IsCompleted=true short-circuit above. The
+            // methodref's return type must be `!0` (open class-T of
+            // the awaiter struct), not the substituted concrete T.
+            context.write_line("{hot_resume_label}:");
+            context.write_line("ldarg.0");
+            context.write_line("ldflda {awaiter_ref}");
+
+            if type? /\ !type.is_void then
+                context.write_line("call instance !0 {awaiter_il}::'GetResult'()");
+            else
+                context.write_line("call instance void {awaiter_il}::'GetResult'()");
+            fi
+        si
+
+        to_string() -> string =>
+            "await-suspend:[{type}](state={state_number})";
+    si
+si

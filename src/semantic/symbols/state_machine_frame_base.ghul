@@ -1,0 +1,205 @@
+namespace Semantic.Symbols is
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+
+    use IoC;
+    use Source;
+
+    use Types.Type;
+
+    // Shared frame-class machinery for both generator and async
+    // state machines: type-parameter capture + substitution, lazily-
+    // allocated locals/anonymous fields, and the outer-self-type
+    // helper. Subclasses add their protocol-specific fields and
+    // ancestors.
+    class STATE_MACHINE_FRAME_BASE: Classy is
+        _owning_function: Function;
+        _local_fields: Collections.LIST[Field];
+        _next_local_id: int;
+        _function_to_class_type_map: Collections.MAP[string, Type];
+
+        owning_function: Function => _owning_function;
+        local_fields: Collections.Iterable[Field] => _local_fields;
+        function_to_class_type_map: Collections.Map[string, Type] => _function_to_class_type_map;
+
+        init(
+            location: LOCATION,
+            span: LOCATION,
+            owner_owner: Scope,
+            name: string,
+            owner: Scope,
+            owning_function: Function
+        ) is
+            super.init(
+                location,
+                span,
+                owner_owner,
+                name,
+                System.Array.empty[string](),
+                owner
+            );
+
+            _owning_function = owning_function;
+            _local_fields = Collections.LIST[Field]();
+            _function_to_class_type_map = Collections.MAP[string, Type]();
+        si
+
+        // Declare class-level type parameters mirroring those visible
+        // inside the owning function: enclosing class's first, then
+        // function's own. Order must match
+        // STATE_MACHINE_TYPE_PARAMS.walk_install /
+        // construction_type_arguments so `!N` indices line up at IL.
+        declare_captured_type_params(listener: SymbolDefinitionListener) -> Collections.LIST[string] is
+            let captured_names = Collections.LIST[string]();
+            let i mut = 0;
+
+            if isa Classy(_owning_function.owner) then
+                let owner_classy = cast Classy(_owning_function.owner);
+
+                if owner_classy.is_generic /\ owner_classy.argument_names? then
+                    for name in owner_classy.argument_names do
+                        let class_type_arg = declare_type(LOCATION.internal, name, i, listener);
+                        _function_to_class_type_map[name] = cast Types.Typed(class_type_arg).type;
+                        captured_names.add(name);
+                        i = i + 1;
+                    od
+                fi
+            fi
+
+            if _owning_function.is_generic /\ _owning_function.generic_argument_names? then
+                for name in _owning_function.generic_argument_names do
+                    let class_type_arg = declare_type(LOCATION.internal, name, i, listener);
+                    _function_to_class_type_map[name] = cast Types.Typed(class_type_arg).type;
+                    captured_names.add(name);
+                    i = i + 1;
+                od
+            fi
+
+            if captured_names.count > 0 then
+                argument_names = captured_names;
+            fi
+
+            return captured_names;
+        si
+
+        // Type for the `$outer_self` field + ctor argument. For a
+        // generic outer class, rebuilds the Classy instantiated with
+        // the frame's mirrored class-T's so the IL signature is
+        // well-formed at frame-class scope.
+        outer_self_type(outer_classy: Classy) -> Type is
+            if !outer_classy? then
+                return null;
+            fi
+
+            let outer_self_type: Type mut = outer_classy.type;
+
+            if outer_classy.is_generic /\ outer_classy.argument_names? /\ outer_classy.argument_names.count > 0 then
+                let outer_args = Collections.LIST[Type]();
+                for name in outer_classy.argument_names do
+                    if _function_to_class_type_map.contains_key(name) then
+                        outer_args.add(_function_to_class_type_map[name]);
+                    fi
+                od
+
+                if outer_args.count == outer_classy.argument_names.count then
+                    outer_self_type = Types.GENERIC(LOCATION.internal, outer_classy, outer_args);
+                fi
+            fi
+
+            return outer_self_type;
+        si
+
+        // Frame field for a body local. Idempotent — same Variable
+        // gets the same field — but refreshes the field's type on
+        // every call so iterative-inference narrowing of
+        // `local.storage_type` flows into the IL signature.
+        declare_local_field(local: Variable) -> Field is
+            if local.state_machine_field? then
+                local.state_machine_field.set_type(_class_relative(local.storage_type));
+                return local.state_machine_field;
+            fi
+
+            let id = _next_local_id;
+            _next_local_id = _next_local_id + 1;
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$local_{local.name}_{id}");
+            `field.set_type(_class_relative(local.storage_type));
+            declare(LOCATION.internal, `field, listener);
+
+            _local_fields.add(`field);
+
+            local.state_machine_field = `field;
+
+            return `field;
+        si
+
+        // Anonymous frame field for a synthesised value with no
+        // user-named source symbol (the FOR iterator, async spill
+        // slots). Each call produces a fresh field.
+        declare_anonymous_field(prefix: string, type: Type) -> Field is
+            let id = _next_local_id;
+            _next_local_id = _next_local_id + 1;
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "${prefix}_{id}");
+            `field.set_type(_class_relative(type));
+            declare(LOCATION.internal, `field, listener);
+
+            _local_fields.add(`field);
+
+            return `field;
+        si
+
+        // Bump the shared counter without creating a field — for
+        // subclasses that name fields outside the standard prefixes
+        // (e.g. async's `$awaiter_N`).
+        next_local_id() -> int is
+            let id = _next_local_id;
+            _next_local_id = _next_local_id + 1;
+            return id;
+        si
+
+        // Mirrors Classy.FRAME.set_type_arguments — base-level Classy
+        // doesn't define one.
+        populate_argument_names(arguments: Collections.Iterable[Symbol]) is
+            argument_names = arguments | .map(a => a.name) .collect();
+        si
+
+        // Override Classy's default declare_type (which errors out)
+        // so generic state machines can install their type
+        // parameters, matching the CLASS shape.
+        declare_type(location: LOCATION, name: string, index: int, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.CLASSY_GENERIC_ARGUMENT(location, self, name, index);
+            declare(location, result, symbol_definition_listener);
+            return result;
+        si
+
+        // Rewrite function-T references in `t` to the parallel
+        // CLASSY_GENERIC_ARGUMENT declared on this frame, so types
+        // emit `!N` (class-level) rather than `!!N` (method-level).
+        // No-op when the owning function is non-generic.
+        _class_relative(t: Type) -> Type is
+            if !t? then
+                return t;
+            fi
+
+            if !_function_to_class_type_map? \/ _function_to_class_type_map.count == 0 then
+                return t;
+            fi
+
+            return t.specialize(_function_to_class_type_map);
+        si
+
+        gen_access(buffer: StringBuilder) is
+            buffer.append("private ");
+        si
+
+        gen_type_prefix(buffer: StringBuilder) is
+            buffer.append("class ");
+        si
+    si
+si

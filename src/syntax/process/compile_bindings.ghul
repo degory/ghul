@@ -415,6 +415,15 @@ namespace Syntax.Process is
                 return;
             fi
 
+            // State-machine async: `return X` provides X of type T
+            // (the Task element type), generate-il stashes X into
+            // `_result` and leaves to success_label.
+            let async_sm = Semantic.Symbols.async_state_machine_for(function);
+            if async_sm? /\ async_sm.frame? then
+                _visit_return_state_machine_async(r, function, async_sm);
+                return;
+            fi
+
             if r.expression? then
                 if
                     r.expression.value? /\
@@ -434,19 +443,10 @@ namespace Syntax.Process is
                         // should stay ERROR until the user fixes the
                         // source.
                         //
-                        // When the closure was flagged by DESUGAR_AWAIT
-                        // as part of an async chain, a body-supplied
-                        // bare-T value is wrapped to Task[T] before
-                        // pinning — without this, a synthesised
-                        // continuation lambda whose body just returns
-                        // T would settle on T (not Task[T]) and the
-                        // surrounding `Tasks.TaskExtensions.unwrap(...
-                        // continue_with ...)` chain would reject the
-                        // resulting Task[T] (not Task[Task[T]]).
-                        // Values already typed Task[?] are pinned as-
-                        // is — outer user-written async bodies whose
-                        // last expression is the unwrap call return
-                        // Task[T] directly and should not double-wrap.
+                        // Async closures: wrap a bare-T body return
+                        // to Task[T] before pinning, so the closure's
+                        // signature matches its SM emission shape.
+                        // Values already typed Task[?] pass through.
                         let value_type = r.expression.value.type;
 
                         if
@@ -457,21 +457,11 @@ namespace Syntax.Process is
                         then
                             let task_type = _innate_symbol_lookup.get_task_type(value_type);
 
-                            // Wrap the actual return expression as
-                            // `Tasks.TASK.from_result(orig)` so the
-                            // IL returns a Task[T] (not a boxed T)
-                            // matching the closure's declared
-                            // return slot.
-                            // try_wrap_value_as_task_return mutates
-                            // r.expression in place and refreshes
-                            // its value/type. Guarded on
-                            // `value_type.is_settled` so we don't
-                            // fire during early iterative-inference
-                            // walks where the body type is still
-                            // partially resolved (e.g. bare
-                            // `Tasks.TASK` before its argument
-                            // pins) — those would over-wrap to
-                            // `Task[Task[?]]`.
+                            // Wrap as `Tasks.TASK.from_result(orig)`.
+                            // Guard on `is_settled` so we don't fire
+                            // during iterative-inference walks with a
+                            // partially-resolved body type — those
+                            // would over-wrap to `Task[Task[?]]`.
                             if task_type? /\ _task_conversion.try_wrap_value_as_task_return(r, task_type, _visitor) then
                                 value_type = r.expression.value.type;
                             fi
@@ -522,12 +512,8 @@ namespace Syntax.Process is
                     return;
                 fi
             else
-                // Void async: bare `return;` is the user-visible
-                // sugar for "complete this async chain with no
-                // value". Synthesise `return Tasks.TASK.completed_task;`
-                // and re-walk the synthesised expression so it goes
-                // through normal compile-expressions and produces a
-                // Task value of the right shape.
+                // Void async: bare `return;` sugar — synthesise
+                // `return Tasks.TASK.completed_task;` and re-walk.
                 if function.is_void_async then
                     r.expression = Semantic.TASK_CONVERSION.build_completed_task_expression(r.location);
                     r.expression.walk(_visitor);
@@ -541,6 +527,81 @@ namespace Syntax.Process is
                             r.location,
                             "return without value from non void function returns default value of type {function.return_type}"
                         );
+                fi
+            fi
+        si
+
+        // Type-check `return X` against the element type T (not
+        // Task[T]); bare `return;` is left for generate-il to map to
+        // `leave success_label`.
+        _visit_return_state_machine_async(
+            r: Trees.Statements.RETURN,
+            function: Semantic.Symbols.Function,
+            async_sm: Semantic.Symbols.ASYNC_STATE_MACHINE
+        ) is
+            let frame = async_sm.frame;
+
+            if r.expression? then
+                if
+                    !r.expression.value? \/
+                    !r.expression.value.type? \/
+                    !r.expression.value.check_is_consumable(_logger, r.expression.location)
+                then
+                    return;
+                fi
+
+                if frame.is_void then
+                    _logger.error(
+                        r.expression.location,
+                        "cannot return a value from a void-async function (declared return type is `Tasks.TASK`)"
+                    );
+                    return;
+                fi
+
+                // Async-closure inference: lambdas with
+                // INFERED_RETURN_TYPE + wrap_inferred_return_as_task
+                // pin from the body's value-returning statement here.
+                // The SM frame's result_type follows via
+                // ensure_result_field.
+                if
+                    function.return_type? /\
+                    function.return_type.is_inferred /\
+                    function.wrap_inferred_return_as_task /\
+                    r.expression.value.type? /\
+                    r.expression.value.type.is_settled /\
+                    !_task_conversion.is_task_type(r.expression.value.type)
+                then
+                    let task_type =
+                        _innate_symbol_lookup.get_task_type(r.expression.value.type);
+                    if task_type? then
+                        function.set_return_type(task_type);
+                    fi
+                fi
+
+                let element_type = frame.result_type;
+
+                if !element_type? then
+                    return;
+                fi
+
+                if !element_type.is_assignable_from(r.expression.value.type) then
+                    _logger.error(
+                        r.expression.location,
+                        "cannot return value of type {r.expression.value.type} where {element_type} expected"
+                    );
+                    return;
+                fi
+
+                _visitor.check_non_optional(element_type, r.expression, r.expression.location);
+            else
+                // Bare `return;`. For value-async this is an
+                // error — the result slot is non-void. For
+                // void-async it's the usual no-op.
+                if !frame.is_void then
+                    _logger.warn(
+                        r.location,
+                        "return without value from value-async function returns default value of type {frame.result_type}"
+                    );
                 fi
             fi
         si
