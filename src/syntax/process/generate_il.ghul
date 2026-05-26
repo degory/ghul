@@ -26,6 +26,27 @@ namespace Syntax.Process is
         si
     si
 
+    // Async sibling of PENDING_STATE_MACHINE. Flushed by
+    // `emit_pending_state_machines` alongside the generator list.
+    class PENDING_ASYNC_STATE_MACHINE is
+        async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE;
+        move_next_block: IR.Values.BLOCK;
+        success_label: IR.LABEL;
+        end_label: IR.LABEL;
+
+        init(
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE,
+            move_next_block: IR.Values.BLOCK,
+            success_label: IR.LABEL,
+            end_label: IR.LABEL
+        ) is
+            self.async_state_machine = async_state_machine;
+            self.move_next_block = move_next_block;
+            self.success_label = success_label;
+            self.end_label = end_label;
+        si
+    si
+
     class GENERATE_IL: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
@@ -36,6 +57,7 @@ namespace Syntax.Process is
         _type_caster: Semantic.TYPE_CASTER;
         _overload_resolver: Semantic.OVERLOAD_RESOLVER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+        _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
 
         _context: CONTEXT;
         _brancher: BRANCHER;
@@ -70,6 +92,16 @@ namespace Syntax.Process is
         // the existing closure-FRAME emission pattern (see
         // gen_closures called from visit(`class)).
         _pending_state_machines: Collections.LIST[PENDING_STATE_MACHINE];
+        _pending_async_state_machines: Collections.LIST[PENDING_ASYNC_STATE_MACHINE];
+
+        // Per-async-function emission context, set/cleared by
+        // `_pre_async_function`. Visit handlers for AWAIT / RETURN
+        // check `current_function == _current_async_state_machine
+        // .function` so a nested closure's own visit doesn't fire
+        // the outer function's async paths.
+        _current_async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE;
+        _current_async_success_label: IR.LABEL;
+        _current_async_end_label: IR.LABEL;
 
         current_block: Values.BLOCK => _block_context.current_block;
 
@@ -87,7 +119,8 @@ namespace Syntax.Process is
             block_context: BlockContext,
             brancher: BRANCHER,
             boilerplate_generator: BOILERPLATE_GENERATOR,
-            boxer: VALUE_BOXER
+            boxer: VALUE_BOXER,
+            build_flags: Compiler.GLOBAL_BUILD_FLAGS
         )
         is
             super.init(logger, null, symbol_table, namespaces);
@@ -105,9 +138,11 @@ namespace Syntax.Process is
             _brancher = brancher;
             _boilerplate_generator = boilerplate_generator;
             _boxer = boxer;
+            _build_flags = build_flags;
 
             _loops = LOOP_LABEL_STACK();
             _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
+            _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
         si
 
         ensure_runtime_symbols_are_materialized() is
@@ -585,6 +620,13 @@ namespace Syntax.Process is
                 return _pre_generator_function(function, cast Semantic.Symbols.Function(symbol), state_machine);
             fi
 
+            // Async branch (parallel to the generator branch above).
+            let async_sm = Semantic.Symbols.async_state_machine_for(cast Semantic.Symbols.Function(symbol));
+
+            if async_sm? then
+                return _pre_async_function(function, cast Semantic.Symbols.Function(symbol), async_sm);
+            fi
+
             if let global_function: Semantic.Symbols.GLOBAL_FUNCTION = symbol then
                 gen_globals_class_open(cast Semantic.Symbols.NAMESPACE(global_function.owner));
             fi
@@ -677,6 +719,16 @@ namespace Syntax.Process is
             if state_machine? then
                 _visit_generator_function(function, cast Semantic.Symbols.Function(symbol), state_machine);
 
+                return;
+            fi
+
+            let async_sm = Semantic.Symbols.async_state_machine_for(cast Semantic.Symbols.Function(symbol));
+
+            if async_sm? then
+                // _pre_async_function already emitted the outer
+                // method and stashed the move_next block onto
+                // _pending_async_state_machines. Nothing else to
+                // do at AST visit time.
                 return;
             fi
 
@@ -780,39 +832,13 @@ namespace Syntax.Process is
                 od
             fi
 
-            // Generic generators: the frame is generic in the
-            // function's type parameters; construct a specialized
-            // class reference so the IL emits
-            // `newobj ... class Frame`1<!!0>::'.ctor'(...)`
-            // with the function-level T flowing into the constructed
-            // class's type-arg slot. Mirrors closure FRAME's
-            // `get_create_instance` codepath.
-            let ctor_reference: string mut = default;
-
-            try
-                let construction_type_args = state_machine.get_construction_type_arguments();
-
-                if construction_type_args? then
-                    let specialized_frame_type = Semantic.Types.GENERIC(
-                        symbol.location,
-                        frame,
-                        construction_type_args
-                    );
-
-                    let specialized_ctor_symbol = specialized_frame_type.find_member("init");
-
-                    if isa Semantic.Symbols.Function(specialized_ctor_symbol) then
-                        ctor_reference = (cast Semantic.Symbols.Function(specialized_ctor_symbol)).get_il_reference();
-                    fi
-                fi
-
-                if !ctor_reference? then
-                    ctor_reference = frame.constructor.get_il_reference();
-                fi
-            catch e: System.Exception
-                _logger.exception(function.location, e, "while building ctor reference for generator outer method");
-                ctor_reference = "/* error */";
-            yrt
+            let ctor_reference = _build_specialized_ctor_reference(
+                frame,
+                frame.constructor,
+                state_machine.get_construction_type_arguments(),
+                symbol.location,
+                "while building ctor reference for generator outer method"
+            );
 
             _context.write_line("newobj {ctor_reference}");
             _context.write_line("ret");
@@ -910,21 +936,443 @@ namespace Syntax.Process is
             // Nothing more to do at AST visit time.
         si
 
+        // `newobj` operand for the SM frame's constructor. For a
+        // generic frame, constructs a specialized type so the
+        // class-T's appear in the signature; for a non-generic frame,
+        // just the default ctor's IL reference. Exceptions in lookup
+        // are logged and a sentinel returned.
+        _build_specialized_ctor_reference(
+            frame: Semantic.Symbols.Classy,
+            default_ctor: Semantic.Symbols.Method,
+            construction_type_args: Collections.List[Semantic.Types.Type]?,
+            location: Source.LOCATION,
+            error_context: string
+        ) -> string is
+            let ctor_reference: string mut = default;
+
+            try
+                if construction_type_args? then
+                    let specialized_frame_type = Semantic.Types.GENERIC(
+                        location,
+                        frame,
+                        construction_type_args
+                    );
+
+                    let specialized_ctor_symbol = specialized_frame_type.find_member("init");
+
+                    if isa Semantic.Symbols.Function(specialized_ctor_symbol) then
+                        ctor_reference = (cast Semantic.Symbols.Function(specialized_ctor_symbol)).get_il_reference();
+                    fi
+                fi
+
+                if !ctor_reference? then
+                    ctor_reference = default_ctor.get_il_reference();
+                fi
+            catch e: System.Exception
+                _logger.exception(location, e, error_context);
+                ctor_reference = "/* error */";
+            yrt
+
+            return ctor_reference;
+        si
+
+        // Async-function IL emission. Parallels
+        // `_pre_generator_function`: emits the outer method (newobj
+        // SM, builder.Start, return Task) and stashes a MoveNext
+        // BLOCK to be flushed when the enclosing class closes.
+        // MoveNext wraps the body in a try/catch routing exceptions
+        // through `builder.SetException` and success through
+        // `builder.SetResult`.
+        _pre_async_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE) -> bool is
+            let frame = async_state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "cannot emit async state-machine for {symbol}: return type is not Tasks.TASK or Tasks.TASK[T]");
+                return true;
+            fi
+
+            frame.declare();
+
+            let owner_is_global = isa Semantic.Symbols.GLOBAL_FUNCTION(symbol);
+
+            if owner_is_global then
+                gen_globals_class_open(cast Semantic.Symbols.NAMESPACE(symbol.owner));
+            fi
+
+            // --- Outer method ---
+            println_comment("define {symbol.description}");
+
+            let outer_buffer = StringBuilder();
+            symbol.gen_definition_header(outer_buffer);
+            println(outer_buffer);
+
+            println("{{");
+            _context.indent();
+
+            gen_tuple_element_name_attributes(symbol);
+            gen_custom_attributes(symbol);
+
+            symbol.gen_body_header(_context);
+
+            _context.write_line(".maxstack 64");
+
+            let ctor_reference = _build_specialized_ctor_reference(
+                frame,
+                frame.constructor,
+                async_state_machine.get_construction_type_arguments(),
+                symbol.location,
+                "while building ctor reference for async outer method"
+            );
+
+            // ctor args: instance methods prepend `ldarg.0` for
+            // _outer_self, then each user-declared parameter via
+            // `ldarg '<name>'`. Build them as a sequence Value so
+            // ASYNC_METHOD_LAUNCH composes them in the right order.
+            let ctor_args_block = Values.BLOCK();
+            if frame.outer_self_field? then
+                ctor_args_block.add(IR.RAW("ldarg.0"));
+            fi
+            if symbol.argument_names? then
+                for arg_name in symbol.argument_names do
+                    ctor_args_block.add(IR.RAW("ldarg '{arg_name}'"));
+                od
+            fi
+            ctor_args_block.close();
+
+            let task_type = symbol.return_type;
+
+            // Open-T forms — only meaningful for the generic
+            // (value-async) builder/Task. For void-async, the
+            // builder type is non-generic and Create / get_Task
+            // signatures have no class-T to resolve, so pass null
+            // (ASYNC_METHOD_LAUNCH falls back to the constructed
+            // owner type for the signature).
+            let unspec_builder: Semantic.Types.Type mut = default;
+            let unspec_task: Semantic.Types.Type mut = default;
+            if !frame.is_void then
+                unspec_builder = _innate_symbol_lookup.get_unspecialized_async_task_method_builder_type();
+                unspec_task = _innate_symbol_lookup.get_unspecialized_task_type();
+            fi
+
+            let launch = IR.Values.ASYNC_METHOD_LAUNCH(
+                task_type,
+                frame.type,
+                ctor_reference,
+                ctor_args_block,
+                frame.state_field,
+                frame.builder_field,
+                unspec_builder,
+                unspec_task,
+                "'.sm'"
+            );
+
+            launch.gen(_context);
+            _context.write_line("ret");
+
+            _context.outdent();
+            println("}}");
+
+            if owner_is_global then
+                gen_globals_class_close();
+            fi
+
+            // --- Walk the body into MoveNext's block ---
+            async_state_machine.install_body_emission_overrides();
+
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            add(".maxstack 64");
+
+            // Entry-dispatch placeholder. Each AWAIT_SUSPEND records
+            // a (state, cold_resume_label) pair as it runs; we fill
+            // this out after the body walk completes.
+            let dispatch = Values.BLOCK();
+            add(dispatch);
+
+            // Labels used by the trailer: success fall-through and
+            // the end of the wrapping try/catch. The entire MoveNext
+            // body lives inside a `.try` whose handler routes
+            // exceptions through `builder.SetException(e)`.
+            let success_label = IR.LABEL();
+            let end_label = IR.LABEL();
+
+            // Stash the emission context so visit(LET-await),
+            // visit(AWAIT), and visit(RETURN) inside the body know
+            // they're inside this state machine and can reach the
+            // frame / labels they need to emit. Cleared after the
+            // body walk so anything else emitted at this nesting
+            // level (other functions, nested classes' visits)
+            // goes through the standard paths.
+            let prev_async_sm = _current_async_state_machine;
+            let prev_success = _current_async_success_label;
+            let prev_end = _current_async_end_label;
+            _current_async_state_machine = async_state_machine;
+            _current_async_success_label = success_label;
+            _current_async_end_label = end_label;
+
+            // Walk the body. visit(AWAIT) appends AWAIT_SUSPEND IR
+            // Values into move_next_block; other statements emit
+            // normally.
+            if function.body? then
+                function.body.walk(self);
+            fi
+
+            // Body fell off the end: leave success_label so the
+            // trailer fires.
+            add("leave {success_label}");
+
+            _current_async_state_machine = prev_async_sm;
+            _current_async_success_label = prev_success;
+            _current_async_end_label = prev_end;
+
+            // Populate the entry-dispatch placeholder. Each recorded
+            // await label gets a `_state == N → branch to cold_resume_N`
+            // entry; the `state = 0` initial entry falls through.
+            let state_field_ref = frame.state_field.get_il_reference();
+            for al in async_state_machine.await_labels do
+                dispatch.add("ldarg.0");
+                dispatch.add("ldfld {state_field_ref}");
+                dispatch.add("ldc.i4 {al.state}");
+                dispatch.add("beq {al.label}");
+            od
+
+            leave_block();
+            leave_scope(function);
+
+            async_state_machine.uninstall_body_emission_overrides();
+
+            _pending_async_state_machines.add(
+                PENDING_ASYNC_STATE_MACHINE(
+                    async_state_machine,
+                    move_next_block,
+                    success_label,
+                    end_label
+                )
+            );
+
+            return true;
+        si
+
         // Emit all pending state-machine classes accumulated during
         // the walk of an enclosing class or namespace. Called at the
         // tail of visit(`class) / visit(`namespace) so the classes
         // land at namespace scope, parallel to the user's class.
         emit_pending_state_machines() is
-            if !_pending_state_machines? \/ _pending_state_machines.count == 0 then
-                return;
+            if _pending_state_machines? /\ _pending_state_machines.count > 0 then
+                let pending = _pending_state_machines;
+                _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
+
+                for psm in pending do
+                    _emit_state_machine_class(psm.state_machine, psm.move_next_block);
+                od
             fi
 
-            let pending = _pending_state_machines;
-            _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
+            if _pending_async_state_machines? /\ _pending_async_state_machines.count > 0 then
+                let pending = _pending_async_state_machines;
+                _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
 
-            for psm in pending do
-                _emit_state_machine_class(psm.state_machine, psm.move_next_block);
+                for pasm in pending do
+                    _emit_async_state_machine_class(
+                        pasm.async_state_machine,
+                        pasm.move_next_block,
+                        pasm.success_label,
+                        pasm.end_label
+                    );
+                od
+            fi
+        si
+
+        // Emits the synthesised IAsyncStateMachine class — parallels
+        // `_emit_state_machine_class` for generators. Class members:
+        // `$state`, `$builder`, `$result` (value-async), `$outer_self`
+        // (instance), `$arg_*`, `$local_*`, `$awaiter_*` fields; ctor;
+        // MoveNext (with entry-dispatch and try/catch routing through
+        // the builder); trivial SetStateMachine.
+        _emit_async_state_machine_class(
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE,
+            move_next_block: Values.BLOCK,
+            success_label: IR.LABEL,
+            end_label: IR.LABEL
+        ) is
+            let frame = async_state_machine.frame;
+
+            async_state_machine.install_body_emission_overrides();
+
+            println_comment("define async state-machine class for {async_state_machine.function.description}");
+
+            let class_buffer = StringBuilder();
+            frame.gen_definition_header(class_buffer);
+            println(class_buffer);
+
+            println("{{");
+            _context.indent();
+
+            // Fields.
+            let state_buf = StringBuilder();
+            frame.state_field.gen_definition_header(state_buf);
+            println(state_buf);
+
+            if frame.builder_field? then
+                let builder_buf = StringBuilder();
+                frame.builder_field.gen_definition_header(builder_buf);
+                println(builder_buf);
+            fi
+
+            if frame.result_field? then
+                let result_buf = StringBuilder();
+                frame.result_field.gen_definition_header(result_buf);
+                println(result_buf);
+            fi
+
+            if frame.outer_self_field? then
+                let outer_buf = StringBuilder();
+                frame.outer_self_field.gen_definition_header(outer_buf);
+                println(outer_buf);
+            fi
+
+            for arg_field in frame.argument_fields do
+                let arg_buf = StringBuilder();
+                arg_field.gen_definition_header(arg_buf);
+                println(arg_buf);
             od
+
+            for local_field in frame.local_fields do
+                let local_buf = StringBuilder();
+                local_field.gen_definition_header(local_buf);
+                println(local_buf);
+            od
+
+            for awaiter_field in frame.awaiter_fields do
+                let awaiter_buf = StringBuilder();
+                awaiter_field.gen_definition_header(awaiter_buf);
+                println(awaiter_buf);
+            od
+
+            // .ctor — same shape as the generator's: chain to
+            // Object::.ctor, then store each ctor arg into its frame
+            // field. Builder isn't initialised here; the outer
+            // method's body calls AsyncTaskMethodBuilder.Create()
+            // and stfld's it after newobj.
+            _gen_async_state_machine_ctor(frame);
+
+            // MoveNext — wraps the user's body in try/catch so
+            // exceptions route through builder.SetException.
+            _gen_async_move_next(async_state_machine, move_next_block, success_label, end_label);
+
+            // SetStateMachine — trivial no-op for class-based SM.
+            _boilerplate_generator.gen("async-set-state-machine");
+
+            _context.outdent();
+            println("}}");
+
+            async_state_machine.uninstall_body_emission_overrides();
+        si
+
+        _gen_async_state_machine_ctor(frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME) is
+            let ctor_buf = StringBuilder();
+            frame.constructor.gen_definition_header(ctor_buf);
+            println(ctor_buf);
+
+            println("{{");
+            _context.indent();
+            _context.write_line(".maxstack 8");
+            _context.write_line("ldarg.0");
+            _context.write_line("call instance void ['System.Runtime']'System'.'Object'::'.ctor'()");
+
+            let arg_names = frame.constructor.argument_names;
+            let i mut = 0;
+
+            if frame.outer_self_field? then
+                _context.write_line("ldarg.0");
+                _context.write_line("ldarg '{arg_names[i]}'");
+                _context.write_line("stfld {frame.outer_self_field.get_il_reference()}");
+                i = i + 1;
+            fi
+
+            for arg_field in frame.argument_fields do
+                _context.write_line("ldarg.0");
+                _context.write_line("ldarg '{arg_names[i]}'");
+                _context.write_line("stfld {arg_field.get_il_reference()}");
+                i = i + 1;
+            od
+
+            _context.write_line("ret");
+            _context.outdent();
+            println("}}");
+        si
+
+        _gen_async_move_next(
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE,
+            move_next_block: Values.BLOCK,
+            success_label: IR.LABEL,
+            end_label: IR.LABEL
+        ) is
+            let frame = async_state_machine.frame;
+
+            println(".method public final hidebysig newslot virtual instance default void 'MoveNext'() cil managed");
+            println("{{");
+            _context.indent();
+            _context.write_line(".override class ['System.Runtime']System.Runtime.CompilerServices.IAsyncStateMachine::MoveNext");
+
+            // Wrap the move_next_block in a try/catch that routes
+            // exceptions through builder.SetException. The success
+            // fall-through path (leave success_label) calls
+            // builder.SetResult and falls through to end_label/ret.
+            _context.write_line(".try {{");
+            _context.indent();
+
+            move_next_block.gen(_context);
+
+            _context.outdent();
+            _context.write_line("}}");
+
+            let exception_il = "class ['System.Runtime']System.Exception";
+            _context.write_line("catch {exception_il} {{");
+            _context.indent();
+            _context.write_line(".locals init ({exception_il} '.exception')");
+            _context.write_line("stloc '.exception'");
+            _context.write_line("ldarg.0");
+            _context.write_line("ldc.i4.m1");
+            _context.write_line("stfld {frame.state_field.get_il_reference()}");
+            _context.write_line("ldarg.0");
+            _context.write_line("ldflda {frame.builder_field.get_il_reference()}");
+            _context.write_line("ldloc '.exception'");
+            let builder_il = frame.builder_field.type.get_il_type();
+            _context.write_line("call instance void {builder_il}::'SetException'({exception_il})");
+            _context.write_line("leave {end_label}");
+            _context.outdent();
+            _context.write_line("}}");
+
+            // Success: state = -1; builder.SetResult(<result>).
+            //
+            // `SetResult(T)` on `AsyncTaskMethodBuilder<T>` takes
+            // class-T; the methodref's arg type slot must be `!0`
+            // (open class-T), not the substituted concrete T. The
+            // non-generic `AsyncTaskMethodBuilder`'s SetResult takes
+            // no value-async result and has no class-T issue.
+            _context.write_line("{success_label}:");
+            _context.write_line("ldarg.0");
+            _context.write_line("ldc.i4.m1");
+            _context.write_line("stfld {frame.state_field.get_il_reference()}");
+            _context.write_line("ldarg.0");
+            _context.write_line("ldflda {frame.builder_field.get_il_reference()}");
+            if frame.result_field? then
+                _context.write_line("ldarg.0");
+                _context.write_line("ldfld {frame.result_field.get_il_reference()}");
+                _context.write_line("call instance void {builder_il}::'SetResult'(!0)");
+            else
+                _context.write_line("call instance void {builder_il}::'SetResult'()");
+            fi
+
+            _context.write_line("{end_label}:");
+            _context.write_line("ret");
+
+            _context.outdent();
+            println("}}");
         si
 
         _emit_state_machine_class(state_machine: Semantic.Symbols.STATE_MACHINE, move_next_block: Values.BLOCK) is
@@ -1242,7 +1690,7 @@ namespace Syntax.Process is
             let closure = cast Semantic.Symbols.Closure(scope_for(function));
 
             if !closure? then
-                return true;                
+                return true;
             fi
 
             closure.map_type_arguments();
@@ -1251,9 +1699,25 @@ namespace Syntax.Process is
         si
 
         visit(function: Trees.Expressions.FUNCTION) is
-            enter_block();
-
             let closure = cast Semantic.Symbols.Closure(scope_for(function));
+
+            // Async closure dispatch (parallel to the named-function
+            // path in pre(Definitions.FUNCTION)). The lambda's $anon
+            // method body becomes a state-machine launch sequence
+            // (Create + MoveNext + return Task); the lambda body
+            // walks into a separate move_next_block; the SM class is
+            // queued for emission at class/namespace tail.
+            if closure? then
+                let async_sm = Semantic.Symbols.async_state_machine_for(closure);
+                if async_sm? then
+                    _emit_async_closure(function, closure, async_sm);
+                    super.visit(function);
+                    closure.unmap_type_arguments();
+                    return;
+                fi
+            fi
+
+            enter_block();
 
             // Safety net: if a closure's return type resolved to ERROR
             // (e.g. its body referenced a variable that itself never got
@@ -1306,6 +1770,139 @@ namespace Syntax.Process is
             closure.unmap_type_arguments();
         si
 
+        // Async closure: the lambda's $anon body becomes a builder-
+        // create / Start / return-Task launch sequence stashed in
+        // `closure.il_body`; the user body walks into a separate
+        // move_next_block; the SM class is queued for class-tail
+        // emission alongside named-function SMs.
+        _emit_async_closure(
+            function: Trees.Expressions.FUNCTION,
+            closure: Semantic.Symbols.Closure,
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE
+        ) is
+            let frame = async_state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "cannot emit async state-machine for {closure}: return type is not Tasks.TASK or Tasks.TASK[T]");
+                return;
+            fi
+
+            frame.declare();
+
+            // Body walk before launch IL — populates the frame's
+            // await labels / locals / awaiters before launch
+            // references any of them.
+            async_state_machine.install_body_emission_overrides();
+
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            add(".maxstack 64");
+
+            let dispatch = Values.BLOCK();
+            add(dispatch);
+
+            let success_label = IR.LABEL();
+            let end_label = IR.LABEL();
+
+            let prev_async_sm = _current_async_state_machine;
+            let prev_success = _current_async_success_label;
+            let prev_end = _current_async_end_label;
+            _current_async_state_machine = async_state_machine;
+            _current_async_success_label = success_label;
+            _current_async_end_label = end_label;
+
+            if function.body? then
+                function.body.walk(self);
+            fi
+
+            add("leave {success_label}");
+
+            _current_async_state_machine = prev_async_sm;
+            _current_async_success_label = prev_success;
+            _current_async_end_label = prev_end;
+
+            let state_field_ref = frame.state_field.get_il_reference();
+            for al in async_state_machine.await_labels do
+                dispatch.add("ldarg.0");
+                dispatch.add("ldfld {state_field_ref}");
+                dispatch.add("ldc.i4 {al.state}");
+                dispatch.add("beq {al.label}");
+            od
+
+            leave_block();
+            leave_scope(function);
+
+            async_state_machine.uninstall_body_emission_overrides();
+
+            // --- Build launch IL into closure.il_body ---
+            enter_block();
+            add(".maxstack 64");
+
+            let ctor_reference = _build_specialized_ctor_reference(
+                frame,
+                frame.constructor,
+                async_state_machine.get_construction_type_arguments(),
+                function.location,
+                "while building ctor reference for async closure"
+            );
+
+            // Ctor args: instance closures prepend ldarg.0 (the
+            // closure-frame instance, which holds captures), then
+            // each user-declared lambda parameter via ldarg '<name>'.
+            let ctor_args_block = Values.BLOCK();
+            if frame.outer_self_field? then
+                ctor_args_block.add(IR.RAW("ldarg.0"));
+            fi
+            if closure.argument_names? then
+                for arg_name in closure.argument_names do
+                    ctor_args_block.add(IR.RAW("ldarg '{arg_name}'"));
+                od
+            fi
+            ctor_args_block.close();
+
+            let task_type = closure.return_type;
+
+            let unspec_builder: Semantic.Types.Type mut = default;
+            let unspec_task: Semantic.Types.Type mut = default;
+            if !frame.is_void then
+                unspec_builder = _innate_symbol_lookup.get_unspecialized_async_task_method_builder_type();
+                unspec_task = _innate_symbol_lookup.get_unspecialized_task_type();
+            fi
+
+            let launch = IR.Values.ASYNC_METHOD_LAUNCH(
+                task_type,
+                frame.type,
+                ctor_reference,
+                ctor_args_block,
+                frame.state_field,
+                frame.builder_field,
+                unspec_builder,
+                unspec_task,
+                "'.sm'"
+            );
+
+            add(launch);
+            add("ret");
+
+            _context.enter_buffer(false);
+            current_block.gen(_context);
+            leave_block();
+            closure.il_body = _context.leave_buffer();
+
+            _pending_async_state_machines.add(
+                PENDING_ASYNC_STATE_MACHINE(
+                    async_state_machine,
+                    move_next_block,
+                    success_label,
+                    end_label
+                )
+            );
+        si
+
         pre(statement: Expressions.STATEMENT) -> bool is
             super.pre(statement);
 
@@ -1313,6 +1910,115 @@ namespace Syntax.Process is
         si
 
         visit(statement: Expressions.STATEMENT) is
+        si
+
+        // Override CALL.walk's default args-first order so SPILLs in
+        // the receiver position emit before AWAIT_SUSPENDs in the
+        // argument position — needed for source-order side effects
+        // across instance-call receivers.
+        pre(call: Trees.Expressions.CALL) -> bool is
+            super.pre(call);
+
+            if call.function? then
+                call.function.walk(self);
+            fi
+            if call.arguments? then
+                call.arguments.walk(self);
+            fi
+
+            return true;
+        si
+
+        visit(`await: Trees.Expressions.AWAIT) is
+            // Emit AWAIT_SUSPEND eagerly, stash the result into a
+            // fresh frame field (NOT a CLR local — CLR locals reset
+            // on every MoveNext re-entry), and rebind the wrapper to
+            // a `ldfld <field>` load. The CLR-local TEMP is a
+            // one-MoveNext bridge: we can't `ldarg.0` before
+            // AWAIT_SUSPEND (would push across its internal labels),
+            // so the suspend's result goes to a tmp first, then
+            // `ldarg.0 / ldloc / stfld`.
+            let await_wrapper = cast Values.WRAPPER(`await.value);
+
+            if !await_wrapper? then
+                return;
+            fi
+
+            if !_current_async_state_machine? \/ current_function != _current_async_state_machine.function then
+                _logger.error(`await.location, "`await` outside async state-machine context");
+                return;
+            fi
+
+            if !`await.operand? \/ !`await.operand.value? \/ !`await.operand.value.type? then
+                return;
+            fi
+
+            let suspend =
+                _build_await_suspend(`await.operand.value, `await.operand.value.type);
+
+            if !suspend? then
+                return;
+            fi
+
+            let frame = _current_async_state_machine.frame;
+            let result_type = await_wrapper.type;
+
+            if suspend.type? /\ !suspend.type.is_void then
+                let result_temp = TEMP(current_block, "await_bridge", suspend);
+                let result_field = frame.declare_spill_field(result_type);
+                add(IR.RAW("ldarg.0"));
+                add(result_temp.load());
+                add("stfld {result_field.get_il_reference()}");
+                await_wrapper.value =
+                    IR.Values.Load.INSTANCE_FIELD(
+                        IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                        result_field
+                    );
+            else
+                // void-async — emit the suspend IL eagerly. The wrapper
+                // already holds a void-typed DUMMY which surrounding
+                // emit paths must skip (the type check in
+                // visit(Statements.EXPRESSION) handles the only place
+                // this matters in practice — bare `await E;`).
+                add(suspend);
+            fi
+        si
+
+        visit(spill: Trees.Expressions.SPILL) is
+            // Eagerly emit the operand's IL, then `stfld` to a fresh
+            // frame field. The wrapper's value becomes a
+            // `ldarg.0; ldfld <field>` load that surrounding IR
+            // consumes lazily. Used by the SPILL_AWAITS pass to
+            // persist intermediate values evaluated to the left of an
+            // `await` so they survive the suspend.
+            let spill_wrapper = cast Values.WRAPPER(spill.value);
+
+            if !spill_wrapper? then
+                return;
+            fi
+
+            if !_current_async_state_machine? \/ current_function != _current_async_state_machine.function then
+                _logger.error(spill.location, "SPILL outside async state-machine context");
+                return;
+            fi
+
+            if !spill.operand? \/ !spill.operand.value? \/ !spill.operand.value.type? then
+                return;
+            fi
+
+            let frame = _current_async_state_machine.frame;
+            let spill_type = spill.operand.value.type;
+            let spill_field = frame.declare_spill_field(spill_type);
+
+            add(IR.RAW("ldarg.0"));
+            add(spill.operand.value);
+            add("stfld {spill_field.get_il_reference()}");
+
+            spill_wrapper.value =
+                IR.Values.Load.INSTANCE_FIELD(
+                    IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                    spill_field
+                );
         si
 
         visit(`cast: Trees.Expressions.CAST) is
@@ -1347,12 +2053,17 @@ namespace Syntax.Process is
 
             try
                 if !expression.want_value /\ expression.expression.value? then
-                    add(expression.expression.value);
+                    let value = expression.expression.value;
+                    let is_void = value.type? /\ value.type =~ _innate_symbol_lookup.get_void_type();
 
-                    if
-                        expression.expression.value.type? /\
-                        expression.expression.value.type !~ _innate_symbol_lookup.get_void_type()
-                    then
+                    // Bare `await E;` with void result: visit(AWAIT)
+                    // emitted the suspend eagerly; re-emitting the
+                    // wrapper would call gen on its unreplaced DUMMY.
+                    if !is_void \/ !isa Values.WRAPPER(value) then
+                        add(value);
+                    fi
+
+                    if !is_void then
                         add("pop");
                     fi
                 fi
@@ -1370,25 +2081,21 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            // Generator body locals: lift into frame fields and
-            // skip emitting `.locals init` for them. The redirect
-            // to `ldarg.0; ldfld/stfld <field>` happens at
-            // load/store IR emission time via state_machine_field.
+            // Generator / async body locals: `state_machine_field`
+            // was wired up in compile-expressions (so closures
+            // freezing inside the body capture the right
+            // ldarg.0/ldfld IL). Skip emitting `.locals init` here;
+            // load/store routes through the frame field via
+            // state_machine_field.
             let sm_for_function = Semantic.Symbols.state_machine_for(current_function);
 
             if sm_for_function? /\ sm_for_function.frame? then
-                let frame = sm_for_function.frame;
-                let names_into = Collections.LIST[Identifiers.Identifier]();
-                variable.left.get_names_into(names_into);
+                return false;
+            fi
 
-                for name in names_into do
-                    let symbol = find(name);
+            let async_sm = Semantic.Symbols.async_state_machine_for(current_function);
 
-                    if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol then
-                        frame.declare_local_field(local);
-                    fi
-                od
-
+            if async_sm? /\ async_sm.frame? then
                 return false;
             fi
 
@@ -1515,6 +2222,35 @@ namespace Syntax.Process is
             super.visit(r);
 
             let function = current_function;
+
+            // State-machine async return: stash the value into
+            // `_result` (value-async only) and `leave` to the
+            // success label so the MoveNext trailer fires
+            // `builder.SetResult` and returns. The standard
+            // `ret` path below would unwind MoveNext without
+            // signalling completion to the builder.
+            if
+                _current_async_state_machine? /\
+                _current_async_success_label? /\
+                function == _current_async_state_machine.function
+            then
+                let frame = _current_async_state_machine.frame;
+
+                if r.expression? /\ r.expression.value? /\ frame.result_field? then
+                    let boxed_value =
+                        _boxer.box_if_needed(
+                            r.expression.value,
+                            frame.class_result_type
+                        );
+                    add("ldarg.0");
+                    add(boxed_value);
+                    add("stfld {frame.result_field.get_il_reference()}");
+                fi
+
+                add("leave {_current_async_success_label}");
+                return;
+            fi
+
             let value: Value mut = default;
 
             if
@@ -1631,6 +2367,67 @@ namespace Syntax.Process is
             );
 
             add("throw");
+        si
+
+        // Build an AWAIT_SUSPEND for `awaited`: allocates a state
+        // number + cold/hot resume labels + a fresh `$awaiter_N`
+        // field, and records the (state, awaiter, label) triple
+        // for entry-dispatch population. Returns null on the stubs
+        // lookup path (awaiter type can't be resolved).
+        _build_await_suspend(awaited: Value, awaited_type: Semantic.Types.Type) -> IR.Values.AWAIT_SUSPEND is
+            let async_sm = _current_async_state_machine;
+            let frame = async_sm.frame;
+
+            let element_type =
+                Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(
+                    awaited_type,
+                    _innate_symbol_lookup.get_unspecialized_task_type()
+                );
+
+            let awaiter_type: Semantic.Types.Type mut;
+            let result_type: Semantic.Types.Type mut;
+
+            if element_type? then
+                awaiter_type = _innate_symbol_lookup.get_task_awaiter_type(element_type);
+                result_type = element_type;
+            else
+                awaiter_type = _innate_symbol_lookup.get_task_awaiter_void_type();
+                result_type = _innate_symbol_lookup.get_void_type();
+            fi
+
+            if !awaiter_type? then
+                return null;
+            fi
+
+            let state = async_sm.allocate_state();
+            let cold_resume = IR.LABEL();
+            let hot_resume = IR.LABEL();
+            let awaiter_field = frame.declare_awaiter_field(awaiter_type);
+
+            async_sm.record_label(state, awaiter_field, cold_resume);
+
+            let unspec_awaiter_type =
+                if element_type? then
+                    _innate_symbol_lookup.get_unspecialized_task_awaiter_type();
+                else
+                    awaiter_type;
+                fi;
+
+            return IR.Values.AWAIT_SUSPEND(
+                result_type,
+                awaited,
+                awaited_type,
+                awaiter_type,
+                unspec_awaiter_type,
+                state,
+                cold_resume,
+                hot_resume,
+                _current_async_end_label,
+                frame.type,
+                frame.state_field,
+                awaiter_field,
+                frame.builder_field
+            );
         si
 
         visit(`assert: Statements.ASSERT) is
@@ -2001,25 +2798,45 @@ namespace Syntax.Process is
 
             brancher.label(label.start);
             brancher.branch(BRANCH.Z, label.return_needed.load(), label.end);
-            
+
             if outer_try? then
                 if return_value? then
                     assert outer_try.return_value? else "outer try has no return value temporary";
                     outer_try.return_value.store(return_value.load());
                 fi
-                
+
                 if outer_try.is_in_finally then
                     outer_try.return_needed.store(Literal.NUMBER("1", _innate_symbol_lookup.get_bool_type(), "i4"));
                     brancher.branch(outer_try.middle);
                 else
                     brancher.leave(outer_try.start);
                 fi
+            elif
+                _current_async_state_machine? /\
+                _current_async_success_label? /\
+                current_function == _current_async_state_machine.function
+            then
+                // State-machine async: a return inside a try block
+                // accumulates the value in `return_value` and the
+                // "need return" flag. The post-try emit reaches here
+                // — for state-machine async we stash the value to
+                // `_result` and `leave success_label` (NOT `ret`),
+                // so the trailer's `builder.SetResult` fires.
+                let frame = _current_async_state_machine.frame;
+
+                if return_value? /\ frame.result_field? then
+                    add("ldarg.0");
+                    add(return_value.load());
+                    add("stfld {frame.result_field.get_il_reference()}");
+                fi
+
+                add("leave {_current_async_success_label}");
             else
                 if return_value? then
-                    add(return_value.load());                    
-                fi                
+                    add(return_value.load());
+                fi
 
-                add("ret");                
+                add("ret");
             fi
 
             brancher.label(label.end);
@@ -2109,7 +2926,26 @@ namespace Syntax.Process is
 
             let symbol = find(`catch.variable.name);
 
-            add("stloc {symbol!.get_il_reference()}");
+            // State-machine-resident catch variable (async function):
+            // the exception's on the stack but `stloc <name>` would
+            // reference an undeclared CLR local since pre(VARIABLE)
+            // skipped the `.locals init` directive. Route through
+            // the frame field via a temp instead.
+            if let v: Semantic.Symbols.Variable = symbol then
+                if v.state_machine_field? then
+                    let field_ref = v.state_machine_field.get_il_reference();
+                    let exception_il = `catch.variable.type_expression.type.get_il_type();
+                    add(".locals init ({exception_il} '.catch_exc')");
+                    add("stloc '.catch_exc'");
+                    add("ldarg.0");
+                    add("ldloc '.catch_exc'");
+                    add("stfld {field_ref}");
+                else
+                    add("stloc {symbol!.get_il_reference()}");
+                fi
+            else
+                add("stloc {symbol!.get_il_reference()}");
+            fi
 
             `catch.body.walk(self);
 
@@ -2170,17 +3006,29 @@ namespace Syntax.Process is
 
             `for.variable.walk(self);
 
-            // Generator FOR: the iterator value has to survive
-            // every yield in the body. Allocate a frame field and
-            // route both load and store through it; the regular
-            // CLR-local TEMP path would reset on every MoveNext
-            // re-entry.
+            // Generator / async FOR: the iterator value has to
+            // survive every yield / await in the body. Allocate a
+            // frame field and route both load and store through it;
+            // the regular CLR-local TEMP path would reset on every
+            // MoveNext re-entry.
             let sm_for_function = Semantic.Symbols.state_machine_for(current_function);
+            let async_sm_for_function: Semantic.Symbols.ASYNC_STATE_MACHINE mut = default;
+            if !sm_for_function? then
+                async_sm_for_function = Semantic.Symbols.async_state_machine_for(current_function);
+            fi
+
             let iterator_field: Semantic.Symbols.Field mut = default;
+            let iterator_frame: Semantic.Symbols.Classy mut = default;
 
             if sm_for_function? /\ sm_for_function.frame? /\ iterator? /\ iterator.type? then
                 iterator_field = sm_for_function.frame.declare_anonymous_field("for_iterator", iterator.type);
+                iterator_frame = sm_for_function.frame;
+            elif async_sm_for_function? /\ async_sm_for_function.frame? /\ iterator? /\ iterator.type? then
+                iterator_field = async_sm_for_function.frame.declare_anonymous_field("for_iterator", iterator.type);
+                iterator_frame = async_sm_for_function.frame;
+            fi
 
+            if iterator_field? then
                 add("ldarg.0");
                 add(iterator);
                 add("stfld {iterator_field.get_il_reference()}");
@@ -2197,7 +3045,7 @@ namespace Syntax.Process is
             let load_iter_a =
                 if iterator_field? then
                     cast Value(IR.Values.Load.INSTANCE_FIELD(
-                        IR.Values.Load.REFERENCE_SELF(sm_for_function.frame, sm_for_function.frame.type),
+                        IR.Values.Load.REFERENCE_SELF(iterator_frame, iterator_frame.type),
                         iterator_field
                     ));
                 else
@@ -2211,7 +3059,7 @@ namespace Syntax.Process is
             let load_iter_b =
                 if iterator_field? then
                     cast Value(IR.Values.Load.INSTANCE_FIELD(
-                        IR.Values.Load.REFERENCE_SELF(sm_for_function.frame, sm_for_function.frame.type),
+                        IR.Values.Load.REFERENCE_SELF(iterator_frame, iterator_frame.type),
                         iterator_field
                     ));
                 else

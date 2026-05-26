@@ -1,0 +1,536 @@
+namespace Semantic.Symbols is
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+
+    use IoC;
+    use Logging;
+    use Source;
+
+    use IR.Values.Value;
+
+    use Types.Type;
+
+    // Per-`let await` bookkeeping recorded by await IL emission.
+    // The resume label is placed immediately after the per-await
+    // `leave` that suspends MoveNext; entry-dispatch jumps here
+    // when the builder re-enters MoveNext on awaiter completion.
+    class ASYNC_STATE_LABEL is
+        state: int public;
+        awaiter_field: Field public;
+        label: IR.LABEL public;
+
+        init(state: int, awaiter_field: Field, label: IR.LABEL) is
+            self.state = state;
+            self.awaiter_field = awaiter_field;
+            self.label = label;
+        si
+    si
+
+    // State held on an async function symbol: the synthesised frame
+    // class, the running state-number counter, the recorded
+    // (state, awaiter_field, resume_label) triples for entry-dispatch
+    // emission. Lives as a non-null field on each *_ASYNC_*
+    // function; checked-for via `async_state_machine_for(...)`.
+    class ASYNC_STATE_MACHINE is
+        function: Function public;
+
+        _frame: ASYNC_STATE_MACHINE_FRAME;
+        _next_state: int;
+        _await_labels: Collections.LIST[ASYNC_STATE_LABEL];
+
+        init(function: Function) is
+            self.function = function;
+
+            _next_state = 1;
+            _await_labels = Collections.LIST[ASYNC_STATE_LABEL]();
+        si
+
+        // Lazy: the frame class is materialised on first access,
+        // pulling its result type from the (now-resolved) function
+        // return type (Tasks.TASK[T] → T, Tasks.TASK → void). Returns
+        // null only when the return type isn't a Task — which is an
+        // upstream diagnostic, not something the frame can recover
+        // from.
+        frame: ASYNC_STATE_MACHINE_FRAME? is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            if !_frame? then
+                if !function? \/ !function.return_type? then
+                    return null;
+                fi
+
+                let result_type: Type mut = default;
+                let is_void = false;
+
+                // Named functions + closures with pinned return type
+                // extract directly from `-> Tasks.TASK[T]` /
+                // `-> Tasks.TASK`. Lambdas with INFERED_RETURN_TYPE
+                // can't (INFER.`=~` matches anything) so fall back
+                // to the AST flag `is_void_async`; `result_type`
+                // fills in later via `ensure_result_field`.
+                let extracted = _extract_result_type(lookup);
+
+                if extracted? then
+                    result_type = extracted;
+                elif function.return_type.is_inferred then
+                    is_void = function.is_void_async;
+                else
+                    let void_task = lookup.get_void_task_type();
+                    if void_task? /\ function.return_type =~ void_task then
+                        is_void = true;
+                    else
+                        return null;
+                    fi
+                fi
+
+                _frame = ASYNC_STATE_MACHINE_FRAME(
+                    function.owner,
+                    function,
+                    result_type,
+                    is_void
+                );
+            else
+                // Re-poll on each access: a value-async lambda whose
+                // return type wasn't yet settled when the frame was
+                // first realised needs its _result_type filled in
+                // once the type pins. Idempotent.
+                _frame.ensure_result_field(lookup);
+            fi
+
+            return _frame;
+        si
+
+        _extract_result_type(lookup: Lookups.InnateSymbolLookup) -> Type? =>
+            TYPE_ARGUMENT_EXTRACTOR.extract(function.return_type, lookup.get_unspecialized_task_type());
+
+        allocate_state() -> int is
+            let n = _next_state;
+
+            _next_state = _next_state + 1;
+
+            return n;
+        si
+
+        record_label(state: int, awaiter_field: Field, label: IR.LABEL) is
+            _await_labels.add(ASYNC_STATE_LABEL(state, awaiter_field, label));
+        si
+
+        await_labels: Collections.Iterable[ASYNC_STATE_LABEL] => _await_labels;
+
+        // See `STATE_MACHINE_TYPE_PARAMS` — generator + async use
+        // the same capture order so the helper handles both.
+        install_body_emission_overrides() is
+            STATE_MACHINE_TYPE_PARAMS.walk_install(function, true);
+        si
+
+        uninstall_body_emission_overrides() is
+            STATE_MACHINE_TYPE_PARAMS.walk_install(function, false);
+        si
+
+        get_construction_type_arguments() -> Collections.List[Type]? =>
+            STATE_MACHINE_TYPE_PARAMS.construction_type_arguments(function);
+    si
+
+    // Frame class synthesised for each async function. Implements
+    // `IAsyncStateMachine` (MoveNext, SetStateMachine); holds the
+    // current state, a builder, per-await awaiter fields, captured
+    // arguments + locals + outer-self, and a result slot for
+    // value-async (omitted for void-async). The class itself is
+    // generic in any type parameters visible inside the owning
+    // function (mirrors `STATE_MACHINE_FRAME`).
+    class ASYNC_STATE_MACHINE_FRAME: STATE_MACHINE_FRAME_BASE is
+        _next_id: int static;
+
+        _result_type: Type;
+        _is_void: bool;
+
+        _state_field: Field;
+        _builder_field: Field;
+        _result_field: Field;
+        _outer_self_field: Field;
+        _constructor: Method;
+
+        result_type: Type => _result_type;
+        is_void: bool => _is_void;
+
+        class_result_type: Type? =>
+            if _result_type? then
+                _class_relative(_result_type)
+            else
+                null
+            fi;
+
+        state_field: Field => _state_field;
+        builder_field: Field => _builder_field;
+        result_field: Field => _result_field;
+        outer_self_field: Field => _outer_self_field;
+        constructor: Method => _constructor;
+
+        next_id: int static is
+            let result = _next_id;
+            _next_id = _next_id + 1;
+            return result;
+        si
+
+        init(owner: Scope, owning_function: Function, result_type: Type, is_void: bool) is
+            let owner_owner: Scope mut;
+
+            if isa Symbol(owner) then
+                let owner_symbol = owner;
+                owner_owner = owner_symbol.owner;
+            else
+                owner_owner = owner;
+            fi
+
+            super.init(
+                LOCATION.internal,
+                LOCATION.internal,
+                owner_owner,
+                "$AsyncStateMachine_{owning_function.name}_{next_id}",
+                owner,
+                owning_function
+            );
+
+            _result_type = result_type;
+            _is_void = is_void;
+
+            set_type(Types.NAMED(self));
+        si
+
+        _argument_fields: Collections.LIST[Field];
+
+        argument_fields: Collections.Iterable[Field] => _argument_fields;
+
+        _awaiter_fields: Collections.LIST[Field];
+
+        awaiter_fields: Collections.Iterable[Field] => _awaiter_fields;
+
+        // Lazy + idempotent realisation of frame members. Value-async
+        // frames short-circuit until `_result_type` is available
+        // (otherwise we'd resolve `AsyncTaskMethodBuilder<null>`).
+        declare() is
+            if _state_field? then
+                return;
+            fi
+
+            if !_is_void /\ !_result_type? then
+                return;
+            fi
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            declare_captured_type_params(listener);
+
+            let int_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type();
+
+            _state_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$state");
+            _state_field.set_type(int_type);
+            declare(LOCATION.internal, _state_field, listener);
+
+            // Builder field — `AsyncTaskMethodBuilder<T>` for
+            // value-async, non-generic for void-async. Omitted on
+            // the stubs path; IL emission supplies the type literally.
+            let builder_type = _resolve_builder_type();
+            if builder_type? then
+                _builder_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$builder");
+                _builder_field.set_type(builder_type);
+                declare(LOCATION.internal, _builder_field, listener);
+            fi
+
+            // `$result` only for value-async. Lambdas with
+            // unresolved result_type defer to `ensure_result_field`.
+            if !_is_void /\ _result_type? then
+                _result_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$result");
+                _result_field.set_type(_class_relative(_result_type));
+                declare(LOCATION.internal, _result_field, listener);
+            fi
+
+            // Async closures may have populated _local_fields via
+            // declare_local_field's lightweight path before declare()
+            // fires. Re-init the protocol-specific lists only when
+            // null.
+            if !_argument_fields? then
+                _argument_fields = Collections.LIST[Field]();
+            fi
+            if !_awaiter_fields? then
+                _awaiter_fields = Collections.LIST[Field]();
+            fi
+
+            let ctor_argument_names = Collections.LIST[string]();
+            let ctor_argument_types = Collections.LIST[Type]();
+
+            // Outer-self target: enclosing user class for an
+            // instance method, or the closure's captures-holding
+            // FRAME for an async closure (whose launch is emitted as
+            // an instance method on the FRAME).
+            let outer_classy: Classy mut = default;
+
+            if owning_function.is_instance /\ owning_function.owner? /\ isa Classy(owning_function.owner) then
+                outer_classy = cast Classy(owning_function.owner);
+            elif isa Closure(owning_function) then
+                let closure = cast Closure(owning_function);
+                if closure.frame? then
+                    outer_classy = closure.frame;
+                fi
+            fi
+
+            if outer_classy? then
+                let self_type = outer_self_type(outer_classy);
+
+                _outer_self_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$outer_self");
+                _outer_self_field.set_type(self_type);
+                declare(LOCATION.internal, _outer_self_field, listener);
+
+                ctor_argument_names.add("$outer_self");
+                ctor_argument_types.add(self_type);
+            fi
+
+            if owning_function.argument_names? then
+                for arg_name in owning_function.argument_names do
+                    let local = cast Symbols.LOCAL_ARGUMENT(owning_function.find_direct(arg_name));
+
+                    if !local? then
+                        continue;
+                    fi
+
+                    let arg_field_type = _class_relative(local.type);
+
+                    let arg_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$arg_{arg_name}");
+                    arg_field.set_type(arg_field_type);
+                    declare(LOCATION.internal, arg_field, listener);
+
+                    _argument_fields.add(arg_field);
+
+                    local.state_machine_field = arg_field;
+
+                    ctor_argument_names.add(arg_name);
+                    ctor_argument_types.add(arg_field_type);
+                od
+            fi
+
+            _constructor = Symbols.INSTANCE_METHOD(LOCATION.internal, LOCATION.internal, self, "init", self);
+            _constructor.set_arguments(ctor_argument_names, ctor_argument_types);
+            _constructor.set_void_return_type();
+            declare(LOCATION.internal, _constructor, listener);
+
+            // Ancestors: Object as base class, IAsyncStateMachine as
+            // implemented interface. The frame doesn't expose
+            // Iterable/Iterator like the generator frame; the runtime
+            // calls MoveNext via the builder.
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            add_ancestor(lookup.get_object_type());
+
+            let async_state_machine_type = _resolve_async_state_machine_type();
+            if async_state_machine_type? then
+                add_ancestor(async_state_machine_type);
+            fi
+        si
+
+        // Resolves to `System.Runtime.CompilerServices.AsyncTaskMethodBuilder<T>`
+        // for value-async or `System.Runtime.CompilerServices.AsyncTaskMethodBuilder`
+        // for void-async. Goes via the innate lookup so reflection
+        // (or the bootstrap stubs) supplies the actual Type.
+        _resolve_builder_type() -> Type is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            if _is_void then
+                return lookup.get_async_task_method_builder_void_type();
+            else
+                let class_result = _class_relative(_result_type);
+                return lookup.get_async_task_method_builder_type(class_result);
+            fi
+        si
+
+        _resolve_async_state_machine_type() -> Type is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            return lookup.get_async_state_machine_interface_type();
+        si
+
+        // Late-fill `_result_type` once the owning lambda's
+        // wrap-as-task pin settles. Unblocks declare() for value-
+        // async closures whose return type was inferred. Idempotent.
+        ensure_result_field(lookup: Lookups.InnateSymbolLookup) is
+            if _is_void \/ _result_type? then
+                return;
+            fi
+            if !owning_function? \/ !owning_function.return_type? then
+                return;
+            fi
+
+            let extracted = TYPE_ARGUMENT_EXTRACTOR.extract(
+                owning_function.return_type,
+                lookup.get_unspecialized_task_type()
+            );
+
+            if extracted? then
+                _result_type = extracted;
+            fi
+        si
+
+        // Per-await awaiter field. Each call site gets its own slot
+        // since the awaiter is typically a value type
+        // (`TaskAwaiter<T>` / its non-generic sibling).
+        declare_awaiter_field(awaiter_type: Type) -> Field is
+            let id = next_local_id();
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "$awaiter_{id}");
+            `field.set_type(_class_relative(awaiter_type));
+            declare(LOCATION.internal, `field, listener);
+
+            _awaiter_fields.add(`field);
+
+            return `field;
+        si
+
+        // Allocate a fresh field for a spilled intermediate value
+        // (SPILL_AWAITS pass + visit(SPILL) in generate-il) or for
+        // an await's result. The frame holds them so they survive
+        // across MoveNext re-entries.
+        declare_spill_field(type: Type) -> Field =>
+            declare_anonymous_field("spill", type);
+    si
+
+    // Free helper: returns the ASYNC_STATE_MACHINE held by any of
+    // the async function or closure forms, or null if `f` is a plain
+    // function / generator / sync closure.
+    async_state_machine_for(f: Function) -> ASYNC_STATE_MACHINE? is
+        if !f? then
+            return null;
+        fi
+
+        if isa STATIC_ASYNC_METHOD(f) then
+            return (cast STATIC_ASYNC_METHOD(f)).async_state_machine;
+        fi
+
+        if isa INSTANCE_ASYNC_METHOD(f) then
+            return (cast INSTANCE_ASYNC_METHOD(f)).async_state_machine;
+        fi
+
+        if isa GLOBAL_ASYNC_FUNCTION(f) then
+            return (cast GLOBAL_ASYNC_FUNCTION(f)).async_state_machine;
+        fi
+
+        if isa INSTANCE_ASYNC_CLOSURE(f) then
+            return (cast INSTANCE_ASYNC_CLOSURE(f)).async_state_machine;
+        fi
+
+        if isa STATIC_ASYNC_CLOSURE(f) then
+            return (cast STATIC_ASYNC_CLOSURE(f)).async_state_machine;
+        fi
+
+        if isa GLOBAL_ASYNC_CLOSURE(f) then
+            return (cast GLOBAL_ASYNC_CLOSURE(f)).async_state_machine;
+        fi
+
+        return null;
+    si
+
+    // Concrete async-function forms — thin extensions of the
+    // STATIC_METHOD / INSTANCE_METHOD / GLOBAL_FUNCTION classes
+    // that additionally carry an ASYNC_STATE_MACHINE.
+
+    class STATIC_ASYNC_METHOD: STATIC_METHOD is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // async (static)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+    si
+
+    class INSTANCE_ASYNC_METHOD: INSTANCE_METHOD is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // async";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+
+        // Inside the body, `self` and instance-member access go via
+        // the async state-machine frame's _outer_self field rather
+        // than ldarg.0 (which inside MoveNext refers to the state
+        // machine itself). Mirrors INSTANCE_GENERATOR_METHOD.load_self.
+        load_self(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            let frame = async_state_machine.frame;
+
+            if frame? then
+                frame.declare();
+
+                if frame.outer_self_field? then
+                    let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+                    if context? then
+                        return IR.Values.Load.OUTER_SELF(context!, context!.type, frame.outer_self_field);
+                    fi
+                fi
+            fi
+
+            return super.load_self(location, loader);
+        si
+    si
+
+    class GLOBAL_ASYNC_FUNCTION: GLOBAL_FUNCTION is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // async (global)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+    si
+
+    // Async closure forms — parallel to the *_ASYNC_METHOD /
+    // GLOBAL_ASYNC_FUNCTION trio, but for user-written async lambdas.
+    // Each is a thin extension of the corresponding sync closure that
+    // additionally carries an ASYNC_STATE_MACHINE; generate-il dispatches
+    // on `async_state_machine_for(symbol)` to route lambda emission down
+    // the state-machine path. Nested lambdas inside an async closure
+    // are sync by default — `declare_closure` returns the regular
+    // form, matching the named-function convention.
+
+    class INSTANCE_ASYNC_CLOSURE: INSTANCE_CLOSURE is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        init(location: LOCATION, owner: Scope, name: string, enclosing_scope: Scope, is_recursive: bool) is
+            super.init(location, owner, name, enclosing_scope, is_recursive);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+
+        to_string() -> string => "[instance async closure {name}]";
+    si
+
+    class STATIC_ASYNC_CLOSURE: STATIC_CLOSURE is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        init(location: LOCATION, owner: Scope, name: string, enclosing_scope: Scope, is_recursive: bool) is
+            super.init(location, owner, name, enclosing_scope, is_recursive);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+
+        to_string() -> string => "[static async closure {name}]";
+    si
+
+    class GLOBAL_ASYNC_CLOSURE: GLOBAL_CLOSURE is
+        async_state_machine: ASYNC_STATE_MACHINE public;
+
+        init(location: LOCATION, owner: Scope, name: string, enclosing_scope: Scope, is_recursive: bool) is
+            super.init(location, owner, name, enclosing_scope, is_recursive);
+
+            async_state_machine = ASYNC_STATE_MACHINE(self);
+        si
+
+        to_string() -> string => "[global async closure {name}]";
+    si
+si

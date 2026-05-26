@@ -334,17 +334,33 @@ namespace Semantic.Symbols is
                 null
             fi;
         
-        // TODO save previous type argument overrides otherwise this won't
-        // work for nested closures that capture type arguments
+        // Saved gen_type_override per captured type-arg symbol, set
+        // on entry to map_type_arguments and reinstated by
+        // unmap_type_arguments. Without this save/restore, an outer
+        // override (e.g. the enclosing generator's
+        // install_body_emission_overrides) would be clobbered by the
+        // closure's nullout in unmap and any later freeze of the
+        // outer's IR would emit the wrong type-arg index.
+        _saved_gen_type_overrides: Collections.MAP[Symbol, (Symbol, StringBuilder) -> void];
+
         map_type_arguments() is
             if !captured_type_arguments? then
                 return;
             fi
 
+            if !_saved_gen_type_overrides? then
+                _saved_gen_type_overrides = Collections.MAP[Symbol, (Symbol, StringBuilder) -> void]();
+            fi
+
             for symbol_cta in captured_type_arguments do
                 let symbol = symbol_cta.key;
                 let cta = symbol_cta.value;
-                
+
+                let prior = symbol.current_gen_type_override;
+                if prior? then
+                    _saved_gen_type_overrides[symbol] = prior;
+                fi
+
                 symbol.gen_type_override((s, buffer) is
                     if frame? then
                         buffer.append("!{cta.index} ")
@@ -357,7 +373,6 @@ namespace Semantic.Symbols is
 
         gen_overridden_type_argument_name(index: int, buffer: System.Text.StringBuilder);
 
-        // TODO restore previous type argument overrides
         unmap_type_arguments() is
             if !captured_type_arguments? then
                 return;
@@ -366,8 +381,14 @@ namespace Semantic.Symbols is
             for symbol_cta in captured_type_arguments do
                 let symbol = symbol_cta.key;
 
-                symbol.gen_type_override(null);
-            od            
+                let prior: (Symbol, StringBuilder) -> void mut = default;
+                if _saved_gen_type_overrides? /\ _saved_gen_type_overrides.try_get_value(symbol, prior ref) then
+                    symbol.gen_type_override(prior);
+                    _saved_gen_type_overrides.remove(symbol);
+                else
+                    symbol.gen_type_override(null);
+                fi
+            od
         si
 
         load(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
@@ -397,7 +418,21 @@ namespace Semantic.Symbols is
 
             for c in captured_values do
                 if c == null then
-                    let outer_self = loader.load_outer_self(location);
+                    // The "captured self" passed to the closure's
+                    // frame constructor. Same construction-site
+                    // distinction as `_load_delegate`: inside a
+                    // generator's MoveNext, route through the state-
+                    // machine frame's `_outer_self` so the frame ctor
+                    // receives the user's instance and not the state
+                    // machine.
+                    let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+                    let outer_self: Value mut;
+                    if context? then
+                        outer_self = _try_load_self_for_construction_via_outer_self(context!);
+                    fi
+                    if !outer_self? then
+                        outer_self = loader.load_outer_self(location);
+                    fi
 
                     actual_arguments.add(outer_self);
 
@@ -631,7 +666,23 @@ namespace Semantic.Symbols is
             assert !captured_type_arguments? else "delegate cannot capture type arguments";
 
             let function_pointer = IR.Values.Load.FUNCTION_POINTER(self);
-            let self_pointer = loader.load_self(LOCATION.internal);
+
+            // Delegate target: the receiver the runtime binds to the
+            // delegate. Inside a generator's MoveNext, `ldarg.0` is
+            // the state machine, so a plain `loader.load_self` would
+            // bind the delegate to it rather than the user's
+            // instance. Route through the state-machine frame's
+            // `_outer_self` field at construction-time when there's
+            // an enclosing generator; otherwise fall back to the
+            // ordinary load_self path.
+            let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+            let self_pointer: Value mut;
+            if context? then
+                self_pointer = _try_load_self_for_construction_via_outer_self(context!);
+            fi
+            if !self_pointer? then
+                self_pointer = loader.load_self(LOCATION.internal);
+            fi
 
             let delegate = IR.Values.Load.DELEGATE(type, function_pointer, self_pointer);
 
@@ -643,9 +694,9 @@ namespace Semantic.Symbols is
             let context = symbol_table.current_instance_context;
 
             if is_delegate then
-                return IR.Values.Load.REFERENCE_SELF(context!, context!.type);                
+                return IR.Values.Load.REFERENCE_SELF(context!, context!.type);
             fi
-            
+
             let is_captured = false;
 
             let stack = symbol_table.stack;
@@ -679,7 +730,7 @@ namespace Semantic.Symbols is
             od
 
             if !is_captured then
-                // load self normally: 
+                // load self normally:
                 return IR.Values.Load.REFERENCE_SELF(context!, context!.type);
             fi
             return null;
@@ -689,12 +740,59 @@ namespace Semantic.Symbols is
             if is_delegate then
                 let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
 
-                return IR.Values.Load.REFERENCE_SELF(context!, context!.type);                
+                return IR.Values.Load.REFERENCE_SELF(context!, context!.type);
             fi
 
             let `field = find_or_add_capture_self();
 
             return loader.load_instance_variable(location, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+        si
+
+        // At a closure-construction emission site that ends up inside
+        // a generator's MoveNext, `ldarg.0` refers to the state
+        // machine — so the closure's delegate target / captured-self
+        // value can't be loaded via REFERENCE_SELF (which would emit
+        // `ldarg.0` of the state machine). Instead load through the
+        // state-machine frame's `_outer_self` field, which the outer
+        // method populates with the user's instance at .ctor time.
+        //
+        // Walks outward from this closure to find the closest
+        // enclosing Function. If that function is a generator with a
+        // frame carrying `_outer_self`, returns the matching
+        // `OUTER_SELF` IR Value; otherwise returns null and the
+        // caller falls back to a plain REFERENCE_SELF.
+        //
+        // Called only at construction sites (`_load_delegate`,
+        // `_get_actual_arguments`) — NOT from `load_self` /
+        // `load_outer_self`, because those are also invoked while
+        // emitting the lambda's body, where `ldarg.0` is the
+        // delegate's target (the user's instance) and a `_outer_self`
+        // redirect would dereference the wrong receiver.
+        _try_load_self_for_construction_via_outer_self(context: Symbol) -> Value? is
+            let stack = IoC.CONTAINER.instance.symbol_table.stack;
+            let index mut = stack.count - 1;
+
+            while index >= 0 do
+                let scope = stack[index];
+
+                if scope == self then
+                    index = index - 1;
+                    continue;
+                fi
+
+                if let function: Function = scope then
+                    let sm = state_machine_for(function);
+                    if sm? /\ sm.frame? /\ sm.frame.outer_self_field? then
+                        sm.frame.declare();
+                        return IR.Values.Load.OUTER_SELF(context, context.type, sm.frame.outer_self_field);
+                    fi
+                    return null;
+                fi
+
+                index = index - 1;
+            od
+
+            return null;
         si
 
         load_outer_captured_value(location: LOCATION, symbol: Variable, loader: SYMBOL_LOADER) -> Value? is
@@ -757,7 +855,7 @@ namespace Semantic.Symbols is
             let `field = find_or_add_capture(symbol);
 
             let frame_field_load =
-                loader.load_instance_variable(LOCATION.internal, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+                loader.load_instance_variable(LOCATION.internal, _capture_frame_self_load(), `field);
 
             if symbol.is_boxed then
                 let value_member = loader.resolve_box_value_member(symbol);
@@ -772,7 +870,7 @@ namespace Semantic.Symbols is
             // the upstream diagnostic blocks unboxed captured
             // assignment, but the defensive path keeps us out of
             // NRE territory if it ever does.
-            return loader.store_instance_variable(LOCATION.internal, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field, value);
+            return loader.store_instance_variable(LOCATION.internal, _capture_frame_self_load(), `field, value);
         si
 
         load_captured_value(location: LOCATION, symbol: Variable, loader: SYMBOL_LOADER) -> Value is
@@ -795,7 +893,33 @@ namespace Semantic.Symbols is
             // returns, so that inter-frame capture transfers
             // (via `load_outer_captured_value`) keep passing the
             // box reference between frames untouched.
-            return loader.load_instance_variable(LOCATION.internal, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+            return loader.load_instance_variable(LOCATION.internal, _capture_frame_self_load(), `field);
+        si
+
+        // Load the captures-frame `this` for capture access. Normally
+        // REFERENCE_SELF (`ldarg.0` of the frame's type). For an
+        // ASYNC_CLOSURE compiled down the state-machine path, the
+        // body lives in the SM's MoveNext where `ldarg.0` is the SM
+        // instance — the captures-frame is reached via the SM's
+        // `_outer_self` field. Mirror of INSTANCE_ASYNC_METHOD's
+        // load_self.
+        _capture_frame_self_load() -> Value is
+            let async_sm = async_state_machine_for(self);
+            if async_sm? then
+                let sm_frame = async_sm.frame;
+                if sm_frame? then
+                    // declare() materialises outer_self_field; it's
+                    // lazy and idempotent. Required because the frame
+                    // property only constructs the bare FRAME object —
+                    // its members (including _outer_self_field) come
+                    // from declare().
+                    sm_frame.declare();
+                    if sm_frame.outer_self_field? then
+                        return IR.Values.Load.OUTER_SELF(frame, frame.type, sm_frame.outer_self_field);
+                    fi
+                fi
+            fi
+            return IR.Values.Load.REFERENCE_SELF(frame, frame.type);
         si
 
         gen_definition_header(buffer: StringBuilder) is
@@ -855,6 +979,14 @@ namespace Semantic.Symbols is
 
         declare_closure(location: LOCATION, name: string, owner: Scope, enclosing: Scope, is_recursive: bool, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
             let result = Symbols.INSTANCE_CLOSURE(location, owner, name, enclosing, is_recursive);
+
+            declare(location, result, null);
+
+            return result;
+        si
+
+        declare_async_closure(location: LOCATION, name: string, owner: Scope, enclosing: Scope, is_recursive: bool, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.INSTANCE_ASYNC_CLOSURE(location, owner, name, enclosing, is_recursive);
 
             declare(location, result, null);
 
@@ -923,6 +1055,14 @@ namespace Semantic.Symbols is
             return result;
         si
 
+        declare_async_closure(location: LOCATION, name: string, owner: Scope, enclosing: Scope, is_recursive: bool, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.STATIC_ASYNC_CLOSURE(location, owner, name, enclosing, is_recursive);
+
+            declare(location, result, null);
+
+            return result;
+        si
+
         load(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
             if frame? then
                 return super.load_closure(location, loader);
@@ -981,6 +1121,14 @@ namespace Semantic.Symbols is
 
         declare_closure(location: LOCATION, name: string, owner: Scope, enclosing: Scope, is_recursive: bool, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
             let result = Symbols.GLOBAL_CLOSURE(location, owner, name, enclosing, is_recursive);
+
+            declare(location, result, null);
+
+            return result;
+        si
+
+        declare_async_closure(location: LOCATION, name: string, owner: Scope, enclosing: Scope, is_recursive: bool, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.GLOBAL_ASYNC_CLOSURE(location, owner, name, enclosing, is_recursive);
 
             declare(location, result, null);
 

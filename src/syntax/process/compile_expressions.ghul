@@ -56,6 +56,7 @@ namespace Syntax.Process is
         _pragma_scope_stack: PRAGMA_SCOPE_STACK;
         _attribute_resolver: ATTRIBUTE_RESOLVER;
 
+        // Depth-counter for nested `let await` walks. When > 0,
         // Flow-sensitive narrowing — holds the narrowing environment
         // in force at the current walk point and keeps each narrowed
         // variable's `.type` reconciled to it. See
@@ -456,31 +457,57 @@ namespace Syntax.Process is
         si
 
         visit(function: Trees.Definitions.FUNCTION) is
-            _lambdas.visit_function_definition(function);
-
-            // Generator-function v1 restrictions: parameters and
-            // body locals aren't captured into the frame yet, so a
-            // reference to either inside MoveNext would dereference
-            // the wrong `this`. Emit a clean diagnostic at function
-            // level rather than letting the user hit ilasm errors
-            // or InvalidProgramException at runtime.
             let symbol = symbol_for(function);
 
+            let state_machine: Semantic.Symbols.STATE_MACHINE mut = default;
+            let async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE mut = default;
+
+            // Generator / async: realise the state-machine frame's
+            // argument fields and `_outer_self` field before the body
+            // walks. A closure inside the body freezes captured loads
+            // via `Value.freeze()` at compile-expressions time, and
+            // the captured `Load.LOCAL_ARGUMENT.gen` only redirects
+            // through `ldarg.0; ldfld _arg_<name>` when
+            // `state_machine_field` is populated on the symbol —
+            // populating it later (generate-il) would be too late.
+            //
+            // Also install the function-T → class-T gen_type override
+            // so that any closure that freezes inside the body — and
+            // any IR.Values inside that freeze that ref a function-T
+            // symbol — emits `!N` (class-level on the state machine)
+            // rather than `!!N` (method-level, which has no meaning
+            // inside MoveNext). The override is uninstalled after the
+            // body walk; generate-il re-installs it around its own
+            // body / state-machine emission paths.
             if isa Semantic.Symbols.Function(symbol) then
                 let function_symbol = cast Semantic.Symbols.Function(symbol);
-                let state_machine = Semantic.Symbols.state_machine_for(function_symbol);
+                state_machine = Semantic.Symbols.state_machine_for(function_symbol);
+                async_state_machine = Semantic.Symbols.async_state_machine_for(function_symbol);
 
-                if state_machine? then
-                    // Yield inside try/catch/finally needs the
-                    // fault-block / state-machine-finalisation
-                    // dance C# uses and isn't implemented in v1.
-                    // Lambdas need closure-capture integration with
-                    // the frame.
-                    if function.body? then
-                        YIELD_IN_TRY_SCANNER(_logger).scan(function.body);
-                        GENERATOR_LAMBDA_SCANNER(_logger).scan(function.body);
-                    fi
+                if state_machine? /\ state_machine.frame? then
+                    state_machine.frame.declare();
+                    state_machine.install_body_emission_overrides();
+                elif async_state_machine? /\ async_state_machine.frame? then
+                    async_state_machine.frame.declare();
+                    async_state_machine.install_body_emission_overrides();
                 fi
+            fi
+
+            _lambdas.visit_function_definition(function);
+
+            if state_machine? /\ state_machine.frame? then
+                state_machine.uninstall_body_emission_overrides();
+            elif async_state_machine? /\ async_state_machine.frame? then
+                async_state_machine.uninstall_body_emission_overrides();
+            fi
+
+            // Yield inside try/catch/finally needs the fault-block /
+            // state-machine-finalisation dance C# uses and isn't
+            // implemented in v1. The "yield + await in same body"
+            // diagnostic fires earlier in declare-symbols, where
+            // both AST forms are still observable.
+            if state_machine? /\ function.body? then
+                YIELD_IN_TRY_SCANNER(_logger).scan(function.body);
             fi
 
             super.visit(function);
@@ -552,6 +579,14 @@ namespace Syntax.Process is
 
             if `for.variable? /\ !`for.variable.is_poisoned then
                 set_symbol_type(`for.variable.left, type);
+
+                // Generator: register the per-iteration loop variable
+                // on the state-machine frame so closures inside the
+                // body that capture it freeze correctly. Same
+                // rationale as the LET path above; `for.variable` is
+                // not walked through the visitor framework here, so
+                // we call the helper directly.
+                _declare_state_machine_local_fields(`for.variable.left);
             fi
 
             if `for.body? then
@@ -798,10 +833,17 @@ namespace Syntax.Process is
             let state_machine = Semantic.Symbols.state_machine_for(function);
 
             if !state_machine? then
-                _logger.error(
-                    `yield.location,
-                    "yield is only allowed in a function returning Iterable[T] or Iterator[T]"
-                );
+                if function? /\ function.is_closure then
+                    _logger.error(
+                        `yield.location,
+                        "yield is not allowed in a lambda — only a named function declared to return Iterable[T] or Iterator[T] can be a generator"
+                    );
+                else
+                    _logger.error(
+                        `yield.location,
+                        "yield is only allowed in a function returning Iterable[T] or Iterator[T]"
+                    );
+                fi
 
                 return;
             fi
@@ -1295,6 +1337,59 @@ namespace Syntax.Process is
                 // FIXME: breaks VSCode rename symbol:
                 // _symbol_use_locations.add_symbol_use(`super.location, s);
             fi
+        si
+
+        // SPILL is synthesised by the SPILL_AWAITS pass *after*
+        // compile-expressions for the spiller's runtime path, so it
+        // generally won't be seen here. The implementation is included
+        // for completeness — types as a transparent wrapper over the
+        // operand. Generate-IL handles the actual eager-emission +
+        // frame-field-store at visit time.
+        visit(spill: Trees.Expressions.SPILL) is
+            spill.value = null;
+
+            if !spill.operand? \/ !spill.operand.value? \/ !spill.operand.value.type? then
+                spill.value = DUMMY(Semantic.Types.ERROR(), spill.location);
+                return;
+            fi
+
+            spill.value = IR.Values.WRAPPER(DUMMY(spill.operand.value.type, spill.location));
+        si
+
+        visit(`await: Trees.Expressions.AWAIT) is
+            `await.value = null;
+
+            if !`await.operand? \/ !`await.operand.value? \/ !`await.operand.value.type? then
+                `await.value = DUMMY(Semantic.Types.ERROR(), `await.location);
+                return;
+            fi
+
+            let operand_type = `await.operand.value.type;
+
+            // Element type for a constructed Tasks.TASK[T]; for the
+            // non-generic Tasks.TASK the result is void.
+            let element_type: Semantic.Types.Type mut =
+                _bindings.task_conversion.try_get_task_element_type(operand_type);
+
+            if !element_type? then
+                if _bindings.task_conversion.is_task_type(operand_type) then
+                    // Non-generic Tasks.TASK → void result.
+                    element_type = _innate_symbol_lookup.get_void_type();
+                else
+                    _logger.error(
+                        `await.location,
+                        "`await` requires a Tasks.TASK or Tasks.TASK[T] expression, got {operand_type}"
+                    );
+                    `await.value = DUMMY(Semantic.Types.ERROR(), `await.location);
+                    return;
+                fi
+            fi
+
+            // Generate-il fills the wrapper with IR.Values.AWAIT_SUSPEND
+            // when emitting the SM body. The wrapper carries the result
+            // type so surrounding expressions / let-bindings see the
+            // right type at compile-expressions time.
+            `await.value = IR.Values.WRAPPER(DUMMY(element_type, `await.location));
         si
 
         visit(`cast: Trees.Expressions.CAST) is
@@ -1818,6 +1913,15 @@ namespace Syntax.Process is
 
             variable.left.walk(self);
 
+            // Generator: register the new local on the state-machine
+            // frame so a closure later in the body that captures it
+            // freezes IL referencing the frame field rather than a
+            // CLR-local slot that doesn't exist inside MoveNext.
+            // No-op outside a generator function; idempotent on the
+            // field (declare_local_field returns the existing field
+            // and only refreshes its type on subsequent calls).
+            _declare_state_machine_local_fields(variable.left);
+
             return true;
         si
 
@@ -1831,6 +1935,50 @@ namespace Syntax.Process is
                     variable.initializer,
                     variable.initializer.location
                 );
+            fi
+        si
+
+        // Iterate the names on a variable-left pattern and, when the
+        // enclosing function is a generator, register each LOCAL_VARIABLE
+        // with the state-machine frame. LOCAL_ARGUMENTs are filtered out
+        // — those are already wired by `frame.declare()` at function
+        // entry — and non-generator functions are a no-op.
+        _declare_state_machine_local_fields(left: Trees.Variables.VariableLeft) is
+            if !left? then
+                return;
+            fi
+
+            let function = current_function;
+
+            if !function? then
+                return;
+            fi
+
+            // Try generator first, then async — they're mutually
+            // exclusive (declare-symbols enforces, see the
+            // generator-and-async-not-allowed diagnostic).
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+            let async_state_machine = Semantic.Symbols.async_state_machine_for(function);
+
+            let names_into = Collections.LIST[Trees.Identifiers.Identifier]();
+            left.get_names_into(names_into);
+
+            if state_machine? /\ state_machine.frame? then
+                let frame = state_machine.frame;
+                for name in names_into do
+                    let symbol = find(name);
+                    if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol then
+                        frame.declare_local_field(local);
+                    fi
+                od
+            elif async_state_machine? /\ async_state_machine.frame? then
+                let frame = async_state_machine.frame;
+                for name in names_into do
+                    let symbol = find(name);
+                    if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol then
+                        frame.declare_local_field(local);
+                    fi
+                od
             fi
         si
 
