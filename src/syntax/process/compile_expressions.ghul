@@ -457,6 +457,32 @@ namespace Syntax.Process is
 
         visit(function: Trees.Definitions.FUNCTION) is
             _lambdas.visit_function_definition(function);
+
+            // Generator-function v1 restrictions: parameters and
+            // body locals aren't captured into the frame yet, so a
+            // reference to either inside MoveNext would dereference
+            // the wrong `this`. Emit a clean diagnostic at function
+            // level rather than letting the user hit ilasm errors
+            // or InvalidProgramException at runtime.
+            let symbol = symbol_for(function);
+
+            if isa Semantic.Symbols.Function(symbol) then
+                let function_symbol = cast Semantic.Symbols.Function(symbol);
+                let state_machine = Semantic.Symbols.state_machine_for(function_symbol);
+
+                if state_machine? then
+                    // Yield inside try/catch/finally needs the
+                    // fault-block / state-machine-finalisation
+                    // dance C# uses and isn't implemented in v1.
+                    // Lambdas need closure-capture integration with
+                    // the frame.
+                    if function.body? then
+                        YIELD_IN_TRY_SCANNER(_logger).scan(function.body);
+                        GENERATOR_LAMBDA_SCANNER(_logger).scan(function.body);
+                    fi
+                fi
+            fi
+
             super.visit(function);
         si
 
@@ -736,6 +762,108 @@ namespace Syntax.Process is
 
             // FIXME: need to signal to any enclosing expression if statement that this is a throw so
             // if all branches are throws, an error can be reported
+        si
+
+        pre(`yield: Trees.Statements.YIELD) -> bool is
+            super.pre(`yield);
+
+            // The yielded expression's type must match the element
+            // type T (drawn from the enclosing function's
+            // `Iterable[T]` / `Iterator[T]` return type). Setting
+            // the constraint here — before walking the expression —
+            // lets the expression participate in inference / overload
+            // resolution against the expected type, like RETURN's
+            // value does in compile_bindings.pre_return.
+            let function = _symbol_table.current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if state_machine? /\ function.return_type? /\ `yield.expression? then
+                let element_type = _yield_element_type_for(function);
+
+                if element_type? /\ !element_type.is_inferred then
+                    `yield.expression.set_constraint(
+                        element_type,
+                        "yielded value of type {{0}} is not assignable to element type {{1}}"
+                    );
+                fi
+            fi
+
+            return false;
+        si
+
+        visit(`yield: Trees.Statements.YIELD) is
+            super.visit(`yield);
+
+            let function = _symbol_table.current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if !state_machine? then
+                _logger.error(
+                    `yield.location,
+                    "yield is only allowed in a function returning Iterable[T] or Iterator[T]"
+                );
+
+                return;
+            fi
+
+            if `yield.expression? /\ !Value.check_is_consumable(_logger, `yield.expression.location, `yield.expression.value) then
+                return;
+            fi
+
+            // Verify the function's return type is actually an
+            // Iterable[T] / Iterator[T]. The yield-presence test in
+            // declare-symbols routes here without inspecting the
+            // return type, so a body with `yield` and a non-iterable
+            // return type lands here as a diagnostic.
+            let element_type = _yield_element_type_for(function);
+
+            if !element_type? then
+                _logger.error(
+                    `yield.location,
+                    "yield is only allowed in a function returning Iterable[T] or Iterator[T] — found {function.return_type}"
+                );
+            fi
+        si
+
+        // Extract `T` from `current_function.return_type`'s
+        // `Iterable[T]` / `Iterator[T]` ancestor, or null if the
+        // return type implements neither.
+        _yield_element_type_for(function: Semantic.Symbols.Function) -> Semantic.Types.Type is
+            if !function? \/ !function.return_type? then
+                return null;
+            fi
+
+            let return_type = function.return_type;
+
+            let iterator = _innate_symbol_lookup.get_unspecialized_iterator_type();
+            let iterable = _innate_symbol_lookup.get_unspecialized_iterable_type();
+
+            let ancestor mut = return_type.find_ancestor(iterator);
+
+            if !ancestor? then
+                ancestor = return_type.find_ancestor(iterable);
+            fi
+
+            // Return type could itself be an Iterator[T] / Iterable[T]
+            // — find_ancestor skips the self-match in some flavours,
+            // so fall back to checking the type itself.
+            if !ancestor? /\ return_type.is_settled then
+                let symbol mut = return_type.symbol;
+
+                if let g: Semantic.Symbols.GENERIC = symbol then
+                    symbol = g.symbol;
+                fi
+
+                if symbol == iterator.symbol \/ symbol == iterable.symbol then
+                    ancestor = return_type;
+                fi
+            fi
+
+            if !ancestor? \/ !ancestor.arguments? \/ ancestor.arguments.count == 0 then
+                return null;
+            fi
+
+            return ancestor.arguments[0];
         si
 
         visit(`break: Trees.Statements.BREAK) is
@@ -1092,19 +1220,36 @@ namespace Syntax.Process is
                     fi
                 fi
 
-                if s.is_value_type then
-                    `self.value =
-                        Load.VALUE_SELF(
-                            s, type
-                        );
-                else
-                    `self.value =
-                        Load.REFERENCE_SELF(
-                            s, type
-                        );
+                // Generator instance methods read `self` from the
+                // frame's _outer_self field — the state-machine's
+                // ldarg.0 is the state machine itself, not the
+                // user instance.
+                let state_machine = Semantic.Symbols.state_machine_for(current_function);
+
+                if state_machine? /\ state_machine.frame? /\ !s.is_value_type then
+                    let frame = state_machine.frame;
+                    frame.declare();
+
+                    if frame.outer_self_field? then
+                        `self.value = Load.OUTER_SELF(s, type, frame.outer_self_field);
+                    fi
                 fi
 
-                // FIXME: this breaks VSCode rename symbol: 
+                if !`self.value? then
+                    if s.is_value_type then
+                        `self.value =
+                            Load.VALUE_SELF(
+                                s, type
+                            );
+                    else
+                        `self.value =
+                            Load.REFERENCE_SELF(
+                                s, type
+                            );
+                    fi
+                fi
+
+                // FIXME: this breaks VSCode rename symbol:
                 // _symbol_use_locations.add_symbol_use(`self.location, s);
             else
                 _logger.error(`self.location, "cannot access self from non-instance context");

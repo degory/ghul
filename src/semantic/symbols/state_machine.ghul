@@ -1,0 +1,715 @@
+namespace Semantic.Symbols is
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+
+    use IoC;
+    use Logging;
+    use Source;
+
+    use IR.Values.Value;
+
+    use Types.Type;
+
+    // Per-yield bookkeeping recorded by yield IL emission.
+    // The resumption label is placed immediately after the
+    // `ret` that suspends the generator; entry-dispatch jumps
+    // here when MoveNext re-enters in this state.
+    class STATE_LABEL is
+        state: int;
+        label: IR.LABEL;
+
+        init(state: int, label: IR.LABEL) is
+            self.state = state;
+            self.label = label;
+        si
+    si
+
+    // State held on a generator function symbol: the synthesised
+    // frame class, the running state-number counter, the recorded
+    // (state, resumption-label) pairs for entry-dispatch emission.
+    // Lives as a non-null field on each *_GENERATOR_* function;
+    // checked-for via `state_machine_for(...)`.
+    class STATE_MACHINE is
+        function: Function public;
+
+        _frame: STATE_MACHINE_FRAME;
+        _next_state: int;
+        _yield_labels: Collections.LIST[STATE_LABEL];
+
+        init(function: Function) is
+            self.function = function;
+
+            _next_state = 1;
+            _yield_labels = Collections.LIST[STATE_LABEL]();
+        si
+
+        // Lazy: the frame class is materialised on first access,
+        // pulling its element type from the (now-resolved) function
+        // return type. Returns null only if the return type is not
+        // an `Iterable[T]` / `Iterator[T]` — which is an upstream
+        // diagnostic, not something the frame can recover from.
+        frame: STATE_MACHINE_FRAME? is
+            if !_frame? then
+                let element_type = _extract_element_type();
+
+                if !element_type? then
+                    return null;
+                fi
+
+                _frame = STATE_MACHINE_FRAME(function.owner, function, element_type);
+            fi
+
+            return _frame;
+        si
+
+        _extract_element_type() -> Type? is
+            if !function? \/ !function.return_type? then
+                return null;
+            fi
+
+            let return_type = function.return_type;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let iterator = lookup.get_unspecialized_iterator_type();
+            let iterable = lookup.get_unspecialized_iterable_type();
+
+            let ancestor mut = return_type.find_ancestor(iterator);
+
+            if !ancestor? then
+                ancestor = return_type.find_ancestor(iterable);
+            fi
+
+            // If `return_type` is itself `Iterator[T]` /
+            // `Iterable[T]`, find_ancestor may have skipped the
+            // self-match. Detect by comparing the underlying
+            // unspecialized symbol.
+            if !ancestor? /\ return_type.is_settled /\ return_type.symbol? then
+                let symbol mut = return_type.symbol;
+
+                if let g: Symbols.GENERIC = symbol then
+                    symbol = g.symbol;
+                fi
+
+                if symbol == iterator.symbol \/ symbol == iterable.symbol then
+                    ancestor = return_type;
+                fi
+            fi
+
+            if !ancestor? \/ !ancestor.arguments? \/ ancestor.arguments.count == 0 then
+                return null;
+            fi
+
+            return ancestor.arguments[0];
+        si
+
+        allocate_state() -> int is
+            let n = _next_state;
+
+            _next_state = _next_state + 1;
+
+            return n;
+        si
+
+        record_label(state: int, label: IR.LABEL) is
+            _yield_labels.add(STATE_LABEL(state, label));
+        si
+
+        yield_labels: Collections.Iterable[STATE_LABEL] => _yield_labels;
+
+        // For a generic generator (or instance generator on a
+        // generic class), install gen_type_override on every
+        // type-parameter symbol visible inside the function body so
+        // that any remaining type-parameter references in IR.Values
+        // built by compile-expressions render as `!N` (state-machine
+        // class-level) rather than `!!N` (function-level) or `!N`
+        // bound to a different class.
+        //
+        // The order of installation must match the order
+        // STATE_MACHINE_FRAME.declare() captured them — class T's
+        // first, function T's second — so the indices align.
+        install_body_emission_overrides() is
+            _walk_captured_type_symbols(true);
+        si
+
+        uninstall_body_emission_overrides() is
+            _walk_captured_type_symbols(false);
+        si
+
+        _walk_captured_type_symbols(install: bool) is
+            if !function? then
+                return;
+            fi
+
+            let i mut = 0;
+
+            if isa Classy(function.owner) then
+                let owner_classy = cast Classy(function.owner);
+                if owner_classy.is_generic /\ owner_classy.argument_names? then
+                    for name in owner_classy.argument_names do
+                        let arg = owner_classy.find_direct(name);
+                        if arg? then
+                            _set_or_clear_override(arg, install, i);
+                        fi
+                        i = i + 1;
+                    od
+                fi
+            fi
+
+            if function.generic_argument_names? then
+                for name in function.generic_argument_names do
+                    let arg = function.find_direct(name);
+                    if arg? then
+                        _set_or_clear_override(arg, install, i);
+                    fi
+                    i = i + 1;
+                od
+            fi
+        si
+
+        _set_or_clear_override(arg: Symbol, install: bool, index: int) is
+            if install then
+                let captured_index = index;
+                arg.gen_type_override((s, buffer) is
+                    buffer.append("!{captured_index} ");
+                si);
+            else
+                arg.gen_type_override(null);
+            fi
+        si
+
+        // The list of Type values to pass at newobj construction
+        // time to instantiate the state-machine class. Class T's
+        // (from the enclosing classy) come first, then function T's
+        // — matches the declare order in STATE_MACHINE_FRAME.declare.
+        get_construction_type_arguments() -> Collections.List[Type]? is
+            if !function? then
+                return null;
+            fi
+
+            let result = Collections.LIST[Type]();
+
+            if isa Classy(function.owner) then
+                let owner_classy = cast Classy(function.owner);
+                if owner_classy.is_generic /\ owner_classy.argument_names? then
+                    for name in owner_classy.argument_names do
+                        let arg = owner_classy.find_direct(name);
+                        if arg? /\ isa Types.Typed(arg) then
+                            result.add(cast Types.Typed(arg).type);
+                        fi
+                    od
+                fi
+            fi
+
+            if function.is_generic /\ function.generic_arguments? then
+                for arg_type in function.generic_arguments do
+                    result.add(arg_type);
+                od
+            fi
+
+            if result.count == 0 then
+                return null;
+            fi
+
+            return result;
+        si
+    si
+
+    // Synthesised class that holds a generator's state machine. One
+    // per generator function. Implements `Iterator[T]` (which extends
+    // `Iterable[T]`), so the existing ienumerable/ienumerator boiler-
+    // plate emitters fire automatically for the non-generic bridges.
+    //
+    // Members:
+    //   - `_state: int`        — current state number (0 = initial,
+    //                            -1 = done, N > 0 = resumption point).
+    //   - `_current: T`        — last value pushed by `yield`.
+    //   - `_outer_self`        — (instance form only) the user's
+    //                            enclosing-instance reference. Wired
+    //                            in a later PR; the field is provisioned
+    //                            now so the IL shape carries forward.
+    //   - `init()`             — parameterless ctor (static-method form).
+    //
+    // No ghūl-side method declarations: the IL is hand-written in
+    // `gen_state_machine` (in generate_il), using the canonical .NET
+    // member names (`GetEnumerator`, `get_Current`, `MoveNext`,
+    // `Dispose`, `Reset`). The ghūl reflection mapping makes them
+    // visible to ghūl callers as `iterator`, `current`, `move_next`,
+    // `dispose`, `reset`.
+    class STATE_MACHINE_FRAME: Classy is
+        _next_id: int static;
+
+        _owning_function: Function;
+        _element_type: Type;
+
+        _state_field: Field;
+        _current_field: Field;
+        _outer_self_field: Field;
+        _constructor: Method;
+
+        owning_function: Function => _owning_function;
+        element_type: Type => _element_type;
+
+        // The element type rewritten into the frame class's scope —
+        // for use when hand-emitting IL strings that reference the
+        // element type inside the class body (e.g. accessor method
+        // signatures). Renders as `!N` (class-level) for a generic
+        // generator, same as `_element_type` for a non-generic one.
+        class_element_type: Type => _class_relative(_element_type);
+        state_field: Field => _state_field;
+        current_field: Field => _current_field;
+        outer_self_field: Field => _outer_self_field;
+        constructor: Method => _constructor;
+
+        next_id: int static is
+            let result = _next_id;
+            _next_id = _next_id + 1;
+            return result;
+        si
+
+        init(owner: Scope, owning_function: Function, element_type: Type) is
+            let owner_owner: Scope mut;
+
+            if isa Symbol(owner) then
+                let owner_symbol = owner;
+                owner_owner = owner_symbol.owner;
+            else
+                owner_owner = owner;
+            fi
+
+            // v1 frame classes are not generic. A generator over a
+            // function-level generic argument would need the class
+            // type-parameters to mirror the function's, and the
+            // body's references to the function-T to substitute to
+            // the class-T at IL time — not yet wired up. The
+            // `generic_generators_not_yet_supported` diagnostic in
+            // compile-expressions stops the user from reaching here
+            // with a generic generator.
+            super.init(
+                LOCATION.internal,
+                LOCATION.internal,
+                owner_owner,
+                "$StateMachine_{owning_function.name}_{next_id}",
+                System.Array.empty[string](),
+                owner
+            );
+
+            _owning_function = owning_function;
+            _element_type = element_type;
+
+            set_type(Types.NAMED(self));
+        si
+
+        // Argument fields, paired with their LOCAL_ARGUMENT source
+        // symbols. The constructor takes one parameter per argument
+        // (in the same order as the user function's parameters) and
+        // stores each into the matching field; the body's IR for a
+        // parameter load routes through `state_machine_field` and
+        // becomes ldarg.0; ldfld instead of ldarg.
+        _argument_fields: Collections.LIST[Field];
+
+        argument_fields: Collections.Iterable[Field] => _argument_fields;
+
+        // Per-LOCAL_VARIABLE frame fields. Populated lazily during
+        // body walking (generate_il's pre handlers for LET / FOR /
+        // CATCH bindings) so the field count matches what the body
+        // actually introduces — including nested-scope locals. The
+        // same redirect mechanism as parameters: the Variable's
+        // state_machine_field points at the field, and
+        // Load/Store.LOCAL_VARIABLE redirects through it.
+        _local_fields: Collections.LIST[Field];
+
+        local_fields: Collections.Iterable[Field] => _local_fields;
+
+        // Unique-id counter so two `let x` in sibling scopes don't
+        // collide on the same `_local_x` field name. Starts after
+        // the argument count so argument fields and local fields
+        // never share an id space (they have different name
+        // prefixes anyway — `_arg_` vs `_local_` — but bumping the
+        // counter keeps the IL diff easy to read).
+        _next_local_id: int;
+
+        // Substitution map keyed on the function's generic-argument
+        // names; values are the class-level CLASSY_GENERIC_ARGUMENT
+        // types for the frame. Used to specialize body/field/ctor
+        // types so they reference the frame's own T instead of the
+        // function's T — matches the shape of user-defined generic
+        // classes (where field types use class-T as `!N`).
+        _function_to_class_type_map: Collections.MAP[string, Type];
+
+        function_to_class_type_map: Collections.Map[string, Type] => _function_to_class_type_map;
+
+        // Declare the frame's members lazily — called by IL emission.
+        // Fields and constructor get real Symbol entities so reference
+        // emission (ldfld, stfld, newobj) routes through the existing
+        // SYMBOL_LOADER paths. The Iterator[T] / Iterable[T] methods
+        // are NOT declared as ghūl symbols — their IL is emitted by
+        // hand in `gen_all` using the canonical .NET names.
+        declare() is
+            if _state_field? then
+                return;
+            fi
+
+            let listener_for_types = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            // Capture every type-parameter visible inside the
+            // owning function — both the function's own type-params
+            // (declared via `[T]` on the function) and, when the
+            // function is instance/static on a generic class, the
+            // enclosing class's type-params. Each becomes a class-
+            // level type-parameter on the frame; the substitution
+            // map carries the rewrite for all of them.
+            //
+            // Function and class T's keep their original names. A
+            // future enhancement could collision-disambiguate; for
+            // now we trust that ghūl-level names don't clash within
+            // a single function's lexical scope (the type-resolver
+            // would already reject `class Box[T] is m[T]() is ... si si`).
+            _function_to_class_type_map = Collections.MAP[string, Type]();
+            let captured_names = Collections.LIST[string]();
+            let i mut = 0;
+
+            // 1) Enclosing-class generic args. Both instance AND
+            //    static methods on a generic class can reference
+            //    the class's T from inside their bodies (e.g.
+            //    `Container[T].items(items: Iterable[T])`), so
+            //    capture them for either form.
+            if isa Classy(_owning_function.owner) then
+                let owner_classy = cast Classy(_owning_function.owner);
+
+                if owner_classy.is_generic /\ owner_classy.argument_names? then
+                    for name in owner_classy.argument_names do
+                        let class_type_arg = declare_type(LOCATION.internal, name, i, listener_for_types);
+                        _function_to_class_type_map[name] = cast Types.Typed(class_type_arg).type;
+                        captured_names.add(name);
+                        i = i + 1;
+                    od
+                fi
+            fi
+
+            // 2) Function's own generic args.
+            if _owning_function.is_generic /\ _owning_function.generic_argument_names? then
+                for name in _owning_function.generic_argument_names do
+                    let class_type_arg = declare_type(LOCATION.internal, name, i, listener_for_types);
+                    _function_to_class_type_map[name] = cast Types.Typed(class_type_arg).type;
+                    captured_names.add(name);
+                    i = i + 1;
+                od
+            fi
+
+            if captured_names.count > 0 then
+                argument_names = captured_names;
+            fi
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let int_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type();
+
+            _state_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_state");
+            _state_field.set_type(int_type);
+            declare(LOCATION.internal, _state_field, listener);
+
+            _current_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_current");
+            _current_field.set_type(_class_relative(_element_type));
+            declare(LOCATION.internal, _current_field, listener);
+
+            // Per-argument fields. The owning function's LOCAL_ARGUMENT
+            // symbols get pointed at these so the body's argument
+            // load/store IR redirects from CLR-parameter access to
+            // field access (the CLR parameter exists only on the
+            // outer method, not on MoveNext).
+            _argument_fields = Collections.LIST[Field]();
+            _local_fields = Collections.LIST[Field]();
+
+            let ctor_argument_names = Collections.LIST[string]();
+            let ctor_argument_types = Collections.LIST[Type]();
+
+            // Instance generators carry a reference to the user's
+            // enclosing instance so the body's `self` / instance
+            // field access can be redirected via `ldarg.0; ldfld
+            // _outer_self`. The outer method (which has its own
+            // `this`) passes `this` to the .ctor as the first
+            // argument; the .ctor stores it into _outer_self.
+            //
+            // For a generic enclosing class the field/ctor argument
+            // type is `Wrapper<T>` (the enclosing class instantiated
+            // with the frame's mirror of Wrapper's T) rather than
+            // the un-instantiated `Wrapper`. Built from the captured
+            // class-T types so the field's IL signature is well-
+            // formed at frame-class scope.
+            if _owning_function.is_instance /\ _owning_function.owner? /\ isa Classy(_owning_function.owner) then
+                let outer_classy = cast Classy(_owning_function.owner);
+
+                let outer_self_type: Type mut = outer_classy.type;
+
+                if outer_classy.is_generic /\ outer_classy.argument_names? /\ outer_classy.argument_names.count > 0 then
+                    let outer_args = Collections.LIST[Type]();
+                    for name in outer_classy.argument_names do
+                        if _function_to_class_type_map.contains_key(name) then
+                            outer_args.add(_function_to_class_type_map[name]);
+                        fi
+                    od
+
+                    if outer_args.count == outer_classy.argument_names.count then
+                        outer_self_type = Types.GENERIC(LOCATION.internal, outer_classy, outer_args);
+                    fi
+                fi
+
+                _outer_self_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_outer_self");
+                _outer_self_field.set_type(outer_self_type);
+                declare(LOCATION.internal, _outer_self_field, listener);
+
+                ctor_argument_names.add("$outer_self");
+                ctor_argument_types.add(outer_self_type);
+            fi
+
+            if _owning_function.argument_names? then
+                for arg_name in _owning_function.argument_names do
+                    let local = cast Symbols.LOCAL_ARGUMENT(_owning_function.find_direct(arg_name));
+
+                    if !local? then
+                        continue;
+                    fi
+
+                    let arg_field_type = _class_relative(local.type);
+
+                    let arg_field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_arg_{arg_name}");
+                    arg_field.set_type(arg_field_type);
+                    declare(LOCATION.internal, arg_field, listener);
+
+                    _argument_fields.add(arg_field);
+
+                    local.state_machine_field = arg_field;
+
+                    ctor_argument_names.add(arg_name);
+                    ctor_argument_types.add(arg_field_type);
+                od
+            fi
+
+            _constructor = Symbols.INSTANCE_METHOD(LOCATION.internal, LOCATION.internal, self, "init", self);
+            _constructor.set_arguments(ctor_argument_names, ctor_argument_types);
+            _constructor.set_void_return_type();
+            declare(LOCATION.internal, _constructor, listener);
+
+            // Wire ancestors so the standard ghūl type-system
+            // machinery (is_derived_from_iterator_trait, the
+            // ienumerable/ienumerator boilerplate emitters, the
+            // gen_extends / gen_implements IL emission) treats
+            // this class correctly:
+            //   - Object as the base class (the existing
+            //     gen_extends picks the first non-trait ancestor).
+            //   - Iterable[T] so callers consuming the function's
+            //     `Iterable[T]` return type can call .iterator on
+            //     the returned state machine.
+            //   - Iterator[T] so the state machine can itself
+            //     answer MoveNext / get_Current / Dispose / Reset.
+            //
+            // The interface arguments use the class's own T
+            // (via _class_relative) so the implements clause emits
+            // `IEnumerable<!N>` rather than `IEnumerable<!!N>`.
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let class_relative_element = _class_relative(_element_type);
+
+            add_ancestor(lookup.get_object_type());
+            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterable_type(), class_relative_element));
+            add_ancestor(_construct_specialised(lookup.get_unspecialized_iterator_type(), class_relative_element));
+        si
+
+        _construct_specialised(unspecialized: Type, type_arg: Type) -> Type is
+            let symbol mut = unspecialized.symbol;
+
+            if let g: Symbols.GENERIC = symbol then
+                symbol = g.symbol;
+            fi
+
+            let classy = cast Symbols.Classy(symbol);
+
+            let args = Collections.LIST[Type]();
+            args.add(type_arg);
+
+            return Types.GENERIC(LOCATION.internal, classy, args);
+        si
+
+        // Declare a frame field for a body local. Idempotent — if
+        // the variable already has a state_machine_field linked
+        // (e.g. because pre(LET) and the FOR-each pre both visit
+        // the same binding through different visitor entry points)
+        // the second call returns the existing field.
+        declare_local_field(local: Variable) -> Field is
+            if local.state_machine_field? then
+                return local.state_machine_field;
+            fi
+
+            let id = _next_local_id;
+            _next_local_id = _next_local_id + 1;
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_local_{local.name}_{id}");
+            `field.set_type(_class_relative(local.storage_type));
+            declare(LOCATION.internal, `field, listener);
+
+            _local_fields.add(`field);
+
+            local.state_machine_field = `field;
+
+            return `field;
+        si
+
+        // Populate this Classy's argument_names so the emitted
+        // class header is generic in the named type-parameters.
+        // Mirrors `Classy.FRAME.set_type_arguments` — placed here
+        // directly because Classy doesn't define one at the base
+        // level (only FRAME does).
+        populate_argument_names(arguments: Collections.Iterable[Symbol]) is
+            argument_names = arguments | .map(a => a.name) .collect();
+        si
+
+        // Declare a class-level generic type-parameter on the frame.
+        // CLASS/TRAIT/STRUCT each define their own declare_type;
+        // Classy at the base level falls through to declare_undefined
+        // ("cannot declare type here"). Mirror the CLASS shape so
+        // generic generators can install their type parameters.
+        declare_type(location: LOCATION, name: string, index: int, symbol_definition_listener: SymbolDefinitionListener) -> Symbol is
+            let result = Symbols.CLASSY_GENERIC_ARGUMENT(location, self, name, index);
+            declare(location, result, symbol_definition_listener);
+            return result;
+        si
+
+        // Declare an anonymous frame field — used by code paths that
+        // need a temporary value that survives across yields without
+        // a user-named source symbol (most often, the hidden FOR
+        // iterator that today would be a CLR local TEMP). Each call
+        // produces a fresh field; no de-duplication.
+        declare_anonymous_field(prefix: string, type: Type) -> Field is
+            let id = _next_local_id;
+            _next_local_id = _next_local_id + 1;
+
+            let listener = IoC.CONTAINER.instance.symbol_definition_locations;
+
+            let `field = Symbols.INSTANCE_FIELD(LOCATION.internal, self, "_{prefix}_{id}");
+            `field.set_type(_class_relative(type));
+            declare(LOCATION.internal, `field, listener);
+
+            _local_fields.add(`field);
+
+            return `field;
+        si
+
+        // Rewrite a type from the function's generic-parameter scope
+        // into the frame class's scope. For a non-generic generator
+        // this is a no-op; for a generic generator each FUNCTION_
+        // GENERIC_ARGUMENT referenced inside `t` becomes the parallel
+        // CLASSY_GENERIC_ARGUMENT declared on the frame, so the
+        // field/ctor/local types emit `!N` (class level) rather than
+        // `!!N` (method level) — matching the shape of user-defined
+        // generic classes.
+        _class_relative(t: Type) -> Type is
+            if !t? then
+                return t;
+            fi
+
+            if !_function_to_class_type_map? \/ _function_to_class_type_map.count == 0 then
+                return t;
+            fi
+
+            return t.specialize(_function_to_class_type_map);
+        si
+
+        gen_access(buffer: StringBuilder) is
+            buffer.append("private ");
+        si
+
+        gen_type_prefix(buffer: StringBuilder) is
+            buffer.append("class ");
+        si
+    si
+
+    // Free helper: returns the STATE_MACHINE held by any of the three
+    // generator function forms, or null if `f` is a plain function.
+    state_machine_for(f: Function) -> STATE_MACHINE? is
+        if !f? then
+            return null;
+        fi
+
+        if isa STATIC_GENERATOR_METHOD(f) then
+            return (cast STATIC_GENERATOR_METHOD(f)).state_machine;
+        fi
+
+        if isa INSTANCE_GENERATOR_METHOD(f) then
+            return (cast INSTANCE_GENERATOR_METHOD(f)).state_machine;
+        fi
+
+        if isa GLOBAL_GENERATOR_FUNCTION(f) then
+            return (cast GLOBAL_GENERATOR_FUNCTION(f)).state_machine;
+        fi
+
+        return null;
+    si
+
+    // Concrete generator-function forms — thin extensions of the
+    // existing function/method classes that additionally carry a
+    // STATE_MACHINE bookkeeping object. Each form differs only in
+    // its CLR-level signature shape (instance, static, global).
+
+    class STATIC_GENERATOR_METHOD: STATIC_METHOD is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator (static)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+    si
+
+    class INSTANCE_GENERATOR_METHOD: INSTANCE_METHOD is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+
+        // Inside the body, `self` and instance-member access go via
+        // the state-machine frame's _outer_self field rather than
+        // ldarg.0 (which would point at the state machine itself).
+        // Force the frame's declare() so _outer_self_field is
+        // available — compile-expressions reaches here before
+        // _pre_generator_function (the regular declare site) but
+        // after return-type resolution, so the lazy frame creation
+        // succeeds.
+        load_self(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            let frame = state_machine.frame;
+
+            if frame? then
+                frame.declare();
+
+                if frame.outer_self_field? then
+                    let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+                    if context? then
+                        return IR.Values.Load.OUTER_SELF(context!, context!.type, frame.outer_self_field);
+                    fi
+                fi
+            fi
+
+            return super.load_self(location, loader);
+        si
+    si
+
+    class GLOBAL_GENERATOR_FUNCTION: GLOBAL_FUNCTION is
+        state_machine: STATE_MACHINE public;
+
+        description: string => "{qualified_name}{generic_argument_descriptions}({argument_descriptions}) -> {return_type} // generator (global)";
+
+        init(location: LOCATION, span: LOCATION, owner: Scope, name: string, enclosing_scope: Scope) is
+            super.init(location, span, owner, name, enclosing_scope);
+
+            state_machine = STATE_MACHINE(self);
+        si
+    si
+si
