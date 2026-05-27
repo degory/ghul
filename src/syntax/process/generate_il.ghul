@@ -951,21 +951,7 @@ namespace Syntax.Process is
             // outside (ECMA-335 forbids that, and the previous
             // centralized-dispatch shape had exactly that bug).
             let state_field_ref = frame.state_field.get_il_reference();
-            add(".locals init (int32 '.gen_state')");
-            add("ldarg.0");
-            add("ldfld {state_field_ref}");
-            add("stloc '.gen_state'");
-
-            // Outer dispatch placeholder. Yields fire visit(YIELD),
-            // which registers (state, resume_label) with the
-            // innermost dispatch holder. Inner `.try` bodies push
-            // their own holder; yields inside register there. So
-            // the dispatch `beq` and the label always live in the
-            // same region.
-            let outer_dispatch_block = Values.BLOCK();
-            add(outer_dispatch_block);
-            let outer_dispatch_holder = ASYNC_DISPATCH_HOLDER(outer_dispatch_block, "'.gen_state'");
-            _async_dispatch_stack.add(outer_dispatch_holder);
+            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.gen_state'");
 
             // Stash the previous generator-yield-return label so
             // nested generator functions (rare) don't trip over
@@ -1191,22 +1177,7 @@ namespace Syntax.Process is
             // finally before exiting), and side effects must be
             // skipped.
             let state_field_ref = frame.state_field.get_il_reference();
-            add(".locals init (int32 '.async_state')");
-            add("ldarg.0");
-            add("ldfld {state_field_ref}");
-            add("stloc '.async_state'");
-
-            // Outer dispatch placeholder. AWAIT_SUSPENDs that fire
-            // OUTSIDE any inner `.try` register here; inner `.try`
-            // bodies push their own holder. Both registration sites
-            // emit `beq cold_resume_N` against the same V_state
-            // local, but the placeholder block lives in the same
-            // region as the targets it reaches — so the beq never
-            // crosses a try boundary.
-            let outer_dispatch_block = Values.BLOCK();
-            add(outer_dispatch_block);
-            let outer_dispatch_holder = ASYNC_DISPATCH_HOLDER(outer_dispatch_block, "'.async_state'");
-            _async_dispatch_stack.add(outer_dispatch_holder);
+            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.async_state'");
 
             // Labels used by the trailer: success fall-through and
             // the end of the wrapping try/catch. The entire MoveNext
@@ -1263,6 +1234,109 @@ namespace Syntax.Process is
             );
 
             return true;
+        si
+
+        // The state-local IL spelling of the innermost open
+        // dispatch holder — `'.async_state'` for async state
+        // machines, `'.gen_state'` for generators, null when no
+        // state machine is open. Used by `.try` emission and the
+        // finally-body state guard so the same code paths emit the
+        // right local name without each caller having to know.
+        _current_state_local_il() -> string? is
+            if _async_dispatch_stack.count == 0 then
+                return null;
+            fi
+            return _async_dispatch_stack[_async_dispatch_stack.count - 1].state_local_il;
+        si
+
+        // Declare a CLR `int32` local in the MoveNext frame, copy
+        // the state field into it, and push the outer dispatch
+        // holder bound to that local. Returns the pushed holder so
+        // the caller can pop it at the end of the body walk via
+        // `_pop_async_dispatch_holder`. Used by every state-machine
+        // entry point (named function, lambda closure, generator).
+        // `state_local_il` is the local's IL spelling —
+        // `'.async_state'` for async, `'.gen_state'` for
+        // generators — and travels with the holder so inner
+        // dispatch sites pick it up.
+        _open_state_machine_entry(
+            state_field_ref: string,
+            state_local_il: string
+        ) -> ASYNC_DISPATCH_HOLDER is
+            add(".locals init (int32 {state_local_il})");
+            add("ldarg.0");
+            add("ldfld {state_field_ref}");
+            add("stloc {state_local_il}");
+
+            let block = Values.BLOCK();
+            add(block);
+            let holder = ASYNC_DISPATCH_HOLDER(block, state_local_il);
+            _async_dispatch_stack.add(holder);
+            return holder;
+        si
+
+        // Push an inner dispatch holder at the top of a `.try` body
+        // if we're inside a state-machine method. Returns the
+        // holder (to pop later) or null when no state machine is
+        // open — the caller can pass that null back to
+        // `_maybe_pop_dispatch_holder` for symmetric cleanup
+        // without an `if` at every call site.
+        _maybe_push_dispatch_holder() -> ASYNC_DISPATCH_HOLDER? is
+            if !_current_state_local_il()? then
+                return null;
+            fi
+            return _push_async_dispatch_holder();
+        si
+
+        _maybe_pop_dispatch_holder(holder: ASYNC_DISPATCH_HOLDER?) is
+            if holder? then
+                _pop_async_dispatch_holder(holder);
+            fi
+        si
+
+        // Record a (state, resume_label) pair with the innermost
+        // open dispatch holder, so its dispatch block (at the top
+        // of its `.try` body OR at MoveNext outer scope) routes
+        // cold-resume entries to {resume_label}. No-op outside a
+        // state machine.
+        _register_resume_with_dispatch(state: int, resume_label: IR.LABEL) is
+            if _async_dispatch_stack.count == 0 then
+                return;
+            fi
+            let holder = _async_dispatch_stack[_async_dispatch_stack.count - 1];
+            holder.register(state, resume_label);
+        si
+
+        // Emit the `if V_state >= 0 → skip` guard at the top of a
+        // finally body in a state-machine method. The `leave` that
+        // ends a suspend (AwaitUnsafeOnCompleted or yield) fires the
+        // surrounding finally with state >= 0; the user's code must
+        // not run then. Real exits (state == -1) and exceptional
+        // unwinds run the finally normally.
+        //
+        // Returns the skip label so the caller can plant it at the
+        // end of the guarded code via `_close_finally_state_guard`.
+        // Returns null when not inside a state machine — caller
+        // emits the finally body unguarded.
+        _open_finally_state_guard() -> LABEL? is
+            let state_local_il = _current_state_local_il();
+
+            if !state_local_il? then
+                return null;
+            fi
+
+            let skip = LABEL();
+            add("ldloc {state_local_il}");
+            add("ldc.i4.0");
+            add("bge {skip}");
+
+            return skip;
+        si
+
+        _close_finally_state_guard(skip: LABEL?) is
+            if skip? then
+                get_brancher_for_block().label(skip);
+            fi
         si
 
         // Push a new dispatch holder onto the stack and emit its
@@ -1969,15 +2043,7 @@ namespace Syntax.Process is
             // the closure body register with the outer holder unless
             // an inner `.try` pushes its own.
             let state_field_ref = frame.state_field.get_il_reference();
-            add(".locals init (int32 '.async_state')");
-            add("ldarg.0");
-            add("ldfld {state_field_ref}");
-            add("stloc '.async_state'");
-
-            let outer_dispatch_block = Values.BLOCK();
-            add(outer_dispatch_block);
-            let outer_dispatch_holder = ASYNC_DISPATCH_HOLDER(outer_dispatch_block, "'.async_state'");
-            _async_dispatch_stack.add(outer_dispatch_holder);
+            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.async_state'");
 
             let success_label = IR.LABEL();
             let end_label = IR.LABEL();
@@ -2494,15 +2560,7 @@ namespace Syntax.Process is
 
             state_machine.record_label(state, resume);
 
-            // Register the (state, resume_label) pair with the
-            // innermost open protected region. The dispatch block at
-            // the top of that region's `.try` body — or the outer
-            // dispatch at MoveNext top — emits the `beq` to {resume}
-            // so the branch and target stay in the same region.
-            if _async_dispatch_stack.count > 0 then
-                let holder = _async_dispatch_stack[_async_dispatch_stack.count - 1];
-                holder.register(state, resume);
-            fi
+            _register_resume_with_dispatch(state, resume);
 
             let current_field_ref = frame.current_field.get_il_reference();
             let state_field_ref = frame.state_field.get_il_reference();
@@ -2610,16 +2668,7 @@ namespace Syntax.Process is
 
             async_sm.record_label(state, awaiter_field, cold_resume);
 
-            // Register the (state, cold-resume) pair with the
-            // innermost open protected region. The dispatch block
-            // for that region (sitting at the top of its `.try`
-            // body, OR at MoveNext outer scope) will emit
-            // `ldloc V_state; ldc.i4 N; beq cold_resume` so the
-            // branch and the target live in the same region.
-            if _async_dispatch_stack.count > 0 then
-                let holder = _async_dispatch_stack[_async_dispatch_stack.count - 1];
-                holder.register(state, cold_resume);
-            fi
+            _register_resume_with_dispatch(state, cold_resume);
 
             let unspec_awaiter_type =
                 if element_type? then
@@ -2715,16 +2764,15 @@ namespace Syntax.Process is
 
             let brancher = get_brancher_for_block();
 
-            // A dispatch holder is open whenever we're emitting the
-            // body of an async or generator state machine. Either
-                // way, a `.try` inside that body needs its own holder
-            // and a state-guarded finally — both behave the same
-            // way; only the state-local IL spelling
-            // (`'.async_state'` vs `'.gen_state'`) differs, and that
-            // travels via the holder.
-            let in_state_machine = _async_dispatch_stack.count > 0;
-            let dispatch_holder: ASYNC_DISPATCH_HOLDER mut = default;
-            let state_local_il: string mut = default;
+            // A `.try` inside a state-machine body needs its own
+            // dispatch holder (so awaits/yields inside register here,
+            // keeping the `beq cold_resume_N` and the target label
+            // in the same protected region) plus a state-guarded
+            // finally body (skip dispose / user-cleanup on suspend
+            // `leave`). Both works the same way for let-use and
+            // user-written try; the helpers below no-op outside a
+            // state machine.
+            let dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
 
             if list.want_dispose then
                 (outer_try, return_needed, return_value) = get_exception_handler_temps();
@@ -2740,10 +2788,7 @@ namespace Syntax.Process is
 
                 add(".try {{ // RAII ");
 
-                if in_state_machine then
-                    state_local_il = _async_dispatch_stack[_async_dispatch_stack.count - 1].state_local_il;
-                    dispatch_holder = _push_async_dispatch_holder();
-                fi
+                dispatch_holder = _maybe_push_dispatch_holder();
             fi
 
             for s in list.statements do
@@ -2757,9 +2802,7 @@ namespace Syntax.Process is
             fi
 
             if list.want_dispose then
-                if dispatch_holder? then
-                    _pop_async_dispatch_holder(dispatch_holder);
-                fi
+                _maybe_pop_dispatch_holder(dispatch_holder);
 
                 ensure_runtime_symbols_are_materialized();
 
@@ -2770,20 +2813,7 @@ namespace Syntax.Process is
                 add("}}");
                 add("finally {{");
 
-                // In an async / generator function, `leave` out of
-                // the `.try` fires this finally even when the leave
-                // was a suspend (AwaitUnsafeOnCompleted, or yield).
-                // The state local is >= 0 in that case (we just set
-                // it to the suspension's state number), so skip the
-                // dispose calls. On a real exit (state == -1) the
-                // finally runs normally.
-                let skip_dispose_label: LABEL? mut = null;
-                if in_state_machine then
-                    skip_dispose_label = LABEL();
-                    add("ldloc {state_local_il}");
-                    add("ldc.i4.0");
-                    add("bge {skip_dispose_label}");
-                fi
+                let skip_dispose_label = _open_finally_state_guard();
 
                 let to_dispose = list.variables_to_dispose;
 
@@ -2812,11 +2842,8 @@ namespace Syntax.Process is
                     i = i - 1;
                 od
 
-                if skip_dispose_label? then
-                    brancher.label(skip_dispose_label);
-                fi
+                _close_finally_state_guard(skip_dispose_label);
 
-                // TODO this is duplicated from try statement handling - needs to be refactored
                 brancher.label(label.middle);
 
                 add("endfinally");
@@ -3118,34 +3145,21 @@ namespace Syntax.Process is
 
             let need_double_try = `try.catches? /\ `try.catches.count > 0 /\ `try.`finally?;
 
-            let in_state_machine = _async_dispatch_stack.count > 0;
-            let outer_dispatch_holder: ASYNC_DISPATCH_HOLDER mut = default;
-            let body_dispatch_holder: ASYNC_DISPATCH_HOLDER mut = default;
-            let state_local_il: string mut = default;
-
-            if in_state_machine then
-                state_local_il = _async_dispatch_stack[_async_dispatch_stack.count - 1].state_local_il;
-            fi
+            let outer_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
+            let body_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
 
             if need_double_try then
                 add(".try {{");
-
-                if in_state_machine then
-                    outer_dispatch_holder = _push_async_dispatch_holder();
-                fi
+                outer_dispatch_holder = _maybe_push_dispatch_holder();
             fi
 
             add(".try {{");
 
-            if in_state_machine then
-                body_dispatch_holder = _push_async_dispatch_holder();
-            fi
+            body_dispatch_holder = _maybe_push_dispatch_holder();
 
             `try.body.walk(self);
 
-            if body_dispatch_holder? then
-                _pop_async_dispatch_holder(body_dispatch_holder);
-            fi
+            _maybe_pop_dispatch_holder(body_dispatch_holder);
 
             brancher.leave(label.start);
 
@@ -3156,37 +3170,20 @@ namespace Syntax.Process is
             od
 
             if need_double_try then
-                if outer_dispatch_holder? then
-                    _pop_async_dispatch_holder(outer_dispatch_holder);
-                fi
+                _maybe_pop_dispatch_holder(outer_dispatch_holder);
                 add("}}");
             fi
 
-            // TODO a lot of this is duplicated in the list statement handling - needs to be refactored
             if `try.`finally? then
                 label.is_in_finally = true;
 
                 add("finally {{");
 
-                // In an async / generator function the suspend
-                // `leave` (or `leave` from a yield) fires this
-                // finally with state >= 0 (the suspension's state
-                // number). Skip the user's `finally` body in that
-                // case — it runs on real exit (state == -1) and on
-                // exception, not when the function is mid-suspend.
-                let skip_finally_label: LABEL? mut = null;
-                if in_state_machine then
-                    skip_finally_label = LABEL();
-                    add("ldloc {state_local_il}");
-                    add("ldc.i4.0");
-                    add("bge {skip_finally_label}");
-                fi
+                let skip_finally_label = _open_finally_state_guard();
 
                 `try.`finally.walk(self);
 
-                if skip_finally_label? then
-                    brancher.label(skip_finally_label);
-                fi
+                _close_finally_state_guard(skip_finally_label);
 
                 brancher.label(label.middle);
 
