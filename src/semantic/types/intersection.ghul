@@ -1,0 +1,485 @@
+namespace Semantic.Types is
+    use System.Text.StringBuilder;
+
+    // Compiler-internal "value is A AND B (AND ...)" representation,
+    // produced only by the narrowing pass when `isa T(x: D)` fires
+    // and neither type strict-subtypes the other. Tracks both the
+    // declared-side type and each isa-target so member lookup can
+    // see members from any side.
+    //
+    // Never user-spellable, never appears in slot types (fields,
+    // arguments, return types, generic-argument positions), never
+    // reaches IL emission or reflection metadata. Reads of a narrowed
+    // variable in IL load against the variable's declared type — the
+    // intersection is purely a compile-time member-resolution and
+    // assignability fact.
+    //
+    // Invariants (enforced by `INTERSECTION.create`):
+    //   - At most one class / struct / union member (the runtime
+    //     value has exactly one concrete identity).
+    //   - Zero or more trait members.
+    //   - No duplicate members (`=~` equality).
+    //   - No redundant supertype members — if A and B are both in
+    //     the list and B subtypes A, A is dropped (B implies A).
+    //   - If after de-dup / supertype-drop only one member remains,
+    //     `create` returns that plain type, never a singleton
+    //     INTERSECTION.
+    //   - Canonical order: class/struct/union first (if any), then
+    //     traits sorted by `to_string`. Lets `=~` be element-wise.
+    //
+    // Design note: `docs/claude/intersection-types.md`.
+    class INTERSECTION: NAMED is
+        _members: Collections.LIST[Type];
+
+        members: Collections.Iterable[Type] => _members;
+        members_count: int => _members.count;
+
+        // The class / struct / union member, if any. The intersection's
+        // "concrete identity" for queries that need a single CLR-type
+        // answer. Null when every member is a trait.
+        class_side: Type? is
+            for m in _members do
+                if _is_concrete_kind(m) then
+                    return m;
+                fi
+            od
+            return null;
+        si
+
+        // Default delegation target for Type-level queries that don't
+        // have a defined intersection semantics: class side if any,
+        // first trait otherwise. Members list is non-empty by
+        // construction so this never reads `_members[0]` on an empty
+        // list.
+        representative: Type =>
+            let cs = class_side in
+            if cs? then cs else _members[0] fi;
+
+        // `_build` orders members class-side first (if any), then
+        // traits — so members[0] is the natural CLR-level identity
+        // for any NAMED-shaped query (gen_type, etc).
+        init(members: Collections.LIST[Type]) is
+            super.init(members[0].symbol);
+            _members = members;
+        si
+
+        // Build the intersection of `a` and `b`. Applies de-dup,
+        // supertype-drop, singleton collapse, and canonical ordering.
+        // Returns a plain Type (one of the inputs, or the surviving
+        // member after collapse) when no real intersection is needed.
+        create(a: Type, b: Type) -> Type static is
+            let collected = Collections.LIST[Type]();
+
+            _collect(a, collected);
+            _collect(b, collected);
+
+            return _build(collected);
+        si
+
+        // True for types that can be the "concrete identity" of a
+        // runtime value: classes, structs, value types, unions,
+        // variants. At most one of these may appear in an intersection.
+        _is_concrete_kind(t: Type) -> bool static =>
+            t.is_class
+            \/ t.is_value_type
+            \/ (t.symbol? /\ t.symbol.is_union);
+
+        // Flatten `t` into `into`, applying _add_member's
+        // de-dup / supertype-drop rules. Skips ERROR / inferred /
+        // null inputs.
+        _collect(t: Type, into: Collections.LIST[Type]) static is
+            if !t? \/ t.is_error \/ t.is_inferred then
+                return;
+            fi
+
+            if let inner: INTERSECTION = t then
+                for m in inner.members do
+                    _add_member(m, into);
+                od
+            else
+                _add_member(t, into);
+            fi
+        si
+
+        // Add `m` to `into` with redundancy elimination.
+        //   - If an existing member subtypes `m` (existing implies
+        //     `m`), `m` is redundant — skip.
+        //   - Otherwise, drop every existing member that `m` subtypes
+        //     (more-specific `m` supersedes them).
+        //   - Then add `m`.
+        _add_member(m: Type, into: Collections.LIST[Type]) static is
+            for existing in into do
+                if existing =~ m then
+                    return;
+                fi
+
+                if m.is_assignable_from(existing) then
+                    return;
+                fi
+            od
+
+            let kept = Collections.LIST[Type]();
+
+            for existing in into do
+                if !existing.is_assignable_from(m) then
+                    kept.add(existing);
+                fi
+            od
+
+            into.clear();
+
+            for k in kept do
+                into.add(k);
+            od
+
+            into.add(m);
+        si
+
+        // Final assembly: validate the at-most-one-concrete invariant,
+        // sort canonically, collapse singleton to plain type.
+        _build(members: Collections.LIST[Type]) -> Type static is
+            if members.count == 0 then
+                return ERROR();
+            fi
+
+            if members.count == 1 then
+                return members[0];
+            fi
+
+            let concrete_count mut = 0;
+
+            for m in members do
+                if _is_concrete_kind(m) then
+                    concrete_count = concrete_count + 1;
+                fi
+            od
+
+            assert concrete_count <= 1
+                else "intersection contains more than one class/struct/union member";
+
+            let ordered = Collections.LIST[Type]();
+            let traits = Collections.LIST[Type]();
+
+            for m in members do
+                if _is_concrete_kind(m) then
+                    ordered.add(m);
+                else
+                    traits.add(m);
+                fi
+            od
+
+            for i in 0..traits.count do
+                for j in (i + 1)..traits.count do
+                    if traits[i].to_string().compare_to(traits[j].to_string()) > 0 then
+                        let temp = traits[i];
+                        traits[i] = traits[j];
+                        traits[j] = temp;
+                    fi
+                od
+            od
+
+            for t in traits do
+                ordered.add(t);
+            od
+
+            return INTERSECTION(ordered);
+        si
+
+        // ===== Type-property delegation =====
+        //
+        // Most queries that ask "what kind of type is this?" delegate
+        // to the representative (class side, or first trait). The
+        // intersection's runtime value behaves like the class side
+        // for CLR-level queries (gen_type, gen_class_name); for
+        // type-system queries that have a defined intersection
+        // semantics (is_assignable_from, find_member) we override.
+
+        symbol: Symbols.Symbol => representative.symbol;
+        scope: Scope? => representative.scope;
+        name: string? => null;
+
+        is_value_type: bool => false;
+        is_class: bool => class_side?;
+        is_trait: bool => !class_side?;
+        is_named: bool => true;
+
+        is_inheritable: bool => representative.is_inheritable;
+        is_object: bool => false;
+        is_root_value_type: bool => false;
+        is_void: bool => false;
+        is_action: bool => false;
+        is_function: bool => false;
+        is_ref: bool => false;
+        is_type_variable: bool => false;
+        is_value_tuple: bool => false;
+        is_optional: bool => false;
+
+        as_optional() -> Type => self;
+        as_non_optional() -> Type => self;
+
+        // ===== Equality and hashing =====
+        //
+        // Element-wise compare in canonical order. Two intersections
+        // with the same membership are =~ regardless of construction
+        // path because the factory enforces canonical ordering.
+
+        =~(other: Type) -> bool is
+            if !isa INTERSECTION(other) then
+                return false;
+            fi
+
+            let o = other;
+
+            if o._members.count != _members.count then
+                return false;
+            fi
+
+            for i in 0.._members.count do
+                if _members[i] !~ o._members[i] then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        get_hash_code() -> int is
+            let h mut = 0;
+
+            for m in _members do
+                h = h * 31 + m.get_hash_code();
+            od
+
+            return h;
+        si
+
+        // ===== Assignability =====
+        //
+        // A value of type `D & T1 & T2 ...` IS each of D, T1, T2 ...
+        //   (D & T1 & ...).is_assignable_from(X)
+        //       iff X is assignable to every member.
+        //   X.is_assignable_from(D & T1 & ...)
+        //       iff X is assignable to any member
+        //       (handled by the existing dispatch — each member's
+        //       compare(X) finds X among its supertypes when
+        //       applicable).
+
+        is_assignable_from(other: Type) -> bool is
+            for m in _members do
+                if !m.is_assignable_from(other) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        compare(other: Type) -> MATCH is
+            let worst mut = MATCH.SAME;
+
+            for m in _members do
+                let c = m.compare(other);
+
+                if c == MATCH.DIFFERENT then
+                    return MATCH.DIFFERENT;
+                fi
+
+                if cast int(c) > cast int(worst) then
+                    worst = c;
+                fi
+            od
+
+            return worst;
+        si
+
+        // ===== Member lookup =====
+        //
+        // Walk each member, collect the non-null lookups. Resolution:
+        //   - 0 results        → null
+        //   - 1 result         → that result
+        //   - all FUNCTION_GROUPs → merge (same shape as
+        //                          classy.find_enclosing, dedup by
+        //                          override_class)
+        //   - mixed kinds      → class-side wins for non-function
+        //                        members (per design's tie-break);
+        //                        else first trait wins (pragmatic
+        //                        fallback for multi-trait clash —
+        //                        documented limitation, matches
+        //                        existing classy.find_enclosing
+        //                        non-function handling)
+
+        find_member(name: string) -> Symbols.Symbol? is
+            let class_member: Symbols.Symbol? mut = null;
+            let trait_members = Collections.LIST[Symbols.Symbol]();
+            let cs = class_side;
+
+            for m in _members do
+                let r = m.find_member(name);
+
+                if r? then
+                    if cs? /\ m == cs then
+                        class_member = r;
+                    else
+                        trait_members.add(r);
+                    fi
+                fi
+            od
+
+            if !class_member? /\ trait_members.count == 0 then
+                return null;
+            fi
+
+            if class_member? /\ trait_members.count == 0 then
+                return class_member;
+            fi
+
+            if !class_member? /\ trait_members.count == 1 then
+                return trait_members[0];
+            fi
+
+            let all_groups mut = true;
+
+            if class_member? /\ !isa Symbols.FUNCTION_GROUP(class_member) then
+                all_groups = false;
+            fi
+
+            for t in trait_members do
+                if !isa Symbols.FUNCTION_GROUP(t) then
+                    all_groups = false;
+                fi
+            od
+
+            if all_groups then
+                return _merge_function_groups(class_member, trait_members, name);
+            fi
+
+            if class_member? then
+                return class_member;
+            fi
+
+            return trait_members[0];
+        si
+
+        // Build a combined FUNCTION_GROUP from `class_member`
+        // (optional) and `trait_members`. Dedupe by `override_class`
+        // so the same method declared by the same trait doesn't
+        // appear twice when reached via multiple paths. Functions
+        // without an override_class — typically synthesized — are
+        // added unconditionally; collisions there are not expected
+        // in practice.
+        _merge_function_groups(
+            class_member: Symbols.Symbol?,
+            trait_members: Collections.LIST[Symbols.Symbol],
+            name: string
+        ) -> Symbols.Symbol is
+            let sample =
+                if class_member? then
+                    class_member
+                else
+                    trait_members[0]
+                fi;
+
+            let combined = Symbols.FUNCTION_GROUP(sample.location, sample.owner, name);
+            let seen = Collections.SET[METHOD_OVERRIDE_CLASS]();
+
+            _absorb_function_group(class_member, combined, seen);
+
+            for t in trait_members do
+                _absorb_function_group(t, combined, seen);
+            od
+
+            return combined;
+        si
+
+        _absorb_function_group(
+            source: Symbols.Symbol?,
+            into: Symbols.FUNCTION_GROUP,
+            seen: Collections.SET[METHOD_OVERRIDE_CLASS]
+        ) static is
+            if !source? then
+                return;
+            fi
+
+            if let group: Symbols.FUNCTION_GROUP = source then
+                for f in group.functions do
+                    if f.override_class? then
+                        if !seen.contains(f.override_class) then
+                            seen.add(f.override_class);
+                            into.add(f);
+                        fi
+                    else
+                        into.add(f);
+                    fi
+                od
+            fi
+        si
+
+        // ===== Display =====
+        //
+        // Plain text join with ` & `. Single canonical form used in
+        // error messages, hovers, snapshots, debug dumps.
+
+        to_string() -> string is
+            let buffer = StringBuilder();
+            let first mut = true;
+
+            for m in _members do
+                if !first then
+                    buffer.append(" & ");
+                fi
+
+                buffer.append(m.to_string());
+                first = false;
+            od
+
+            return buffer.to_string();
+        si
+
+        short_description: string => to_string();
+
+        // ===== IL emission boundary =====
+        //
+        // Intersections never appear in slot types — narrowed-variable
+        // reads load against the variable's declared type, not the
+        // narrowed view. These shouldn't normally execute; if they
+        // do, emit the representative's IL (the concrete CLR-level
+        // identity).
+
+        gen_type(buffer: StringBuilder) is
+            representative.gen_type(buffer);
+        si
+
+        gen_class_name(buffer: StringBuilder) is
+            representative.gen_class_name(buffer);
+        si
+
+        walk(action: (Type) -> void) is
+            for m in _members do
+                m.walk(action);
+            od
+
+            action(self);
+        si
+
+        // ===== Specialization =====
+        //
+        // Intersections shouldn't appear in generic-argument
+        // positions, so this path is defensive. If it fires,
+        // specialize each member and rebuild through the factory
+        // to preserve invariants.
+
+        specialize(type_map: Collections.Map[string,Type]) -> Type is
+            if _members.count < 2 then
+                return self;
+            fi
+
+            let result mut = _members[0].specialize(type_map);
+
+            for i in 1.._members.count do
+                result = INTERSECTION.create(result, _members[i].specialize(type_map));
+            od
+
+            return result;
+        si
+    si
+si
