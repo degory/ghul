@@ -362,6 +362,29 @@ namespace Syntax.Process is
         si
 
         // should be called with logger speculating
+        _compile_call_arguments(
+            argument_expressions: Trees.Expressions.LIST,
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type]
+        ) is
+            for a in argument_expressions do
+                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                    arguments.add(a.value);
+                    argument_types.add(a.value.type);
+                else
+                    let t = Semantic.Types.ERROR();
+
+                    if a? then
+                        arguments.add(DUMMY(t, a.location));
+                    else
+                        arguments.add(DUMMY(t, argument_expressions.location));
+                    fi
+
+                    argument_types.add(t);
+                fi
+            od
+        si
+
         resolve_constructor(
             location: LOCATION,
             right_location: LOCATION,
@@ -389,22 +412,7 @@ namespace Syntax.Process is
             let arguments = Collections.LIST[Value]();
             let argument_types = Collections.LIST[Type]();
 
-            for a in argument_expressions do
-                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                    arguments.add(a.value);
-                    argument_types.add(a.value.type);
-                else
-                    let t = Semantic.Types.ERROR();
-
-                    if a? then
-                        arguments.add(DUMMY(t, a.location));
-                    else
-                        arguments.add(DUMMY(t, argument_expressions.location));
-                    fi
-
-                    argument_types.add(t);
-                fi
-            od
+            _compile_call_arguments(argument_expressions, arguments, argument_types);
 
             if !function_group? then
                 _logger.error(location, "no constructor found init({argument_types|})");
@@ -567,7 +575,7 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            let found = Ghul.BOX[bool](false);
+            let found = Ghul.BOX(false);
 
             for arg in function.arguments do
                 if !arg? then
@@ -604,7 +612,7 @@ namespace Syntax.Process is
                 return false;
             fi
 
-            let found = Ghul.BOX[bool](false);
+            let found = Ghul.BOX(false);
 
             for arg in function.arguments do
                 if !arg? then
@@ -759,6 +767,186 @@ namespace Syntax.Process is
             od
         si
 
+        // Constraint-push retry: when the first resolve fails AND
+        // there's exactly one arity-matching candidate AND at least
+        // one argument's first-walk type is under-determined for
+        // its corresponding formal type, push that candidate's
+        // formal arg types as constraints to each call argument
+        // and re-walk. This catches `apply(Box())` cases where a
+        // constructor argument's owner generic args were
+        // under-determined the first time round but become
+        // resolvable from the formal argument's type. The
+        // candidate's signature is the only signal we have for
+        // what the under-determined arg should resolve to —
+        // multi-candidate disambiguation under constraint push
+        // is left to a more general overload-as-constraint
+        // pass under #1174.
+        _retry_overload_after_null(
+            function_group: Semantic.Symbols.FUNCTION_GROUP,
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type],
+            want_instance: bool,
+            named_restrict: Collections.List[Semantic.Symbols.Function]?,
+            call: Trees.Expressions.CALL
+        ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
+            let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
+
+            // Trigger the retry when at least one actual
+            // is a FUNCTION literal even if its first-walk
+            // type has been ERROR-tainted by a body that
+            // walked without a constraint. The lambda can
+            // be re-walked under a pushed formal, so a
+            // FUNCTION arg is the natural signal that the
+            // null overload result might be recoverable.
+            // The pre-existing `any_arg_under_determined`
+            // path still covers the constructor-arg shape
+            // (e.g. `apply(Box())`).
+
+            if candidate? /\ (
+                _under_determination_detector.any_arg_under_determined(candidate, argument_types) \/
+                _has_function_literal_call_argument(call)
+            ) then
+                // Sibling-arg specialisation, symmetric to
+                // the path in `resolve_constructor`: when
+                // one actual is a not-yet-resolved FUNCTION
+                // literal AND the candidate has a generic
+                // owner, push specialised formals (bound
+                // from concrete sibling actuals) rather
+                // than unsubstituted formals containing
+                // free type variables that the lambda's
+                // argument-setup would reject as "type
+                // variable" anyway. Owners that aren't
+                // generic short-circuit inside
+                // OWNER_TYPE_ARG_SPECIALIZER and the
+                // pre-existing behaviour is preserved.
+                let push_candidate mut = candidate;
+
+                // Two-step specialisation: try
+                // owner-class generic args first (for
+                // method calls whose receiver class is
+                // generic), then if push_candidate is
+                // still the unsubstituted candidate and
+                // the candidate has its own generic
+                // args, try binding those from concrete
+                // siblings. The function-own path is
+                // what catches free-function HOFs like
+                // `generate[T,S]((0,1), state => ...)` —
+                // S binds from the (0,1) actual, T fills
+                // from a phantom, and the substituted
+                // formal-arg-type can then constrain the
+                // lambda's body re-walk.
+                push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
+
+                if push_candidate == candidate /\ candidate.is_generic then
+                    let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
+                    push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
+                fi
+
+                _logger.roll_back();
+                _logger.speculate();
+
+                for (index, a) in call.arguments | .index() do
+                    if !a? then
+                        continue;
+                    fi
+
+                    let f = push_candidate!.arguments[index];
+
+                    if f? then
+                        a.set_constraint(f, "{{0}} is not assignable to {{1}}");
+                    fi
+
+                    a.walk(_visitor);
+
+                    if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
+                        arguments[index] = a.value;
+                        argument_types[index] = a.value.type;
+                    else
+                        let t = Semantic.Types.ERROR();
+
+                        arguments[index] = DUMMY(t, a.location);
+                        argument_types[index] = t;
+                    fi
+                od
+
+                return _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict);
+            fi
+
+            return null;
+        si
+
+        // PARTIAL re-specialisation: the resolver may
+        // have driven its type-arg binding from a
+        // tainted lambda actual whose body errored on
+        // the first walk (the free-function lambda-
+        // inference gap). Pushing those ERROR-bearing
+        // formals as constraints to the lambda would
+        // taint its re-walk too. Detect the case and
+        // re-specialise from CLEAN siblings via the
+        // function-own-args specialiser (which skips
+        // ERROR / placeholder-bearing actuals); push
+        // that cleaner form.
+        //
+        // Same shape for unbound function-own type
+        // variables: when the resolver couldn't bind a
+        // slot, the formal still contains the
+        // candidate's literal `T` / `S` /…, which is
+        // useless as a constraint downstream
+        // (literal `T` matches nothing concrete the
+        // body could produce). Re-specialise so those
+        // slots become phantoms — back-feedable from
+        // inside the lambda body.
+        _retry_overload_on_partial(
+            overload_result: Semantic.OVERLOAD_RESOLVE_RESULT,
+            function_group: Semantic.Symbols.FUNCTION_GROUP,
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type],
+            want_instance: bool,
+            named_restrict: Collections.List[Semantic.Symbols.Function]?,
+            call: Trees.Expressions.CALL
+        ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
+            let push_function mut = overload_result.function;
+
+            if
+                _partial_arguments_contain_error(push_function) \/
+                _partial_arguments_contain_unbound_function_type_variable(push_function)
+            then
+                let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
+
+                if candidate? /\ candidate.is_generic then
+                    let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
+                    let respecialized = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
+
+                    if respecialized != candidate then
+                        push_function = respecialized;
+                    fi
+                fi
+            fi
+
+            _logger.roll_back();
+            _logger.speculate();
+
+            for (index, a) in call.arguments | .index() do
+                if !a? then
+                    continue;
+                elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
+                    let f = push_function.arguments[index];
+
+                    a.set_constraint(f, "{{0}} is not assignable to {{1}}");
+                    a.walk(_visitor);
+
+                    argument_types[index] = a.value.type;
+                else
+                    // ensure any error messages are committed
+                    a.walk(_visitor);
+                fi
+
+                arguments[index] = a.value;
+            od
+
+            return _overload_resolver.resolve(call.arguments.location, function_group, argument_types, false, want_instance, false, named_restrict);
+        si
+
         visit_call(call: Trees.Expressions.CALL) is
             // Recursive-call back-feed for self-recursive lambdas
             // (`let f = x rec => ... rec(actual) ...`). The
@@ -819,26 +1007,7 @@ namespace Syntax.Process is
             let arguments = Collections.LIST[Value]();
             let argument_types = Collections.LIST[Type]();
 
-            let buffer: IO.TextWriter;
-
-            let outer_state: (writer: IO.TextWriter, error_count: int);
-
-            for a in call.arguments do
-                if a? /\ a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                    arguments.add(a.value);
-                    argument_types.add(a.value.type);
-                else
-                    let t = Semantic.Types.ERROR();
-
-                    if a? then
-                        arguments.add(DUMMY(t, a.location));
-                    else
-                        arguments.add(DUMMY(t, call.arguments.location));
-                    fi
-
-                    argument_types.add(t);
-                fi
-            od
+            _compile_call_arguments(call.arguments, arguments, argument_types);
 
             // TODO handle if left is actually a type not a function or method
             // in which case we should treat this as a constructor call
@@ -880,103 +1049,8 @@ namespace Syntax.Process is
 
                     let overload_result mut = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict);
 
-                    // Constraint-push retry: when the first resolve fails AND
-                    // there's exactly one arity-matching candidate AND at least
-                    // one argument's first-walk type is under-determined for
-                    // its corresponding formal type, push that candidate's
-                    // formal arg types as constraints to each call argument
-                    // and re-walk. This catches `apply(Box())` cases where a
-                    // constructor argument's owner generic args were
-                    // under-determined the first time round but become
-                    // resolvable from the formal argument's type. The
-                    // candidate's signature is the only signal we have for
-                    // what the under-determined arg should resolve to —
-                    // multi-candidate disambiguation under constraint push
-                    // is left to a more general overload-as-constraint
-                    // pass under #1174.
                     if !overload_result? then
-                        let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
-
-                        // Trigger the retry when at least one actual
-                        // is a FUNCTION literal even if its first-walk
-                        // type has been ERROR-tainted by a body that
-                        // walked without a constraint. The lambda can
-                        // be re-walked under a pushed formal, so a
-                        // FUNCTION arg is the natural signal that the
-                        // null overload result might be recoverable.
-                        // The pre-existing `any_arg_under_determined`
-                        // path still covers the constructor-arg shape
-                        // (e.g. `apply(Box())`).
-
-                        if candidate? /\ (
-                            _under_determination_detector.any_arg_under_determined(candidate, argument_types) \/
-                            _has_function_literal_call_argument(call)
-                        ) then
-                            // Sibling-arg specialisation, symmetric to
-                            // the path in `resolve_constructor`: when
-                            // one actual is a not-yet-resolved FUNCTION
-                            // literal AND the candidate has a generic
-                            // owner, push specialised formals (bound
-                            // from concrete sibling actuals) rather
-                            // than unsubstituted formals containing
-                            // free type variables that the lambda's
-                            // argument-setup would reject as "type
-                            // variable" anyway. Owners that aren't
-                            // generic short-circuit inside
-                            // OWNER_TYPE_ARG_SPECIALIZER and the
-                            // pre-existing behaviour is preserved.
-                            let push_candidate mut = candidate;
-
-                            // Two-step specialisation: try
-                            // owner-class generic args first (for
-                            // method calls whose receiver class is
-                            // generic), then if push_candidate is
-                            // still the unsubstituted candidate and
-                            // the candidate has its own generic
-                            // args, try binding those from concrete
-                            // siblings. The function-own path is
-                            // what catches free-function HOFs like
-                            // `generate[T,S]((0,1), state => ...)` —
-                            // S binds from the (0,1) actual, T fills
-                            // from a phantom, and the substituted
-                            // formal-arg-type can then constrain the
-                            // lambda's body re-walk.
-                            push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, call, call.arguments.location);
-
-                            if push_candidate == candidate /\ candidate.is_generic then
-                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
-                                push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
-                            fi
-
-                            _logger.roll_back();
-                            _logger.speculate();
-
-                            for (index, a) in call.arguments | .index() do
-                                if !a? then
-                                    continue;
-                                fi
-
-                                let f = push_candidate!.arguments[index];
-
-                                if f? then
-                                    a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                                fi
-
-                                a.walk(_visitor);
-
-                                if a.value? /\ a.value.type? /\ a.value.check_is_consumable(_logger, a.location) then
-                                    arguments[index] = a.value;
-                                    argument_types[index] = a.value.type;
-                                else
-                                    let t = Semantic.Types.ERROR();
-
-                                    arguments[index] = DUMMY(t, a.location);
-                                    argument_types[index] = t;
-                                fi
-                            od
-
-                            overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict);
-                        fi
+                        overload_result = _retry_overload_after_null(function_group, arguments, argument_types, want_instance, named_restrict, call);
                     fi
 
                     if overload_result == null then
@@ -985,71 +1059,10 @@ namespace Syntax.Process is
                     fi
 
                     if overload_result!.score == Semantic.Types.MATCH.PARTIAL then
-                        // PARTIAL re-specialisation: the resolver may
-                        // have driven its type-arg binding from a
-                        // tainted lambda actual whose body errored on
-                        // the first walk (the free-function lambda-
-                        // inference gap). Pushing those ERROR-bearing
-                        // formals as constraints to the lambda would
-                        // taint its re-walk too. Detect the case and
-                        // re-specialise from CLEAN siblings via the
-                        // function-own-args specialiser (which skips
-                        // ERROR / placeholder-bearing actuals); push
-                        // that cleaner form.
-                        //
-                        // Same shape for unbound function-own type
-                        // variables: when the resolver couldn't bind a
-                        // slot, the formal still contains the
-                        // candidate's literal `T` / `S` /…, which is
-                        // useless as a constraint downstream
-                        // (literal `T` matches nothing concrete the
-                        // body could produce). Re-specialise so those
-                        // slots become phantoms — back-feedable from
-                        // inside the lambda body.
-                        let push_function mut = overload_result!.function;
-
-                        if
-                            _partial_arguments_contain_error(push_function) \/
-                            _partial_arguments_contain_unbound_function_type_variable(push_function)
-                        then
-                            let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
-
-                            if candidate? /\ candidate.is_generic then
-                                let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(call, call.arguments.location, candidate);
-                                let respecialized = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, call.arguments.location);
-
-                                if respecialized != candidate then
-                                    push_function = respecialized;
-                                fi
-                            fi
-                        fi
-
-                        _logger.roll_back();
-                        _logger.speculate();
-
-                        for (index, a) in call.arguments | .index() do
-                            if !a? then
-                                continue;
-                            elif a.value? /\ isa Trees.Expressions.FUNCTION(a) then
-                                let f = push_function.arguments[index];
-
-                                a.set_constraint(f, "{{0}} is not assignable to {{1}}");
-                                a.walk(_visitor);
-
-                                argument_types[index] = a.value.type;
-                            else
-                                // ensure any error messages are committed
-                                a.walk(_visitor);
-                            fi
-
-                            arguments[index] = a.value;
-                        od
-
-                        overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, false, want_instance, false, named_restrict);
+                        overload_result = _retry_overload_on_partial(overload_result!, function_group, arguments, argument_types, want_instance, named_restrict, call);
 
                         if !overload_result? then
                             call.value = DUMMY(Semantic.Types.ERROR(), call.location);
-                            // caller will commit any error messages
                             return;
                         fi
                     fi
