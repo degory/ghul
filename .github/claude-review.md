@@ -1,6 +1,6 @@
 # Cloud code review brief
 
-Instructions for the Anthropic Claude Code Action invoked from `.github/workflows/claude-review.yml`. Not loaded by local Claude Code; only the cloud reviewer reads this.
+Instructions for the Anthropic Claude Code Action invoked from the `code_review` job in `.github/workflows/ci.yml`. Not loaded by local Claude Code; only the cloud reviewer reads this.
 
 ## How to operate
 
@@ -24,9 +24,10 @@ You're invoked only after the CI workflow passes (unit tests, integration tests,
 Flag:
 
 - Bugs and likely-bugs.
-- Violations of the contracts below (IL emission, type-system change protocol, project-test traps).
+- Violations of the contracts below (type-system change protocol, project-test traps).
 - Deprecated idioms (e.g. `new Type(...)` instead of `Type(...)`).
 - Missing tests where AGENTS.md requires one (any behavioural change wants an integration test; type-system changes additionally want unit tests).
+- `GHUL.md` falling out of step with reality — a PR introduces a feature `GHUL.md` doesn't document, changes documented behaviour without updating it, or otherwise leaves the reference contradicting the code.
 - Source comment hygiene violations.
 - PR description violations.
 
@@ -34,7 +35,6 @@ Don't flag:
 
 - Hypothetical concerns ("could this race…?" without a concrete path).
 - "Consider…" suggestions that don't identify a real defect.
-- Style points the linter doesn't catch.
 - Anything you're not confident about.
 
 Silence on a low-confidence finding is better than noise. The reviewer's job is high-signal feedback, not exhaustive enumeration.
@@ -44,26 +44,16 @@ PR scope: a docs-only or workflow-only PR doesn't need code-review scrutiny. Ski
 ## ghūl idioms to know
 
 - **`new` is deprecated.** Construct by calling the type as a function: `Box(42)`, not `new Box(42)`. Generic constructor inference works (`Box(42)` infers `T = int`).
-- **No generic constraint enforcement.** Code that uses `Mock[SomeStruct]()` where `Mock<T>` declares `where T : class` parses fine. Flag uses of Moq from ghūl tests — prefer NSubstitute, real collaborators, or hand-written fakes.
-- **Variance is hard-wired per type.** Functions contravariant in inputs / covariant in return. Arrays covariant for non-value-types. Everything else (`Iterable[T]`, `List[T]`, `MAP[K,V]`) invariant. `[Cat()]` does *not* satisfy `Iterable[Animal]`.
-- **Array literals don't widen.** `[a, b]` produces `List[T]` with `T = LUB(elements)`. Empty `[]` doesn't parse as a primary expression — use `LIST[T]()`.
+- **Kind constraints are enforced.** `where T : class` / `struct` / `new()` are checked at type-argument resolution, on ghūl-declared and imported generics alike. A type argument that violates the constraint produces a compile error.
+- **Variance comes from .NET reflection.** ghūl reads `GenericParameterAttributes` from the CLR. So `IEnumerable<out T>` → `Iterable[T]` is covariant, `IList<T>` → `List[T]` invariant, function inputs contravariant / returns covariant. Arrays are covariant for non-value-types. CLR rule: value-type instantiations force invariance regardless of declared variance.
+- **Array literals.** `[a, b]` produces `T[]` (an array) with `T = LUB(elements)`. Array + iterable covariance let `[Cat(), Dog()]` satisfy `Iterable[Animal]`.
 - **String interpolation `{}` flips to expression context.** Inside `{...}` string literals nest normally (`"{g("hello")}"` is correct, not `"{g(\"hello\")}"`). `\"` only escapes in string-literal context.
 - **Naming**: `UPPER_CASE` for concrete/generated types (`CLASS`, `INSTANCE_METHOD`, `LEAST_UPPER_BOUND_MAP`), `PascalCase` for abstract bases (`Function`, `Classy`, `Type`), `snake_case` for members. .NET-imported names auto-convert (`DoSomething` → `do_something`).
 - **Reserved words bite.** `field`, `and`, etc. can't be local identifiers; backtick to escape (`` `field ``).
 
 Full reference: `GHUL.md`.
 
-## Bug classes to actively hunt
-
-### IL emission
-
-Methodref and fieldref signatures must use open-generic indexed references (`!N` for class-level type params, `!!N` for method-level), even when the constructed-type spec at the start of the methodref already pins the concrete instantiation. The `Function` type provides `unspecialized_arguments` / `unspecialized_return_type`; `Field` provides `unspecialized_type`. The `gen_*` emitters prefer them.
-
-Cheat sheet:
-
-- `MissingMethodException` / `MissingFieldException` at call time → methodref/fieldref signature with substituted types where it should have `!N`.
-- `InvalidProgramException` at JIT time → literal type-parameter names (e.g. `T`) in positions that require indexed refs.
-- `ArrayTypeMismatchException` at access time → array literal typed too narrowly (LUB ordering).
+## Contracts the test suite doesn't fully cover
 
 ### Type system & inference
 
