@@ -1,0 +1,124 @@
+# Cloud code review brief
+
+Instructions for the Anthropic Claude Code Action invoked from `.github/workflows/claude-review.yml`. Not loaded by local Claude Code; only the cloud reviewer reads this.
+
+## How to operate
+
+- The PR branch is checked out in the working directory.
+- Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`, CI status via `gh pr checks <N>`.
+- Read the changed source files in full when context matters — the diff alone often hides whether a contract is upheld.
+- Post findings only to GitHub. Anything you say in chat is invisible. If you have nothing to flag, post nothing.
+
+## What to post, where
+
+- **Inline comments** for specific code findings: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`. One finding per comment; don't pile multiple unrelated concerns into one.
+- **At most one top-level comment** via `gh pr comment` for holistic concerns that aren't tied to a line — PR description issues, missing tests overall, scope drift.
+- Sign top-level summary comments with a trailing `*— Claude (PR review)*` line so they're distinguishable from human reviewers.
+
+## What CI has already proven
+
+You're invoked only after the CI workflow passes (unit tests, integration tests, project tests, bootstrap). That means: parsing, semantic correctness, self-hosting reproducibility, and the regression suite are all settled before you read a line. **Don't second-guess validity.** Don't ask "is this valid ghūl?" "will this compile?" "does this break self-hosting?" CI just answered all three. Spend your attention on what the test suite can't catch: contract violations the suite doesn't yet cover, idiom drift, comment hygiene, and PR description quality.
+
+## Severity bar
+
+Flag:
+
+- Bugs and likely-bugs.
+- Violations of the contracts below (IL emission, type-system change protocol, project-test traps).
+- Deprecated idioms (e.g. `new Type(...)` instead of `Type(...)`).
+- Missing tests where AGENTS.md requires one (any behavioural change wants an integration test; type-system changes additionally want unit tests).
+- Source comment hygiene violations.
+- PR description violations.
+
+Don't flag:
+
+- Hypothetical concerns ("could this race…?" without a concrete path).
+- "Consider…" suggestions that don't identify a real defect.
+- Style points the linter doesn't catch.
+- Anything you're not confident about.
+
+Silence on a low-confidence finding is better than noise. The reviewer's job is high-signal feedback, not exhaustive enumeration.
+
+PR scope: a docs-only or workflow-only PR doesn't need code-review scrutiny. Skim, check the PR description, post nothing if there's nothing to say.
+
+## ghūl idioms to know
+
+- **`new` is deprecated.** Construct by calling the type as a function: `Box(42)`, not `new Box(42)`. Generic constructor inference works (`Box(42)` infers `T = int`).
+- **No generic constraint enforcement.** Code that uses `Mock[SomeStruct]()` where `Mock<T>` declares `where T : class` parses fine. Flag uses of Moq from ghūl tests — prefer NSubstitute, real collaborators, or hand-written fakes.
+- **Variance is hard-wired per type.** Functions contravariant in inputs / covariant in return. Arrays covariant for non-value-types. Everything else (`Iterable[T]`, `List[T]`, `MAP[K,V]`) invariant. `[Cat()]` does *not* satisfy `Iterable[Animal]`.
+- **Array literals don't widen.** `[a, b]` produces `List[T]` with `T = LUB(elements)`. Empty `[]` doesn't parse as a primary expression — use `LIST[T]()`.
+- **String interpolation `{}` flips to expression context.** Inside `{...}` string literals nest normally (`"{g("hello")}"` is correct, not `"{g(\"hello\")}"`). `\"` only escapes in string-literal context.
+- **Naming**: `UPPER_CASE` for concrete/generated types (`CLASS`, `INSTANCE_METHOD`, `LEAST_UPPER_BOUND_MAP`), `PascalCase` for abstract bases (`Function`, `Classy`, `Type`), `snake_case` for members. .NET-imported names auto-convert (`DoSomething` → `do_something`).
+- **Reserved words bite.** `field`, `and`, etc. can't be local identifiers; backtick to escape (`` `field ``).
+
+Full reference: `GHUL.md`.
+
+## Bug classes to actively hunt
+
+### IL emission
+
+Methodref and fieldref signatures must use open-generic indexed references (`!N` for class-level type params, `!!N` for method-level), even when the constructed-type spec at the start of the methodref already pins the concrete instantiation. The `Function` type provides `unspecialized_arguments` / `unspecialized_return_type`; `Field` provides `unspecialized_type`. The `gen_*` emitters prefer them.
+
+Cheat sheet:
+
+- `MissingMethodException` / `MissingFieldException` at call time → methodref/fieldref signature with substituted types where it should have `!N`.
+- `InvalidProgramException` at JIT time → literal type-parameter names (e.g. `T`) in positions that require indexed refs.
+- `ArrayTypeMismatchException` at access time → array literal typed too narrowly (LUB ordering).
+
+### Type system & inference
+
+`src/semantic/types/`, `src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference paths in `src/syntax/process/compile_expressions.ghul`, related IR-value gates are fragile. Patches that work in isolation can break LUB widening, retry-loop convergence, or IL emission gating.
+
+For changes here, AGENTS.md requires:
+
+- New logic in distinct classes with a single clear responsibility, not long methods on existing ones.
+- Unit tests under `unit-tests/src/` pinning the new behaviour.
+- Test coverage even for corner cases that behave oddly but aren't being fixed in this PR — pin the current behaviour with a comment explaining what looks off.
+
+Flag type-system PRs that don't follow this.
+
+### Project tests
+
+- **Don't share a `.csproj` reference across project tests.** Parallel `dotnet build` races on `bin/Debug/net8.0/<project>.deps.json` (MSBuild's `GenerateDepsFile` takes an exclusive write lock). Each project test gets its own private library. Stochastic — passes on PR, fails on main.
+- **Bootstrap source-compat**: `src/` must build under the currently-pinned compiler. A PR that uses a brand-new language feature in `src/` will fail bootstrap until the feature ships and the pin bumps. Fix-and-consume must be separate PRs across a publish.
+
+## Source comment hygiene
+
+Default position: no comment.
+
+Only comment where a competent informed reader would need extra context — a non-obvious invariant, a subtle ordering requirement, a workaround whose reason isn't visible from the code.
+
+Flag comments that:
+
+- Are excessively long. Brevity beats completeness.
+- Read as justification ("this is important because…", "this matters because…"). Either the code stands on its own merit, or it shouldn't be there.
+- Reference documents that aren't in the repo (memory files, hoisted depth docs, external URLs).
+- Reference internal labels — "phase 1", "stage 2", "option B", "the predecessor branch" — that a future reader has no context for.
+- Reference issues, PRs, "the fix", "what changed", or previous attempts. PR descriptions are the place for that, not source.
+- Read as one half of a conversation.
+
+## PR description
+
+PR description becomes the squash-commit message and the changelog entry. It ships permanently.
+
+- **Plain language.** No marketing tone, no defensive prose, no self-justification.
+- **Brevity.** Match the density of pre-Claude commits on `main` — a focused fix is often a single bullet.
+- **No `## Summary` / `## Test plan` / `## Testing` headings.** The PR description IS the summary.
+- **No external links, no references to documents that aren't in this repo.** Memory files, hoisted `docs/claude/`, internal workplans — none of it should appear.
+- **No internal labels.** "Phase 2 of…", "predecessor branch", "stage 1", "option B" — meaningless to a reader six months later.
+- **No local test results.** "All 247 integration tests pass locally", "bootstrap green", etc. CI is the proof of what's delivered; the description is for what changed, not what passed on the author's machine.
+- **No `Co-authored-by:` trailer in the body.** Squash-merge appends a deduped block automatically; a body trailer produces a duplicate.
+
+Body is `-`-bullets under one or more of:
+
+- `Enhancements:` — only for things someone actually using the compiler and language would notice. If in doubt, it isn't an enhancement. Internal improvements that don't change observable behaviour are `Technical:`.
+- `Bugs fixed:` — describe what was *broken*. Reuse the issue's exact title with `(closes #NNNN)` if there's an issue. Don't raise an issue solely to reference it.
+- `Technical:` — internal changes. Don't write self-justifyingly. If the change is needed it stands on its own merit; if it reads as needing justification, ask whether it's really needed.
+
+At least one section; any can be omitted.
+
+## Posting mechanics — reminder
+
+- Inline: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`.
+- Summary (at most one): `gh pr comment <N> --body "..."` — sign with `*— Claude (PR review)*`.
+- Chat output is invisible. If you didn't post it to GitHub, it didn't happen.
