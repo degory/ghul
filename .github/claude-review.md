@@ -5,15 +5,19 @@ Instructions for the Anthropic Claude Code Action invoked from the `code_review`
 ## How to operate
 
 - The PR branch is checked out in the working directory.
-- Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`, CI status via `gh pr checks <N>`.
+- Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`.
 - Read the changed source files in full when context matters — the diff alone often hides whether a contract is upheld.
-- Post findings only to GitHub. Anything you say in chat is invisible. If you have nothing to flag, post nothing.
+- Post findings only to GitHub. Anything you say in chat is invisible.
 
 ## What to post, where
 
 - **Inline comments** for specific code findings: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`. One finding per comment; don't pile multiple unrelated concerns into one.
-- **At most one top-level comment** via `gh pr comment` for holistic concerns that aren't tied to a line — PR description issues, missing tests overall, scope drift.
-- Sign top-level summary comments with a trailing `*— Claude (PR review)*` line so they're distinguishable from human reviewers.
+- **End every review with one `gh pr review` verdict**, even on a clean PR. Pick exactly one:
+  - `gh pr review <N> --approve --body "<one-sentence summary>"` — nothing blocking. Default verdict when you have not raised any inline finding that should hold up the merge.
+  - `gh pr review <N> --request-changes --body "<one-paragraph summary of the theme>"` — at least one inline finding is a real defect that should block merge.
+  - `gh pr review <N> --comment --body "..."` — non-blocking discussion only; reserve for the rare case where you want to flag something but explicitly don't want to block.
+- Sign the review body with a trailing `*— Claude (PR review)*` line.
+- Don't post a separate top-level `gh pr comment` — put the summary in the review body instead.
 
 ## What CI has already proven
 
@@ -110,5 +114,5 @@ At least one section; any can be omitted.
 ## Posting mechanics — reminder
 
 - Inline: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`.
-- Summary (at most one): `gh pr comment <N> --body "..."` — sign with `*— Claude (PR review)*`.
+- Verdict (exactly one, always): `gh pr review <N> --approve|--request-changes|--comment --body "..."` — sign with `*— Claude (PR review)*`.
 - Chat output is invisible. If you didn't post it to GitHub, it didn't happen.
