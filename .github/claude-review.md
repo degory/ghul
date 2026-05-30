@@ -12,11 +12,11 @@ Instructions for the Anthropic Claude Code Action invoked from the `code_review`
 ## What to post, where
 
 - **Inline comments** for specific code findings: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`. One finding per comment; don't pile multiple unrelated concerns into one.
-- **End every review with one `gh pr review` verdict**, even on a clean PR. Pick exactly one:
-  - `gh pr review <N> --approve --body "<one-sentence summary>"` — nothing blocking. Default verdict when you have not raised any inline finding that should hold up the merge.
-  - `gh pr review <N> --request-changes --body "<one-paragraph summary of the theme>"` — at least one inline finding is a real defect that should block merge.
-  - `gh pr review <N> --comment --body "..."` — non-blocking discussion only; reserve for the rare case where you want to flag something but explicitly don't want to block.
-- Sign the review body with a trailing `*— Claude (PR review)*` line.
+- **End every review with one `gh pr review` verdict.** Pick exactly one:
+  - `gh pr review <N> --approve --body "<one-sentence summary>"` — no findings worth raising. Approval is the merge signal: auto-merge is usually on, and even when it isn't, an approved PR is one button-click from landing. Do not approve while raising reservations of any kind.
+  - `gh pr review <N> --request-changes --body "<one-paragraph summary of the theme>"` — at least one finding should hold up the merge. Use this whenever you've posted an inline comment the author should act on before this PR ships.
+- **The approve body is a brief positive summary, nothing more.** One sentence describing what the PR does ("Wording fixes for the trait-override diagnostic", "Caches the analyser's symbol table across edits"). It is not a place to add caveats, "BTW", "minor nit", or "consider…" observations alongside the approval. If you find yourself wanting to add a qualification or addendum, that qualification *is* a finding — drop the approval, raise it as an inline comment, and switch the verdict to `--request-changes`.
+- **There is no "non-blocking" verdict.** If a finding is worth saying out loud, it's worth blocking on — raise it and request changes. If it isn't worth blocking, stay silent. Closing notes like "neither blocks merge", "non-blocking, but…", "minor nit…", "consider…" are incoherent with the workflow: by the time the author reads them, the PR is approved and about to merge. Don't write them.
 - Don't post a separate top-level `gh pr comment` — put the summary in the review body instead.
 
 ## What CI has already proven
@@ -114,5 +114,5 @@ At least one section; any can be omitted.
 ## Posting mechanics — reminder
 
 - Inline: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`.
-- Verdict (exactly one, always): `gh pr review <N> --approve|--request-changes|--comment --body "..."` — sign with `*— Claude (PR review)*`.
+- Verdict (exactly one, always): `gh pr review <N> --approve|--request-changes --body "..."`. Approve only when you've raised nothing the author should act on; otherwise request changes.
 - Chat output is invisible. If you didn't post it to GitHub, it didn't happen.
