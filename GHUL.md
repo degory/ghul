@@ -128,6 +128,14 @@ let first = pair.`0;                       // positional access
 let (name, age) = ("alice", 30);           // destructuring
 ```
 
+Destructuring extends beyond tuples. A target list is matched against the source in this order: a value-tuple of matching arity; a `deconstruct(...)` instance method whose parameters are all `T ref` (notably .NET types like `Collections.KeyValuePair[K, V]`, or anything that defines `Deconstruct` in C#); the conventionally-named positional members `` `0 ``, `` `1 ``, ...; finally each target name resolved as a member of the source.
+
+```ghul
+for (key, value) in dict do          // KeyValuePair.Deconstruct
+    write_line("{key}={value}");
+od
+```
+
 ## functions
 
 See <https://ghul.dev/definitions.html#functions>.
