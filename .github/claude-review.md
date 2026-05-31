@@ -20,9 +20,9 @@ Instructions for the Anthropic Claude Code Action invoked from the `code_review`
 - **There is no "non-blocking" verdict.** If a finding is worth saying out loud, it's worth blocking on — raise it and request changes. If it isn't worth blocking, stay silent. Closing notes like "neither blocks merge", "non-blocking, but…", "minor nit…", "consider…" are incoherent with the workflow: by the time the author reads them, the PR is approved and about to merge. Don't write them.
 - Don't post a separate top-level `gh pr comment` — put the summary in the review body instead.
 
-## What CI has already proven
+## What you're reading vs. what CI gates
 
-You're invoked only after the CI workflow passes (unit tests, integration tests, project tests, bootstrap). That means: parsing, semantic correctness, self-hosting reproducibility, and the regression suite are all settled before you read a line. **Don't second-guess validity.** Don't ask "is this valid ghūl?" "will this compile?" "does this break self-hosting?" CI just answered all three. Spend your attention on what the test suite can't catch: contract violations the suite doesn't yet cover, idiom drift, comment hygiene, and PR description quality.
+You're invoked in parallel with CI, not after it. **Trust the diff as written** — don't try to mentally compile the code, run tests, or verify self-hosting reproducibility. Whether tests pass is gated by CI and GitHub branch protection before merge; that's not your job. Don't ask "is this valid ghūl?" "will this compile?" "does this break self-hosting?" Spend your attention on what the test suite can't catch even when it passes: contract violations the suite doesn't yet cover, idiom drift, comment hygiene, and PR description quality.
 
 ## Severity bar
 
