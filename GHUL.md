@@ -360,6 +360,16 @@ if let (name, _) = lookup(id) then
 fi
 ```
 
+Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the binding, with the bound name in scope:
+
+```ghul
+if let c: Cat = animal /\ c.is_friendly then
+    write_line("friendly cat: {c.name}");
+fi
+```
+
+The binding's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The binding's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
+
 ghūl has no dedicated `match` construct; variant tags, narrowing, and `if let` cover that ground.
 
 ### loops
