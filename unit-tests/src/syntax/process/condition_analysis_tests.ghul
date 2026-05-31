@@ -7,17 +7,27 @@ namespace Syntax.Process.UnitTests is
     use Source.LOCATION;
 
     use Semantic.Symbols.CLASS;
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.UNION;
+    use Semantic.Symbols.VARIANT;
     use Semantic.Symbols.Variable;
+    use Semantic.Types.GENERIC;
+    use Semantic.Types.INTERSECTION;
+    use Semantic.Types.NAMED;
+    use Semantic.Types.ONE_OF;
     use Semantic.Types.Type;
 
     use Trees.Expressions.Expression;
 
     // Tests for CONDITION_ANALYZER.analyze_condition — focused on
-    // the boolean combinator composition (/\, \/, !), which is the
-    // new logic. ISA leaves are built directly; the narrowing-target
+    // the boolean combinator composition (/\, \/, !) and the
+    // variant-aware ISA receiver shapes (wide union, ONE_OF, an
+    // already-narrowed singleton variant, an INTERSECTION carrying
+    // one). ISA leaves are built directly; the narrowing-target
     // resolver is a per-test stub mapping the constructed `right`
-    // expressions to constructed Variables. The is_<variant> MEMBER
-    // leaf is exercised by integration tests, not here.
+    // expressions to constructed Variables. Receiver-type-aware
+    // tests attach an IR.DUMMY value to the right-operand so the
+    // analyzer can read its type.
     class CONDITION_ANALYSIS_TESTS is
         @test()
 
@@ -281,6 +291,166 @@ namespace Syntax.Process.UnitTests is
             Assert.is_true(facts.then_env.is_non_null(y));
             Assert.is_false(facts.else_env.is_non_null(x));
             Assert.is_false(facts.else_env.is_non_null(y));
+        si
+
+        // ---- Variant-receiver helpers (new in this branch) -----------
+
+        // Build {object, U, A, B, C} mirroring how `declare_variant`
+        // wires variants under a union scope. The variants are
+        // declared through `the_union.declare_variant` so they show
+        // up in `the_union.symbols` — `try_get_variant_type_for_classy`
+        // walks that list to confirm membership.
+        build_three_variant_union() -> (the_union: UNION, a: VARIANT, b: VARIANT, c: VARIANT) is
+            let object_class = CLASS(loc(), loc(), null, "object", empty_names(), false, null);
+            object_class.mark_is_object();
+
+            let the_union = UNION(loc(), loc(), null, "U", empty_names(), false, null);
+            the_union.add_ancestor(object_class.type);
+
+            let a = cast VARIANT(the_union.declare_variant(loc(), loc(), "A", false, null, null));
+            let b = cast VARIANT(the_union.declare_variant(loc(), loc(), "B", false, null, null));
+            let c = cast VARIANT(the_union.declare_variant(loc(), loc(), "C", false, null, null));
+
+            return (the_union, a, b, c);
+        si
+
+        // An IDENTIFIER carrying a value whose type is `t`. Used to
+        // exercise the receiver-aware branches of `_analyze_isa`,
+        // which read the receiver type off `isa.right.value.type`.
+        typed_id(name: string, t: Type) -> Trees.Expressions.IDENTIFIER is
+            let id = id_expr(name);
+            id.value = IR.Values.DUMMY(t, loc());
+            return id;
+        si
+
+        // get_classy_for_narrowing peels an INTERSECTION to the
+        // first member with a Classy symbol. The INTERSECTION is
+        // constructed via its raw `init` rather than the dedup-aware
+        // `INTERSECTION.create` factory so the multi-member shape
+        // survives — that is the shape the narrowing pipeline hands
+        // in when a singleton-variant narrow stacks on an existing
+        // ONE_OF narrow without dropping it.
+        get_classy_for_narrowing_should_peel_intersection() is
+            @test()
+
+            let h = build_three_variant_union();
+            let analyzer = make_analyzer(MAP[Expression, Variable]());
+
+            let one_of = ONE_OF(cast NAMED(h.the_union.type), list_of(h.a, h.b));
+            let pair = INTERSECTION(types_of(cast NAMED(h.a.type), one_of));
+
+            let classy = analyzer.get_classy_for_narrowing(pair);
+
+            Assert.is_not_null(classy);
+            Assert.are_same(h.a, classy);
+        si
+
+        // pick_underlying_type peels an INTERSECTION to the first
+        // NAMED member whose Classy is a union or variant.
+        pick_underlying_type_should_peel_intersection() is
+            @test()
+
+            let h = build_three_variant_union();
+            let analyzer = make_analyzer(MAP[Expression, Variable]());
+
+            let one_of = ONE_OF(cast NAMED(h.the_union.type), list_of(h.a, h.b));
+            let pair = INTERSECTION(types_of(cast NAMED(h.a.type), one_of));
+
+            let underlying = analyzer.pick_underlying_type(pair);
+
+            Assert.is_not_null(underlying);
+        si
+
+        // try_get_variant_type_for_classy resolves the parent union
+        // via the receiver-variant's `owner`, then specialises the
+        // target variant carrying the receiver's generic args.
+        try_get_variant_type_for_classy_should_walk_variant_owner() is
+            @test()
+
+            let h = build_three_variant_union();
+            let analyzer = make_analyzer(MAP[Expression, Variable]());
+
+            // Receiver is the already-narrowed A variant; ask for B.
+            let result = analyzer.try_get_variant_type_for_classy(h.a.type, h.b);
+
+            Assert.is_not_null(result);
+            Assert.is_true(isa NAMED(result));
+            Assert.are_same(h.b, (cast NAMED(result)).symbol);
+        si
+
+        // try_get_variant_type_for_classy returns null when the target
+        // variant is not a member of the receiver's union.
+        try_get_variant_type_for_classy_should_reject_foreign_variant() is
+            @test()
+
+            let h = build_three_variant_union();
+            let other = build_three_variant_union();
+            let analyzer = make_analyzer(MAP[Expression, Variable]());
+
+            // Receiver A of union U; ask for A' of the *other* union.
+            let result = analyzer.try_get_variant_type_for_classy(h.a.type, other.a);
+
+            Assert.is_null(result);
+        si
+
+        // Within the receiver's ONE_OF the narrow is specialized to
+        // the matched variant — the receiver-aware path in
+        // `try_get_variant_type_for_classy`.
+        analyze_isa_should_narrow_on_variant_inside_one_of() is
+            @test()
+
+            let h = build_three_variant_union();
+            let v = make_var(make_owner(), "v", h.the_union.type);
+
+            let one_of = ONE_OF(cast NAMED(h.the_union.type), list_of(h.b, h.c));
+            let right = typed_id("v", one_of);
+
+            let targets = MAP[Expression, Variable]();
+            targets[right] = v;
+
+            // `isa U.B(v)` — B is in {B, C}.
+            let facts = make_analyzer(targets).analyze_condition(make_isa(right, h.b.type), NARROW_ENV());
+
+            let narrowed = facts.then_env.narrowed_type_of(v);
+            Assert.is_not_null(narrowed);
+            Assert.is_true(isa NAMED(narrowed));
+            Assert.are_same(h.b, (cast NAMED(narrowed)).symbol);
+        si
+
+        // Receiver is a singleton variant; targeting a sibling
+        // variant of the same union also returns a specialised
+        // NAMED. Pins the helper's IL-specialisation contract —
+        // even when the test is statically false at runtime, the
+        // returned type must reference the variant with the
+        // receiver's generic args, never a bare open-generic one.
+        try_get_variant_type_for_classy_should_specialize_even_for_out_of_set_variant() is
+            @test()
+
+            let h = build_three_variant_union();
+            let analyzer = make_analyzer(MAP[Expression, Variable]());
+
+            // Receiver narrowed to ONE_OF{B, C}; ask for A — outside
+            // the set but still a member of the parent union.
+            let one_of = ONE_OF(cast NAMED(h.the_union.type), list_of(h.b, h.c));
+            let result = analyzer.try_get_variant_type_for_classy(one_of, h.a);
+
+            Assert.is_not_null(result);
+            Assert.is_true(isa NAMED(result));
+            Assert.are_same(h.a, (cast NAMED(result)).symbol);
+        si
+
+        list_of(a: Classy, b: Classy) -> LIST[Classy] is
+            let l = LIST[Classy]();
+            l.add(a);
+            l.add(b);
+            return l;
+        si
+
+        types_of(a: Type, b: Type) -> LIST[Type] is
+            let l = LIST[Type]();
+            l.add(a);
+            l.add(b);
+            return l;
         si
     si
 si
