@@ -5,6 +5,7 @@ Instructions for the Anthropic Claude Code Action invoked from the `code_review`
 ## How to operate
 
 - The PR branch is checked out in the working directory.
+- **You may be re-invoked on every push to the branch.** `pull_request` retriggers on `synchronize`; each run is a fresh context with no memory of prior reviews. Before reviewing, run `gh pr view <N> --json reviews` and read any prior review you posted on this PR. The verdict body summarises what you raised — treat the new commits since that review as the author's response to it. Don't re-raise a finding the diff has addressed; acknowledge it in one phrase in the verdict body if relevant. A verdict that flips direction across pushes (`--approve` ↔ `--request-changes`) deserves one sentence of explanation — silent flips confuse the author.
 - Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`.
 - Get author-supplied PR comments via `gh pr view <N> --json comments`. Rationale that doesn't belong in the changelog-shape description body lives there: a subtle invariant the diff hides, why this approach over a tempting alternative, a deliberate oddity. Read comments before flagging anything as "unjustified", "approach unclear", or "this looks wrong" — the answer may already be in a comment.
 - Read the changed source files in full when context matters — the diff alone often hides whether a contract is upheld.
@@ -41,6 +42,7 @@ Don't flag:
 
 - Hypothetical concerns ("could this race…?" without a concrete path).
 - "Consider…" suggestions that don't identify a real defect.
+- Compiler tool-version bumps in `.config/dotnet-tools.json` going out without an explanation. CI resolves the bootstrap compiler at run time, so the pin only affects local dev; the worst case from a bump is a rebuild against the latest published compiler, which is never unacceptable. Routine. Don't ask why.
 - Anything you're not confident about.
 
 Silence on a low-confidence finding is better than noise. The reviewer's job is high-signal feedback, not exhaustive enumeration.
