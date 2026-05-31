@@ -34,6 +34,7 @@ Flag:
 - `GHUL.md` falling out of step with reality — a PR introduces a feature `GHUL.md` doesn't document, changes documented behaviour without updating it, or otherwise leaves the reference contradicting the code.
 - Source comment hygiene violations.
 - PR description violations.
+- Wrong `VERSION` bump — see "Versioning" below. Both directions: a breaking change going out under the default patch, and a `VERSION` raise that the change doesn't merit.
 
 Don't flag:
 
@@ -110,6 +111,25 @@ Body is `-`-bullets under one or more of:
 - `Technical:` — internal changes. Don't write self-justifyingly. If the change is needed it stands on its own merit; if it reads as needing justification, ask whether it's really needed.
 
 At least one section; any can be omitted.
+
+## Versioning
+
+The compiler is in v1.x. **The next breaking change goes to v3.0.0** — v2 was accidentally published once during the 1.0.6x sequence and is permanently contaminated (NuGet unlisted, can't republish). From v3.0.0 onward: strict semver.
+
+Bump table:
+
+- **Major (X.0.0).** Removed/changed language syntax that rejects or miscompiles previously-valid source. Breaking analysis-mode protocol change (coordinated with a `degory/ghul-vsce` major — VSCE consumes the protocol). IL/metadata shape change that breaks binary compatibility with assemblies built by older compilers.
+- **Minor (X.Y.0).** New language features that don't conflict with existing source. New compiler flags or opt-in behaviour. New analysis-mode protocol messages or fields the VSCE can ignore. New warnings (always default-on — no per-warning suppression flag).
+- **Patch (X.Y.Z).** Bug fixes aligning behaviour with the documented/intended spec. Rejecting source that was previously accepted but demonstrably wrong (bad IL, undefined semantics, runtime corruption, unsafe operation). Promoting a warning to an error when analysis becomes confident enough to insist. IL/codegen improvements with no observable semantic change. Internal refactors, tests, docs, CI.
+
+Mechanism: default is patch. A non-patch release is cut by **raising the `VERSION` file** in the PR (code-owned via `.github/CODEOWNERS` — requires the code owner's approval). `#minor`/`#major` markers in the PR body are no-ops; don't add them. A `workflow_dispatch` `version` input overrides outright (emergencies only).
+
+Flag when:
+
+- The PR introduces a breaking change without raising `VERSION` to a major (or any change that should be major but is going out under the default patch).
+- The PR adds a new language feature, compiler flag, protocol message, or default-on warning without raising `VERSION` to a minor.
+- The PR raises `VERSION` but the change doesn't merit the bump.
+- The PR breaks the analysis-mode protocol without a coordinated `degory/ghul-vsce` PR in flight (or vice versa) — both must ship together with matched major bumps.
 
 ## Posting mechanics — reminder
 
