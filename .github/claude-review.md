@@ -130,7 +130,7 @@ Flag when:
 - The PR introduces a breaking change without raising `VERSION` to a major (or any change that should be major but is going out under the default patch).
 - The PR adds a new language feature, compiler flag, protocol message, or default-on warning without raising `VERSION` to a minor.
 - The PR raises `VERSION` but the change doesn't merit the bump.
-- The PR breaks the analysis-mode protocol without a coordinated `degory/ghul-vsce` PR in flight (or vice versa) — both must ship together with matched major bumps.
+- The PR breaks the analysis-mode protocol without a coordinated `degory/ghul-vsce` PR in flight (or vice versa). Both must ship together and both must bump major in their own version streams — the two version *numbers* are not required to match.
 
 ## Posting mechanics — reminder
 
