@@ -4,6 +4,8 @@ namespace Analysis.Protocol is
     use System.Diagnostics.ProcessStartInfo;
     use System.Text.StringBuilder;
     use System.Text.UTF8Encoding;
+    use System.Text.Json.JsonSerializer;
+    use System.Text.Json.JsonSerializerOptions;
 
     use Collections.Iterable;
     use Collections.MutableList;
@@ -13,40 +15,24 @@ namespace Analysis.Protocol is
     use IO.File;
     use IO.Path;
 
-    // Form-feed character (ASCII 12). The analyser uses this to terminate every
-    // response frame and to terminate file content in EDIT requests.
-    FORM_FEED: char static => cast char(12);
-
-    // One file's worth of payload for a multi-file EDIT request.
-    class EDIT_FILE is
-        path: string;
-        source: string;
-
-        init(path: string, source: string) is
-            self.path = path;
-            self.source = source;
-        si
-    si
-
-    // Long-lived wrapper around a `dotnet ghul-compiler --analyse @...` subprocess.
-    // Each test should construct one in [@test_initialize] and dispose() it in
-    // [@test_cleanup] — see project_analysis_protocol_locked memory for why we
-    // can't share processes across tests (the compiler has substantial persistent
-    // global state that the analyser's `clear_symbols` doesn't fully scrub).
+    // Long-lived wrapper around a `dotnet ghul-compiler --analyse @...`
+    // subprocess speaking the JSON analysis protocol: one JSON object per line,
+    // newline-terminated, requests discriminated by `command`, responses by
+    // `kind`. Each test constructs one in [@test_initialize] and dispose()s it
+    // in [@test_cleanup]: the compiler carries persistent global state that
+    // `clear_symbols` doesn't fully scrub, so a process can't be safely reused
+    // across tests.
     class ANALYSER_PROCESS: Disposable is
         _process: Process;
         _stderr_capture: StringBuilder;
+        _options: JsonSerializerOptions;
 
         // Walk up from the running assembly to the consuming project's root —
-        // the first ancestor directory that holds a .ghulproj. That's where
-        // .assemblies.json (and, via ghul/, .config/dotnet-tools.json) live.
-        // Generalised from a hard-coded analysis-tests.ghulproj check so both
-        // the test harness and the profiler can host this driver.
+        // the first ancestor directory that holds a .ghulproj.
         find_project_directory() -> string static is
             let assembly_path = System.Reflection.Assembly.get_executing_assembly().location;
             let dir mut = Path.get_directory_name(assembly_path);
 
-            // bin/Debug/net8.0/<dll> -> walk up to project root
             do
                 if dir? /\ Directory.get_files(dir, "*.ghulproj").count > 0 then
                     return dir;
@@ -64,14 +50,10 @@ namespace Analysis.Protocol is
             throw Exception("could not find a .ghulproj project directory from assembly path: {assembly_path}");
         si
 
-        // Read .assemblies.json (produced by the GenerateAssembliesJson MSBuild
-        // target) and return the list of "-a <path>" args plus a trailing "-A".
-        // Format is exactly { "assemblies": ["path1", "path2", ...] }.
-        // The compiler's own ghul.dll is filtered out — it lands in our bin via
-        // the ProjectReference (so the analyser tests can spawn it as the
-        // compiler-under-test) but exposing it to the analyser as an `-a`
-        // reference would have it load its own type metadata into the symbol
-        // table, polluting test fixtures.
+        // Read .assemblies.json and return the list of "-a <path>" args plus a
+        // trailing "-A". The compiler's own ghul.dll is filtered out — it lands
+        // in our bin via the ProjectReference but exposing it to the analyser
+        // would pollute the symbol table with the compiler's own metadata.
         build_analyser_arguments(project_directory: string) -> Iterable[string] static is
             let assemblies_json_path = Path.combine(project_directory, ".assemblies.json");
 
@@ -81,9 +63,6 @@ namespace Analysis.Protocol is
 
             let content = File.read_all_text(assemblies_json_path);
 
-            // Plain-line parse: split on '"', take every odd-indexed element after
-            // the "assemblies" key. We don't need a real JSON parser — the file is
-            // produced by MSBuild with a fixed shape.
             let result = LIST[string]();
             let in_string mut = false;
             let current = StringBuilder();
@@ -109,9 +88,6 @@ namespace Analysis.Protocol is
                     if in_string then
                         let captured = current.to_string();
 
-                        // Skip: (a) the literal "assemblies" key, (b) empty
-                        // strings, and (c) the compiler's own ghul.dll (case-
-                        // insensitive on basename).
                         if
                             captured !~ "assemblies" /\
                             captured.length > 0 /\
@@ -130,17 +106,11 @@ namespace Analysis.Protocol is
                 fi
             od
 
-            // The analysis-test fixtures exercise IPC / query / state
-            // behaviour, not the definite-return / definite-assignment
-            // flow warnings. Suppress those so a fixture's deliberate
-            // deferred-init local (the `default(T)` idiom) or stub
-            // body does not surface as a spurious diagnostic.
+            // The analysis-test fixtures exercise IPC / query / state behaviour,
+            // not the definite-return / definite-assignment flow warnings.
             result.add("--no-warn-definite-return");
             result.add("--no-warn-definite-assignment");
 
-            // Optional caller-supplied extra analyser flags, space-separated in
-            // ANALYSER_EXTRA_ARGS — e.g. "--show-analysis-stats" so a profiling
-            // run gets the periodic TIMERS dump on the analyser's stderr.
             let extra = System.Environment.get_environment_variable("ANALYSER_EXTRA_ARGS");
 
             if !string.is_null_or_white_space(extra) then
@@ -159,12 +129,9 @@ namespace Analysis.Protocol is
         is_compiler_own_dll(path: string) -> bool static =>
             Path.get_file_name(path).to_lower_invariant() =~ "ghul.dll";
 
-        // Resolve the path of the ghul.dll the harness will spawn as the
-        // compiler-under-test. ANALYSIS_TESTS_COMPILER_DLL=<path> overrides
-        // (CI uses this to point at the dll extracted from the bootstrapped
-        // ghul.compiler nupkg). Default is bin/.../ghul.dll, copied into
-        // our bin/ via the ProjectReference in analysis-tests.ghulproj —
-        // suitable for local dev where we want to test PR-source changes.
+        // Resolve the path of the ghul.dll the harness spawns as the
+        // compiler-under-test. ANALYSIS_TESTS_COMPILER_DLL overrides; default is
+        // bin/.../ghul.dll, copied in via the ProjectReference.
         resolve_compiler_dll() -> string static is
             let override_path = System.Environment.get_environment_variable("ANALYSIS_TESTS_COMPILER_DLL");
 
@@ -187,11 +154,18 @@ namespace Analysis.Protocol is
             return compiler_dll;
         si
 
-        // Compose a response file (`.analyser.rsp`) in the project directory and
-        // spawn `dotnet ghul-compiler @<rsp>`. Mirrors what the VS Code server
-        // does in server-manager.ts.
+        // Compose a per-instance response file in the project directory and
+        // spawn `dotnet ghul-compiler @<rsp>`. The name is suffixed with a
+        // fresh GUID so parallel analyser instances don't race on a single
+        // `.analyser.rsp` — without that the loser of the write race reads a
+        // truncated file and the spawned compiler either exits with just the
+        // version line (`arguments.count == 0`) or aborts on a malformed
+        // assembly path. Either way the harness sees the analyser's stdout
+        // close before the first response line. The VS Code server uses its
+        // own response-file path (`server-manager.ts`); this name is internal
+        // to the test / profiler harness.
         write_response_file(project_directory: string, arguments: Iterable[string]) -> string static is
-            let path = Path.combine(project_directory, ".analyser.rsp");
+            let path = Path.combine(project_directory, ".analyser-{System.Guid.new_guid()}.rsp");
 
             let line = arguments
                 | .map(a -> string => "\"{a}\"")
@@ -203,6 +177,8 @@ namespace Analysis.Protocol is
         si
 
         init() is
+            _options = JsonSerializerOptions();
+
             let project_directory = find_project_directory();
             let arguments = build_analyser_arguments(project_directory);
             let response_file = write_response_file(project_directory, arguments);
@@ -220,8 +196,6 @@ namespace Analysis.Protocol is
             start_info.redirect_standard_output = true;
             start_info.redirect_standard_error = true;
 
-            // The compiler's stdin/stdout are byte-oriented framing (form-feed
-            // delimiter mid-stream). UTF-8 keeps the multi-byte semantics stable.
             start_info.standard_input_encoding = UTF8Encoding();
             start_info.standard_output_encoding = UTF8Encoding();
             start_info.standard_error_encoding = UTF8Encoding();
@@ -235,8 +209,7 @@ namespace Analysis.Protocol is
             _stderr_capture = StringBuilder();
 
             // Drain stderr in the background so a chatty analyser doesn't fill
-            // its stderr pipe and block. Stash text for inclusion in failure
-            // messages.
+            // its stderr pipe and block.
             Tasks.TASK.run(
                 () is
                     try
@@ -255,14 +228,12 @@ namespace Analysis.Protocol is
                 si
             );
 
-            // Block until the analyser writes its initial LISTEN frame, then
-            // we know it's ready. If anything fails between Process.start and
-            // here, dispose the subprocess so it doesn't leak.
+            // Block until the analyser writes its initial listen frame.
             try
                 let listen = read_response();
 
-                if listen.header !~ "LISTEN" then
-                    throw Exception("expected LISTEN as first response, got '{listen.header}'.\nstderr so far:\n{_stderr_capture}");
+                if listen.kind !~ "listen" then
+                    throw Exception("expected listen as first response, got '{listen.kind}'.\nstderr so far:\n{_stderr_capture}");
                 fi
             catch ex: Exception
                 dispose();
@@ -270,27 +241,24 @@ namespace Analysis.Protocol is
             yrt
         si
 
-        // Read a response that may be preceded by an unsolicited DIAGNOSTICS
-        // frame. HOVER / DEFINITION / etc. fall through to FULL_COMPILER
-        // .compile_all when the symbol-use-locations don't have the queried
-        // position cached — that path writes a DIAGNOSTICS frame to the
-        // same stdout *before* the handler writes its actual response.
-        // Tests asserting on a query response should use this helper rather
-        // than read_response, so the optional DIAGNOSTICS is drained
-        // transparently.
+        // Read a response that may be preceded by an unsolicited diagnostics
+        // frame. Query commands (hover / definition / …) fall through to a
+        // compile_all when the queried position isn't cached; that path writes a
+        // diagnostics response before the handler's own response. Tests
+        // asserting on a query response use this so the optional diagnostics is
+        // drained transparently.
         read_query_response() -> RESPONSE is
             let response mut = read_response();
 
-            if response.header =~ "DIAGNOSTICS" then
+            if response.kind =~ "diagnostics" then
                 response = read_response();
             fi
 
             return response;
         si
 
-        // Read characters from stdout until we hit the form-feed terminator,
-        // then split into header (first line) + body lines (remaining lines,
-        // excluding the empty trailing line that comes from "\n\f").
+        // Read one JSON line from stdout (char-by-char until newline; a JSON
+        // message never contains a raw newline) and deserialize into a RESPONSE.
         read_response() -> RESPONSE is
             let buffer = StringBuilder();
 
@@ -299,13 +267,13 @@ namespace Analysis.Protocol is
 
                 if c < 0 then
                     throw Exception(
-                        "analyser stdout closed before form-feed.\n"
+                        "analyser stdout closed before a response line.\n"
                         "buffer so far:\n{buffer}\n"
                         "stderr so far:\n{_stderr_capture}"
                     );
                 fi
 
-                if c == 12 then
+                if c == 10 then
                     break;
                 fi
 
@@ -314,96 +282,57 @@ namespace Analysis.Protocol is
                 fi
             od
 
-            let raw = buffer.to_string();
-            let lines = LIST[string](raw.split(['\n']));
-
-            if lines.count == 0 then
-                throw Exception("empty response frame");
-            fi
-
-            let header = lines[0];
-
-            // Drop header and trailing empty entry (from the "\n\f" tail).
-            let body = LIST[string]();
-
-            for i in 1..lines.count do
-                let line = lines[i];
-
-                if i == lines.count - 1 /\ line.length == 0 then
-                    continue;
-                fi
-
-                body.add(line);
-            od
-
-            return RESPONSE(header, body);
+            return JsonSerializer.deserialize[RESPONSE](buffer.to_string(), _options);
         si
 
-        write(text: string) is
-            _process.standard_input.write(text);
-        si
-
-        flush() is
+        // Serialize by the request's runtime type — JsonSerializer.serialize
+        // keyed on the static type `object` would emit `{}`, so the non-generic
+        // overload taking an explicit System.Type is used.
+        write_request(request: object) is
+            _process.standard_input.write(JsonSerializer.serialize(request, request.get_type(), _options));
+            _process.standard_input.write("\n");
             _process.standard_input.flush();
         si
 
-        // Send `#EDIT#` for one or more files. The wire format mirrors
-        // ghul-vsce's requester.ts:sendDocuments — path list, blank-line
-        // terminator, then form-feed-terminated source per file.
-        //
-        // The IDE sends a *multi-file* EDIT once at startup with every
-        // discovered source file in the project (see
-        // project_analysis_mode_workflow memory). After startup, edits are
-        // single-file and other files' ASTs are retained. Tests that want
-        // to exercise the realistic startup path or the retained-AST
-        // condition use this multi-file form.
+        // Send `edit` for one or more files.
         send_edit_files(files: Collections.Iterable[EDIT_FILE]) is
-            write("#EDIT#\n");
+            let request = EDIT_REQUEST();
+
             for f in files do
-                write("{f.path}\n");
+                request.files.add(f);
             od
-            write("\n");           // empty line ends path list
-            for f in files do
-                write(f.source);
-                write("{FORM_FEED}");  // form-feed terminates each source
-            od
-            flush();
+
+            write_request(request);
         si
 
-        // Convenience for single-file EDIT — the common case.
+        // Convenience for single-file edit — the common case.
         send_edit(path: string, source: string) is
             send_edit_files([EDIT_FILE(path, source)]);
         si
 
-        // Send `#FORMAT#` for a single file — path then form-feed-terminated
-        // source. Mirrors ghul-vsce's requester.ts:sendDocumentFormatting.
         send_format(path: string, source: string) is
-            write("#FORMAT#\n");
-            write("{path}\n");
-            write(source);
-            write("{FORM_FEED}");
-            flush();
+            write_request(FORMAT_REQUEST(path, source));
+        si
+
+        send_format_range(path: string, start_line: int, start_column: int, end_line: int, end_column: int, source: string) is
+            write_request(FORMAT_RANGE_REQUEST(path, start_line, start_column, end_line, end_column, source));
         si
 
         send_compile() is
-            write("#COMPILE#\n");
-            flush();
+            write_request(COMPILE_REQUEST());
         si
 
-        // Ask the analyser to recycle. It answers with a RESTART frame and
+        // Ask the analyser to recycle. It answers with a restart response and
         // then exits, so the IDE can spawn a fresh process.
         send_restart() is
-            write("#RESTART#\n");
-            flush();
+            write_request(SIMPLE_REQUEST("restart"));
         si
 
-        // Ask the analyser to sample the heap (the VS Code extension sends
-        // this during a lull in editing). It answers with a HEAPCHECK frame —
-        // or, if the heap has grown past the recycle threshold, with RESTART
-        // and then exits.
+        // Ask the analyser to sample the heap. It answers with a heap_check
+        // response — or, if the heap has grown past the recycle threshold, with
+        // restart and then exits.
         send_heap_check() is
-            write("#HEAPCHECK#\n");
-            flush();
+            write_request(SIMPLE_REQUEST("heap_check"));
         si
 
         // Block until the subprocess exits, up to timeout_ms. True if it exited.
@@ -415,111 +344,55 @@ namespace Analysis.Protocol is
         process_id: int => _process.id;
 
         send_hover(path: string, line: int, column: int) is
-            write("#HOVER#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("hover", path, line, column));
         si
 
-        // Send `#HOVERMAP#` for a single file — the batch counterpart to
-        // #HOVER#. The analyser answers with a HOVERMAP frame: one
-        // tab-separated `startLine startColumn endLine endColumn description`
-        // row per recorded hover range. Drive an EDIT (and/or COMPILE) first.
         send_hover_map(path: string) is
-            write("#HOVERMAP#\n");
-            write("{path}\n");
-            flush();
+            write_request(PATH_REQUEST("hover_map", path));
         si
 
-        // Send `#SEMANTICTOKENS#` for a single file. The analyser answers
-        // with a SEMANTICTOKENS frame: one tab-separated `startLine
-        // startColumn endLine endColumn tokenType modifiers` row per
-        // recorded symbol-use range whose kind maps to an LSP semantic-
-        // token type. Drive an EDIT (and/or COMPILE) first.
         send_semantic_tokens(path: string) is
-            write("#SEMANTICTOKENS#\n");
-            write("{path}\n");
-            flush();
+            write_request(PATH_REQUEST("semantic_tokens", path));
         si
 
         send_definition(path: string, line: int, column: int) is
-            write("#DEFINITION#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("definition", path, line, column));
         si
 
         send_declaration(path: string, line: int, column: int) is
-            write("#DECLARATION#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("declaration", path, line, column));
         si
 
         send_references(path: string, line: int, column: int) is
-            write("#REFERENCES#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("references", path, line, column));
         si
 
         send_implementation(path: string, line: int, column: int) is
-            write("#IMPLEMENTATION#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("implementation", path, line, column));
         si
 
         send_type_definition(path: string, line: int, column: int) is
-            write("#TYPEDEFINITION#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("type_definition", path, line, column));
         si
 
         send_completion(path: string, line: int, column: int) is
-            write("#COMPLETE#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("complete", path, line, column));
         si
 
         send_signature(path: string, line: int, column: int) is
-            write("#SIGNATURE#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            flush();
+            write_request(POSITION_REQUEST("signature", path, line, column));
         si
 
         send_symbols(path: string) is
-            write("#SYMBOLS#\n");
-            write("{path}\n");
-            flush();
+            write_request(PATH_REQUEST("symbols", path));
         si
 
         send_rename_request(path: string, line: int, column: int, new_name: string) is
-            write("#RENAMEREQUEST#\n");
-            write("{path}\n");
-            write("{line}\n");
-            write("{column}\n");
-            write("{new_name}\n");
-            flush();
+            write_request(RENAME_REQUEST(path, line, column, new_name));
         si
 
-        // Drain stdout for any lingering frames, then close stdin and wait for
-        // exit. Kill the subprocess if it overruns the wait timeout — a runaway
-        // analyser shouldn't leak across tests.
-        // Drain stdout for any lingering frames, then close stdin and wait for
-        // exit. Kill the subprocess if it overruns the wait timeout — a runaway
-        // analyser shouldn't leak across tests.
+        // Drain stdin, wait for exit, kill on overrun — a runaway analyser
+        // shouldn't leak across tests.
         dispose() is
             try
                 _process.standard_input.close();
@@ -537,11 +410,7 @@ namespace Analysis.Protocol is
         stderr_capture: string => _stderr_capture.to_string();
 
         // Wait until the compiler's startup banner appears in captured stderr
-        // and return the version string from it. The analyser writes
-        //   "ghūl compiler {version}: serving analysis requests"
-        // to stderr immediately before entering the request-handling loop
-        // (see driver/main.ghul) so this should land within milliseconds of
-        // the LISTEN frame arriving on stdout.
+        // and return the version string from it.
         await_compiler_version(timeout_ms: int) -> string is
             let deadline_ticks = System.DateTime.now.add_milliseconds(cast double(timeout_ms)).ticks;
 

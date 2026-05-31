@@ -11,7 +11,23 @@ namespace Analysis is
     use Source;
     use Compiler;
 
-    class HOVER_HANDLER: CommandHandler is
+    use Protocol.JSON_PROTOCOL;
+
+    // Generic base for every command handler. The despatcher holds handlers as
+    // the non-generic CommandHandler trait and hands each a deserialized
+    // Protocol.Request; this base does the single cast to the concrete request
+    // type T and forwards to handle_request, so no individual handler casts.
+    class RequestHandler[T]: CommandHandler is
+        init() is si
+
+        handle(request: Protocol.Request, writer: IO.TextWriter) is
+            handle_request(cast T(request), writer);
+        si
+
+        handle_request(request: T, writer: IO.TextWriter);
+    si
+
+    class HOVER_HANDLER: RequestHandler[Protocol.HOVER_REQUEST] is
         _watchdog: WATCHDOG;
         _timers: TIMERS;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
@@ -24,20 +40,20 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _symbol_use_locations = symbol_use_locations;
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+        handle_request(request: Protocol.HOVER_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
+            let line = request.line;
+            let column = request.column;
 
-            let path = reader.read_line();
-            let line = System.Convert.to_int32(reader.read_line());
-            let column = System.Convert.to_int32(reader.read_line());
+            let response = Protocol.HOVER_RESPONSE();
 
-            let written_header mut = false;
-            
             try
                 if !_watchdog.want_restart then
                     let hover mut = _symbol_use_locations.find_hover_use(path, line, column);
@@ -48,37 +64,27 @@ namespace Analysis is
                         hover = _symbol_use_locations.find_hover_use(path, line, column);
                     fi
 
-                    writer.write_line("HOVER");
-                    written_header = true;
-
                     if hover? then
-                        writer.write_line(hover.description);
+                        response.description = hover.description;
                     fi
                 fi
             catch ex: Exception
                 debug_always("HOVER caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("HOVER");                    
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
-    // Dumps every HOVER_USE recorded for one file as tab-separated rows:
-    //   startLine  startColumn  endLine  endColumn  description
-    // — one row per source range. Unlike #HOVER# it takes no position and
-    // never falls back to a recompile; the caller drives an EDIT (and/or
-    // COMPILE) first. It lets a batch consumer — the ghul.dev example
-    // pipeline — collect a file's hovers in one frame.
-    class HOVERMAP_HANDLER: CommandHandler is
+    // Dumps every HOVER_USE recorded for one file. Unlike hover it takes no
+    // position and never falls back to a recompile; the caller drives an EDIT
+    // (and/or COMPILE) first. Lets a batch consumer — the ghul.dev example
+    // pipeline — collect a file's hovers in one response.
+    class HOVERMAP_HANDLER: RequestHandler[Protocol.HOVER_MAP_REQUEST] is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
 
@@ -87,29 +93,28 @@ namespace Analysis is
             symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _symbol_use_locations = symbol_use_locations;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+        handle_request(request: Protocol.HOVER_MAP_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
 
-            let path = reader.read_line();
-
-            let written_header mut = false;
+            let response = Protocol.HOVER_MAP_RESPONSE();
 
             try
                 if !_watchdog.want_restart then
-                    writer.write_line("HOVERMAP");
-                    written_header = true;
-
                     for entry in _symbol_use_locations.hover_uses_in_file(path) do
                         let location = entry.location;
 
-                        writer.write_line(
-                            "{location.start_line}\t{location.start_column}\t"
-                            "{location.end_line}\t{location.end_column}\t"
-                            "{entry.value.description}"
+                        response.entries.add(
+                            Protocol.HOVER_ENTRY(
+                                location.start_line, location.start_column,
+                                location.end_line, location.end_column,
+                                entry.value.description
+                            )
                         );
                     od
                 fi
@@ -117,31 +122,19 @@ namespace Analysis is
                 debug_always("HOVERMAP caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("HOVERMAP");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
-    // Whole-file semantic-token dump for VS Code's semantic-tokens
-    // provider. Output is the same shape as HOVERMAP — one row per
-    // recorded HOVER_USE — but each row carries an LSP token-type
-    // string and a comma-separated modifiers string instead of the
-    // hover description:
-    //
-    //   startLine  startColumn  endLine  endColumn  tokenType  modifiers
-    //
-    // A symbol with no LSP-mappable kind contributes no row. Like
-    // HOVERMAP this never triggers a recompile of its own; the caller
-    // has just driven an EDIT (or COMPILE).
-    class SEMANTICTOKENS_HANDLER: CommandHandler is
+    // Whole-file semantic-token dump for VS Code's semantic-tokens provider:
+    // one token per recorded HOVER_USE whose kind maps to an LSP token type.
+    // A symbol with no LSP-mappable kind contributes no token. Like HOVERMAP
+    // this triggers a recompile only when the hover map is empty (first open).
+    class SEMANTICTOKENS_HANDLER: RequestHandler[Protocol.SEMANTIC_TOKENS_REQUEST] is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _full_compiler: FULL_COMPILER;
@@ -153,50 +146,43 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _symbol_use_locations = symbol_use_locations;
             _full_compiler = full_compiler;
             _classifier = SEMANTIC_TOKEN_CLASSIFIER();
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+        handle_request(request: Protocol.SEMANTIC_TOKENS_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
 
-            let path = reader.read_line();
-
-            let written_header mut = false;
+            let response = Protocol.SEMANTIC_TOKENS_RESPONSE();
 
             try
                 if !_watchdog.want_restart then
                     let uses mut = _symbol_use_locations.hover_uses_in_file(path);
 
                     // Unlike HOVERMAP (built for the offline ghul.dev pipeline
-                    // that explicitly drives EDIT + COMPILE), SEMANTICTOKENS
-                    // serves a live IDE that asks for tokens whenever a
-                    // document opens. The hover map is only populated by a
-                    // whole-project compile; on first open we get nothing
-                    // back. Fall back like HOVER does and force one — the
-                    // user otherwise sees TextMate-only coloring until the
-                    // first edit triggers a debounced compile.
+                    // that explicitly drives EDIT + COMPILE), this serves a live
+                    // IDE that asks for tokens whenever a document opens. The
+                    // hover map is only populated by a whole-project compile; on
+                    // first open we get nothing back. Fall back like hover does
+                    // and force one — the user otherwise sees TextMate-only
+                    // coloring until the first edit triggers a debounced compile.
                     if uses.count == 0 then
                         _full_compiler.compile_all(writer, path);
 
                         uses = _symbol_use_locations.hover_uses_in_file(path);
                     fi
 
-                    writer.write_line("SEMANTICTOKENS");
-                    written_header = true;
-
-                    // Discard wide spans that strictly contain another
-                    // recorded use on the same line. Desugared expressions
-                    // (e.g. `let await x = e;` rewritten to a synthesized
-                    // `unwrap(...)` call) register a hover use whose
-                    // location is the original source span — useful for
-                    // HOVER, since the IDE can show the desugared meaning
-                    // anywhere on the statement, but for semantic tokens
-                    // it produces a giant token covering identifiers and
-                    // operators. The strict-containment filter drops the
-                    // outer use while keeping every inner identifier.
+                    // Discard wide spans that strictly contain another recorded
+                    // use on the same line. Desugared expressions register a
+                    // hover use whose location is the original source span —
+                    // useful for hover, but for semantic tokens it produces a
+                    // giant token covering identifiers and operators. The
+                    // strict-containment filter drops the outer use while
+                    // keeping every inner identifier.
                     let useful = _filter_outer_spans(uses);
 
                     for entry in useful do
@@ -207,10 +193,12 @@ namespace Analysis is
                             let location = entry.location;
                             let modifiers = _classifier.modifiers(symbol);
 
-                            writer.write_line(
-                                "{location.start_line}\t{location.start_column}\t"
-                                "{location.end_line}\t{location.end_column}\t"
-                                "{token_type}\t{modifiers}"
+                            response.tokens.add(
+                                Protocol.SEMANTIC_TOKEN(
+                                    location.start_line, location.start_column,
+                                    location.end_line, location.end_column,
+                                    token_type, modifiers
+                                )
                             );
                         fi
                     od
@@ -219,16 +207,11 @@ namespace Analysis is
                 debug_always("SEMANTICTOKENS caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("SEMANTICTOKENS");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
         _filter_outer_spans(
@@ -255,10 +238,9 @@ namespace Analysis is
         si
     si
 
-    // Maps a Symbol to the LSP semantic-token type and modifier strings
-    // the VS Code client expects. Returns null token_type for kinds
-    // VS Code has no slot for (UNDEFINED, MODULE, PACKAGE, CONSTANT,
-    // STRING, …); the handler then skips emitting a row.
+    // Maps a Symbol to the LSP semantic-token type and modifier strings the
+    // VS Code client expects. Returns null token_type for kinds VS Code has no
+    // slot for; the handler then skips that token.
     class SEMANTIC_TOKEN_CLASSIFIER is
         init() is si
 
@@ -302,10 +284,10 @@ namespace Analysis is
             esac
         si
 
-        // Comma-separated LSP modifiers, possibly empty. Currently
-        // emits `static` for STATIC_* subclasses and `readonly` for
-        // immutable bindings — bare `let` (no `mut`) and captured
-        // values, both of which the user cannot reassign.
+        // Comma-separated LSP modifiers, possibly empty. Emits `static` for
+        // STATIC_* subclasses and `readonly` for immutable bindings — bare
+        // `let` (no `mut`) and captured values, both of which the user cannot
+        // reassign.
         modifiers(symbol: Semantic.Symbols.Symbol) -> string is
             if !symbol? then
                 return "";
@@ -337,9 +319,43 @@ namespace Analysis is
         si
     si
 
-    class DEFINITION_HANDLER: SymbolLocationHandler is
+    // Shared base for the location-list commands (definition / declaration /
+    // references / implementation / type_definition). They all take a position
+    // and answer with a list of LOCATION_DTOs, so they bind T to the common
+    // PositionRequest and share add_locations.
+    class SymbolLocationHandler: RequestHandler[Protocol.PositionRequest] is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
+
+        init(
+            watchdog: WATCHDOG,
+            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS
+        )
+        is
+            super.init();
+
+            _watchdog = watchdog;
+            _symbol_use_locations = symbol_use_locations;
+        si
+
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter);
+
+        add_locations(into: Collections.LIST[Protocol.LOCATION_DTO], locations: Iterable[LOCATION]) is
+            for location in locations do
+                into.add(
+                    Protocol.LOCATION_DTO(
+                        location.file_name,
+                        location.start_line,
+                        location.start_column,
+                        location.end_line,
+                        location.end_column
+                    )
+                );
+            od
+        si
+    si
+
+    class DEFINITION_HANDLER: SymbolLocationHandler is
         _full_compiler: FULL_COMPILER;
 
         init(
@@ -348,19 +364,17 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
-            _watchdog = watchdog;
-            _symbol_use_locations = symbol_use_locations;
+            super.init(watchdog, symbol_use_locations);
+
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter) is
+            let path = request.path;
+            let line = request.line;
+            let column = request.column;
 
-            let path = reader.read_line();
-            let line = System.Convert.to_int32(reader.read_line());
-            let column = System.Convert.to_int32(reader.read_line());
-
-            let written_header mut = false;
+            let response = Protocol.DEFINITION_RESPONSE();
 
             try
                 if !_watchdog.want_restart then
@@ -371,27 +385,19 @@ namespace Analysis is
 
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
-                    
-                    writer.write_line("DEFINITION");
-                    written_header = true;
-                                            
+
                     if symbol? /\ !symbol.is_internal /\ !symbol.is_reflected then
-                        write_location_list(writer, [symbol.location]);
+                        add_locations(response.locations, [symbol.location]);
                     fi
                 fi
             catch e: Exception
                 debug_always("DEFINITION caught: {e.get_type()}: {e.message}");
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("DEFINITION");                    
-                fi                
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
@@ -409,15 +415,13 @@ namespace Analysis is
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
-
-            let written_header mut = false;
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter) is
+            let response = Protocol.DECLARATION_RESPONSE();
 
             try
-                let path = reader.read_line();
-                let line = System.Convert.to_int32(reader.read_line());
-                let column = System.Convert.to_int32(reader.read_line());
+                let path = request.path;
+                let line = request.line;
+                let column = request.column;
 
                 if !_watchdog.want_restart then
                     let symbol mut = _symbol_use_locations.find_definition_from_use(path, line, column);
@@ -428,28 +432,17 @@ namespace Analysis is
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
 
-                    writer.write_line("DECLARATION");
-                    written_header = true;
-    
                     if symbol? then
-                        let locations = _symbol_use_locations.find_declarations_of_symbol(symbol);
-
-                        write_location_list(writer, locations);
+                        add_locations(response.locations, _symbol_use_locations.find_declarations_of_symbol(symbol));
                     fi
                 fi
-
             catch e: Exception
                 debug_always("DECLARATION caught: {e.get_type()}: {e.message}");
-
-                if !written_header then
-                    writer.write_line("DECLARATION");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
@@ -478,11 +471,12 @@ namespace Analysis is
             compile_all(writer, null);
         si
 
+        // Recompile (driven by a query miss), then emit the diagnostics as a
+        // standalone diagnostics response with phase "query" — the client
+        // drains this before reading the query's own response.
         compile_all(writer: IO.TextWriter, only_for_file_name: string?) is
             try
                 _timers.start("compile-all");
-
-                writer.write_line("DIAGNOSTICS");
 
                 Semantic.Types.NAMED.clear_cache();
 
@@ -512,7 +506,9 @@ namespace Analysis is
 
                     _compiler.build();
 
-                    IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                    let response = DIAGNOSTICS_COLLECTOR.collect(IoC.CONTAINER.instance.logger);
+                    response.phase = "query";
+                    JSON_PROTOCOL.write_response(writer, response);
 
                     _watchdog.note_full_compile();
 
@@ -526,30 +522,25 @@ namespace Analysis is
 
                 _watchdog.request_restart();
             finally
-                // Semantic.Types.NAMED.dump_stats();
-
                 IoC.CONTAINER.instance.logger.end_analysis();
 
-                _compiler.clear_queue(); 
-
-                writer.write("{cast char(12)}");
-                writer.flush();
+                _compiler.clear_queue();
 
                 _timers.finish("compile-all");
             yrt
         si
     si
 
-    // this does a full compile of the files that have been edited, plus a partial
-    // compile (up to but not including expressions) of all other files
-    class FILE_EDITED_HANDLER: CommandHandler, SourceFileLookup, Iterable[SOURCE_FILE] is
+    // Does a full compile of the files that have been edited, plus a partial
+    // compile (up to but not including expressions) of all other files.
+    class FILE_EDITED_HANDLER: RequestHandler[Protocol.EDIT_REQUEST], SourceFileLookup, Iterable[SOURCE_FILE] is
         _watchdog: WATCHDOG;
         _timers: TIMERS;
         _compiler: COMPILER;
         _build_flags: GLOBAL_BUILD_FLAGS;
         _library_files: Iterable[string]?;
         _symbol_table: Semantic.SYMBOL_TABLE;
-        
+
         _source_files_by_path: Collections.MutableMap[string,SOURCE_FILE];
 
         _is_interface_changed: bool;
@@ -567,6 +558,8 @@ namespace Analysis is
             library_files: Iterable[string],
             symbol_table: Semantic.SYMBOL_TABLE
         ) is
+            super.init();
+
             _watchdog = watchdog;
             _timers = timers;
             _compiler = compiler;
@@ -584,7 +577,7 @@ namespace Analysis is
                 null
             fi;
 
-        parse_and_add_file(path: string, writer: IO.TextWriter, reader: IO.TextReader, is_internal_file: bool) is
+        parse_and_add_file(path: string, reader: IO.TextReader, is_internal_file: bool) is
             IoC.CONTAINER.instance.logger.clear(path, false);
 
             let previous = find_source_file(path);
@@ -608,10 +601,8 @@ namespace Analysis is
                 _is_interface_changed = true;
             fi
         si
-        
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
 
+        handle_request(request: Protocol.EDIT_REQUEST, writer: IO.TextWriter) is
             _is_interface_changed = false;
 
             for i in _source_files_by_path.values do
@@ -620,17 +611,7 @@ namespace Analysis is
 
             let paths = Collections.LIST[string]();
 
-            do
-                let path = reader.read_line();
-
-                if string.is_null_or_white_space(path) then
-                    break;
-                fi
-                
-                paths.add(path);
-            od
-
-            let want_timer = paths.count == 1 /\ !_library_files?;
+            let want_timer = request.files.count == 1 /\ !_library_files?;
 
             if want_timer then
                 _timers.start("edit-single");
@@ -638,15 +619,16 @@ namespace Analysis is
 
             if _library_files? then
                 for library_file_path in _library_files do
-                    parse_and_add_file(library_file_path, writer, IO.File.open_text(library_file_path), true);
-                od 
+                    parse_and_add_file(library_file_path, IO.File.open_text(library_file_path), true);
+                od
 
-                _library_files = null;                    
+                _library_files = null;
             fi
 
             try
-                for path in paths do
-                    parse_and_add_file(path, writer, reader, false);
+                for f in request.files do
+                    parse_and_add_file(f.path, IO.StringReader(f.source), false);
+                    paths.add(f.path);
                 od
             catch ex: Exception
                 debug_always("PARSE caught: {ex.get_type()} {ex.message}");
@@ -665,9 +647,10 @@ namespace Analysis is
                 _timers.start(edit_class_timer);
             fi
 
-            try
-                writer.write_line("DIAGNOSTICS");
+            let response = Protocol.DIAGNOSTICS_RESPONSE();
+            response.phase = "partial";
 
+            try
                 Semantic.Types.NAMED.clear_cache();
 
                 if !_watchdog.want_restart then
@@ -683,7 +666,9 @@ namespace Analysis is
                     _compiler.queue(self);
                     _compiler.build();
 
-                    IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                    let collected = DIAGNOSTICS_COLLECTOR.collect(IoC.CONTAINER.instance.logger);
+                    response.diagnostics = collected.diagnostics;
+                    response.checked_paths = collected.checked_paths;
                 fi
 
             catch ex: Exception
@@ -691,7 +676,7 @@ namespace Analysis is
 
                 _watchdog.request_restart();
             finally
-                _compiler.clear_queue(); 
+                _compiler.clear_queue();
 
                 IoC.CONTAINER.instance.logger.end_analysis();
 
@@ -708,18 +693,16 @@ namespace Analysis is
                     _compiler.is_full_compile_needed = true;
                 fi
 
-                writer.write("{cast char(12)}");
-                writer.write_line("PARTIAL DONE");
-                writer.write_line(_timers.edit_single_timer.max_average_milliseconds);
-                writer.write_line(if compile_needed then "1" else "0" fi);
-                writer.write("{cast char(12)}");
-                writer.flush();
+                response.elapsed_ms = _timers.edit_single_timer.max_average_milliseconds;
+                response.compile_needed = compile_needed;
+
+                JSON_PROTOCOL.write_response(writer, response);
             yrt
         si
     si
 
-    // This does a full compile of all files
-    class COMPILE_HANDLER: CommandHandler is
+    // Does a full compile of all files.
+    class COMPILE_HANDLER: RequestHandler[Protocol.COMPILE_REQUEST] is
         _watchdog: WATCHDOG;
         _compiler: COMPILER;
         _timers: TIMERS;
@@ -733,6 +716,8 @@ namespace Analysis is
             source_files: Iterable[SOURCE_FILE],
             build_flags: GLOBAL_BUILD_FLAGS
         ) is
+            super.init();
+
             _watchdog = watchdog;
             _timers = timers;
             _compiler = compiler;
@@ -740,21 +725,21 @@ namespace Analysis is
             _build_flags = build_flags;
         si
 
-        handle(
-            reader: IO.TextReader,
-            writer: IO.TextWriter
-        ) is
+        handle_request(request: Protocol.COMPILE_REQUEST, writer: IO.TextWriter) is
+            let response = Protocol.DIAGNOSTICS_RESPONSE();
+            response.phase = "full";
+
             try
                 if !_watchdog.want_restart then
-                    writer.write_line("DIAGNOSTICS");
-
                     if !_compiler.is_full_compile_needed then
                         // No interface-affecting edit pending — the rebuild is
                         // skipped. Timed under `compile-skipped` so the
                         // skipped-vs-run split shows in the stats dump.
                         _timers.start("compile-skipped");
 
-                        IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                        let collected = DIAGNOSTICS_COLLECTOR.collect(IoC.CONTAINER.instance.logger);
+                        response.diagnostics = collected.diagnostics;
+                        response.checked_paths = collected.checked_paths;
 
                         _timers.finish("compile-skipped");
                     else
@@ -782,7 +767,9 @@ namespace Analysis is
 
                         _compiler.build();
 
-                        IoC.CONTAINER.instance.logger.write_all_diagnostics(writer, IoC.CONTAINER.instance.logger_formatter);
+                        let collected = DIAGNOSTICS_COLLECTOR.collect(IoC.CONTAINER.instance.logger);
+                        response.diagnostics = collected.diagnostics;
+                        response.checked_paths = collected.checked_paths;
 
                         _watchdog.note_full_compile();
 
@@ -799,18 +786,16 @@ namespace Analysis is
             finally
                 IoC.CONTAINER.instance.logger.end_analysis();
 
-                _compiler.clear_queue(); 
+                _compiler.clear_queue();
 
-                writer.write("{cast char(12)}");
-                writer.write_line("FULL DONE");
-                writer.write_line(_timers.compile_timer.max_average_milliseconds);
-                writer.write("{cast char(12)}");
-                writer.flush();
-            yrt 
+                response.elapsed_ms = _timers.compile_timer.max_average_milliseconds;
+
+                JSON_PROTOCOL.write_response(writer, response);
+            yrt
         si
     si
 
-    class COMPLETION_HANDLER: CommandHandler is
+    class COMPLETION_HANDLER: RequestHandler[Protocol.COMPLETE_REQUEST] is
         _watchdog: WATCHDOG;
         _completer: Syntax.Process.COMPLETER;
         _source_file_lookup: SourceFileLookup;
@@ -823,18 +808,18 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _completer = completer;
             _source_file_lookup = source_file_lookup;
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            let written_header mut = false;
-
-            let path = reader.read_line();
-            let target_line = System.Convert.to_int32(reader.read_line());
-            let target_column = System.Convert.to_int32(reader.read_line());
+        handle_request(request: Protocol.COMPLETE_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
+            let target_line = request.line;
+            let target_column = request.column;
 
             let source_file = _source_file_lookup.find_source_file(path);
 
@@ -842,37 +827,43 @@ namespace Analysis is
                 _full_compiler.compile_all(writer, path);
             fi
 
-            try
-                writer.write_line("COMPLETION");
-                written_header = true;
+            let response = Protocol.COMPLETION_RESPONSE();
 
+            try
                 if !_watchdog.want_restart then
                     let results = find_completions(path, target_line, target_column);
 
                     if results? then
                         for pair in results do
-                            writer.write_line("{pair.key}\t{cast int(pair.value.completion_kind)}\t{pair.value.description}");
+                            response.items.add(
+                                Protocol.COMPLETION_ITEM(
+                                    pair.key,
+                                    cast int(pair.value.completion_kind),
+                                    pair.value.description
+                                )
+                            );
                         od
                     fi
 
                     for keyword in _completer.keyword_results do
-                        writer.write_line("{keyword}\t{cast int(Semantic.Symbols.COMPLETION_KIND.KEYWORD)}\tkeyword");
+                        response.items.add(
+                            Protocol.COMPLETION_ITEM(
+                                keyword,
+                                cast int(Semantic.Symbols.COMPLETION_KIND.KEYWORD),
+                                "keyword"
+                            )
+                        );
                     od
                 fi
             catch ex: Exception
                 debug_always("COMPLETION caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("COMPLETION");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
         find_completions(path: string, target_line: int, target_column: int) -> Iterable[Pair[string,Semantic.Symbols.Symbol]] is
@@ -882,7 +873,7 @@ namespace Analysis is
         si
     si
 
-    class SIGNATURE_HANDLER: CommandHandler is
+    class SIGNATURE_HANDLER: RequestHandler[Protocol.SIGNATURE_REQUEST] is
         _watchdog: WATCHDOG;
         _signature_help: Syntax.Process.SIGNATURE_HELP;
         _source_file_lookup: SourceFileLookup;
@@ -893,35 +884,34 @@ namespace Analysis is
             source_file_lookup: SourceFileLookup
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _signature_help = signature_help;
             _source_file_lookup = source_file_lookup;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            let written_header mut = false;
+        handle_request(request: Protocol.SIGNATURE_REQUEST, writer: IO.TextWriter) is
+            let response = Protocol.SIGNATURE_RESPONSE();
 
             try
-                let path = reader.read_line();
-                let target_line = System.Convert.to_int32(reader.read_line());
-                let target_column = System.Convert.to_int32(reader.read_line());
+                let path = request.path;
+                let target_line = request.line;
+                let target_column = request.column;
 
                 if !_watchdog.want_restart then
-                    writer.write_line("SIGNATURE");
-                    written_header = true;
-
                     let results = find_signatures(path, target_line, target_column);
 
                     if results? then
-                        writer.write_line("{results.best_signature_index}");
-                        writer.write_line("{results.current_parameter_index}");
+                        response.best_signature_index = results.best_signature_index;
+                        response.current_parameter_index = results.current_parameter_index;
 
                         for signature in results.signatures do
                             if !signature? then
                                 continue;
                             fi
 
-                            writer.write_line(format_signature(signature));
+                            response.signatures.add(to_signature_dto(signature));
                         od
                     fi
                 fi
@@ -929,32 +919,21 @@ namespace Analysis is
                 debug_always("SIGNATURE caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("SIGNATURE");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
-        // One wire line per overload: the label, then a tab-separated
-        // field per parameter. Mirrors response-handler.ts handleSignature.
-        format_signature(signature: Syntax.Process.SIGNATURE) -> string is
-            let result = System.Text.StringBuilder();
-
-            result.append(signature.description);
+        to_signature_dto(signature: Syntax.Process.SIGNATURE) -> Protocol.SIGNATURE_DTO is
+            let parameters = Collections.LIST[string]();
 
             for parameter_description in signature.parameter_descriptions do
-                result
-                    .append('\t')
-                    .append(parameter_description);
+                parameters.add(parameter_description);
             od
 
-            return result.to_string();
+            return Protocol.SIGNATURE_DTO(signature.description, parameters);
         si
 
         find_signatures(path: string, target_line: int, target_column: int) -> Syntax.Process.SIGNATURE_HELP_RESULT? is
@@ -964,7 +943,7 @@ namespace Analysis is
         si
     si
 
-    class SYMBOLS_HANDLER: CommandHandler is
+    class SYMBOLS_HANDLER: RequestHandler[Protocol.SYMBOLS_REQUEST] is
         _watchdog: WATCHDOG;
         _symbol_definition_locations: Semantic.SYMBOL_DEFINITION_LOCATIONS;
         _source_file_lookup: SourceFileLookup;
@@ -977,42 +956,37 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _symbol_definition_locations = symbol_definition_locations;
             _source_file_lookup = source_file_lookup;
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            let written_header mut = false;
+        handle_request(request: Protocol.SYMBOLS_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
+
+            let response = Protocol.SYMBOLS_RESPONSE();
 
             try
-                let path = reader.read_line();
-
                 if !_watchdog.want_restart then
                     if path? /\ path.length > 0 then
-                        writer.write_line("SYMBOLS");
-                        written_header = true;
-
-                        // VSCode can race the initial outline request in
-                        // ahead of the first project COMPILE; without this
-                        // re-compile the outline stays empty until the
-                        // user provokes one another way (e.g. workspace
-                        // symbol search).
+                        // VSCode can race the initial outline request in ahead
+                        // of the first project COMPILE; without this re-compile
+                        // the outline stays empty until the user provokes one
+                        // another way (e.g. workspace symbol search).
                         if !_symbol_definition_locations.has_definitions_for(path) then
                             _full_compiler.compile_all(writer, path);
                         fi
 
-                        write_symbol_list_for_file(writer, path, _symbol_definition_locations.find_definitions_from_file(path, false));
+                        add_symbol_file(response, path, _symbol_definition_locations.find_definitions_from_file(path, false));
                     else
                         _full_compiler.compile_all(writer);
 
-                        writer.write_line("SYMBOLS");
-                        written_header = true;        
-
                         for i in _source_file_lookup.file_names do
                             if i? /\ i.length > 0 then
-                                write_symbol_list_for_file(writer, i, _symbol_definition_locations.find_definitions_from_file(i, true));
+                                add_symbol_file(response, i, _symbol_definition_locations.find_definitions_from_file(i, true));
                             fi
                         od
                     fi
@@ -1021,98 +995,43 @@ namespace Analysis is
                 debug_always("SYMBOLS caught: {ex.get_type()} {ex.message}");
 
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("SYMBOLS");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
-        write_symbol_list_for_file(writer: IO.TextWriter, path: string, symbols: Iterable[Semantic.Symbols.Symbol]) is
-            writer.write_line(path);            
+        add_symbol_file(response: Protocol.SYMBOLS_RESPONSE, path: string, symbols: Iterable[Semantic.Symbols.Symbol]) is
+            let symbol_file = Protocol.SYMBOL_FILE(path);
 
             if symbols? then
                 for symbol in symbols | .filter(s => s? /\ !s.is_internal) do
                     try
-                        writer.write_line(
-                            get_symbol_info_for(symbol)
-                        );
-    
+                        symbol_file.symbols.add(to_symbol_dto(symbol));
                     catch ex: Exception
                     yrt
                 od
             fi
+
+            response.files.add(symbol_file);
         si
 
-        get_symbol_info_for(symbol: Semantic.Symbols.Symbol) -> string is
-            let result = System.Text.StringBuilder();
+        to_symbol_dto(symbol: Semantic.Symbols.Symbol) -> Protocol.SYMBOL_DTO is
             let qualified_name = symbol.qualified_name;
 
             let qualifier = qualified_name.substring(0, qualified_name.length - symbol.name.length - 1);
 
-            result
-                .append(symbol.search_description)
-                .append('\t')
-                .append(cast int(symbol.symbol_kind))
-                .append('\t')
-                .append(symbol.span.start_line)
-                .append('\t')
-                .append(symbol.span.start_column)
-                .append('\t')
-                .append(symbol.span.end_line)
-                .append('\t')
-                .append(symbol.span.end_column)
-                .append('\t')
-                .append(qualifier);
-
-            return result.to_string();
+            return Protocol.SYMBOL_DTO(
+                symbol.search_description,
+                cast int(symbol.symbol_kind),
+                symbol.span.start_line,
+                symbol.span.start_column,
+                symbol.span.end_line,
+                symbol.span.end_column,
+                qualifier
+            );
         si
-    si
-
-    class SymbolLocationHandler: CommandHandler is
-        _watchdog: WATCHDOG;
-        _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
-
-        init(
-            watchdog: WATCHDOG,
-            symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS
-        )
-        is
-            _watchdog = watchdog;
-            _symbol_use_locations = symbol_use_locations;
-        si
-
-        handle(reader: IO.TextReader, writer: IO.TextWriter);
-
-        write_location_list(writer: IO.TextWriter, locations: Iterable[LOCATION]) is
-            for location in locations do
-                writer.write_line(
-                    format_location(location)
-                );
-            od
-        si
-
-        format_location(location: LOCATION) -> string is
-            let result = System.Text.StringBuilder();
-
-            result
-                .append(location.file_name)
-                .append('\t')
-                .append(location.start_line)
-                .append('\t')
-                .append(location.start_column)
-                .append('\t')
-                .append(location.end_line)
-                .append('\t')
-                .append(location.end_column);
-
-            return result.to_string();
-        si        
     si
 
     class REFERENCES_HANDLER: SymbolLocationHandler is
@@ -1129,15 +1048,13 @@ namespace Analysis is
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
-
-            let written_header mut = false;
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter) is
+            let response = Protocol.REFERENCES_RESPONSE();
 
             try
-                let path = reader.read_line();
-                let line = System.Convert.to_int32(reader.read_line());
-                let column = System.Convert.to_int32(reader.read_line());
+                let path = request.path;
+                let line = request.line;
+                let column = request.column;
 
                 if !_watchdog.want_restart then
                     let symbol mut = _symbol_use_locations.find_definition_from_use(path, line, column);
@@ -1145,33 +1062,23 @@ namespace Analysis is
                     if !symbol? then
                         _full_compiler.compile_all(writer);
                     fi
-                    
+
                     if !symbol? then
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
 
-                    writer.write_line("REFERENCES");
-                    written_header = true;    
-
                     if symbol? then
-                        let locations = _symbol_use_locations.find_references_to_symbol(symbol);
-
-                        write_location_list(writer, locations);
+                        add_locations(response.locations, _symbol_use_locations.find_references_to_symbol(symbol));
                     fi
                 fi
 
             catch ex: Exception
                 debug_always("REFERENCES caught: {ex.get_type()} {ex.message}");
-
-                if !written_header then
-                    writer.write_line("REFERENCES");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
@@ -1189,14 +1096,12 @@ namespace Analysis is
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter) is
+            let path = request.path;
+            let line = request.line;
+            let column = request.column;
 
-            let path = reader.read_line();
-            let line = System.Convert.to_int32(reader.read_line());
-            let column = System.Convert.to_int32(reader.read_line());
-
-            let written_header mut = false;
+            let response = Protocol.TYPE_DEFINITION_RESPONSE();
 
             try
                 if !_watchdog.want_restart then
@@ -1208,30 +1113,22 @@ namespace Analysis is
                         symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
                     fi
 
-                    writer.write_line("TYPEDEFINITION");
-                    written_header = true;
-
                     if symbol? then
                         let type_symbol = type_symbol_of(symbol);
 
                         if type_symbol? /\ !type_symbol.is_internal /\ !type_symbol.is_reflected then
-                            write_location_list(writer, [type_symbol.location]);
+                            add_locations(response.locations, [type_symbol.location]);
                         fi
                     fi
                 fi
             catch e: Exception
                 debug_always("TYPEDEFINITION caught: {e.get_type()}: {e.message}");
                 _watchdog.request_restart();
-
-                if !written_header then
-                    writer.write_line("TYPEDEFINITION");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
         // If the cursor sits on a type symbol itself (class/trait/struct/union/variant),
@@ -1267,47 +1164,35 @@ namespace Analysis is
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
-
+        handle_request(request: Protocol.PositionRequest, writer: IO.TextWriter) is
             _full_compiler.compile_all(writer);
 
-            let written_header mut = false;
+            let response = Protocol.IMPLEMENTATION_RESPONSE();
 
             try
-                let path = reader.read_line();
-                let line = System.Convert.to_int32(reader.read_line());
-                let column = System.Convert.to_int32(reader.read_line());
-
-                writer.write_line("IMPLEMENTATION");
-                written_header = true;
+                let path = request.path;
+                let line = request.line;
+                let column = request.column;
 
                 if !_watchdog.want_restart then
                     let symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
 
                     if symbol? then
-                        let locations = _symbol_use_locations.find_implementations_of_symbol(symbol);
-
-                        write_location_list(writer, locations);
+                        add_locations(response.locations, _symbol_use_locations.find_implementations_of_symbol(symbol));
                     fi
                 fi
 
             catch ex: Exception
                 debug_always("IMPLEMENTATION caught: {ex.get_type()} {ex.message}");
-
-                if !written_header then
-                    writer.write_line("IMPLEMENTATION");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
-    class RENAME_REQUEST_HANDLER: CommandHandler is
+    class RENAME_REQUEST_HANDLER: RequestHandler[Protocol.RENAME_REQUEST] is
         _watchdog: WATCHDOG;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _full_compiler: FULL_COMPILER;
@@ -1318,28 +1203,25 @@ namespace Analysis is
             full_compiler: FULL_COMPILER
         )
         is
+            super.init();
+
             _watchdog = watchdog;
             _symbol_use_locations = symbol_use_locations;
             _full_compiler = full_compiler;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
-
+        handle_request(request: Protocol.RENAME_REQUEST, writer: IO.TextWriter) is
             // TODO check scope of symbol - if it can't be referenced outside the current file
             // i.e. if it's a local variable - then this is not required:
             _full_compiler.compile_all(writer);
 
-            let written_header mut = false;
+            let response = Protocol.RENAME_RESPONSE();
 
             try
-                let path = reader.read_line();
-                let line = System.Convert.to_int32(reader.read_line());
-                let column = System.Convert.to_int32(reader.read_line());
-                let new_name = reader.read_line();
-
-                writer.write_line("RENAMEREQUEST");
-                written_header = true; 
+                let path = request.path;
+                let line = request.line;
+                let column = request.column;
+                let new_name = request.new_name;
 
                 if !_watchdog.want_restart then
                     let symbol = _symbol_use_locations.find_definition_from_use(path, line, column);
@@ -1347,121 +1229,86 @@ namespace Analysis is
                     if symbol? then
                         let locations = _symbol_use_locations.find_references_to_symbol_for_rename(symbol);
 
-                        write_edit_list(writer, locations, new_name);
+                        for location in locations do
+                            response.edits.add(
+                                Protocol.RENAME_EDIT(
+                                    location.file_name,
+                                    location.start_line,
+                                    location.start_column,
+                                    location.end_line,
+                                    location.end_column,
+                                    new_name
+                                )
+                            );
+                        od
                     fi
                 fi
 
             catch ex: Exception
                 debug_always("RENAMEREQUEST caught: {ex.get_type()} {ex.message}");
-
-                if !written_header then
-                    writer.write_line("RENAMEREQUEST");
-                fi
             yrt
 
             Std.error.flush();
 
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
+    si
 
-        write_edit_list(writer: IO.TextWriter, locations: Iterable[LOCATION], new_name: string) is
-            let files = Collections.SET[string]();
-
-            for location in locations do
-                writer.write_line(
-                    format_edit(location, new_name)
-                );
-
-                files.add(location.file_name);
-            od
-        si
-
-        format_edit(location: LOCATION, new_name: string) -> string is
-            let result = System.Text.StringBuilder();
-
-            result
-                .append(location.file_name)
-                .append('\t')
-                .append(location.start_line)
-                .append('\t')
-                .append(location.start_column)
-                .append('\t')
-                .append(location.end_line)
-                .append('\t')
-                .append(location.end_column)
-                .append('\t')
-                .append(new_name);
-
-            return result.to_string();
-        si
-    si    
-
-    class RESTART_HANDLER: CommandHandler is
+    class RESTART_HANDLER: RequestHandler[Protocol.RESTART_REQUEST] is
         _watchdog: WATCHDOG;
 
         init(watchdog: WATCHDOG) is
+            super.init();
+
             _watchdog = watchdog;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            IoC.CONTAINER.instance.want_tab_delimited_logger(writer);
-
+        handle_request(request: Protocol.RESTART_REQUEST, writer: IO.TextWriter) is
             _watchdog.recycle(writer, "client requested restart");
         si
     si
 
-    // Handles #HEAPCHECK#: an explicit request to sample the heap. The VS Code
-    // extension sends one during a lull in editing, so the watchdog's forced
-    // GC lands outside the latency path of an interactive request rather than
-    // after every compile.
-    class HEAP_CHECK_HANDLER: CommandHandler is
+    // Handles the heap_check request: an explicit request to sample the heap.
+    // The VS Code extension sends one during a lull in editing, so the
+    // watchdog's forced GC lands outside the latency path of an interactive
+    // request rather than after every compile.
+    class HEAP_CHECK_HANDLER: RequestHandler[Protocol.HEAP_CHECK_REQUEST] is
         _watchdog: WATCHDOG;
 
         init(watchdog: WATCHDOG) is
+            super.init();
+
             _watchdog = watchdog;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
+        handle_request(request: Protocol.HEAP_CHECK_REQUEST, writer: IO.TextWriter) is
             // If the heap has grown past the recycle thresholds, check_heap
-            // writes a RESTART frame and exits; otherwise we ack so the
+            // writes a RESTART response and exits; otherwise we ack so the
             // client's request/response loop completes.
             _watchdog.check_heap_on_request(writer);
 
-            writer.write_line("HEAPCHECK");
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, Protocol.HEAP_CHECK_RESPONSE());
         si
     si
 
-    // Reformats a single file. The request frame is the file path followed
-    // by the buffer contents (form-feed terminated); the buffer is parsed
-    // fresh — no symbol table, no dependence on prior EDIT state — and the
-    // reformatted text is returned whole. On any failure the original buffer
-    // is echoed back unchanged, so a format request can never corrupt it.
-    class FORMAT_HANDLER: CommandHandler is
+    // Reformats a single file. The buffer is parsed fresh — no symbol table, no
+    // dependence on prior EDIT state — and the reformatted text returned whole.
+    // On any failure the original buffer is echoed back unchanged, so a format
+    // request can never corrupt it.
+    class FORMAT_HANDLER: RequestHandler[Protocol.FORMAT_REQUEST] is
         _compiler: COMPILER;
         _build_flags: GLOBAL_BUILD_FLAGS;
 
         init(compiler: COMPILER, build_flags: GLOBAL_BUILD_FLAGS) is
+            super.init();
+
             _compiler = compiler;
             _build_flags = build_flags;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            let path = reader.read_line();
-
-            let buffer = System.Text.StringBuilder();
-
-            do
-                let c = reader.read();
-                if c < 0 \/ c == 12 then
-                    break;
-                fi
-                buffer.append(cast char(c));
-            od
-
-            let source = buffer.to_string();
+        handle_request(request: Protocol.FORMAT_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
+            let source = request.source;
 
             let result mut = source;
 
@@ -1491,52 +1338,38 @@ namespace Analysis is
                 debug_always("FORMAT caught: {ex.get_type()} {ex.message}");
             yrt
 
-            writer.write_line("FORMAT");
-            writer.write(result);
-            writer.write("{cast char(12)}");
-            writer.flush();
+            let response = Protocol.FORMAT_RESPONSE();
+            response.text = result;
+
+            JSON_PROTOCOL.write_response(writer, response);
         si
     si
 
     // Reformats just the run of definitions/statements covering a requested
-    // range. The request frame is the path, the range (start/end line and
-    // column, 1-based), then the buffer contents (form-feed terminated). The
-    // response is the whole-line span actually replaced followed by the
-    // reformatted text; a `0 0` span means nothing was formatted (the buffer
-    // is left untouched).
-    class FORMATRANGE_HANDLER: CommandHandler is
+    // range. The response carries the whole-line span actually replaced and the
+    // reformatted text; a zero span (all zeros) means nothing was formatted (the
+    // buffer is left untouched).
+    class FORMATRANGE_HANDLER: RequestHandler[Protocol.FORMAT_RANGE_REQUEST] is
         _compiler: COMPILER;
         _build_flags: GLOBAL_BUILD_FLAGS;
 
         init(compiler: COMPILER, build_flags: GLOBAL_BUILD_FLAGS) is
+            super.init();
+
             _compiler = compiler;
             _build_flags = build_flags;
         si
 
-        handle(reader: IO.TextReader, writer: IO.TextWriter) is
-            let path = reader.read_line();
-            let start_line = System.Convert.to_int32(reader.read_line());
-            let start_column = System.Convert.to_int32(reader.read_line());
-            let end_line = System.Convert.to_int32(reader.read_line());
-            let end_column = System.Convert.to_int32(reader.read_line());
+        handle_request(request: Protocol.FORMAT_RANGE_REQUEST, writer: IO.TextWriter) is
+            let path = request.path;
+            let start_line = request.start_line;
+            let start_column = request.start_column;
+            let end_line = request.end_line;
+            let end_column = request.end_column;
+            let source = request.source;
 
-            let buffer = System.Text.StringBuilder();
-
-            do
-                let c = reader.read();
-                if c < 0 \/ c == 12 then
-                    break;
-                fi
-                buffer.append(cast char(c));
-            od
-
-            let source = buffer.to_string();
-
-            let response_start_line mut = 0;
-            let response_start_column mut = 0;
-            let response_end_line mut = 0;
-            let response_end_column mut = 0;
-            let formatted mut = "";
+            let response = Protocol.FORMAT_RANGE_RESPONSE();
+            response.text = "";
 
             try
                 // Parse into a throwaway logger so a format request never
@@ -1576,16 +1409,16 @@ namespace Analysis is
                                     100 - continuation_indent
                                 );
 
-                            formatted =
+                            response.text =
                                 _reindent(formatter.format(target.node), continuation_indent);
 
-                            response_start_line = target.start_line;
-                            response_start_column = target.start_column;
-                            response_end_line = target.end_line;
+                            response.start_line = target.start_line;
+                            response.start_column = target.start_column;
+                            response.end_line = target.end_line;
                             // exclusive end of the span to replace, one past
                             // the run's last character (and any ';' the
                             // statement node's location does not cover)
-                            response_end_column = _span_end_column(source, target) + 1;
+                            response.end_column = _span_end_column(source, target) + 1;
                         fi
                     fi
                 fi
@@ -1593,15 +1426,7 @@ namespace Analysis is
                 debug_always("FORMATRANGE caught: {ex.get_type()} {ex.message}");
             yrt
 
-            writer.write_line("FORMATRANGE");
-            writer.write_line(
-                "{response_start_line}\t{response_start_column}\t{response_end_line}\t{response_end_column}"
-            );
-            // trailing newline is protocol framing — the response parser drops
-            // the final line; the formatted span itself carries no newline
-            writer.write_line(formatted);
-            writer.write("{cast char(12)}");
-            writer.flush();
+            JSON_PROTOCOL.write_response(writer, response);
         si
 
         _trivia_in_lines(
