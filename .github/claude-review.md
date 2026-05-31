@@ -6,6 +6,7 @@ Instructions for the Anthropic Claude Code Action invoked from the `code_review`
 
 - The PR branch is checked out in the working directory.
 - Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`.
+- Get author-supplied PR comments via `gh pr view <N> --json comments`. Rationale that doesn't belong in the changelog-shape description body lives there: a subtle invariant the diff hides, why this approach over a tempting alternative, a deliberate oddity. Read comments before flagging anything as "unjustified", "approach unclear", or "this looks wrong" — the answer may already be in a comment.
 - Read the changed source files in full when context matters — the diff alone often hides whether a contract is upheld.
 - Post findings only to GitHub. Anything you say in chat is invisible.
 
