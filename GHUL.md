@@ -48,28 +48,30 @@ A `use` applies only within the current namespace block — if a namespace is sp
 
 See <https://ghul.dev/definitions.html#variables>.
 
-Local variables are declared with `let`, with a type, an initializer, or both:
+Local variables are declared with `let`, with an inferred or explicit type and an initializer:
 
 ```ghul
 let i = 1234;          // type inferred as int
-let j: int;            // explicit type, no initializer
-let k: int = 5678;     // both
+let k: int = 5678;     // explicit type
 ```
 
-With an initializer the type is inferred from it; without one a type is required. A variable declared without an initializer takes the default value of its type (zero, `false`, or `null`). A single `let` can declare several variables, mixing the three forms:
+A bare `let` is immutable: the initializer is required, the value is fixed, and reassignment is rejected. To reassign, declare with a trailing `mut`; the initializer can then be omitted, giving a deferred-init local that takes the default value of its type (zero, `false`, or `null`):
 
 ```ghul
-let first = 1, second: int, third = "three";
-```
-
-A bare `let` is immutable. To reassign, the declaration takes a trailing `mut`:
-
-```ghul
-let counter mut = 0;
+let counter mut = 0;     // initialised, will be reassigned
 counter = counter + 1;
+
+let result: int mut;     // deferred — default-initialised to 0
+result = compute();
 ```
 
 A `mut` variable still cannot change type. Either form can also take its value from a `default` expression — `let i = default` initializes to the default value of the type that the surrounding context expects, with `default[T]` to pin the type explicitly.
+
+A single `let` can declare several variables, mixing inferred and explicit types:
+
+```ghul
+let first = 1, second: int = 0, third = "three";
+```
 
 The name `_` is a discard placeholder: it stands in for a variable name, but the value that would be assigned to it is discarded. It is accepted in `let` definitions, tuple destructuring, lambda parameters, and `for` loop variables.
 
