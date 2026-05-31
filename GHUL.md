@@ -229,15 +229,17 @@ union Tree is
 si
 ```
 
-A variant is constructed through the union name (`Tree.LEAF(123)`). The compiler synthesises a boolean tag property for each variant — `is_node`, `is_leaf` — and an accessor named after the variant. The accessor yields the variant instance when the variant has several fields, or the field value directly when it has just one; a unit variant (no fields) has only a tag:
+A variant is constructed through the union name (`Tree.LEAF(123)`). Discriminate a union value with `isa V(x)` or `if let v: V = x` — both test the runtime variant, and `if let` binds the value at the narrower variant type for use in the then-arm:
 
 ```ghul
-if tree.is_node then
-    write_line("node: {tree.node.left} and {tree.node.right}");
-elif tree.is_leaf then
-    write_line("leaf: {tree.leaf}");
+if let node: Tree.NODE = tree then
+    write_line("node: {node.left} and {node.right}");
+elif let leaf: Tree.LEAF = tree then
+    write_line("leaf: {leaf.value}");
 fi
 ```
+
+`isa V(x)` also narrows `x` itself inside the then-arm and inside guard-then-return tails, and on a two-variant union narrows the `else` branch to the other variant. Variant-name dispatch is not checked for exhaustiveness yet — the compiler knows the full variant set but won't error on a missing arm.
 
 Unions compare by structural equality through the `=~` operator — two union values are `=~` when they hold the same variant with memberwise-equal fields.
 
@@ -250,7 +252,7 @@ union Result[T, E] is
 si
 ```
 
-`r?` is then true when `r` holds `OK`, and `r!` unwraps the `OK` payload, throwing if `r` holds `ERROR`. A default variant with one field unwraps to that field; with several, it unwraps to the variant.
+`r?` is then true when `r` holds `OK`, and `r!` unwraps the `OK` payload, throwing if `r` holds `ERROR`. A default variant with one field unwraps to that field positionally — the field name does not have to be `value` — and with several fields, it unwraps to the variant.
 
 ### enums
 
@@ -319,7 +321,7 @@ let sign = if x >= 0 then "non-negative" else "negative" fi;
 
 ### type narrowing
 
-When an `if` condition proves a stronger fact about a local variable's type, the branch sees it at the narrower type. The common cases are union variant tags, `isa` class tests, and a `?` presence test on an optional:
+When an `if` condition proves a stronger fact about a local variable's type, the branch sees it at the narrower type. The common cases are `isa` class or variant tests and a `?` presence test on an optional:
 
 ```ghul
 if isa Cat(a) then
