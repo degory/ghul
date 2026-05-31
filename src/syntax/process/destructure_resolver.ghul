@@ -1,64 +1,122 @@
 namespace Syntax.Process is
-    use Semantic.Types.Type;
+    use Semantic.Symbols.Function;
+    use Semantic.Symbols.FUNCTION_GROUP;
     use Semantic.Symbols.Symbol;
+    use Semantic.Types.Type;
+
+    // The shape decided for a destructure of `from_type` into a
+    // fixed list of target elements. Exactly one of `members` and
+    // `deconstruct_function` is populated.
+    //
+    // `members` carries one entry per element (null where it could
+    // not be resolved); the source for each element is loaded by
+    // calling the corresponding symbol's `load`.
+    //
+    // `deconstruct_function` carries the resolved `deconstruct(...)`
+    // instance method; the call shape is one INSTANCE call passing
+    // ADDRESS args for each `ref` parameter, with the temps then
+    // bound to the elements in order.
+    class DESTRUCTURE_STRATEGY is
+        members: Collections.List[Symbol] public;
+        deconstruct_function: Function public;
+
+        is_deconstruct: bool => deconstruct_function?;
+
+        init(members: Collections.List[Symbol]) is
+            super.init();
+            self.members = members;
+        si
+
+        init(deconstruct_function: Function) is
+            super.init();
+            self.deconstruct_function = deconstruct_function;
+        si
+    si
 
     // Decides, for a destructure of a source of `from_type` into a
-    // fixed list of target elements, which member of the source
-    // supplies each element.
+    // fixed list of target elements, how each element is supplied.
     //
-    // The positional members (`0 `1 ... — tuple elements or
-    // conventionally-named members) are used when their count matches
-    // the element count; otherwise each element name is matched
-    // against a member of the source, so a non-exhaustive subset can
-    // be pulled out by name.
+    // Precedence (matches the C# .NET-side convention):
+    //   1. value-tuple positional      — `(a, b) = (x, y)`
+    //   2. `deconstruct(...)` method   — instance method whose
+    //                                    parameters are all `T ref`
+    //   3. `` `0 `` / `` `1 `` ...     — conventionally-named
+    //                                    positional members
+    //   4. by-name                     — each element name matches a
+    //                                    member of the source
     //
-    // Pure and shared: COMPILE_EXPRESSIONS resolves members here and
-    // logs an error for any unresolved element; GENERATE_IL resolves
-    // the same way but only ever runs for an already-valid
-    // destructure. Keeping the decision in one place stops the two
-    // passes drifting apart.
+    // Pure and shared: COMPILE_EXPRESSIONS resolves here and logs an
+    // error for any unresolved element; GENERATE_IL resolves the same
+    // way but only ever runs for an already-valid destructure.
+    // Keeping the decision in one place stops the two passes
+    // drifting apart.
     class DESTRUCTURE_RESOLVER is
         // `names` carries one entry per element, null for an element
-        // with no name (a nested destructuring group). The result has
-        // one entry per element, null where it could not be resolved.
+        // with no name (a nested destructuring group).
+        resolve_strategy(
+            from_type: Type,
+            names: Collections.List[string]
+        ) -> DESTRUCTURE_STRATEGY static is
+            let element_count = names.count;
+
+            if !from_type? \/ from_type.is_error then
+                let result = Collections.LIST[Symbol]();
+                for name in names do
+                    result.add(null);
+                od
+                return DESTRUCTURE_STRATEGY(result);
+            fi
+
+            if
+                from_type.is_value_tuple /\
+                from_type.arguments? /\
+                from_type.arguments.count == element_count
+            then
+                return DESTRUCTURE_STRATEGY(_positional_members(from_type, element_count));
+            fi
+
+            let deconstruct = try_resolve_deconstruct(from_type, element_count);
+
+            if deconstruct? then
+                return DESTRUCTURE_STRATEGY(deconstruct);
+            fi
+
+            let pos_arity = positional_member_count(from_type);
+
+            if pos_arity > 0 /\ pos_arity == element_count then
+                return DESTRUCTURE_STRATEGY(_positional_members(from_type, element_count));
+            fi
+
+            let by_name = Collections.LIST[Symbol]();
+            for name in names do
+                if !name? then
+                    by_name.add(null);
+                else
+                    by_name.add(from_type.find_member(name));
+                fi
+            od
+            return DESTRUCTURE_STRATEGY(by_name);
+        si
+
+        // Back-compat: the per-element symbol list, with deconstruct
+        // strategy silently flattened back to null entries. Callers
+        // that need to know about the deconstruct strategy must use
+        // `resolve_strategy` instead.
         resolve_members(
             from_type: Type,
             names: Collections.List[string]
         ) -> Collections.List[Symbol] static is
-            let result = Collections.LIST[Symbol]();
+            let strategy = resolve_strategy(from_type, names);
 
-            if !from_type? \/ from_type.is_error then
+            if strategy.is_deconstruct then
+                let result = Collections.LIST[Symbol]();
                 for name in names do
                     result.add(null);
                 od
-
                 return result;
             fi
 
-            let positional_arity =
-                if from_type.is_value_tuple then
-                    from_type.arguments.count;
-                else
-                    positional_member_count(from_type);
-                fi;
-
-            if positional_arity > 0 /\ positional_arity == names.count then
-                for i in 0..names.count do
-                    result.add(from_type.find_destructure_member(i));
-                od
-
-                return result;
-            fi
-
-            for name in names do
-                if !name? then
-                    result.add(null);
-                else
-                    result.add(from_type.find_member(name));
-                fi
-            od
-
-            return result;
+            return strategy.members;
         si
 
         // The number of leading `0 `1 ... conventionally-named
@@ -73,6 +131,72 @@ namespace Syntax.Process is
             od
 
             return count;
+        si
+
+        // Returns the resolved `deconstruct(...)` instance method
+        // whose arity equals `element_count` and whose parameters
+        // are all `T ref`, or null if no such method exists. When
+        // more than one overload matches the arity, returns null —
+        // the caller falls through to the next destructure strategy.
+        try_resolve_deconstruct(
+            from_type: Type,
+            element_count: int
+        ) -> Function? static is
+            if !from_type? then
+                return null;
+            fi
+
+            let member = from_type.find_member("deconstruct");
+
+            if !member? then
+                return null;
+            fi
+
+            let candidates = Collections.LIST[Function]();
+
+            if let group: FUNCTION_GROUP = member then
+                for f in group.functions do
+                    if _is_viable_deconstruct(f, element_count) then
+                        candidates.add(f);
+                    fi
+                od
+            elif let function: Function = member then
+                if _is_viable_deconstruct(function, element_count) then
+                    candidates.add(function);
+                fi
+            fi
+
+            if candidates.count == 1 then
+                return candidates[0];
+            fi
+
+            return null;
+        si
+
+        _is_viable_deconstruct(f: Function, element_count: int) -> bool static is
+            if !f? \/ !f.is_instance then
+                return false;
+            fi
+
+            if !f.arguments? \/ f.arguments.count != element_count then
+                return false;
+            fi
+
+            for a in f.arguments do
+                if !a? \/ !a.is_ref then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        _positional_members(from_type: Type, element_count: int) -> Collections.List[Symbol] static is
+            let result = Collections.LIST[Symbol]();
+            for i in 0..element_count do
+                result.add(from_type.find_destructure_member(i));
+            od
+            return result;
         si
     si
 si

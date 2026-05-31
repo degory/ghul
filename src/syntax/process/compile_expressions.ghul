@@ -622,26 +622,30 @@ namespace Syntax.Process is
             value? /\ value.type? /\ value.type.is_settled /\
             !value.type.is_null /\ !value.type.is_optional;
         
-        // Resolve the per-element members for a destructure (see
-        // DESTRUCTURE_RESOLVER) and log an error against `location`
-        // for any element that could not be matched. When nothing
-        // resolved the failure is reported once — as a count mismatch
-        // if the source has positional members, otherwise as a
-        // not-destructurable source; a partial match (some names hit,
-        // some missed) reports each missed name, since that is the
-        // shape of a mistyped by-name destructure.
-        resolve_destructure_members(
+        // Resolve the destructure strategy (see DESTRUCTURE_RESOLVER)
+        // and log an error against `location` for any unresolvable
+        // case. When nothing resolved the failure is reported once —
+        // as a count mismatch if the source has positional members,
+        // otherwise as a not-destructurable source; a partial match
+        // (some names hit, some missed) reports each missed name,
+        // since that is the shape of a mistyped by-name destructure.
+        resolve_destructure_strategy(
             location: LOCATION,
             from_type: Type,
             names: Collections.List[string]
-        ) -> Collections.List[Semantic.Symbols.Symbol]
+        ) -> DESTRUCTURE_STRATEGY
         is
-            let members = DESTRUCTURE_RESOLVER.resolve_members(from_type, names);
+            let strategy = DESTRUCTURE_RESOLVER.resolve_strategy(from_type, names);
 
             if !from_type? \/ from_type.is_error then
-                return members;
+                return strategy;
             fi
 
+            if strategy.is_deconstruct then
+                return strategy;
+            fi
+
+            let members = strategy.members;
             let resolved mut = 0;
 
             for member in members do
@@ -651,7 +655,7 @@ namespace Syntax.Process is
             od
 
             if resolved == names.count then
-                return members;
+                return strategy;
             fi
 
             let positional_arity =
@@ -679,7 +683,7 @@ namespace Syntax.Process is
                 od
             fi
 
-            return members;
+            return strategy;
         si
 
         pre(left: Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION) -> bool is
@@ -719,26 +723,65 @@ namespace Syntax.Process is
                 names.add(name);
             od
 
-            let members = resolve_destructure_members(left.location, from_type, names);
+            let strategy = resolve_destructure_strategy(left.location, from_type, names);
 
             let block = IR.Values.BLOCK();
 
-            let get_from = from.get_temp_copier(block, "destructure");
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function;
+                let arg_temps = Collections.LIST[IR.TEMP]();
+                let call_args = Collections.LIST[IR.Values.Value]();
 
-            for i in 0..elements.count do
-                let element = elements[i];
-                let member = members[i];
+                for i in 0..deconstruct.arguments.count do
+                    let ref_type = deconstruct.arguments[i];
+                    let element_type = ref_type.get_element_type();
+                    let arg_temp = IR.TEMP(block, "destructure_arg", i, element_type);
 
-                if member? then
-                    element.value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+                    arg_temps.add(arg_temp);
+                    call_args.add(IR.Values.ADDRESS(arg_temp.load(), ref_type));
+                od
+
+                let call_value =
+                    deconstruct.call(
+                        left.location,
+                        from,
+                        call_args,
+                        null,
+                        _function_caller
+                    );
+
+                block.add(call_value);
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+
+                    element.value = arg_temps[i].load();
 
                     element.walk(self);
 
                     if element.value? then
                         block.add(element.value);
                     fi
-                fi
-            od
+                od
+            else
+                let members = strategy.members;
+                let get_from = from.get_temp_copier(block, "destructure");
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let member = members[i];
+
+                    if member? then
+                        element.value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                        element.walk(self);
+
+                        if element.value? then
+                            block.add(element.value);
+                        fi
+                    fi
+                od
+            fi
 
             block.close();
             left.value = block;
@@ -1877,17 +1920,18 @@ namespace Syntax.Process is
                 names.add(if element.is_simple_name then element.name.name else null fi);
             od
 
-            let members = resolve_destructure_members(left.location, from_type, names);
+            let strategy = resolve_destructure_strategy(left.location, from_type, names);
 
             let block = IR.Values.BLOCK();
-            let get_from = from.get_temp_copier(block, "destructure");
 
-            for i in 0..elements.count do
-                let element = elements[i];
-                let member = members[i];
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function;
 
-                if member? then
-                    element.right_value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let element_type = deconstruct.arguments[i].get_element_type();
+
+                    element.right_value = IR.Values.DUMMY(element_type, element.location);
 
                     element.variable_location = left.variable_location;
                     element.right_location = left.right_location;
@@ -1897,8 +1941,29 @@ namespace Syntax.Process is
                     if element.value? then
                         block.add(element.value);
                     fi
-                fi
-            od
+                od
+            else
+                let members = strategy.members;
+                let get_from = from.get_temp_copier(block, "destructure");
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let member = members[i];
+
+                    if member? then
+                        element.right_value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                        element.variable_location = left.variable_location;
+                        element.right_location = left.right_location;
+
+                        element.walk(self);
+
+                        if element.value? then
+                            block.add(element.value);
+                        fi
+                    fi
+                od
+            fi
 
             block.close();
 
@@ -2082,7 +2147,41 @@ namespace Syntax.Process is
                 names.add(if element? /\ element.is_simple_name then element.name.name else null fi);
             od
 
-            let members = resolve_destructure_members(left.location, from_type, names);
+            let strategy = resolve_destructure_strategy(left.location, from_type, names);
+
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function;
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+
+                    if !element? then
+                        continue;
+                    fi
+
+                    let element_type = deconstruct.arguments[i].get_element_type();
+
+                    if element.is_simple_name then
+                        let symbol = find(element.name);
+
+                        if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                            let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                            symbol.define();
+
+                            typed_symbol.set_type(element_type);
+                        else
+                            _logger.error(element.location, "couldn't find typed symbol for destructuring element {element.name}");
+                        fi
+                    else
+                        set_symbol_destructure_types(element, element_type);
+                    fi
+                od
+
+                return;
+            fi
+
+            let members = strategy.members;
 
             for i in 0..elements.count do
                 let element = elements[i];
