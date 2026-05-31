@@ -1,0 +1,842 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.RESPONSE;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Same-file query matrix after an incremental EDIT.
+    //
+    // The shared fixture is a single file rich in symbol kinds: a trait
+    // declaring an abstract; a class with a typed field, a property, an
+    // indexer, two methods (one whose body gets edited, one whose body
+    // does not), constructor parameters, body locals; a namespace-level
+    // function below the edited body; a lambda local inside that function.
+    // An interface-preserving body edit to one method shifts every
+    // declaration below it by three lines, exercising the reconciliation
+    // walk's translation of retained interface coordinates.
+    //
+    // Tests query HOVER / DEFINITION / DECLARATION / TYPEDEFINITION /
+    // REFERENCES / IMPLEMENTATION at the cells the design must handle:
+    //
+    //   A — inside the edited body (body re-record)
+    //   B — inside a non-edited body in the edited file (also dropped + re-recorded)
+    //   C — interface region declared above the edit (line-stable)
+    //   D — interface region declared below the edit (line-shifted by reconciliation)
+    //   E — wrapping interface (class whose span extends across the edit)
+    //   H — lambda body inside an edited body's downstream sibling (κ kind)
+    //
+    // The `QUALIFIED.right_location` residual (qualified type names in a
+    // retained signature keep stale coordinates because LOCATION_TRANSFER
+    // does not visit that field) is exercised in
+    // `qualified_type_name_right_half_below_edit_keeps_stale_line_pinned_residual`
+    // — pinning current behaviour with an inline TODO; flip the
+    // assertion when the residual is fixed.
+    class INCREMENTAL_SAME_FILE_QUERY_TESTS is
+        @test()
+
+        init() is si
+
+        // Baseline source. Function `process` (lines 30-37) is the body
+        // that gets edited; everything from line 40 onwards is interface
+        // declared below the edit.
+        //
+        //  1  namespace SameShape is
+        //  2      use Collections.LIST;
+        //  3
+        //  4      trait Renderable is
+        //  5          render() -> string;
+        //  6      si
+        //  7
+        //  8      class WIDGET: Renderable is
+        //  9          _name: string;
+        // 10          _items: LIST[int];
+        // 11
+        // 12          init(name: string) is
+        // 13              _name = name;
+        // 14              _items = LIST[int]();
+        // 15          si
+        // 16
+        // 17          label: string => _name;
+        // 18
+        // 19          render() -> string => "widget";
+        // 20
+        // 21          [index: int]: int is
+        // 22              return _items[index];
+        // 23          si,
+        // 24          = value is
+        // 25              _items[index] = value;
+        // 26          si
+        // 27
+        // 28          process(input: LIST[int]) -> int is
+        // 29              let total mut = 0;
+        // 30              for n in input do
+        // 31                  _items.add(n);
+        // 32                  total = total + n;
+        // 33              od
+        // 34              return total;
+        // 35          si
+        // 36
+        // 37          tally() -> int is
+        // 38              let sum mut = 0;
+        // 39              for x in _items do
+        // 40                  sum = sum + x;
+        // 41              od
+        // 42              return sum;
+        // 43          si
+        // 44      si
+        // 45
+        // 46      describe(w: WIDGET) -> string => w.render();
+        // 47
+        // 48      transform(items: Collections.LIST[int]) -> LIST[int] is
+        // 49          let doubler = (x: int) => x * 2;
+        // 50          let result = LIST[int]();
+        // 51          for n in items do
+        // 52              result.add(doubler(n));
+        // 53          od
+        // 54          return result;
+        // 55      si
+        // 56  si
+        baseline() -> string =>
+            "namespace SameShape is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    trait Renderable is\n"
+            "        render() -> string;\n"
+            "    si\n"
+            "\n"
+            "    class WIDGET: Renderable is\n"
+            "        _name: string;\n"
+            "        _items: LIST[int];\n"
+            "\n"
+            "        init(name: string) is\n"
+            "            _name = name;\n"
+            "            _items = LIST[int]();\n"
+            "        si\n"
+            "\n"
+            "        label: string => _name;\n"
+            "\n"
+            "        render() -> string => \"widget\";\n"
+            "\n"
+            "        [index: int]: int is\n"
+            "            return _items[index];\n"
+            "        si,\n"
+            "        = value is\n"
+            "            _items[index] = value;\n"
+            "        si\n"
+            "\n"
+            "        process(input: LIST[int]) -> int is\n"
+            "            let total mut = 0;\n"
+            "            for n in input do\n"
+            "                _items.add(n);\n"
+            "                total = total + n;\n"
+            "            od\n"
+            "            return total;\n"
+            "        si\n"
+            "\n"
+            "        tally() -> int is\n"
+            "            let sum mut = 0;\n"
+            "            for x in _items do\n"
+            "                sum = sum + x;\n"
+            "            od\n"
+            "            return sum;\n"
+            "        si\n"
+            "    si\n"
+            "\n"
+            "    describe(w: WIDGET) -> string => w.render();\n"
+            "\n"
+            "    transform(items: Collections.LIST[int]) -> LIST[int] is\n"
+            "        let doubler = (x: int) => x * 2;\n"
+            "        let result = LIST[int]();\n"
+            "        for n in items do\n"
+            "            result.add(doubler(n));\n"
+            "        od\n"
+            "        return result;\n"
+            "    si\n"
+            "si\n";
+
+        // Edited source: `process`'s body grows by 3 lines. The signature
+        // is unchanged, so this is an interface-preserving edit. Lines
+        // below `process` shift by +3:
+        //
+        //   `tally`     declared on line 37 → 40
+        //   class `si`  on line 44          → 47
+        //   `describe`  on line 46          → 49
+        //   `transform` on line 48          → 51
+        //   `doubler`   on line 49          → 52
+        //   `result`    on line 50          → 53
+        edited() -> string =>
+            "namespace SameShape is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    trait Renderable is\n"
+            "        render() -> string;\n"
+            "    si\n"
+            "\n"
+            "    class WIDGET: Renderable is\n"
+            "        _name: string;\n"
+            "        _items: LIST[int];\n"
+            "\n"
+            "        init(name: string) is\n"
+            "            _name = name;\n"
+            "            _items = LIST[int]();\n"
+            "        si\n"
+            "\n"
+            "        label: string => _name;\n"
+            "\n"
+            "        render() -> string => \"widget\";\n"
+            "\n"
+            "        [index: int]: int is\n"
+            "            return _items[index];\n"
+            "        si,\n"
+            "        = value is\n"
+            "            _items[index] = value;\n"
+            "        si\n"
+            "\n"
+            "        process(input: LIST[int]) -> int is\n"
+            "            let a = 1;\n"
+            "            let b = 2;\n"
+            "            let c = 3;\n"
+            "            let total mut = a + b + c;\n"
+            "            for n in input do\n"
+            "                _items.add(n);\n"
+            "                total = total + n;\n"
+            "            od\n"
+            "            return total;\n"
+            "        si\n"
+            "\n"
+            "        tally() -> int is\n"
+            "            let sum mut = 0;\n"
+            "            for x in _items do\n"
+            "                sum = sum + x;\n"
+            "            od\n"
+            "            return sum;\n"
+            "        si\n"
+            "    si\n"
+            "\n"
+            "    describe(w: WIDGET) -> string => w.render();\n"
+            "\n"
+            "    transform(items: Collections.LIST[int]) -> LIST[int] is\n"
+            "        let doubler = (x: int) => x * 2;\n"
+            "        let result = LIST[int]();\n"
+            "        for n in items do\n"
+            "            result.add(doubler(n));\n"
+            "        od\n"
+            "        return result;\n"
+            "    si\n"
+            "si\n";
+
+        // ─────────────────────────────────────────────────────────────────
+        //   HOVER tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // A·θ — HOVER on a local declared inside the edited body.
+        // `total` was on line 29 pre-edit; post-edit declaration is line 32
+        // (`let total mut = a + b + c;`). Cols 17-21 inside `total`.
+        hover_on_local_declared_in_edited_body() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 32, 19);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(response, "`total` declared in edited body", analyser);
+        si
+
+        // A·ζ — HOVER on a field use inside the edited body.
+        // Pre-edit line 31 → post-edit line 34: `                _items.add(n);`
+        // `_items` at cols 17-22.
+        hover_on_field_use_in_edited_body() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 34, 19);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(response, "`_items` use in edited body", analyser);
+        si
+
+        // B·θ — HOVER on a local inside the non-edited `tally` body.
+        // `tally` was line 37 pre-edit → 40 post-edit. `sum` declared on
+        // post-edit line 41 (`            let sum mut = 0;`), cols 17-19.
+        hover_on_local_in_non_edited_body_of_edited_file() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 41, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(response, "`sum` declared in non-edited body", analyser);
+        si
+
+        // C·η — HOVER on a parameter declared in an interface region
+        // above the edit. `init(name: string)` is on line 12, unchanged.
+        // `name` is at cols 14-17.
+        hover_on_parameter_in_signature_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 12, 15);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(response, "`name` parameter above edit", analyser);
+        si
+
+        // D·η — HOVER on a parameter declared in an interface region
+        // below the edit. `describe(w: WIDGET)` on post-edit line 49.
+        // `w` at col 14.
+        hover_on_parameter_in_signature_below_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 49, 14);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(
+                response,
+                "`w` parameter below edit — retained interface line shifted "
+                "from 46 → 49 via LOCATION_CORRESPONDENCE",
+                analyser
+            );
+        si
+
+        // C·α — HOVER on a type used in an interface region above the
+        // edit. Line 10 `        _items: LIST[int];` — `LIST` at cols
+        // 17-20. Unchanged across the edit.
+        hover_on_type_use_in_interface_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 10, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(response, "`LIST` type use above edit", analyser);
+        si
+
+        // D·α — HOVER on a type used in an interface region below the
+        // edit. Post-edit line 49 `    describe(w: WIDGET) -> string => w.render();`
+        // — `WIDGET` at cols 17-22.
+        hover_on_type_use_in_interface_below_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 49, 19);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(
+                response,
+                "`WIDGET` type use below edit — retained interface line shifted",
+                analyser
+            );
+        si
+
+        // H·κ — HOVER on a local declared inside a lambda body inside a
+        // function below the edit. Post-edit line 52
+        // `        let doubler = (x: int) => x * 2;`. The lambda parameter
+        // `x` is at col 24.
+        hover_on_lambda_parameter_below_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 52, 24);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+            assert_hover_non_empty(
+                response,
+                "`x` lambda parameter below edit — line shifted; lambda "
+                "body re-walked through the splice",
+                analyser
+            );
+        si
+
+        // γ — HOVER on the right half of a qualified type name in a
+        // retained interface signature. The signature is below the edit,
+        // so the qualified name `Collections.LIST` overall shifted with
+        // the rest of `transform`'s declaration (line 48 → 51). The
+        // `right_location` of `LIST` (i.e. column position of `LIST`
+        // within `Collections.LIST`) is a stored field
+        // `LOCATION_TRANSFER` does not visit, so it stays at the pre-edit
+        // line 48 — the known residual.
+        //
+        // Post-edit line 51 is `    transform(items: Collections.LIST[int]) -> LIST[int] is`
+        // — within `Collections.LIST`, `LIST` is at cols 27-30.
+        //
+        // Pin current (wrong) behaviour — HOVER at the post-edit
+        // line returns empty because the entry stayed at the pre-edit
+        // coordinates. When `QUALIFIED.right_location` is added to the
+        // transfer walk, flip this assertion to
+        // `assert_hover_non_empty(...)`.
+        qualified_type_name_right_half_below_edit_keeps_stale_line_pinned_residual() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_hover("shapes.ghul", 51, 28);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover", response.kind);
+
+            // Pinning behaviour, not asserting correctness. The expected
+            // outcome here is "no hover" because the use-table entry for
+            // the right half is still keyed at line 48. If a future
+            // change makes this pass non-empty *and* the entry is
+            // reconciled to current coordinates, this assertion should
+            // flip — see the docstring above.
+            let body_empty = hover_body_is_empty(response);
+
+            Assert.is_true(
+                body_empty,
+                "QUALIFIED.right_location residual appears to be fixed — "
+                "HOVER at post-edit cols of the right half now returns "
+                "content. Update the assertion (and remove the TODO) to "
+                "lock the corrected behaviour in.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   DEFINITION tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // Target C·ζ — DEFINITION of a use in the edited body that points
+        // up at a field declared above the edit. From `_items.add(n);` on
+        // post-edit line 34, DEFINITION should land on line 10 (the
+        // field's declaration — unchanged).
+        definition_from_edited_body_to_field_declared_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_definition("shapes.ghul", 34, 19);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("definition", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.are_equal(1, lines.count, "expected one DEFINITION location, got {lines.count}");
+            Assert.are_equal(
+                10,
+                lines[0],
+                "`_items` field declaration is at line 10 (above the edit, "
+                "line-stable); got {lines[0]}.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        // Target D·δ — DEFINITION on a use whose target is a function
+        // declared below the edit. `describe`'s declaration shifted
+        // 46 → 49. We need a *use* of `describe`; the fixture has none,
+        // so use `transform` instead and target `transform`'s declaration
+        // line, queried from itself: send DEFINITION on `transform`'s
+        // name on post-edit line 51; expect it to land on line 51 too.
+        definition_on_function_declared_below_edit_lands_on_new_line() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            // post-edit line 51, `    transform(items: ...` — `transform`
+            // at cols 5-13.
+            analyser.send_definition("shapes.ghul", 51, 7);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("definition", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.are_equal(1, lines.count, "expected one DEFINITION location, got {lines.count}");
+            Assert.are_equal(
+                51,
+                lines[0],
+                "`transform` declaration moved 48 → 51 across the edit; "
+                "got start line {lines[0]} — retained interface symbol's "
+                "Symbol.set_location did not run.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        // Target D·δ via a use — `describe` calls `w.render()`. The
+        // `render` here resolves to `WIDGET.render` on line 19 (above
+        // edit, line-stable). DEFINITION from post-edit line 49 col 41
+        // (inside `render`) lands on line 19.
+        definition_from_interface_use_below_edit_to_method_declared_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            // post-edit line 49 `    describe(w: WIDGET) -> string => w.render();`
+            // `render` at cols 40-45.
+            analyser.send_definition("shapes.ghul", 49, 42);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("definition", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.are_equal(1, lines.count, "expected one DEFINITION location, got {lines.count}");
+            Assert.are_equal(
+                19,
+                lines[0],
+                "`render` is declared on line 19 (above edit, line-stable); "
+                "got {lines[0]} — the *use* below the edit was line-shifted "
+                "by reconciliation but the *target* declaration was not.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   DECLARATION tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // DECLARATION on a use in non-edited body of edited file. From
+        // `sum` on post-edit line 41 (`            let sum mut = 0;`,
+        // but `sum` is its own declaration). Pick a use: post-edit line 43
+        // `                sum = sum + x;` — `sum` LHS at cols 17-19.
+        // Declaration is at post-edit line 41.
+        declaration_from_non_edited_body_lands_in_same_body() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_declaration("shapes.ghul", 43, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("declaration", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.is_true(
+                lines.count >= 1,
+                "DECLARATION on `sum` returned no locations\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                41,
+                lines[0],
+                "`sum` declaration on post-edit line 41 (was line 38 "
+                "pre-edit, shifted by +3); got {lines[0]}.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // DECLARATION on a type use in interface below the edit.
+        // `WIDGET` use on post-edit line 49 cols 17-22; declaration on
+        // line 8 (the `class WIDGET:` line — above the edit, line-stable).
+        declaration_on_type_use_below_edit_lands_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_declaration("shapes.ghul", 49, 19);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("declaration", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.is_true(
+                lines.count >= 1,
+                "DECLARATION on `WIDGET` returned no locations\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                8,
+                lines[0],
+                "`class WIDGET` declared on line 8 (above edit); got "
+                "{lines[0]}.\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   TYPEDEFINITION tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // TYPEDEFINITION on a parameter of class type, declared below the
+        // edit. `w: WIDGET` on post-edit line 49; type definition is
+        // `class WIDGET` on line 8.
+        type_definition_on_parameter_below_edit_returns_class_above_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_type_definition("shapes.ghul", 49, 14);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("type_definition", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.is_true(
+                lines.count >= 1,
+                "TYPEDEFINITION on `w` returned no locations\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                8,
+                lines[0],
+                "`w`'s type is WIDGET, declared on line 8; got "
+                "{lines[0]}.\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // TYPEDEFINITION on a local in a non-edited body of the edited
+        // file. `sum` (an `int`) on post-edit line 43 — int's declaration
+        // lives in `lib/dotnet/ghul/ghul.ghul`, so the response should
+        // point into a non-fixture file (or be empty if primitive ints
+        // have no source location). Smoke test: just ensure the header
+        // is right and no crash.
+        type_definition_on_int_local_in_non_edited_body_responds() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_type_definition("shapes.ghul", 43, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("type_definition", response.kind);
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   REFERENCES tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // REFERENCES on a field whose uses straddle the edit: `_items`
+        // is used in `init` (line 13), indexer get (line 21), indexer set
+        // (line 24) — all C-region, line-stable — and in `process` body
+        // (post-edit line 34) and `tally` (post-edit line 42, was line 39).
+        //
+        // We query at the field declaration site (line 10 col 9, on the
+        // field name `_items`). Expect 5 distinct use locations covering
+        // all five lines above.
+        references_on_field_used_in_both_edited_and_non_edited_bodies() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_references("shapes.ghul", 10, 11);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("references", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+
+            // Expected lines: 13 (init), 21 (indexer get), 24 (indexer
+            // set), 34 (process — edited body, post-shift), 42 (tally —
+            // non-edited body in edited file, post-shift).
+            //
+            // Plus the declaration on line 10 (some REFERENCES handlers
+            // include the declaration; some don't). Be flexible on
+            // that — assert each expected use line appears at least once,
+            // and that there are no duplicates.
+            assert_distinct(lines, "REFERENCES on `_items`", analyser);
+
+            assert_contains_line(lines, 14, "init() use", analyser);
+            assert_contains_line(lines, 22, "indexer getter use", analyser);
+            assert_contains_line(lines, 25, "indexer setter use", analyser);
+            assert_contains_line(lines, 34, "process (edited body) use, post-shift", analyser);
+            assert_contains_line(lines, 42, "tally (non-edited body) use, post-shift", analyser);
+        si
+
+        // REFERENCES on the trait abstract `render` (declared line 5,
+        // above edit) should return its call sites across the override
+        // family — find-references walks up to the root overridee
+        // then back down. The fixture has one call site:
+        // `w.render()` in `describe`, post-edit line 49 (shifted from
+        // line 46). The override *declaration* on line 19 is not a use,
+        // so REFERENCES does not include it (that is what IMPLEMENTATION
+        // is for; see implementation_on_trait_abstract_returns_class_override).
+        references_on_trait_abstract_returns_call_site_in_post_edit_coordinates() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_references("shapes.ghul", 5, 10);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("references", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            assert_distinct(lines, "REFERENCES on trait abstract `render`", analyser);
+
+            assert_contains_line(
+                lines,
+                49,
+                "w.render() call site post-shift (was line 46 pre-edit)",
+                analyser
+            );
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   IMPLEMENTATION tests
+        // ─────────────────────────────────────────────────────────────────
+
+        // IMPLEMENTATION on the trait abstract `render` (line 5) should
+        // include the override site on line 19 (WIDGET.render). The
+        // override is above the edit so its line is stable.
+        implementation_on_trait_abstract_returns_class_override() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+            prime(analyser);
+
+            analyser.send_implementation("shapes.ghul", 5, 10);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("implementation", response.kind);
+
+            let lines = location_start_lines(response, "shapes.ghul");
+            Assert.is_true(
+                lines.count >= 1,
+                "IMPLEMENTATION on trait abstract returned no locations\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // Override is at line 19 (above edit, line-stable). It must
+            // be present.
+            assert_contains_line(lines, 19, "WIDGET.render override", analyser);
+        si
+
+        // ─────────────────────────────────────────────────────────────────
+        //   Helpers
+        // ─────────────────────────────────────────────────────────────────
+
+        // Two-step setup: cold-load baseline, then incremental edit to
+        // the line-shifting variant. Both EDITs drained.
+        prime(analyser: ANALYSER_PROCESS) is
+            analyser.send_edit("shapes.ghul", baseline());
+            drain_edit_assert_clean(analyser, "baseline");
+
+            analyser.send_edit("shapes.ghul", edited());
+            drain_edit_assert_clean(analyser, "incremental edit");
+        si
+
+        // Read an EDIT's diagnostics frame and assert it carries no
+        // user diagnostics. A fixture problem will fail every dependent
+        // test the same way, so failing fast at prime() is more useful
+        // than thirty downstream assertion failures.
+        drain_edit_assert_clean(analyser: ANALYSER_PROCESS, label: string) is
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("diagnostics", diagnostics.kind);
+            Assert.are_equal("partial", diagnostics.phase);
+
+            let user_diagnostics = LIST(diagnostics.user_diagnostics);
+            Assert.are_equal(
+                0,
+                user_diagnostics.count,
+                "{label}: fixture expected to compile clean — got "
+                "{user_diagnostics.count} diagnostics. fixture bug.\n"
+                "{diagnostics_summary(label, user_diagnostics)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+        si
+
+        // True if the HOVER response's description is empty.
+        hover_body_is_empty(response: RESPONSE) -> bool =>
+            string.is_null_or_white_space(response.description);
+
+        assert_hover_non_empty(response: RESPONSE, label: string, analyser: ANALYSER_PROCESS) is
+            Assert.is_false(
+                hover_body_is_empty(response),
+                "HOVER for {label} returned an empty body — the use "
+                "was not recorded at the queried coordinates.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Sorted start lines of locations in a location-list response
+        // (DEFINITION / REFERENCES / IMPLEMENTATION) whose file path
+        // ends with `file_name`. Duplicates are kept so the caller can
+        // assert distinctness explicitly.
+        location_start_lines(response: RESPONSE, file_name: string) -> LIST[int] is
+            let result = LIST[int]();
+
+            for loc in response.locations do
+                if loc.file.ends_with(file_name) then
+                    result.add(loc.start_line);
+                fi
+            od
+
+            return LIST[int](result | .sort((a, b) => a - b));
+        si
+
+        assert_contains_line(lines: LIST[int], expected: int, label: string, analyser: ANALYSER_PROCESS) is
+            for l in lines do
+                if l == expected then
+                    return;
+                fi
+            od
+
+            Assert.is_true(
+                false,
+                "expected reference at line {expected} ({label}) not "
+                "present in result: {line_list_to_string(lines)}\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Print a LIST[int] as `[a, b, c]` for assertion messages —
+        // System.Collections.Generic.List`1's ToString is unhelpful.
+        line_list_to_string(lines: LIST[int]) -> string is
+            let result = System.Text.StringBuilder();
+            result.append("[");
+
+            let first mut = true;
+            for l in lines do
+                if !first then
+                    result.append(", ");
+                fi
+                result.append("{l}");
+                first = false;
+            od
+
+            result.append("]");
+            return result.to_string();
+        si
+
+        assert_distinct(lines: LIST[int], label: string, analyser: ANALYSER_PROCESS) is
+            let prev mut = -1;
+
+            for l in lines do
+                Assert.are_not_equal(
+                    prev,
+                    l,
+                    "{label} returned a duplicate line {l} — stale "
+                    "references accumulated across the incremental edit. "
+                    "Full sorted list: {lines}\n--- analyser stderr ---\n"
+                    "{analyser.stderr_capture}"
+                );
+                prev = l;
+            od
+        si
+    si
+si

@@ -1,0 +1,736 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+    use Collections.SET;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.RENAME_EDIT;
+    use Analysis.Protocol.RESPONSE;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Semantic-lookup regression guards for the incremental body re-walk.
+    //
+    // The rest of the analysis suite queries HOVER / DEFINITION /
+    // REFERENCES / etc. only after a *single cold* EDIT — a full rebuild.
+    // The incremental path runs on the *second and later* EDIT, and a
+    // class of bugs lives exactly there: location side-tables
+    // accumulating stale entries and the retained interface keeping
+    // pre-edit coordinates, so find-references returns duplicates and
+    // DEFINITION lands on the wrong line.
+    //
+    // These tests do cold-EDIT -> incremental-EDIT(s) -> query, and assert
+    // the query result is correct: exact, current-coordinate, duplicate-
+    // free.
+    class INCREMENTAL_QUERY_TESTS is
+        @test()
+
+        init() is si
+
+        // --- core fixture: `helper` defined among methods, called twice -----
+        //
+        // `alpha`'s body is grown / shrunk across editions; `helper` and
+        // its two call sites (in `beta` and `gamma`) shift with it. Every
+        // edition has the identical interface, so each edit is
+        // interface-preserving and takes the incremental path.
+
+        // alpha body 1 line — helper at line 6, calls at 9 and 13.
+        q_v0() -> string =>
+            "namespace IQ is\n"
+            "    alpha() -> int is\n"
+            "        return 1;\n"
+            "    si\n"
+            "\n"
+            "    helper() -> int => 2;\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "\n"
+            "    gamma() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "si\n";
+
+        // alpha body 3 lines — helper at line 8, calls at 11 and 15.
+        q_v1() -> string =>
+            "namespace IQ is\n"
+            "    alpha() -> int is\n"
+            "        let a = 1;\n"
+            "        let b = 2;\n"
+            "        return a + b;\n"
+            "    si\n"
+            "\n"
+            "    helper() -> int => 2;\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "\n"
+            "    gamma() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "si\n";
+
+        // alpha body 5 lines — helper at line 10, calls at 13 and 17.
+        q_v2() -> string =>
+            "namespace IQ is\n"
+            "    alpha() -> int is\n"
+            "        let a = 1;\n"
+            "        let b = 2;\n"
+            "        let c = 3;\n"
+            "        let d = 4;\n"
+            "        return a + b + c + d;\n"
+            "    si\n"
+            "\n"
+            "    helper() -> int => 2;\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "\n"
+            "    gamma() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "si\n";
+
+        // alpha body 2 lines — helper at line 7, calls at 10 and 14.
+        q_v3() -> string =>
+            "namespace IQ is\n"
+            "    alpha() -> int is\n"
+            "        let a = 1;\n"
+            "        return a;\n"
+            "    si\n"
+            "\n"
+            "    helper() -> int => 2;\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "\n"
+            "    gamma() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "si\n";
+
+        // alpha body content changed but line count unchanged — nothing
+        // shifts. The re-walk still re-records every body; on the unfixed
+        // path the re-recorded entries land at the *same* coordinates as
+        // the stale ones, so a duplicate-free check still catches it.
+        q_v0_changed() -> string =>
+            "namespace IQ is\n"
+            "    alpha() -> int is\n"
+            "        return 9;\n"
+            "    si\n"
+            "\n"
+            "    helper() -> int => 2;\n"
+            "\n"
+            "    beta() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "\n"
+            "    gamma() -> int is\n"
+            "        return helper();\n"
+            "    si\n"
+            "si\n";
+
+        // find-references after three successive line-shifting incremental
+        // edits. The unfixed path re-records `helper`'s body call sites on
+        // every edit without dropping the previous recording, so the
+        // reference set accumulates; here it must hold exactly the two
+        // current call sites.
+        find_references_survives_repeated_line_shifting_edits() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            apply_edit(analyser, "q.ghul", q_v0());
+            apply_edit(analyser, "q.ghul", q_v1());
+            apply_edit(analyser, "q.ghul", q_v2());
+            apply_edit(analyser, "q.ghul", q_v3());
+
+            // q_v3 — `        return helper();` in `gamma`, line 14;
+            // `helper` spans columns 16-21.
+            analyser.send_references("q.ghul", 14, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("references", response.kind);
+
+            let lines = location_start_lines(response, "q.ghul");
+
+            Assert.are_equal(
+                2,
+                lines.count,
+                "find-references on `helper` should return its two current "
+                "call sites; got {lines.count} ({lines}) — stale references "
+                "accumulated across the edits.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+            Assert.are_equal(10, lines[0], "first call site (beta), q_v3 line 10");
+            Assert.are_equal(14, lines[1], "second call site (gamma), q_v3 line 14");
+        si
+
+        // DEFINITION must keep landing on `helper`'s current declaration
+        // line as repeated edits move it. `helper` is a retained interface
+        // symbol below an edited body — its definition location is
+        // reconciled each edit, and must stay correct, not drift.
+        definition_target_stays_current_across_repeated_edits() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            apply_edit(analyser, "q.ghul", q_v0());
+            apply_edit(analyser, "q.ghul", q_v1());
+            apply_edit(analyser, "q.ghul", q_v2());
+            apply_edit(analyser, "q.ghul", q_v3());
+
+            analyser.send_definition("q.ghul", 14, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("definition", response.kind);
+
+            let lines = location_start_lines(response, "q.ghul");
+
+            Assert.are_equal(
+                1,
+                lines.count,
+                "DEFINITION on the `helper()` call expected one location, "
+                "got {lines.count}.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                7,
+                lines[0],
+                "DEFINITION should land on `helper`'s q_v3 declaration "
+                "line 7 — the retained interface symbol kept a stale "
+                "location across the edits.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+        si
+
+        // #SYMBOLS# (document outline) after incremental edits. The
+        // definition list is rebuilt body-locals-only by the re-walk; on
+        // the unfixed path it keeps the pre-edit definitions too, so the
+        // outline shows every symbol several times over.
+        document_symbols_have_no_duplicate_rows_after_edits() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            apply_edit(analyser, "q.ghul", q_v0());
+            apply_edit(analyser, "q.ghul", q_v1());
+            apply_edit(analyser, "q.ghul", q_v2());
+
+            analyser.send_symbols("q.ghul");
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("symbols", response.kind);
+
+            let rows = LIST[string]();
+            for file in response.files do
+                for s in file.symbols do
+                    rows.add(symbol_row_key(s));
+                od
+            od
+
+            let distinct = SET[string]();
+            for row in rows do
+                distinct.add(row);
+            od
+
+            Assert.are_equal(
+                rows.count,
+                distinct.count,
+                "symbols returned {rows.count} rows but only "
+                "{distinct.count} are distinct — the definition list "
+                "accumulated pre-edit symbols.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+
+            // `helper` (a retained interface symbol below the edited body)
+            // must be reported once, at its q_v2 line 10.
+            let helper_lines = symbol_start_lines(response, "helper");
+            Assert.are_equal(
+                1,
+                helper_lines.count,
+                "symbols should list `helper` exactly once, got "
+                "{helper_lines.count} ({helper_lines})."
+            );
+            Assert.are_equal(
+                10,
+                helper_lines[0],
+                "`helper`'s outline entry should be at its q_v2 line 10, "
+                "got {helper_lines[0]} — a stale symbol location.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // #HOVERMAP# after a non-shifting edit. No line moves, but the
+        // re-walk still re-records every body's hovers; the unfixed path
+        // keeps the pre-edit hovers, producing duplicate rows at identical
+        // spans.
+        hover_map_has_no_duplicate_rows_after_a_non_shifting_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            apply_edit(analyser, "q.ghul", q_v0());
+            apply_edit(analyser, "q.ghul", q_v0_changed());
+
+            analyser.send_hover_map("q.ghul");
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("hover_map", response.kind);
+
+            let rows = LIST[string]();
+            for entry in response.entries do
+                rows.add(hover_entry_key(entry));
+            od
+
+            let distinct = SET[string]();
+            for row in rows do
+                distinct.add(row);
+            od
+
+            Assert.is_true(rows.count > 0, "hover_map returned no entries");
+            Assert.are_equal(
+                rows.count,
+                distinct.count,
+                "hover_map returned {rows.count} entries but only "
+                "{distinct.count} are distinct — stale hover entries were "
+                "not dropped before the re-walk re-recorded them.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // RENAME after an incremental edit. The rename collects every
+        // reference to `helper`; on the unfixed path the accumulated
+        // reference set yields duplicate / stale edits.
+        rename_after_an_incremental_edit_covers_every_use_once() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            apply_edit(analyser, "q.ghul", q_v0());
+            apply_edit(analyser, "q.ghul", q_v1());
+
+            // q_v1 — `    helper() -> int => 2;`, line 8, `helper` at
+            // columns 5-10.
+            analyser.send_rename_request("q.ghul", 8, 7, "helper2");
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("rename", response.kind);
+
+            let edits = LIST[RENAME_EDIT](response.edits);
+
+            Assert.are_equal(
+                3,
+                edits.count,
+                "renaming `helper` should produce three edits — its "
+                "declaration and its two call sites; got {edits.count}. "
+                "Stale references would inflate this.\n--- analyser stderr "
+                "---\n{analyser.stderr_capture}"
+            );
+
+            let start_lines = SET[int]();
+            for e in edits do
+                Assert.is_true(e.file.ends_with("q.ghul"), "edit outside q.ghul: {e}");
+                Assert.are_equal("helper2", e.new_name, "edit carried wrong new name: {e}");
+                start_lines.add(e.start_line);
+            od
+
+            // declaration line 8, call sites lines 11 and 15 — all distinct.
+            Assert.are_equal(
+                3,
+                start_lines.count,
+                "the three rename edits should be on three distinct lines "
+                "(8, 11, 15); got {start_lines.count} distinct."
+            );
+        si
+
+        // --- cross-file fixture ---------------------------------------------
+
+        // `core.ghul` declares `shared` and uses it; `grow`'s body is the
+        // one that gets edited.
+        core_v0() -> string =>
+            "namespace IQX is\n"
+            "    grow() -> int is\n"
+            "        return 1;\n"
+            "    si\n"
+            "\n"
+            "    shared() -> int => 5;\n"
+            "\n"
+            "    in_core() -> int is\n"
+            "        return shared();\n"
+            "    si\n"
+            "si\n";
+
+        // grow body 3 lines — shared at line 8, the in_core call at 11.
+        core_v1() -> string =>
+            "namespace IQX is\n"
+            "    grow() -> int is\n"
+            "        let a = 1;\n"
+            "        let b = 2;\n"
+            "        return a + b;\n"
+            "    si\n"
+            "\n"
+            "    shared() -> int => 5;\n"
+            "\n"
+            "    in_core() -> int is\n"
+            "        return shared();\n"
+            "    si\n"
+            "si\n";
+
+        client_src() -> string =>
+            "namespace IQX is\n"
+            "    in_client() -> int is\n"
+            "        return shared();\n"
+            "    si\n"
+            "si\n";
+
+        // find-references on a symbol used in both an edited and an
+        // unedited file. Editing `core.ghul` must not lose the unedited
+        // `client.ghul` reference, nor accumulate the `core.ghul` one.
+        find_references_spans_an_edited_and_an_unedited_file() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("core.ghul", core_v0()),
+                EDIT_FILE("client.ghul", client_src())
+            ]);
+            drain_edit(analyser);
+
+            // interface-preserving edit to core.ghul only — incremental.
+            apply_edit(analyser, "core.ghul", core_v1());
+
+            // query from the unedited file: `        return shared();`
+            // in client.ghul line 3, `shared` at columns 16-21.
+            analyser.send_references("client.ghul", 3, 18);
+
+            let response = analyser.read_query_response();
+            Assert.are_equal("references", response.kind);
+
+            let core_lines = location_start_lines(response, "core.ghul");
+            let client_lines = location_start_lines(response, "client.ghul");
+
+            Assert.are_equal(
+                1,
+                core_lines.count,
+                "find-references should report `shared`'s single use in "
+                "core.ghul; got {core_lines.count} ({core_lines}) — the "
+                "edited file's reference accumulated.\n--- analyser stderr "
+                "---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                11,
+                core_lines[0],
+                "the core.ghul use should be at its post-edit line 11."
+            );
+            Assert.are_equal(
+                1,
+                client_lines.count,
+                "find-references should still report the unedited "
+                "client.ghul use; got {client_lines.count}.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // --- self-contained fixture: space-only edit + iterative-retry body
+
+        // A fixture exercising compile-expressions' iterative body-retry
+        // path — the path that surfaced the BODY_REWALKER double-walk bug
+        // (the body was walked once manually by BODY_REWALKER and again
+        // by `_lambdas.visit_function_definition`'s retry loop, and the
+        // second walk saw partial state from the first).
+        //
+        // The retry path fires on member access against an
+        // INFERRED_VARIABLE_TYPE (compile_access.ghul: when the receiver
+        // type is a placeholder, `mark_consumed_any` is called and the
+        // body is re-walked). To produce such a placeholder in user-level
+        // code we use a generic constructor with no explicit type argument
+        // (`LIST()`), let the type be pinned by a downstream `add`, and
+        // iterate / dereference on the LIST.
+        //
+        // Two methods, multiple narrowing chains, multiple nested
+        // placeholders — enough shape that the iterative retry actually
+        // re-walks at least once on each invocation. The fixture is fully
+        // self-contained (no compiler-source dependency) so routine
+        // changes to ghul/src/ cannot break it.
+        iterative_retry_baseline() -> string =>
+            "namespace IterRetry is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    trait Element is\n"
+            "        tag() -> string;\n"
+            "    si\n"
+            "\n"
+            "    class Node: Element is\n"
+            "        _name: string;\n"
+            "        init(name: string) is _name = name; si\n"
+            "        tag() -> string => _name;\n"
+            "        depth() -> int => 1;\n"
+            "    si\n"
+            "\n"
+            "    class Leaf: Element is\n"
+            "        _value: int;\n"
+            "        init(value: int) is _value = value; si\n"
+            "        tag() -> string => \"leaf\";\n"
+            "        value() -> int => _value;\n"
+            "    si\n"
+            "\n"
+            "    pick(items: LIST[Element], which: string) -> Element? is\n"
+            "        for item in items do\n"
+            "            if item.tag() =~ which then\n"
+            "                return item;\n"
+            "            fi\n"
+            "        od\n"
+            "        return null;\n"
+            "    si\n"
+            "\n"
+            "    summarise(items: LIST[Element]) -> int is\n"
+            "        let buckets = LIST();\n"
+            "        let total mut = 0;\n"
+            "        for item in items do\n"
+            "            if isa Leaf(item) then\n"
+            "                let leaf = item;\n"
+            "                buckets.add(leaf);\n"
+            "                total = total + leaf.value();\n"
+            "            elif isa Node(item) then\n"
+            "                let node = item;\n"
+            "                total = total + node.depth();\n"
+            "            fi\n"
+            "        od\n"
+            "        for b in buckets do\n"
+            "            total = total + b.value();\n"
+            "        od\n"
+            "        return total;\n"
+            "    si\n"
+            "\n"
+            "    describe(items: LIST[Element], target: string) -> string is\n"
+            "        let found = pick(items, target);\n"
+            "        if found? /\\ isa Leaf(found) then\n"
+            "            let leaf = found;\n"
+            "            let nums = LIST();\n"
+            "            nums.add(leaf.value());\n"
+            "            let sum mut = 0;\n"
+            "            for n in nums do\n"
+            "                sum = sum + n;\n"
+            "            od\n"
+            "            return leaf.tag();\n"
+            "        fi\n"
+            "        return \"\";\n"
+            "    si\n"
+            "si\n";
+
+        // Same fixture with one extra space inserted in `summarise`'s
+        // signature, between `(` and `items`. Interface-preserving, body
+        // unchanged.
+        iterative_retry_edited() -> string =>
+            "namespace IterRetry is\n"
+            "    use Collections.LIST;\n"
+            "\n"
+            "    trait Element is\n"
+            "        tag() -> string;\n"
+            "    si\n"
+            "\n"
+            "    class Node: Element is\n"
+            "        _name: string;\n"
+            "        init(name: string) is _name = name; si\n"
+            "        tag() -> string => _name;\n"
+            "        depth() -> int => 1;\n"
+            "    si\n"
+            "\n"
+            "    class Leaf: Element is\n"
+            "        _value: int;\n"
+            "        init(value: int) is _value = value; si\n"
+            "        tag() -> string => \"leaf\";\n"
+            "        value() -> int => _value;\n"
+            "    si\n"
+            "\n"
+            "    pick(items: LIST[Element], which: string) -> Element? is\n"
+            "        for item in items do\n"
+            "            if item.tag() =~ which then\n"
+            "                return item;\n"
+            "            fi\n"
+            "        od\n"
+            "        return null;\n"
+            "    si\n"
+            "\n"
+            "    summarise( items: LIST[Element]) -> int is\n"
+            "        let buckets = LIST();\n"
+            "        let total mut = 0;\n"
+            "        for item in items do\n"
+            "            if isa Leaf(item) then\n"
+            "                let leaf = item;\n"
+            "                buckets.add(leaf);\n"
+            "                total = total + leaf.value();\n"
+            "            elif isa Node(item) then\n"
+            "                let node = item;\n"
+            "                total = total + node.depth();\n"
+            "            fi\n"
+            "        od\n"
+            "        for b in buckets do\n"
+            "            total = total + b.value();\n"
+            "        od\n"
+            "        return total;\n"
+            "    si\n"
+            "\n"
+            "    describe(items: LIST[Element], target: string) -> string is\n"
+            "        let found = pick(items, target);\n"
+            "        if found? /\\ isa Leaf(found) then\n"
+            "            let leaf = found;\n"
+            "            let nums = LIST();\n"
+            "            nums.add(leaf.value());\n"
+            "            let sum mut = 0;\n"
+            "            for n in nums do\n"
+            "                sum = sum + n;\n"
+            "            od\n"
+            "            return leaf.tag();\n"
+            "        fi\n"
+            "        return \"\";\n"
+            "    si\n"
+            "si\n";
+
+        // A space-only edit inside the interface portion of a file must
+        // not introduce diagnostics, even when the file's bodies exercise
+        // compile-expressions' iterative body-retry path (member access
+        // on an INFERRED_VARIABLE_TYPE / for-loop over one). The fixture
+        // is deliberately self-contained — copies of the relevant
+        // shapes, not a slice of the compiler's source — so the test
+        // survives ordinary edits to ghul/src/.
+        space_only_interface_edit_with_iterative_retry_emits_no_new_diagnostics() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("iter.ghul", iterative_retry_baseline());
+
+            let cold_response = analyser.read_response();
+            Assert.are_equal("diagnostics", cold_response.kind);
+            Assert.are_equal("partial", cold_response.phase);
+            let cold_diags = diagnostics_set(cold_response);
+
+            Assert.are_equal(
+                0,
+                cold_diags.count,
+                "the cold baseline must compile clean — fixture problem.\n"
+                "{describe(LIST[string](cold_diags))}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            analyser.send_edit("iter.ghul", iterative_retry_edited());
+
+            let after_response = analyser.read_response();
+            Assert.are_equal("diagnostics", after_response.kind);
+            Assert.are_equal("partial", after_response.phase);
+            let after_diags = diagnostics_set(after_response);
+
+            let introduced = LIST[string]();
+            for d in after_diags do
+                if !cold_diags.contains(d) then
+                    introduced.add(d);
+                fi
+            od
+
+            Assert.are_equal(
+                0,
+                introduced.count,
+                "a space-only interface edit on a body that exercises "
+                "compile-expressions' iterative retry must not introduce "
+                "diagnostics; got {introduced.count}:\n"
+                "{describe(introduced)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Collect a DIAGNOSTICS response's user diagnostics into a set of
+        // formatted strings (`path:startLine:startCol severity message`)
+        // for cheap, order-independent set comparison.
+        diagnostics_set(response: RESPONSE) -> SET[string] is
+            let result = SET[string]();
+
+            for d in response.user_diagnostics do
+                result.add("{d.path}:{d.start_line}:{d.start_column} sev={d.severity} {d.message}");
+            od
+
+            return result;
+        si
+
+        describe(diagnostics: LIST[string]) -> string is
+            let result = System.Text.StringBuilder();
+
+            let shown mut = 0;
+            for d in diagnostics do
+                if shown < 30 then
+                    result.append("  ");
+                    result.append(d);
+                    result.append('\n');
+                fi
+                shown = shown + 1;
+            od
+
+            if diagnostics.count > 30 then
+                result.append("  ... and {diagnostics.count - 30} more\n");
+            fi
+
+            return result.to_string();
+        si
+
+        // --- helpers --------------------------------------------------------
+
+        // Send a single-file EDIT and discard its DIAGNOSTICS + PARTIAL
+        // DONE frames.
+        apply_edit(analyser: ANALYSER_PROCESS, path: string, source: string) is
+            analyser.send_edit(path, source);
+            drain_edit(analyser);
+        si
+
+        // Read an EDIT's diagnostics frame, discarding it.
+        drain_edit(analyser: ANALYSER_PROCESS) is
+            let diagnostics = analyser.read_response();
+            Assert.are_equal("diagnostics", diagnostics.kind);
+            Assert.are_equal("partial", diagnostics.phase);
+        si
+
+        // Sorted start lines of locations in a location-list response
+        // (DEFINITION / REFERENCES / IMPLEMENTATION / ...) whose file
+        // path ends with `file_name`.
+        location_start_lines(response: RESPONSE, file_name: string) -> LIST[int] is
+            let result = LIST[int]();
+
+            for loc in response.locations do
+                if loc.file.ends_with(file_name) then
+                    result.add(loc.start_line);
+                fi
+            od
+
+            return LIST[int](result | .sort((a, b) => a - b));
+        si
+
+        // Sorted start lines of every symbol entry whose search
+        // description mentions `name`.
+        symbol_start_lines(response: RESPONSE, name: string) -> LIST[int] is
+            let result = LIST[int]();
+
+            for file in response.files do
+                for s in file.symbols do
+                    if s.search_description.contains(name) then
+                        result.add(s.start_line);
+                    fi
+                od
+            od
+
+            return LIST[int](result | .sort((a, b) => a - b));
+        si
+
+        // Stable key for a SYMBOL_DTO row, used to count duplicates.
+        symbol_row_key(s: Analysis.Protocol.SYMBOL_DTO) -> string =>
+            "{s.search_description}|{s.kind}|{s.start_line}|{s.start_column}|{s.end_line}|{s.end_column}|{s.qualifier}";
+
+        // Stable key for a HOVER_ENTRY, used to count duplicates.
+        hover_entry_key(e: Analysis.Protocol.HOVER_ENTRY) -> string =>
+            "{e.start_line}|{e.start_column}|{e.end_line}|{e.end_column}|{e.description}";
+    si
+si

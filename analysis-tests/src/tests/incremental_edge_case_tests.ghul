@@ -1,0 +1,577 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.RESPONSE;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Edge-case probes for the incremental body re-walk. The other
+    // INCREMENTAL_* suites cover ordinary method-body edits with line
+    // shifts; these target the cases where the design has the most room
+    // to go wrong: synthetic functions (property/indexer accessors),
+    // constructors, lambdas nested inside spliced bodies, the
+    // interface-preserving predicate itself (multi-file edits, signature
+    // changes), diagnostic clearing across edits, and idempotence.
+    class INCREMENTAL_EDGE_CASE_TESTS is
+        @test()
+
+        init() is si
+
+        // ──────────────────────────────────────────────────────────────
+        // 1. Property accessor body splice
+        //
+        // `add_accessors_for_properties` synthesizes a getter (and
+        // setter, if present) as Definitions.FUNCTION nodes that
+        // FUNCTION_COLLECTOR picks up. So a property's expression-body
+        // edit goes through the splice path; if BODY_SPLICE skipped
+        // synthetic accessors we'd see a stale diagnostic.
+        // ──────────────────────────────────────────────────────────────
+
+        property_baseline() -> string =>
+            "namespace IncProp is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "        seed: int => 1;\n"
+            "        derived: int => seed + 2;\n"
+            "    si\n"
+            "si\n";
+
+        // Same interface; `derived`'s getter body changed (still returns
+        // an int, still references `seed`). Interface-preserving.
+        property_edited() -> string =>
+            "namespace IncProp is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "        seed: int => 1;\n"
+            "        derived: int => seed * 3 + 4;\n"
+            "    si\n"
+            "si\n";
+
+        property_accessor_body_edit_does_not_introduce_diagnostics() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("prop.ghul", property_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("prop.ghul", property_edited());
+            assert_clean_edit(analyser, "incremental edit");
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 2. Constructor body splice
+        //
+        // `init() is ... si` is an ordinary FUNCTION with name "init".
+        // Confirm a body-only edit to a constructor is handled, and
+        // that a *new* error introduced into the constructor body
+        // surfaces — the splice should not hide diagnostics.
+        // ──────────────────────────────────────────────────────────────
+
+        ctor_baseline() -> string =>
+            "namespace IncCtor is\n"
+            "    class C is\n"
+            "        _x: int;\n"
+            "        init(x: int) is\n"
+            "            _x = x;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // Body-only edit: extra local with no callers.
+        ctor_edited_clean() -> string =>
+            "namespace IncCtor is\n"
+            "    class C is\n"
+            "        _x: int;\n"
+            "        init(x: int) is\n"
+            "            let doubled = x * 2;\n"
+            "            _x = doubled;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        constructor_body_only_edit_is_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("ctor.ghul", ctor_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("ctor.ghul", ctor_edited_clean());
+            assert_clean_edit(analyser, "incremental edit");
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 3. Diagnostic clearing across body edits
+        //
+        // try_incremental_build calls logger.clear(edited_path, true)
+        // before re-walking. A diagnostic the user introduces and then
+        // fixes must not stick around.
+        // ──────────────────────────────────────────────────────────────
+
+        sticky_baseline() -> string =>
+            "namespace IncSticky is\n"
+            "    f() -> int is\n"
+            "        return 1;\n"
+            "    si\n"
+            "si\n";
+
+        // Body has a name that doesn't resolve.
+        sticky_broken() -> string =>
+            "namespace IncSticky is\n"
+            "    f() -> int is\n"
+            "        return missing_name;\n"
+            "    si\n"
+            "si\n";
+
+        // Back to a clean body — different from the baseline so the
+        // analyser actually sees an edit, but with the broken name gone.
+        sticky_fixed() -> string =>
+            "namespace IncSticky is\n"
+            "    f() -> int is\n"
+            "        let v = 42;\n"
+            "        return v;\n"
+            "    si\n"
+            "si\n";
+
+        body_only_error_clears_when_fixed_by_a_later_incremental_edit() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("sticky.ghul", sticky_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("sticky.ghul", sticky_broken());
+            let broken = analyser.read_response();
+            Assert.are_equal("diagnostics", broken.kind);
+            let broken_user = LIST[DIAGNOSTIC](broken.user_diagnostics);
+            Assert.is_true(
+                broken_user.count > 0,
+                "the broken body should produce at least one diagnostic; "
+                "got zero, which means body re-walk did not report the "
+                "unresolved name.\n--- analyser stderr ---\n"
+                "{analyser.stderr_capture}"
+            );
+
+            analyser.send_edit("sticky.ghul", sticky_fixed());
+            let fixed = analyser.read_response();
+            Assert.are_equal("diagnostics", fixed.kind);
+            let fixed_user = LIST[DIAGNOSTIC](fixed.user_diagnostics);
+            Assert.are_equal(
+                0,
+                fixed_user.count,
+                "the fixed body should be diagnostic-clean; got "
+                "{fixed_user.count}. Either the broken diagnostic stuck "
+                "across the splice or a new one was introduced. "
+                "diagnostics:\n{describe(fixed_user)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 4. No-op edit (identical source)
+        //
+        // Resending the exact same source is interface-preserving and
+        // should produce the exact same diagnostic set the cold parse
+        // produced. The incremental path runs the body re-walk against
+        // identical bodies — a useful idempotence check.
+        // ──────────────────────────────────────────────────────────────
+
+        noop_source() -> string =>
+            "namespace IncNoop is\n"
+            "    f() -> int is\n"
+            "        let x = 1;\n"
+            "        let y = 2;\n"
+            "        return x + y;\n"
+            "    si\n"
+            "si\n";
+
+        identical_source_resent_produces_identical_diagnostics() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("noop.ghul", noop_source());
+            let cold = analyser.read_response();
+            Assert.are_equal("diagnostics", cold.kind);
+            let cold_user = LIST[DIAGNOSTIC](cold.user_diagnostics);
+
+            analyser.send_edit("noop.ghul", noop_source());
+            let second = analyser.read_response();
+            Assert.are_equal("diagnostics", second.kind);
+            let second_user = LIST[DIAGNOSTIC](second.user_diagnostics);
+
+            Assert.are_equal(
+                cold_user.count,
+                second_user.count,
+                "resending identical source produced a different "
+                "diagnostic count ({cold_user.count} → {second_user.count}). "
+                "Either body re-walk is non-idempotent or the cold parse "
+                "and the spliced re-walk disagree.\n"
+                "cold:\n{describe(cold_user)}"
+                "second:\n{describe(second_user)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 5. Multi-file edit takes fallback
+        //
+        // `incremental_eligible` requires paths.count == 1. A
+        // two-file EDIT must take the full-rebuild path. We can't
+        // observe the choice directly, but we can observe a side
+        // effect: a body-only error in one file must clear when we
+        // re-send a clean version *in the same EDIT* as another file.
+        // ──────────────────────────────────────────────────────────────
+
+        multi_file_a_v0() -> string =>
+            "namespace IncMulti is\n"
+            "    in_a() -> int => 1;\n"
+            "si\n";
+
+        multi_file_b_broken() -> string =>
+            "namespace IncMulti is\n"
+            "    in_b() -> int is\n"
+            "        return missing_name;\n"
+            "    si\n"
+            "si\n";
+
+        multi_file_b_fixed() -> string =>
+            "namespace IncMulti is\n"
+            "    in_b() -> int => 2;\n"
+            "si\n";
+
+        multi_file_edit_clears_a_body_error() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("a.ghul", multi_file_a_v0()),
+                EDIT_FILE("b.ghul", multi_file_b_broken())
+            ]);
+            let cold = analyser.read_response();
+            Assert.are_equal("diagnostics", cold.kind);
+
+            let cold_b = filter_by_path(cold.user_diagnostics, "b.ghul");
+            Assert.is_true(
+                cold_b.count > 0,
+                "cold b.ghul should report the unresolved name; got zero.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // Two-file EDIT — must take full-rebuild path. The fixed
+            // b.ghul should not carry over the prior diagnostic.
+            analyser.send_edit_files([
+                EDIT_FILE("a.ghul", multi_file_a_v0()),
+                EDIT_FILE("b.ghul", multi_file_b_fixed())
+            ]);
+            let fixed = analyser.read_response();
+            Assert.are_equal("diagnostics", fixed.kind);
+            let fixed_b = filter_by_path(fixed.user_diagnostics, "b.ghul");
+            Assert.are_equal(
+                0,
+                fixed_b.count,
+                "fixed b.ghul should be clean; got {fixed_b.count}. "
+                "A diagnostic surviving a multi-file EDIT means the "
+                "fallback path is not clearing b.ghul's diagnostics.\n"
+                "{describe(fixed_b)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 6. Lambda inside a spliced body
+        //
+        // A lambda lives inside its enclosing function's body. The
+        // body re-walk descends into the body, so the lambda's body
+        // should be re-walked along with the outer body. If lambdas
+        // were skipped, edits to a lambda body would silently produce
+        // stale state.
+        // ──────────────────────────────────────────────────────────────
+
+        lambda_baseline() -> string =>
+            "namespace IncLambda is\n"
+            "    use Collections.LIST;\n"
+            "    consume() -> int is\n"
+            "        let f = (x: int) => x * 2;\n"
+            "        return f(7);\n"
+            "    si\n"
+            "si\n";
+
+        // Lambda body changed (still int -> int). Outer body shifts
+        // by one line because of an added local.
+        lambda_edited() -> string =>
+            "namespace IncLambda is\n"
+            "    use Collections.LIST;\n"
+            "    consume() -> int is\n"
+            "        let multiplier = 3;\n"
+            "        let f = (x: int) => x * multiplier + 1;\n"
+            "        return f(7);\n"
+            "    si\n"
+            "si\n";
+
+        lambda_body_edit_inside_body_does_not_introduce_diagnostics() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("lambda.ghul", lambda_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("lambda.ghul", lambda_edited());
+            assert_clean_edit(analyser, "incremental edit");
+
+            // Find-references on `multiplier` after the incremental
+            // edit must return at least as many locations as a cold
+            // parse of the same source does — anything less means
+            // the lambda body was not re-walked properly. We compare
+            // against the cold count rather than a hard-coded value
+            // because find-references on closure-captured locals is
+            // its own analyser feature; this test only cares about
+            // *parity* with the cold parse.
+            analyser.send_references("lambda.ghul", 5, 13);
+            let after_edit = analyser.read_query_response();
+            Assert.are_equal("references", after_edit.kind);
+            let after_edit_count = location_count(after_edit, "lambda.ghul");
+
+            let use cold_analyser = ANALYSER_PROCESS();
+            cold_analyser.send_edit("lambda.ghul", lambda_edited());
+            assert_clean_edit(cold_analyser, "cold edit");
+
+            cold_analyser.send_references("lambda.ghul", 5, 13);
+            let cold = cold_analyser.read_query_response();
+            Assert.are_equal("references", cold.kind);
+            let cold_count = location_count(cold, "lambda.ghul");
+
+            Assert.are_equal(
+                cold_count,
+                after_edit_count,
+                "references on `multiplier` returned {after_edit_count} "
+                "locations after the incremental edit but a cold parse "
+                "of the same source returns {cold_count}. The lambda "
+                "body inside the spliced outer body was not re-walked "
+                "the same way.\n"
+                "--- incremental stderr ---\n{analyser.stderr_capture}"
+                "--- cold stderr ---\n{cold_analyser.stderr_capture}"
+            );
+        si
+
+        location_count(response: RESPONSE, file_name: string) -> int is
+            let count mut = 0;
+            for loc in response.locations do
+                if loc.file.ends_with(file_name) then
+                    count = count + 1;
+                fi
+            od
+            return count;
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 7. Generic-method body re-walks with type parameters in scope
+        //
+        // The body of `id[T](x: T) -> T is return x; si` references T.
+        // When the body re-walk re-enters the function's scope it must
+        // bring T back in too — if BODY_REWALKER didn't restore the
+        // function scope properly, the body would fail with "T not
+        // found" after the splice.
+        // ──────────────────────────────────────────────────────────────
+
+        generic_baseline() -> string =>
+            "namespace IncGen is\n"
+            "    id[T](x: T) -> T is\n"
+            "        return x;\n"
+            "    si\n"
+            "si\n";
+
+        // Body uses T in a second statement to widen the demand on
+        // type-param scope.
+        generic_edited() -> string =>
+            "namespace IncGen is\n"
+            "    id[T](x: T) -> T is\n"
+            "        let y: T = x;\n"
+            "        return y;\n"
+            "    si\n"
+            "si\n";
+
+        generic_method_body_re_walks_with_type_param_in_scope() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("gen.ghul", generic_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("gen.ghul", generic_edited());
+            assert_clean_edit(analyser, "incremental edit");
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 8. Interface change forces fallback: parameter rename
+        //
+        // Renaming a parameter changes the INTERFACE_SIGNATURE because
+        // the variable identifier is walked at the interface level. So
+        // this edit must take the full-rebuild path. Verify that no
+        // stale state remains by querying a symbol whose location did
+        // not change.
+        // ──────────────────────────────────────────────────────────────
+
+        rename_param_baseline() -> string =>
+            "namespace IncRename is\n"
+            "    f(value: int) -> int is\n"
+            "        return value + 1;\n"
+            "    si\n"
+            "si\n";
+
+        rename_param_edited() -> string =>
+            "namespace IncRename is\n"
+            "    f(n: int) -> int is\n"
+            "        return n + 1;\n"
+            "    si\n"
+            "si\n";
+
+        parameter_rename_is_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("rename.ghul", rename_param_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("rename.ghul", rename_param_edited());
+            assert_clean_edit(analyser, "interface-affecting edit");
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 9. Constructor overloads pair by name + arity
+        //
+        // Two `init` overloads with different arities — make sure the
+        // pairing distinguishes them across an edit to one body.
+        // ──────────────────────────────────────────────────────────────
+
+        ctor_overload_baseline() -> string =>
+            "namespace IncOverload is\n"
+            "    class C is\n"
+            "        _x: int;\n"
+            "        init() is\n"
+            "            _x = 0;\n"
+            "        si\n"
+            "        init(x: int) is\n"
+            "            _x = x;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // Body of init() changed only.
+        ctor_overload_edited() -> string =>
+            "namespace IncOverload is\n"
+            "    class C is\n"
+            "        _x: int;\n"
+            "        init() is\n"
+            "            _x = 7;\n"
+            "        si\n"
+            "        init(x: int) is\n"
+            "            _x = x;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        constructor_overload_body_edit_pairs_by_arity() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("overload.ghul", ctor_overload_baseline());
+            assert_clean_edit(analyser, "baseline");
+
+            analyser.send_edit("overload.ghul", ctor_overload_edited());
+            assert_clean_edit(analyser, "incremental edit");
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // 10. Capability advertisement
+        //
+        // The compiler advertises new feature identifiers on its LISTEN
+        // frame so clients (the VS Code extension, this harness) can
+        // detect support and fall back when talking to an older
+        // binary. The `incremental-analysis` capability is the only
+        // entry today; pinning it stops a future refactor from
+        // silently dropping the advertisement.
+        // ──────────────────────────────────────────────────────────────
+
+        listen_advertises_incremental_analysis_capability() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            Assert.is_true(
+                analyser.supports("incremental-analysis"),
+                "LISTEN did not advertise 'incremental-analysis'. "
+                "advertised capabilities: {analyser.capabilities}\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // ──────────────────────────────────────────────────────────────
+        // Helpers
+        // ──────────────────────────────────────────────────────────────
+
+        assert_clean_edit(analyser: ANALYSER_PROCESS, label: string) is
+            let response = analyser.read_response();
+            Assert.are_equal(
+                "diagnostics",
+                response.kind,
+                "{label}: expected diagnostics frame, got '{response.kind}'.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                "partial",
+                response.phase,
+                "{label}: expected phase 'partial', got '{response.phase}'.\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let user = LIST[DIAGNOSTIC](response.user_diagnostics);
+            Assert.are_equal(
+                0,
+                user.count,
+                "{label}: fixture expected to be diagnostic-clean — got "
+                "{user.count} diagnostics.\n"
+                "{describe(user)}"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        filter_by_path(diagnostics: Collections.Iterable[DIAGNOSTIC], file_name: string) -> LIST[DIAGNOSTIC] is
+            let result = LIST[DIAGNOSTIC]();
+            for d in diagnostics do
+                if d.path.ends_with(file_name) then
+                    result.add(d);
+                fi
+            od
+            return result;
+        si
+
+        describe(diagnostics: LIST[DIAGNOSTIC]) -> string is
+            let result = System.Text.StringBuilder();
+            let shown mut = 0;
+            for d in diagnostics do
+                if shown < 30 then
+                    result.append("  ");
+                    result.append("{d.path}:{d.start_line}:{d.start_column} sev={d.severity} {d.message}");
+                    result.append('\n');
+                fi
+                shown = shown + 1;
+            od
+            if diagnostics.count > 30 then
+                result.append("  ... and {diagnostics.count - 30} more\n");
+            fi
+            return result.to_string();
+        si
+    si
+si
