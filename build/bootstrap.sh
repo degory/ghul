@@ -6,10 +6,16 @@ START_MILLISECONDS=$(date +%s%N)
 if [ "${CI}" == "" ] ; then
     LOCAL=true
 
+    PRE_BOOTSTRAP_VERSION=$(dotnet tool list --local 2>/dev/null | awk '$1 == "ghul.compiler" { print $2 }')
+
     cleanup() {
         echo "Cleaning up..."
         dotnet tool uninstall --local ghul.compiler
-        dotnet tool install --local ghul.compiler
+        if [ -n "${PRE_BOOTSTRAP_VERSION}" ] ; then
+            dotnet tool install --local ghul.compiler --version "${PRE_BOOTSTRAP_VERSION}"
+        else
+            dotnet tool install --local ghul.compiler
+        fi
     }
 
     trap cleanup EXIT
