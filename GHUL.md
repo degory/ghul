@@ -368,6 +368,20 @@ if let (name, _) = lookup(id) then
 fi
 ```
 
+A destructure leaf can also be a literal — an integer, string, character or boolean literal, `null`, or a qualified enum-member name. The leaf is then a value-equality test against the source position rather than a binding; the arm only runs when every literal leaf matches and every named leaf binds:
+
+```ghul
+if let (1, name) = pair then
+    write_line("first is one: {name}");
+fi
+
+if let (Color.RED, label) = entry then
+    write_line("red: {label}");
+fi
+```
+
+Literal leaves are only allowed inside refutable bindings (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
+
 Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the binding, with the bound name in scope:
 
 ```ghul
@@ -428,7 +442,7 @@ esac;
 A `when` arm can also carry a binding pattern instead of an equality list. The patterns mirror those accepted by `if let`:
 
 - `when v: T then` — type-test against `T`; on match, bind `v` to the narrowed value.
-- `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: Cat, d: Dog) then`); discards are `_`.
+- `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: Cat, d: Dog) then`); discards are `_`; literal leaves like `when (1, label) then` or `when (Color.RED, label) then` add a value-equality test at that position.
 - `when _: T then` — type-test only, no binding.
 
 Pattern arms share `if let`'s contract on refutability — an option-shaped scrutinee binds to the unwrapped value, and an impossible value-type narrow is rejected with one error and ERROR-typed recovery on the bound names:
