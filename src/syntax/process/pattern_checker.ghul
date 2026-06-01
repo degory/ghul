@@ -1,11 +1,23 @@
 namespace Syntax.Process is
     use Logging;
 
-    // Checks the binding of an `if let` / `case`-arm pattern: walks the
-    // initializer, emits diagnostics, sets unwrapped types on bound
-    // symbols, and marks them non-null in the flow env. The caller is
-    // responsible for setting the flow env before invoking, and for
-    // walking the arm body and any guard after.
+    use Semantic.Types.Type;
+
+    // Checks an `if let` / `case`-arm pattern. The compositional
+    // primitive is `check_pattern`, which takes the pattern shape and
+    // the source/target types directly — so a caller that has the
+    // types in hand (a `case`-arm walker computing source from the
+    // scrutinee and target from the arm's ascription) does not need
+    // to synthesise a VARIABLE first. `check_binding` is the
+    // if-let-shaped convenience wrapper: walks a binding, extracts
+    // the relevant types from its initializer and delegates.
+    //
+    // Either entry emits the narrowing diagnostics, rejects an
+    // impossible value-type narrow with ERROR-typed recovery on the
+    // bound names, sets the unwrapped type on the bound symbols, and
+    // marks the bound names non-null in the flow env. The caller is
+    // responsible for the flow env before invoking, and for any
+    // guard / body walking after.
     class PATTERN_CHECKER is
         _logger: Logger;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
@@ -29,37 +41,55 @@ namespace Syntax.Process is
         check_binding(binding: Trees.Variables.VARIABLE) is
             binding.walk(_visitor);
 
-            // Warn when an `if let x: T = e` narrowing always succeeds —
-            // the source type is statically known to be (a subtype of)
-            // T and isn't optional, so the test is redundant. Limited
-            // to the typed form: the bare form trips on flow-narrowed
-            // values whose declared type was nullable.
-            if !_build_flags.no_warn_narrowing_always_succeeds /\ binding.initializer? then
-                let init = binding.initializer;
+            let source_type: Type? mut = null;
+            let target_type: Type? mut = null;
+            let init = binding.initializer;
 
+            if init? then
                 if isa Trees.Expressions.CAST(init) then
                     let cast_expr = cast Trees.Expressions.CAST(init);
 
-                    if
-                        cast_expr.right? /\ cast_expr.right.value? /\
-                        cast_expr.right.value.type? /\ cast_expr.type_expression.type?
-                    then
-                        let src = cast_expr.right.value.type;
-                        let tgt = cast_expr.type_expression.type;
-
-                        if
-                            src.is_settled /\ !src.is_type_variable /\ !src.is_any /\ !src.is_error /\
-                            tgt.is_settled /\ !tgt.is_type_variable /\ !tgt.is_any /\ !tgt.is_error /\
-                            !src.is_optional /\
-                            tgt.is_assignable_from(src)
-                        then
-                            _logger.warn(
-                                binding.location,
-                                "narrowing-always-succeeds",
-                                "{src} is already {tgt}"
-                            );
-                        fi
+                    if cast_expr.right? /\ cast_expr.right.value? then
+                        source_type = cast_expr.right.value.type;
                     fi
+
+                    if cast_expr.type_expression.type? then
+                        target_type = cast_expr.type_expression.type;
+                    fi
+                elif init.value? then
+                    source_type = init.value.type;
+                fi
+            fi
+
+            check_pattern(binding.left, source_type, target_type, binding.location);
+        si
+
+        check_pattern(
+            left: Trees.Variables.VariableLeft,
+            source_type: Type?,
+            target_type: Type?,
+            location: Source.LOCATION
+        ) is
+            // Warn when a narrowing always succeeds — the source type
+            // is statically known to be (a subtype of) the target and
+            // isn't optional, so the test is redundant. Only fires
+            // when there's actually a target (an ascription); the bare
+            // form has no narrowing to be redundant.
+            if target_type? /\ source_type? /\ !_build_flags.no_warn_narrowing_always_succeeds then
+                let src = source_type;
+                let tgt = target_type;
+
+                if
+                    src.is_settled /\ !src.is_type_variable /\ !src.is_any /\ !src.is_error /\
+                    tgt.is_settled /\ !tgt.is_type_variable /\ !tgt.is_any /\ !tgt.is_error /\
+                    !src.is_optional /\
+                    tgt.is_assignable_from(src)
+                then
+                    _logger.warn(
+                        location,
+                        "narrowing-always-succeeds",
+                        "{src} is already {tgt}"
+                    );
                 fi
             fi
 
@@ -69,28 +99,23 @@ namespace Syntax.Process is
             // `has_value` and `value` members; the binding then
             // yields the unwrapped `.value`. A plain value type is
             // always present and cannot be tested this way.
-            let binding_type =
-                if binding.initializer? /\ binding.initializer.value? then
-                    binding.initializer.value.type;
-                else
-                    null;
-                fi;
+            let effective_type = if target_type? then target_type else source_type fi;
 
-            if binding_type? /\ binding_type.is_value_type then
-                let has_value_member = binding_type.find_member("has_value");
-                let value_member = binding_type.find_member("value");
+            if effective_type? /\ effective_type.is_value_type then
+                let has_value_member = effective_type.find_member("has_value");
+                let value_member = effective_type.find_member("value");
 
                 if !has_value_member? \/ !value_member? then
                     _logger.error(
-                        binding.location,
-                        "cannot narrow {binding_type}"
+                        location,
+                        "cannot narrow {effective_type}"
                     );
 
                     // Error recovery: an impossible match still binds its
                     // names — typed ERROR — so the one diagnostic above is
                     // not followed by a cascade of spurious errors on uses
                     // of the binding within the then-arm.
-                    for name in binding.left.names do
+                    for name in left.names do
                         let symbol = _visitor.find(name);
 
                         if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
@@ -102,14 +127,14 @@ namespace Syntax.Process is
                 else
                     // The bound names take the unwrapped `.value`
                     // type, not the optional itself.
-                    _visitor.set_symbol_type(binding.left, value_member.type);
+                    _visitor.set_symbol_type(left, value_member.type);
                 fi
             fi
 
             // The bound names hold a value throughout the then-arm —
             // that is what `if let` establishes — so a dereference of
             // one is not flagged.
-            for name in binding.left.names do
+            for name in left.names do
                 let symbol = _visitor.find(name);
 
                 if let variable = cast Semantic.Symbols.Variable(symbol) then
