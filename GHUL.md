@@ -368,7 +368,7 @@ if let (name, _) = lookup(id) then
 fi
 ```
 
-A destructure leaf can also be a literal — an integer, string, character or boolean literal, `null`, or a qualified enum-member name. The leaf is then a value-equality test against the source position rather than a binding; the arm only runs when every literal leaf matches and every named leaf binds:
+A destructure leaf can also be a literal — an integer, float, string, character or boolean literal, `null`, or a qualified enum-member name. The leaf is then an equality test against the source position rather than a binding; the arm only runs when every literal leaf matches and every named leaf binds. The test is value-equality for the value-type kinds (int / float / char / bool / enum); strings and `null` test by reference, so string-literal leaves rely on interning to work for inline literals — for arbitrary runtime strings, use a `/\`-guard with `=~`:
 
 ```ghul
 if let (1, name) = pair then
