@@ -402,7 +402,7 @@ Every loop supports `break` to exit and `continue` to skip to the next iteration
 
 ### case
 
-`case` branches on a constant value — numbers or enum members. Each `when` lists one or more literals; `else` catches the rest; the construct ends with `esac`. There is no fall-through. The body of each arm is introduced by `then`:
+`case` branches on a scrutinee value. Each `when` carries either a value-equality expression list (literals, enum members, named constants) or a binding pattern; `else` catches the rest; the construct ends with `esac`. There is no fall-through. The body of each arm is introduced by `then`:
 
 ```ghul
 case status
@@ -425,7 +425,28 @@ else "other"
 esac;
 ```
 
-`case` cannot deconstruct a union — use variant tags or `if let` for that.
+A `when` arm can also carry a binding pattern instead of an equality list. The patterns mirror those accepted by `if let`:
+
+- `when v: T then` — type-test against `T`; on match, bind `v` to the narrowed value.
+- `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: Cat, d: Dog) then`); discards are `_`.
+- `when _: T then` — type-test only, no binding.
+
+Pattern arms share `if let`'s contract on refutability — an option-shaped scrutinee binds to the unwrapped value, and an impossible value-type narrow is rejected with one error and ERROR-typed recovery on the bound names:
+
+```ghul
+case animal
+when null then
+    write_line("nothing");
+when c: Cat then
+    c.meow();
+when d: Dog then
+    d.bark();
+else
+    write_line("just an animal: {animal!.name}");
+esac
+```
+
+A bare identifier without `:` or `(...)` is still an expression — `when v then` tests equality against the value of `v` in scope, it does not bind a new local. Bindings carry shape information.
 
 ### exceptions
 
