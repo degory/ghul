@@ -19,11 +19,23 @@ Instructions for the cloud reviewer invoked from the `code_review` job in `.gith
 
 ## What to post, where
 
-- **One formal PR Review per run** via `gh pr review <N> --comment --body-file <file>`. The review body holds all your findings; it lands in the PR's Reviews tab and triggers review notifications, unlike an issue comment.
-- **One finding per bullet** within the body, grouped by severity. Use `**Bug**`, `**Concern**`, `**Nit**` as section headings — `**bold**` markers, not `#` headings (gh CLI's anti-injection guard rejects lines starting with `#`).
-- **Use `file:line` references** so the reader can click through to the source.
-- **If there's nothing to raise, post a one-line "LGTM" review** rather than skipping — the absence of a posted review can't be distinguished from a stuck bot.
-- **Don't post a separate top-level `gh pr comment`** — put everything in the review body.
+- **One formal PR Review per run**, posted as JSON via the reviews endpoint:
+  `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json`
+  with a body of the shape:
+  ```json
+  {
+    "event": "COMMENT",
+    "body": "<optional cross-cutting summary>",
+    "comments": [
+      {"path": "src/foo.ghul", "line": 142, "body": "<finding>"},
+      ...
+    ]
+  }
+  ```
+  One finding per `comments[]` entry, anchored to the specific line. Use `body` only for cross-cutting commentary that doesn't belong on one line — most reviews can leave it empty.
+- **Group inline findings by severity inside their `body`** — prefix with `**Bug**`, `**Concern**`, or `**Nit**` so the reader can scan severity at a glance.
+- **If there's nothing to raise, post a one-line "LGTM" review** via `gh pr review <N> --comment --body "LGTM"` rather than skipping — the absence of a posted review can't be distinguished from a stuck bot.
+- **Don't post a top-level `gh pr comment`** — issue comments are the wrong UI affordance for code review.
 - **Don't soft-pedal.** If a finding is worth saying, say it as a finding. If it isn't worth saying, stay silent. Closing notes like "non-blocking, but…", "minor nit (no action)", "consider…" are incoherent with the workflow: by the time the author reads them, the PR may already be merged. Don't write them.
 
 ## What you're reading vs. what CI gates
@@ -141,6 +153,7 @@ Flag when:
 
 ## Posting mechanics — reminder
 
-- One PR Review per run, posted via `gh pr review <N> --comment --body-file <file>`. No separate `gh pr comment`.
-- Findings grouped by `**Bug**` / `**Concern**` / `**Nit**` inside the body. No `# Heading`-style lines anywhere in the body — gh rejects them; use `**bold**` instead.
-- Chat output is invisible. If you didn't post it via `gh pr review`, it didn't happen.
+- One PR Review per run, posted via `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json` with `event: COMMENT` and a `comments[]` array of line-anchored findings. Top-level `body` for cross-cutting commentary only; most reviews leave it empty.
+- LGTM shortcut for no-findings runs: `gh pr review <N> --comment --body "LGTM"`.
+- No separate `gh pr comment`.
+- Chat output is invisible. If you didn't post it, it didn't happen.
