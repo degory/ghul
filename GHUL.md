@@ -415,8 +415,6 @@ else
 esac
 ```
 
-A legacy form is also accepted for now: `:` in place of `then` after each `when` arm's literals, and `default` (no body delimiter) in place of `else`. Both forms produce identical behaviour, and the legacy form will be removed in a future major release; new code should use `then` and `else`.
-
 `case` cannot deconstruct a union — use variant tags or `if let` for that.
 
 ### exceptions
