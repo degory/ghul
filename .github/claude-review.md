@@ -1,25 +1,42 @@
 # Cloud code review brief
 
-Instructions for the Anthropic Claude Code Action invoked from the `code_review` job in `.github/workflows/ci.yml`. Not loaded by local Claude Code; only the cloud reviewer reads this.
+Instructions for the cloud reviewer invoked from the `code_review` job in `.github/workflows/ci.yml`. Not loaded by local Claude Code; only the cloud reviewer reads this.
 
 ## How to operate
 
 - The PR branch is checked out in the working directory.
-- **You may be re-invoked on every push to the branch.** `pull_request` retriggers on `synchronize`; each run is a fresh context with no memory of prior reviews. Before reviewing, run `gh pr view <N> --json reviews` and read any prior review you posted on this PR. The verdict body summarises what you raised — treat the new commits since that review as the author's response to it. Don't re-raise a finding the diff has addressed; acknowledge it in one phrase in the verdict body if relevant. A verdict that flips direction across pushes (`--approve` ↔ `--request-changes`) deserves one sentence of explanation — silent flips confuse the author.
-- Get the diff via `gh pr diff <N>`, the body via `gh pr view <N> --json title,body`.
-- Get author-supplied PR comments via `gh pr view <N> --json comments`. Rationale that doesn't belong in the changelog-shape description body lives there: a subtle invariant the diff hides, why this approach over a tempting alternative, a deliberate oddity. Read comments before flagging anything as "unjustified", "approach unclear", or "this looks wrong" — the answer may already be in a comment.
+- Pre-fetched PR context lives in `.review-context/`:
+  - `diff.patch` — the diff
+  - `pr.json` — PR metadata (title, body, author, file counts, commits)
+  - `comments.json` — top-level issue comments on the PR (author rationale that doesn't belong in the description body often lives here)
+  - `reviews.json` — prior PR reviews you posted on this PR
+  - `review-comments.json` — prior inline review comments
+  Read these via `Read` (or `Grep`) — don't refetch with `gh pr diff` / `gh pr view` / `gh api`.
+- **You may be re-invoked on every push to the branch.** `pull_request` retriggers on `synchronize`; each run is a fresh context with no memory of prior reviews. Use `reviews.json` to see what you raised previously — treat the new commits since that review as the author's response. Don't re-raise a finding the diff has addressed; acknowledge it in one phrase in the new review body if relevant.
+- Read `comments.json` before flagging anything as "unjustified", "approach unclear", or "this looks wrong" — the answer may already be in a comment.
 - Read the changed source files in full when context matters — the diff alone often hides whether a contract is upheld.
 - Post findings only to GitHub. Anything you say in chat is invisible.
 
 ## What to post, where
 
-- **Inline comments** for specific code findings: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`. One finding per comment; don't pile multiple unrelated concerns into one.
-- **End every review with one `gh pr review` verdict.** Pick exactly one:
-  - `gh pr review <N> --approve --body "<one-sentence summary>"` — no findings worth raising. Approval is the merge signal: auto-merge is usually on, and even when it isn't, an approved PR is one button-click from landing. Do not approve while raising reservations of any kind.
-  - `gh pr review <N> --request-changes --body "<one-paragraph summary of the theme>"` — at least one finding should hold up the merge. Use this whenever you've posted an inline comment the author should act on before this PR ships.
-- **The approve body is a brief positive summary, nothing more.** One sentence describing what the PR does ("Wording fixes for the trait-override diagnostic", "Caches the analyser's symbol table across edits"). It is not a place to add caveats, "BTW", "minor nit", or "consider…" observations alongside the approval. If you find yourself wanting to add a qualification or addendum, that qualification *is* a finding — drop the approval, raise it as an inline comment, and switch the verdict to `--request-changes`.
-- **There is no "non-blocking" verdict.** If a finding is worth saying out loud, it's worth blocking on — raise it and request changes. If it isn't worth blocking, stay silent. Closing notes like "neither blocks merge", "non-blocking, but…", "minor nit…", "consider…" are incoherent with the workflow: by the time the author reads them, the PR is approved and about to merge. Don't write them.
-- Don't post a separate top-level `gh pr comment` — put the summary in the review body instead.
+- **One formal PR Review per run**, posted as JSON via the reviews endpoint:
+  `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json`
+  with a body of the shape:
+  ```json
+  {
+    "event": "COMMENT",
+    "body": "<optional cross-cutting summary>",
+    "comments": [
+      {"path": "src/foo.ghul", "line": 142, "body": "<finding>"},
+      ...
+    ]
+  }
+  ```
+  One finding per `comments[]` entry, anchored to the specific line. Use `body` only for cross-cutting commentary that doesn't belong on one line — most reviews can leave it empty.
+- **Group inline findings by severity inside their `body`** — prefix with `**Bug**`, `**Concern**`, or `**Nit**` so the reader can scan severity at a glance.
+- **If there's nothing to raise, post a one-line "LGTM" review** via `gh pr review <N> --comment --body "LGTM"` rather than skipping — the absence of a posted review can't be distinguished from a stuck bot.
+- **Don't post a top-level `gh pr comment`** — issue comments are the wrong UI affordance for code review.
+- **Don't soft-pedal.** If a finding is worth saying, say it as a finding. If it isn't worth saying, stay silent. Closing notes like "non-blocking, but…", "minor nit (no action)", "consider…" are incoherent with the workflow: by the time the author reads them, the PR may already be merged. Don't write them.
 
 ## What you're reading vs. what CI gates
 
@@ -136,6 +153,7 @@ Flag when:
 
 ## Posting mechanics — reminder
 
-- Inline: `mcp__github_inline_comment__create_inline_comment` with `confirmed: true`.
-- Verdict (exactly one, always): `gh pr review <N> --approve|--request-changes --body "..."`. Approve only when you've raised nothing the author should act on; otherwise request changes.
-- Chat output is invisible. If you didn't post it to GitHub, it didn't happen.
+- One PR Review per run, posted via `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json` with `event: COMMENT` and a `comments[]` array of line-anchored findings. Top-level `body` for cross-cutting commentary only; most reviews leave it empty.
+- LGTM shortcut for no-findings runs: `gh pr review <N> --comment --body "LGTM"`.
+- No separate `gh pr comment`.
+- Chat output is invisible. If you didn't post it, it didn't happen.
