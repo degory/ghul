@@ -415,6 +415,16 @@ else
 esac
 ```
 
+`case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` requires an `else` arm so every match path produces a value:
+
+```ghul
+let label = case status
+when 200 then "ok"
+when 500, 501, 502 then "server error"
+else "other"
+esac;
+```
+
 `case` cannot deconstruct a union — use variant tags or `if let` for that.
 
 ### exceptions
