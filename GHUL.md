@@ -205,7 +205,38 @@ si
 
 ### primary constructors
 
-A class or struct may declare its constructor parameters directly in the header. Each parameter becomes a parameter of the synthesised `init`. A field declaration in the body written without a type (`_x;`) is a *capture* — the matching primary parameter's type is filled in and `init` seeds the field from it. The match rule is: a field named `_foo` or `foo` captures a primary parameter named `foo`.
+A class or struct may declare its constructor parameters directly in the header. Each parameter becomes a parameter of the synthesised `init`. A primary parameter without an explicit body declaration **auto-generates** a same-named body field/property mirroring its declared visibility:
+
+```ghul
+class POINT(x: int, y: int) is
+    show() => write_line("({x}, {y})");
+si
+```
+
+is equivalent to
+
+```ghul
+class POINT is
+    x: int;
+    y: int;
+
+    init(x: int, y: int) is
+        self.x = x;
+        self.y = y;
+    si
+
+    show() => write_line("({x}, {y})");
+si
+```
+
+A trailing **modifier suffix** on the parameter overrides the default visibility, matching the same rules as a body field/property declaration:
+
+- `x: int public` — public read and write.
+- `x: int field` — plain field rather than auto-property.
+- `_x: int` — private (protected) field, named `_x`.
+- `x: int init` — **no field generated**. The parameter is in scope only inside the synthesised `init` and any explicit `init(..)` body; useful when the constructor consumes its argument to compute something else (`init(.., other)` style).
+
+An explicit body declaration with the same name as a primary parameter (under the same `_foo` / `foo` matching rule) wins over auto-generation — the body decl receives the auto-init copy. This is the *capture* form: writing the field shorthand `_x;` (or any typed body decl named `_x` / `x`) tells the rewriter "match primary parameter `x` to this declaration." With explicit body decls you also get to choose private renames (`_x;` on a primary parameter `x`) without using the modifier suffix.
 
 ```ghul
 class POINT(x: int, y: int) is
@@ -216,25 +247,11 @@ class POINT(x: int, y: int) is
 si
 ```
 
-is equivalent to
+is also equivalent to the classic-form `POINT` above, with the fields named `_x` and `_y`.
 
-```ghul
-class POINT is
-    _x: int;
-    _y: int;
+The form also supports:
 
-    init(x: int, y: int) is
-        self._x = x;
-        self._y = y;
-    si
-
-    show() => write_line("({_x}, {_y})");
-si
-```
-
-A captured field may carry an explicit access modifier (`x: int public;`) to surface the value as a public field while keeping the capture link. The form also supports:
-
-- **`super(name, name);`** as a class-body declaration — forwards the named primary parameters to the superclass `init`. Arguments are bare identifiers; a derived value passed to `super` requires the classic-form `init`.
+- **`super(expr, expr);`** as a class-body declaration — forwards the given expressions to the superclass `init`. Each argument can be any expression whose free identifiers are primary-ctor parameters (literals and module/type-level references are also in scope), so `super(null)`, `super(other.x)`, `super(LIST([elem]))`, and `super(Source.LOCATION.reflected, owner, name)` all work. Primary parameters consumed by `super(...)` are excluded from auto-generation (their value is forwarded to the base, no field needed locally).
 - **`init(..)`** — an explicit body for the primary `init`; runs after the synthesised field assignments.
 - **`init(.., extras)`** — a secondary `init` overload. The `..` splice expands to the primary parameters and an implicit chain to the primary `init` is prepended to the body, so every captured field is assigned before the secondary's body runs.
 
