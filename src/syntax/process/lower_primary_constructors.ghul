@@ -1,0 +1,449 @@
+namespace Syntax.Process is
+    use Source;
+    use Logging;
+    use Trees;
+
+    // Rewrites `class FOO(p1: T1, p2: T2) is ... si` into the
+    // classic-form equivalent. Runs at the head of
+    // `rewrite-syntax-trees` so the synthesised init (and any
+    // captured-public fields) flow through `add_accessors_for_properties`
+    // exactly like a hand-written init / hand-written public field would.
+    //
+    // Design + load-bearing decisions: docs/claude/primary-constructors.md.
+    //
+    // Surface this visitor consumes:
+    // - Classy.primary_params: parameters parsed from the `(...)` header.
+    // - Body-level `super(name, name);` declarations (Definitions.SUPER_CALL).
+    // - Body-level capture shorthand: a field declaration with INFER
+    //   (no explicit) type expression and no read/assign body. Matches a
+    //   primary parameter named `<field-name>` or `_<field-name>`.
+    // - Secondary-init formal arg lists containing a VARIABLE flagged
+    //   is_splice (the `..` marker). Expanded to the primary parameters
+    //   in place.
+    //
+    // After this visitor runs on a Classy, `primary_params` is null and
+    // every SUPER_CALL / capture-field / splice in the body has been
+    // consumed; downstream phases see a node indistinguishable from a
+    // class written in classic form.
+    class LOWER_PRIMARY_CONSTRUCTORS: Visitor is
+        _logger: Logger;
+
+        init(logger: Logger) is
+            super.init();
+
+            _logger = logger;
+        si
+
+        apply(node: Trees.Node) is
+            node.walk(self);
+        si
+
+        pre(`class: Trees.Definitions.CLASS) -> bool is
+            _lower(`class);
+            return false;
+        si
+
+        pre(`struct: Trees.Definitions.STRUCT) -> bool is
+            _lower(`struct);
+            return false;
+        si
+
+        _lower(classy: Trees.Definitions.Classy) is
+            let primary_params = classy.primary_params;
+
+            if !primary_params? then
+                return;
+            fi
+
+            let class_location = classy.location;
+
+            // First pass over the body: pick out SUPER_CALL, captures
+            // (INFER-typed field-shaped properties whose name matches a
+            // primary param), and any pre-existing `init(..)` /
+            // `init(.., extras)` overloads. Keep everything else.
+            let super_call: Trees.Definitions.SUPER_CALL? mut = null;
+            let captures = Collections.LIST[Trees.Definitions.PROPERTY]();
+            let user_primary_init: Trees.Definitions.FUNCTION? mut = null;
+            let secondary_inits = Collections.LIST[Trees.Definitions.FUNCTION]();
+            let kept = Collections.LIST[Trees.Definitions.Definition]();
+
+            for d in classy.body do
+                if isa Trees.Definitions.SUPER_CALL(d) then
+                    let sc = cast Trees.Definitions.SUPER_CALL(d);
+
+                    if super_call? then
+                        _logger.error(sc.location, "duplicate `super(...)` declaration");
+                    else
+                        super_call = sc;
+                    fi
+                elif _is_capture(d, primary_params) then
+                    captures.add(cast Trees.Definitions.PROPERTY(d));
+                elif _is_init_function(d) then
+                    let f = cast Trees.Definitions.FUNCTION(d);
+                    let has_splice = _arg_list_has_splice(f.arguments);
+
+                    if has_splice then
+                        let splice_count = _count_splices(f.arguments);
+
+                        if splice_count > 1 then
+                            _logger.error(f.location, "`..` may appear at most once in an init parameter list");
+                        fi
+
+                        if _is_primary_init(f) then
+                            if user_primary_init? then
+                                _logger.error(f.location, "duplicate `init(..)` body for primary constructor");
+                            else
+                                user_primary_init = f;
+                            fi
+                        else
+                            secondary_inits.add(f);
+                        fi
+                    else
+                        kept.add(d);
+                    fi
+                else
+                    kept.add(d);
+                fi
+            od
+
+            // Resolve each capture's type expression against the
+            // matching primary parameter. Errors here name the
+            // capture, not the synthesised assignment, per the source-
+            // span discipline in docs/claude/primary-constructors.md.
+            for capture in captures do
+                let matching = _find_matching_param(capture.name.name, primary_params);
+
+                if !matching? then
+                    _logger.error(
+                        capture.location,
+                        "no primary parameter named `{_strip_underscore(capture.name.name)}` to capture"
+                    );
+                else
+                    capture.set_type_expression(matching.type_expression.copy());
+                fi
+            od
+
+            // Synthesise the per-capture assignment statements.
+            let auto_statements = Collections.LIST[Trees.Statements.Statement]();
+
+            if super_call? then
+                auto_statements.add(_make_super_init_call(super_call, primary_params));
+            fi
+
+            for capture in captures do
+                let matching = _find_matching_param(capture.name.name, primary_params);
+
+                if matching? then
+                    auto_statements.add(_make_capture_assignment(capture, matching));
+                fi
+            od
+
+            // If the user wrote `init(..) is body si`, splice their
+            // statements in after the auto-generated assignments.
+            if user_primary_init? /\ user_primary_init.body? /\ isa Trees.Bodies.BLOCK(user_primary_init.body) then
+                let user_block = cast Trees.Bodies.BLOCK(user_primary_init.body);
+
+                for s in user_block.statements do
+                    auto_statements.add(s);
+                od
+            fi
+
+            let primary_init_body =
+                Trees.Bodies.BLOCK(
+                    class_location,
+                    Trees.Statements.LIST(class_location, auto_statements)
+                );
+
+            // The primary init's formal-argument list is the primary
+            // parameters themselves. Make a fresh LIST that shares the
+            // same VARIABLE instances — they were marked is_argument at
+            // parse time and aren't referenced by any other surviving
+            // node.
+            let primary_init_args = _copy_variable_list(primary_params);
+
+            let primary_init =
+                Trees.Definitions.FUNCTION(
+                    class_location,
+                    Trees.Identifiers.Identifier(class_location, "init"),
+                    Trees.TypeExpressions.LIST(class_location, Collections.LIST[Trees.TypeExpressions.TypeExpression](0)),
+                    primary_init_args,
+                    Trees.TypeExpressions.INFER(class_location),
+                    Trees.Modifiers.LIST(class_location, null, null),
+                    primary_init_body
+                );
+
+            kept.add(primary_init);
+
+            // Re-attach each secondary init with its splice expanded
+            // and an implicit chain to the primary init prepended.
+            for f in secondary_inits do
+                _expand_secondary_init(f, primary_params);
+                kept.add(f);
+            od
+
+            // Replace the body's contents with the curated list.
+            classy.body.clear_definitions();
+
+            for d in kept do
+                classy.body.add(d);
+            od
+
+            classy.set_primary_params(null);
+        si
+
+        _is_capture(d: Trees.Definitions.Definition, primary_params: Trees.Variables.LIST) -> bool is
+            if !isa Trees.Definitions.PROPERTY(d) then
+                return false;
+            fi
+
+            let p = cast Trees.Definitions.PROPERTY(d);
+
+            // A "capture" is a field-shaped property: no read body,
+            // no assign body, INFER type expression. Any of those
+            // missing and it's a normal field/property the user wrote
+            // out longhand.
+            if p.read_body? \/ p.assign_body? then
+                return false;
+            fi
+
+            if p.type_expression? /\ !p.type_expression.is_inferred then
+                return false;
+            fi
+
+            return _find_matching_param(p.name.name, primary_params)?;
+        si
+
+        _is_init_function(d: Trees.Definitions.Definition) -> bool is
+            if !isa Trees.Definitions.FUNCTION(d) then
+                return false;
+            fi
+
+            let f = cast Trees.Definitions.FUNCTION(d);
+
+            return f.name? /\ f.name.name =~ "init";
+        si
+
+        _is_primary_init(f: Trees.Definitions.FUNCTION) -> bool is
+            // init(..) — exactly one parameter and it's the splice marker.
+            if !f.arguments? then
+                return false;
+            fi
+
+            let args = f.arguments.variables;
+
+            return args.count == 1 /\ args[0].is_splice;
+        si
+
+        _arg_list_has_splice(args: Trees.Variables.LIST) -> bool is
+            if !args? then
+                return false;
+            fi
+
+            for v in args do
+                if v.is_splice then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        _count_splices(args: Trees.Variables.LIST) -> int is
+            if !args? then
+                return 0;
+            fi
+
+            let n mut = 0;
+
+            for v in args do
+                if v.is_splice then
+                    n = n + 1;
+                fi
+            od
+
+            return n;
+        si
+
+        _find_matching_param(capture_name: string, primary_params: Trees.Variables.LIST) -> Trees.Variables.VARIABLE? is
+            let target = _strip_underscore(capture_name);
+
+            for p in primary_params do
+                if p.name? /\ p.name.name =~ target then
+                    return p;
+                fi
+            od
+
+            return null;
+        si
+
+        _strip_underscore(name: string) -> string is
+            if name? /\ name.length > 0 /\ name.get_chars(0) == '_' then
+                return name.substring(1);
+            fi
+
+            return name;
+        si
+
+        _make_super_init_call(super_call: Trees.Definitions.SUPER_CALL, primary_params: Trees.Variables.LIST) -> Trees.Statements.Statement is
+            let loc = super_call.location;
+            let arg_exprs = Collections.LIST[Trees.Expressions.Expression]();
+
+            for arg_identifier in super_call.args do
+                let matching_param: Trees.Variables.VARIABLE? mut = null;
+
+                for p in primary_params do
+                    if p.name? /\ p.name.name =~ arg_identifier.name then
+                        matching_param = p;
+                    fi
+                od
+
+                if !matching_param? then
+                    _logger.error(
+                        arg_identifier.location,
+                        "`super(...)` argument `{arg_identifier.name}` does not name a primary parameter"
+                    );
+                fi
+
+                arg_exprs.add(
+                    Trees.Expressions.IDENTIFIER(arg_identifier.location, arg_identifier.copy())
+                );
+            od
+
+            // super.init(args)
+            let super_expr = Trees.Expressions.SUPER(loc);
+            let init_identifier = Trees.Identifiers.Identifier(loc, "init");
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    super_expr,
+                    init_identifier,
+                    loc
+                );
+            let call =
+                Trees.Expressions.CALL(
+                    loc,
+                    member,
+                    Trees.Expressions.LIST(loc, arg_exprs)
+                );
+
+            return Trees.Statements.EXPRESSION(loc, call);
+        si
+
+        _make_capture_assignment(capture: Trees.Definitions.PROPERTY, param: Trees.Variables.VARIABLE) -> Trees.Statements.Statement is
+            let loc = capture.location;
+
+            // self.<capture-name> = <param-name>;
+            let self_expr = Trees.Expressions.SELF(loc);
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    capture.name.copy(),
+                    loc
+                );
+            let left = Trees.Expressions.SIMPLE_LEFT_EXPRESSION(loc, member);
+            let right =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    param.name.copy()
+                );
+
+            return Trees.Statements.ASSIGNMENT(loc, left, right);
+        si
+
+        _expand_secondary_init(f: Trees.Definitions.FUNCTION, primary_params: Trees.Variables.LIST) is
+            // Build the new argument list: every existing argument
+            // except the splice marker, with the primary parameters
+            // spliced in at the splice's position.
+            let old_args = f.arguments.variables;
+            let new_args = Collections.LIST[Trees.Variables.VARIABLE]();
+
+            for v in old_args do
+                if v.is_splice then
+                    for p in primary_params do
+                        new_args.add(_copy_variable(p));
+                    od
+                else
+                    new_args.add(v);
+                fi
+            od
+
+            let expanded_args =
+                Trees.Variables.LIST(
+                    f.arguments.location,
+                    new_args
+                );
+
+            f.arguments = expanded_args;
+
+            // Prepend `self.init(<primary args>);` to the body.
+            if f.body? /\ isa Trees.Bodies.BLOCK(f.body) then
+                let block = cast Trees.Bodies.BLOCK(f.body);
+                let chain = _make_self_init_chain(f.location, primary_params);
+
+                let new_statements = Collections.LIST[Trees.Statements.Statement]();
+                new_statements.add(chain);
+
+                for s in block.statements do
+                    new_statements.add(s);
+                od
+
+                block.statements.replace_all(new_statements);
+            fi
+        si
+
+        _make_self_init_chain(loc: LOCATION, primary_params: Trees.Variables.LIST) -> Trees.Statements.Statement is
+            let arg_exprs = Collections.LIST[Trees.Expressions.Expression]();
+
+            for p in primary_params do
+                arg_exprs.add(
+                    Trees.Expressions.IDENTIFIER(loc, p.name.copy())
+                );
+            od
+
+            let self_expr = Trees.Expressions.SELF(loc);
+            let init_identifier = Trees.Identifiers.Identifier(loc, "init");
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    init_identifier,
+                    loc
+                );
+            let call =
+                Trees.Expressions.CALL(
+                    loc,
+                    member,
+                    Trees.Expressions.LIST(loc, arg_exprs)
+                );
+
+            return Trees.Statements.EXPRESSION(loc, call);
+        si
+
+        _copy_variable(v: Trees.Variables.VARIABLE) -> Trees.Variables.VARIABLE is
+            let result =
+                Trees.Variables.VARIABLE(
+                    v.location,
+                    v.name.copy(),
+                    v.type_expression.copy(),
+                    false,
+                    true,
+                    null
+                );
+
+            result.mark_argument();
+
+            return result;
+        si
+
+        _copy_variable_list(list: Trees.Variables.LIST) -> Trees.Variables.LIST is
+            let copied = Collections.LIST[Trees.Variables.VARIABLE]();
+
+            for v in list do
+                copied.add(_copy_variable(v));
+            od
+
+            return Trees.Variables.LIST(list.location, copied);
+        si
+    si
+si
