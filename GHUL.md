@@ -267,6 +267,14 @@ class DOG(name: string, breed: string): ANIMAL is
 si
 ```
 
+When the body would be empty, the `is si` may be replaced with a terminating `;`:
+
+```ghul
+class POINT(x: int, y: int);
+
+struct VECTOR(dx: int, dy: int);
+```
+
 Both `class` and `struct` support primary constructors.
 
 ### traits
