@@ -203,6 +203,55 @@ struct POINT is
 si
 ```
 
+### primary constructors
+
+A class or struct may declare its constructor parameters directly in the header. Each parameter becomes a parameter of the synthesised `init`. A field declaration in the body written without a type (`_x;`) is a *capture* — the matching primary parameter's type is filled in and `init` seeds the field from it. The match rule is: a field named `_foo` or `foo` captures a primary parameter named `foo`.
+
+```ghul
+class POINT(x: int, y: int) is
+    _x;
+    _y;
+
+    show() => write_line("({_x}, {_y})");
+si
+```
+
+is equivalent to
+
+```ghul
+class POINT is
+    _x: int;
+    _y: int;
+
+    init(x: int, y: int) is
+        self._x = x;
+        self._y = y;
+    si
+
+    show() => write_line("({_x}, {_y})");
+si
+```
+
+A captured field may carry an explicit access modifier (`x: int public;`) to surface the value as a public field while keeping the capture link. The form also supports:
+
+- **`super(name, name);`** as a class-body declaration — forwards the named primary parameters to the superclass `init`. Arguments are bare identifiers; a derived value passed to `super` requires the classic-form `init`.
+- **`init(..)`** — an explicit body for the primary `init`; runs after the synthesised field assignments.
+- **`init(.., extras)`** — a secondary `init` overload. The `..` splice expands to the primary parameters and an implicit chain to the primary `init` is prepended to the body, so every captured field is assigned before the secondary's body runs.
+
+```ghul
+class DOG(name: string, breed: string): ANIMAL is
+    _breed;
+
+    super(name);
+
+    init(.., trick: string) is
+        write_line("{_name} the {_breed} can {trick}");
+    si
+si
+```
+
+Both `class` and `struct` support primary constructors.
+
 ### traits
 
 A trait is ghūl's equivalent of an interface. A class or struct implements a trait by naming it in the header, and must provide every trait member that has no default. A trait member *can* carry a default body; an implementing type inherits the default and need only override it to change the behaviour, reaching the default with `super`:
