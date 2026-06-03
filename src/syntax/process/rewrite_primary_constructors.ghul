@@ -3,6 +3,36 @@ namespace Syntax.Process is
     use Logging;
     use Trees;
 
+    // Walks a `super(...)` argument expression tree and collects the
+    // names of primary-ctor parameters referenced as bare variable
+    // expressions (e.g. `super(x, f(x))` — `x` referenced). Member
+    // names in `a.x` and type-arg names in `LIST[T]` are deliberately
+    // NOT collected: only `visit(Expressions.IDENTIFIER)` fires, so the
+    // bare `Identifier` nodes for member names and type arguments never
+    // reach this visitor.
+    //
+    // Used to gate auto-field synthesis: a primary param consumed by
+    // `super(...)` does not auto-generate a same-named field.
+    class SUPER_PARAM_REFERENCE_COLLECTOR(primary_param_names: Collections.SET[string]): Syntax.Visitor is
+        _primary_param_names;
+        referenced_names: Collections.SET[string] public;
+
+        super();
+
+        init(..) is
+            referenced_names = Collections.SET[string]();
+        si
+
+        visit(identifier: Trees.Expressions.IDENTIFIER) is
+            if identifier.identifier? then
+                let name = identifier.identifier.name;
+                if _primary_param_names.contains(name) then
+                    referenced_names.add(name);
+                fi
+            fi
+        si
+    si
+
     // Rewrites `class FOO(p1: T1, p2: T2) is ... si` into the
     // classic-form equivalent. Runs at the head of
     // `rewrite-syntax-trees` so the synthesised init (and any
@@ -11,10 +41,23 @@ namespace Syntax.Process is
     //
     // Surface this visitor consumes:
     // - Classy.primary_params: parameters parsed from the `(...)` header.
-    // - Body-level `super(name, name);` declarations (Definitions.SUPER_CALL).
+    //   Modifier suffixes on each param (`public` / `field` / `init`)
+    //   are read here and ride through to the auto-generated body decl
+    //   (or, for `init`, suppress it).
+    // - Body-level `super(expr, expr);` declarations (Definitions.SUPER_CALL).
+    //   Each arg can be any expression whose only free names are primary-
+    //   ctor params; literals and module/type-level references are also
+    //   in scope. Walking the expression trees identifies which primary
+    //   params are consumed by `super(...)` so they aren't also auto-
+    //   field-generated.
     // - Body-level capture shorthand: a field declaration with INFER
     //   (no explicit) type expression and no read/assign body. Matches a
-    //   primary parameter named `<field-name>` or `_<field-name>`.
+    //   primary parameter named `<field-name>` or `_<field-name>`. Typed
+    //   body decls match the same way — body decl wins, no auto-gen.
+    // - Primary parameters that match nothing in the body and are not in
+    //   `super(...)` and lack the `init` modifier: an auto-field is
+    //   synthesised before the body iteration so downstream phases see
+    //   it as if the user had written it by hand.
     // - Secondary-init formal arg lists containing a VARIABLE flagged
     //   is_splice (the `..` marker). Expanded to the primary parameters
     //   in place.
@@ -95,6 +138,13 @@ namespace Syntax.Process is
 
             let class_location = classy.location;
 
+            // Validate primary-param modifier combinations once up-front;
+            // diagnostics target the param's location so the user sees the
+            // offending param, not the body downstream.
+            for p in primary_params do
+                _validate_primary_param_modifiers(p);
+            od
+
             // Index field-shaped properties by name; per primary
             // parameter prefer the `_foo` match then fall back to bare
             // `foo`; first match wins.
@@ -118,10 +168,12 @@ namespace Syntax.Process is
             let chosen_captures = Collections.SET[Trees.Definitions.PROPERTY]();
             let param_for_capture = Collections.MAP[Trees.Definitions.PROPERTY, Trees.Variables.VARIABLE]();
             let primary_params_by_name = Collections.MAP[string, Trees.Variables.VARIABLE]();
+            let primary_param_names = Collections.SET[string]();
             let already_captured_param_names = Collections.SET[string]();
 
             for p in primary_params do
                 primary_params_by_name[p.name.name] = p;
+                primary_param_names.add(p.name.name);
 
                 let chosen = _find_chosen_capture(p.name.name, field_props_by_name, chosen_captures);
 
@@ -132,11 +184,67 @@ namespace Syntax.Process is
                 fi
             od
 
+            // First sweep over the body — locate `super(...)` so its
+            // argument expressions can be walked for primary-param
+            // references (used below to suppress auto-field synthesis
+            // for params consumed by super). The full body iteration
+            // happens later; this pre-scan never mutates classy.body.
+            let super_call_for_refs: Trees.Definitions.SUPER_CALL? mut = null;
+            for d in classy.body do
+                if isa Trees.Definitions.SUPER_CALL(d) /\ !super_call_for_refs? then
+                    super_call_for_refs = cast Trees.Definitions.SUPER_CALL(d);
+                fi
+            od
+
+            let super_referenced_param_names = Collections.SET[string]();
+            if super_call_for_refs? then
+                let collector = SUPER_PARAM_REFERENCE_COLLECTOR(primary_param_names);
+                for arg_expr in super_call_for_refs.args do
+                    arg_expr.walk(collector);
+                od
+                for name in collector.referenced_names do
+                    super_referenced_param_names.add(name);
+                od
+            fi
+
+            // Auto-field synthesis: a primary param that isn't matched by
+            // an existing body decl, isn't referenced by `super(...)`, and
+            // doesn't carry the `init` modifier auto-generates a body
+            // field/property. Inserted at the head of the body in primary-
+            // header order so member ordering reads naturally. Downstream
+            // (`add_accessors_for_properties`, `declare_symbols`) treats
+            // the synthesised node exactly like a hand-written body decl.
+            let auto_gen_props = Collections.LIST[Trees.Definitions.PROPERTY]();
+            for p in primary_params do
+                if already_captured_param_names.contains(p.name.name) then
+                    continue;
+                fi
+                if super_referenced_param_names.contains(p.name.name) then
+                    continue;
+                fi
+                if p.modifiers? /\ p.modifiers.is_init then
+                    continue;
+                fi
+                let synthesised = _synthesise_auto_property(p);
+                auto_gen_props.add(synthesised);
+                chosen_captures.add(synthesised);
+                param_for_capture[synthesised] = p;
+                already_captured_param_names.add(p.name.name);
+            od
+
             let super_call: Trees.Definitions.SUPER_CALL? mut = null;
             let captures = Collections.LIST[Trees.Definitions.PROPERTY]();
             let user_primary_init: Trees.Definitions.FUNCTION? mut = null;
             let secondary_inits = Collections.LIST[Trees.Definitions.FUNCTION]();
             let kept = Collections.LIST[Trees.Definitions.Definition]();
+
+            // Auto-gen props ride at the head of the body so they precede
+            // user-written members, matching the order of the primary
+            // header.
+            for synthesised in auto_gen_props do
+                captures.add(synthesised);
+                kept.add(synthesised);
+            od
 
             for d in classy.body do
                 if isa Trees.Definitions.SUPER_CALL(d) then
@@ -147,6 +255,12 @@ namespace Syntax.Process is
                     else
                         super_call = sc;
                     fi
+                elif _has_init_modifier(d) then
+                    _logger.error(
+                        d.location,
+                        "init modifier is only valid on a primary constructor parameter"
+                    );
+                    kept.add(d);
                 elif isa Trees.Definitions.PROPERTY(d) /\ chosen_captures.contains(cast Trees.Definitions.PROPERTY(d)) then
                     let capture = cast Trees.Definitions.PROPERTY(d);
                     captures.add(capture);
@@ -215,7 +329,7 @@ namespace Syntax.Process is
             let auto_statements = Collections.LIST[Trees.Statements.Statement]();
 
             if super_call? then
-                auto_statements.add(_make_super_init_call(super_call, primary_params_by_name));
+                auto_statements.add(_make_super_init_call(super_call));
             fi
 
             for capture in captures do
@@ -329,6 +443,12 @@ namespace Syntax.Process is
                     );
                     any_dropped = true;
                 else
+                    if _has_init_modifier(d) then
+                        _logger.error(
+                            d.location,
+                            "init modifier is only valid on a primary constructor parameter"
+                        );
+                    fi
                     kept.add(d);
                 fi
             od
@@ -415,24 +535,121 @@ namespace Syntax.Process is
             return name;
         si
 
+        // Diagnoses incoherent combinations on a primary-ctor parameter:
+        // - `init` combined with any visibility modifier or with another
+        //   storage modifier means "no field, but also make the (non-
+        //   existent) field public / a plain field" — incoherent.
+        // - `init` combined with a `_`-prefixed name means "no field, but
+        //   the name implies a private field" — same incoherence.
+        // The rewriter only flags; it doesn't strip, so the user sees
+        // every diagnostic in one pass.
+        _validate_primary_param_modifiers(p: Trees.Variables.VARIABLE) is
+            if !p.modifiers? then
+                return;
+            fi
+
+            if p.modifiers.is_init then
+                if p.modifiers.access_modifier? then
+                    _logger.error(
+                        p.modifiers.access_modifier.location,
+                        "init modifier cannot combine with visibility modifiers"
+                    );
+                fi
+                if
+                    p.modifiers.storage_class? /\
+                    !p.modifiers.storage_class.is_init
+                then
+                    _logger.error(
+                        p.modifiers.storage_class.location,
+                        "init modifier cannot combine with other storage modifiers"
+                    );
+                fi
+                if
+                    p.name? /\
+                    p.name.name? /\
+                    p.name.name.length > 0 /\
+                    p.name.name.get_chars(0) == '_'
+                then
+                    _logger.error(
+                        p.location,
+                        "init modifier cannot combine with a _-prefixed parameter name"
+                    );
+                fi
+            fi
+        si
+
+        // Body decls with the `init` modifier are diagnosed at the body-
+        // iteration step. This helper recognises the (FUNCTION / PROPERTY)
+        // shapes that carry modifier lists.
+        _has_init_modifier(d: Trees.Definitions.Definition) -> bool is
+            if isa Trees.Definitions.PROPERTY(d) then
+                let p = cast Trees.Definitions.PROPERTY(d);
+                return p.modifiers? /\ p.modifiers.is_init;
+            fi
+            if isa Trees.Definitions.FUNCTION(d) then
+                let f = cast Trees.Definitions.FUNCTION(d);
+                return f.modifiers? /\ f.modifiers.is_init;
+            fi
+            return false;
+        si
+
+        // Synthesise a body-level field/property declaration mirroring the
+        // primary-ctor parameter, ready to flow through
+        // `add_accessors_for_properties` and `declare_symbols` as if the
+        // user had written it by hand. Strips the `init` modifier from
+        // the synthesised modifier list as a safety net — even though the
+        // caller has already filtered INIT params, leaving INIT on the
+        // body decl would re-trigger the "init only on primary param"
+        // diagnostic.
+        _synthesise_auto_property(p: Trees.Variables.VARIABLE) -> Trees.Definitions.PROPERTY is
+            let loc = p.location;
+            let modifiers = _make_body_modifiers(p);
+
+            let property =
+                Trees.Definitions.PROPERTY(
+                    loc,
+                    p.type_expression.copy(),
+                    p.name.copy(),
+                    modifiers,
+                    null,
+                    null,
+                    null
+                );
+
+            return property;
+        si
+
+        _make_body_modifiers(p: Trees.Variables.VARIABLE) -> Trees.Modifiers.LIST is
+            let loc = p.location;
+
+            if !p.modifiers? then
+                return Trees.Modifiers.LIST(loc, null, null);
+            fi
+
+            let access: Trees.Modifiers.AccessModifier mut = default;
+            let storage: Trees.Modifiers.StorageClass mut = default;
+
+            if p.modifiers.access_modifier? then
+                access = p.modifiers.access_modifier.copy();
+            fi
+
+            // Drop INIT — it has no meaning on the body decl. Other
+            // storage classes (FIELD, etc.) flow through.
+            if p.modifiers.storage_class? /\ !p.modifiers.storage_class.is_init then
+                storage = p.modifiers.storage_class.copy();
+            fi
+
+            return Trees.Modifiers.LIST(loc, access, storage);
+        si
+
         _make_super_init_call(
-            super_call: Trees.Definitions.SUPER_CALL,
-            primary_params_by_name: Collections.MAP[string, Trees.Variables.VARIABLE]
+            super_call: Trees.Definitions.SUPER_CALL
         ) -> Trees.Statements.Statement is
             let loc = super_call.location;
             let arg_exprs = Collections.LIST[Trees.Expressions.Expression]();
 
-            for arg_identifier in super_call.args do
-                if !primary_params_by_name.contains_key(arg_identifier.name) then
-                    _logger.error(
-                        arg_identifier.location,
-                        "super(...) argument {arg_identifier.name} does not name a primary parameter"
-                    );
-                fi
-
-                arg_exprs.add(
-                    Trees.Expressions.IDENTIFIER(arg_identifier.location, arg_identifier.copy())
-                );
+            for arg_expr in super_call.args do
+                arg_exprs.add(arg_expr);
             od
 
             // super.init(args)
