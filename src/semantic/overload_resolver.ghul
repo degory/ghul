@@ -33,7 +33,7 @@ namespace Semantic is
             want_instance: bool,
             is_constructor_call: bool
         ) -> OVERLOAD_RESOLVE_RESULT? =>
-            resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, null);
+            resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, null, null);
 
         // `restrict_to`, when non-null, limits resolution to the given
         // candidates instead of the whole group - used by named-
@@ -47,12 +47,31 @@ namespace Semantic is
             want_instance: bool,
             is_constructor_call: bool,
             restrict_to: Collections.List[Symbols.Function]?
+        ) -> OVERLOAD_RESOLVE_RESULT? =>
+            resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to, null);
+
+        // `return_constraint`, when non-null, supplies the return-type
+        // context (typically `function.return_type` of the enclosing
+        // function for a call in return-position, or the LHS slot type
+        // for an assignment-position call). Used as a tie-breaker when
+        // arg-side scoring leaves multiple candidates tied: a candidate
+        // whose return type is assignable to the constraint wins over
+        // one that isn't.
+        resolve(
+            location: LOCATION,
+            group: Symbols.FUNCTION_GROUP,
+            arguments: Collections.List[Type],
+            want_infer: bool,
+            want_instance: bool,
+            is_constructor_call: bool,
+            restrict_to: Collections.List[Symbols.Function]?,
+            return_constraint: Type
         ) -> OVERLOAD_RESOLVE_RESULT?
         is
             let mark = _logger.mark();
 
             try
-                return _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to);
+                return _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to, return_constraint);
             catch e: Exception
                 _logger.release(mark);
 
@@ -91,7 +110,8 @@ namespace Semantic is
             want_infer: bool,
             want_instance: bool,
             is_constructor_call: bool,
-            restrict_to: Collections.List[Symbols.Function]?
+            restrict_to: Collections.List[Symbols.Function]?,
+            return_constraint: Type
         ) -> OVERLOAD_RESOLVE_RESULT?
         is
             if group == null \/ group.functions == null \/ arguments == null then
@@ -325,9 +345,50 @@ namespace Semantic is
                 fi
             fi
 
+            // Return-type-context filter: when the caller supplied a
+            // return-type constraint (e.g. a return statement whose
+            // function returns `Tasks.TASK[int]`, or an assignment-
+            // position call's LHS type), prefer candidates whose
+            // return type is assignable to that constraint. Picks
+            // between `from_exception(ex) -> Tasks.TASK` vs
+            // `from_exception[T](ex) -> Tasks.TASK[T]` where T can
+            // bind from the constraint — the latter is the
+            // user's intent and the former would fail the return-
+            // statement's own assignability check. Runs BEFORE the
+            // non-generic filter so a generic candidate matching the
+            // constraint wins over a non-generic one that doesn't.
+            //
+            // For a generic candidate whose return type carries type
+            // variables that the constraint can pin (e.g.
+            // `Tasks.TASK[T]` against `Tasks.TASK[int]`), specialize
+            // the chosen function so its emitted return type binds T
+            // from the constraint. Without this the caller would
+            // accept the candidate as the right overload but reject
+            // its result against the constraint at the next
+            // assignability check.
+            if is_ambiguous /\ return_constraint? /\ !return_constraint.is_sentinel then
+                let constraint_matches =
+                    ambiguous_matches |
+                        .filter(f => f.return_type? /\ _return_type_matches_constraint(f.return_type, return_constraint));
+
+                let count = constraint_matches | .count();
+
+                if count == 1 then
+                    result = constraint_matches | .only();
+                    is_ambiguous = false;
+
+                    let specialized = _try_specialize_from_return_constraint(location, result, return_constraint);
+                    if specialized? then
+                        result = specialized;
+                    fi
+                elif count > 1 then
+                    ambiguous_matches = Collections.LIST(constraint_matches);
+                fi
+            fi
+
             if is_ambiguous then
-                let non_generic_matches = 
-                    ambiguous_matches | 
+                let non_generic_matches =
+                    ambiguous_matches |
                         .filter(f => !f.is_generic);
 
                 let count = non_generic_matches | .count();
@@ -422,6 +483,93 @@ namespace Semantic is
             fi
 
             back_feed.pairs(chosen.arguments, actual_types);
+        si
+
+        // Bind the candidate function's own generic type-args from a
+        // return-type constraint. Returns the specialized function
+        // (with T mapped to the matching constraint slot) or null
+        // when the function isn't generic, the binding is
+        // incomplete, or the return slot carries no type variables
+        // for the constraint to pin. Mirrors the arg-driven binding
+        // in `try_bind_generic_arguments` but pairs the formal
+        // return type against the constraint instead of formal args
+        // against actual args.
+        _try_specialize_from_return_constraint(
+            location: LOCATION,
+            chosen: Symbols.Function,
+            constraint: Type
+        ) -> Symbols.Function? is
+            if !chosen? \/ !chosen.is_generic then
+                return null;
+            fi
+
+            if !chosen.return_type? \/ chosen.return_type.is_sentinel then
+                return null;
+            fi
+
+            let results = Types.GENERIC_ARGUMENT_BIND_RESULTS();
+
+            if !chosen.return_type.bind_type_variables(constraint, results) then
+                return null;
+            fi
+
+            results.check_complete(location, chosen.generic_arguments);
+
+            if !results.is_bound then
+                return null;
+            fi
+
+            return chosen.specialize_function(results.map, null);
+        si
+
+        // True when an overload's return type is compatible with a
+        // call-site return-type constraint, used as a tie-breaker
+        // when arg-side scoring leaves multiple candidates tied.
+        //
+        // Three shapes pass:
+        //   1. is_assignable_from: a concrete constraint (Tasks.TASK[int])
+        //      accepts a candidate whose return type fits as-is
+        //      (Tasks.TASK[int]) or via covariance.
+        //   2. Same outer generic head, candidate generic still has
+        //      unbound type-args: the resolver will bind them on the
+        //      chosen-overload's second pass, so a `Tasks.TASK[T]`
+        //      return for a `Tasks.TASK[int]` constraint matches even
+        //      when the arg-side pass didn't pin T.
+        //   3. Wild return-type slot: candidate.return_type is itself
+        //      a type variable still awaiting binding.
+        _return_type_matches_constraint(return_type: Type, constraint: Type) -> bool is
+            if !return_type? \/ !constraint? then
+                return false;
+            fi
+
+            if return_type.is_sentinel \/ return_type.is_error then
+                return false;
+            fi
+
+            if constraint.is_assignable_from(return_type) then
+                return true;
+            fi
+
+            if return_type.is_wild \/ return_type.is_type_variable then
+                return true;
+            fi
+
+            let rt_named = cast Types.NAMED(return_type);
+            let c_named = cast Types.NAMED(constraint);
+
+            if rt_named? /\ c_named? then
+                let rt_symbol = cast Symbols.GENERIC(rt_named.symbol);
+                let c_symbol = cast Symbols.GENERIC(c_named.symbol);
+
+                if
+                    rt_symbol? /\ c_symbol? /\
+                    rt_symbol.symbol =~ c_symbol.symbol
+                then
+                    return true;
+                fi
+            fi
+
+            return false;
         si
 
 
