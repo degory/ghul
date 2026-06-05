@@ -635,7 +635,7 @@ namespace Syntax.Process is
         // concrete the body produces. Re-specialise with phantoms in
         // those slots so the constraint pushed becomes
         // (`int -> STEP[<phantom>]`) — actually informative, and
-        // open to match propagation from inside the body.
+        // match propagationable from inside the body.
         _partial_arguments_contain_unbound_function_type_variable(function: Semantic.Symbols.Function) -> bool is
             if !function? \/ !function.arguments? then
                 return false;
@@ -921,8 +921,8 @@ namespace Syntax.Process is
         // useless as a constraint downstream
         // (literal `T` matches nothing concrete the
         // body could produce). Re-specialise so those
-        // slots become phantoms — open to match propagation
-        // from inside the lambda body.
+        // slots become phantoms — match propagationable from
+        // inside the lambda body.
         _retry_overload_on_partial(
             overload_result: Semantic.OVERLOAD_RESOLVE_RESULT,
             function_group: Semantic.Symbols.FUNCTION_GROUP,
@@ -1142,44 +1142,14 @@ namespace Syntax.Process is
 
             let function_type = call.function.value.type;
 
-            // Iterative-inference match propagation: if the function being
-            // called has a placeholder formal arg (e.g. f's type is
-            // Function[INFERRED_VARIABLE_TYPE, ?] from a let-bound
-            // lambda whose argument types weren't inferable from
-            // the body alone), push the actual arg's type onto the
-            // placeholder's origin symbol. Done *before* the
-            // is_error early-return because the return-type slot
-            // may legitimately be ERROR while the arg slot is a
-            // propagation-ready placeholder (e.g. `x => x.length`'s
-            // body errors with ERROR-typed member access on
-            // unresolved receiver, propagating through the function
-            // type's is_error). The next iteration resolves x and
-            // x.length cleanly.
+            // Run before the is_error check below so a callee whose
+            // return-slot is ERROR but whose formal-arg slots still
+            // carry placeholders gets its placeholders fed (e.g.
+            // `x => x.length` has an ERROR-typed body but its arg
+            // slot is recoverable once a call site supplies the
+            // actual).
             if isa Semantic.Types.NAMED(function_type) then
-                let ft_named = function_type;
-                let ft_args = ft_named.arguments;
-                let formal_count =
-                    if function_type.is_function then
-                        ft_args.count - 1;
-                    else
-                        ft_args.count;
-                    fi;
-
-                if formal_count == arguments.count then
-                    for i in 0..arguments.count do
-                        let formal = ft_args[i];
-                        let actual = argument_types[i];
-
-                        if formal? /\ actual? /\ isa Semantic.Types.INFERRED_VARIABLE_TYPE(formal) then
-                            let placeholder = formal;
-                            // See `INFERENCE_HELPERS.widen_variant_to_union`
-                            // for why a variant actual is widened to its
-                            // union before becoming a constraint here.
-                            let push_actual = Semantic.INFERENCE_HELPERS.widen_variant_to_union(actual);
-                            _logger.mark_consumed_any_if(placeholder.origin.add_lower_bound(push_actual));
-                        fi
-                    od
-                fi
+                _propagate_to_placeholder_formals(function_type, argument_types, arguments.count);
             fi
 
             // Only short-circuit when the receiver is itself the ERROR
@@ -1187,59 +1157,13 @@ namespace Syntax.Process is
             // function shape (`Function[good_formals, ERROR_return]`).
             // For composites the formal-arg slots are still known, so the
             // result-type path below can propagate a usable Function shape
-            // to the let-init binding. The body-retry loop can then
-            // propagate actuals onto placeholder formals on the next
-            // iteration.
+            // to the let-init binding. The body-retry loop can then back-
+            // feed actuals onto placeholder formals on the next iteration.
             if function_type? /\ isa Semantic.Types.ERROR(function_type) then
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                 return;
             elif isa Semantic.Types.INFERRED_VARIABLE_TYPE(function_type) then
-                // Iterative-inference match propagation when the call's receiver is
-                // itself an unresolved placeholder. Synthesize a function
-                // shape from the actual arg types plus a deferred return
-                // type and push it as a constraint on the placeholder's
-                // origin, so the next body-retry iteration sees the symbol
-                // resolved to a function type and the call can be compiled.
-                // Required for mutually-recursive lambdas where each side's
-                // signature depends on the other.
-                let placeholder = function_type;
-
-                // Skip the speculative function-shape constraint
-                // when the LUB already has a candidate (typically
-                // from an earlier `v = <lambda>` assignment in the
-                // same body). The synthesised type carries the
-                // call's actual arg types, which may differ from
-                // the assigned shape (e.g. `(v: List[int]) => 28`
-                // assigned, then called with `int[]`); the per-
-                // position LUB merge can't bridge that and the
-                // pair stays in the pool as ambiguous candidates,
-                // letting the placeholder-bearing one out-rank the
-                // settled one in IL emission. CALL_CONSTRAINT
-                // below still records the call shape for filter
-                // purposes. Mutual recursion (the original motivator
-                // of this match propagation) keeps working because there
-                // the receiver has no other source of candidate
-                // types.
-                if !placeholder.origin.has_lub_candidate /\ argument_types | .all(a => a? /\ a.is_settled) then
-                    let function_type_components = Collections.LIST[Type](argument_types);
-                    function_type_components.add(Semantic.Types.INFERRED_RETURN_TYPE());
-                    let synthesized = _innate_symbol_lookup.get_function_type(function_type_components);
-                    _logger.mark_consumed_any_if(placeholder.origin.add_lower_bound(synthesized));
-                fi
-
-                // Operation-constraint inference: regardless of
-                // whether the args are concrete enough to synthesize
-                // a Function constraint above, record a CALL_CONSTRAINT
-                // with the captured arg-types on the placeholder's
-                // origin so the constraint-aware LUB can later filter
-                // candidate types to those that actually accept this
-                // call shape. The constraint's own discharge defers
-                // conservatively when the captured args still contain
-                // placeholders, so emitting unconditionally here is
-                // safe.
-                let call_args = Collections.LIST[Type](argument_types);
-                _logger.mark_consumed_any_if(placeholder.origin.add_constraint(Semantic.CALL_CONSTRAINT(call_args)));
-
+                _propagate_to_unresolved_callee(function_type, argument_types);
                 call.value = DUMMY(Semantic.Types.ERROR(), call.location);
                 return;
             elif !function_type? \/ !isa Semantic.Types.NAMED(function_type) then
@@ -1326,6 +1250,84 @@ namespace Syntax.Process is
                     function_generic_type,
                     arguments
                 );
+        si
+
+        // For a function-typed callee whose formal slots include
+        // INFERRED_VARIABLE_TYPE placeholders (typically a let-bound
+        // lambda whose arg types couldn't be pinned from the body
+        // alone), push the corresponding actual arg type onto each
+        // placeholder formal's origin Variable as a lower bound. The
+        // body-retry loop's next iteration then sees the placeholder
+        // resolved and walks the lambda body cleanly.
+        //
+        // Variant actuals are widened to their union before being
+        // pushed — see `INFERENCE_HELPERS.widen_variant_to_union` —
+        // to keep the lambda-arg LUB monotonic across sibling
+        // variants from different call sites.
+        _propagate_to_placeholder_formals(
+            function_type: Semantic.Types.Type,
+            argument_types: Collections.List[Semantic.Types.Type],
+            argument_count: int
+        ) is
+            let ft_named = cast Semantic.Types.NAMED(function_type);
+            let ft_args = ft_named.arguments;
+            let formal_count =
+                if function_type.is_function then
+                    ft_args.count - 1;
+                else
+                    ft_args.count;
+                fi;
+
+            if formal_count != argument_count then
+                return;
+            fi
+
+            for i in 0..argument_count do
+                let formal = ft_args[i];
+                let actual = argument_types[i];
+
+                if formal? /\ actual? /\ isa Semantic.Types.INFERRED_VARIABLE_TYPE(formal) then
+                    let placeholder = formal;
+                    let push_actual = Semantic.INFERENCE_HELPERS.widen_variant_to_union(actual);
+                    _logger.mark_consumed_any_if(placeholder.origin.add_lower_bound(push_actual));
+                fi
+            od
+        si
+
+        // When the call's receiver is itself an unresolved placeholder
+        // (`let f = ...; f(1)` while `f`'s body is still settling, or
+        // mutually-recursive lambdas where each side's signature
+        // depends on the other), record two constraints on the
+        // placeholder's origin:
+        //
+        //   1. A synthesised function-type shape from the actual arg
+        //      types + a deferred return type, as a lower bound, so
+        //      the next iteration sees the receiver resolved to a
+        //      function type and the call can compile. Skipped when
+        //      the LUB already has a candidate (typically from a
+        //      direct `v = <lambda>` assignment in the same body) —
+        //      the call's actual arg types may differ from the
+        //      assigned shape and the per-position merge can't bridge
+        //      them, leaving an ambiguous pair in the pool.
+        //
+        //   2. A CALL_CONSTRAINT capturing the actual arg types
+        //      unconditionally, so the constraint-aware LUB can later
+        //      filter candidate types to those that actually accept
+        //      this call shape. Its discharge defers conservatively
+        //      when the captured args still contain placeholders.
+        _propagate_to_unresolved_callee(
+            placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE,
+            argument_types: Collections.List[Semantic.Types.Type]
+        ) is
+            if !placeholder.origin.has_lub_candidate /\ argument_types | .all(a => a? /\ a.is_settled) then
+                let function_type_components = Collections.LIST[Semantic.Types.Type](argument_types);
+                function_type_components.add(Semantic.Types.INFERRED_RETURN_TYPE());
+                let synthesized = _innate_symbol_lookup.get_function_type(function_type_components);
+                _logger.mark_consumed_any_if(placeholder.origin.add_lower_bound(synthesized));
+            fi
+
+            let call_args = Collections.LIST[Semantic.Types.Type](argument_types);
+            _logger.mark_consumed_any_if(placeholder.origin.add_constraint(Semantic.CALL_CONSTRAINT(call_args)));
         si
     si
 si
