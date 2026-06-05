@@ -14,11 +14,11 @@ This is the compiler for the [ghūl programming language](https://ghul.dev). It 
 
 ## Prerequisites
 
-The compiler requires the [.NET 8.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/8.0)
+The compiler requires the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0). The SDK includes the .NET 10 runtime that the compiler tool itself runs on, and will fetch reference packs for any target framework you build against on demand.
 
 ## Target
 
-The compiler produces standard .NET assemblies and packages targeting .NET 8.0
+The compiler produces standard .NET assemblies and packages targeting .NET 10 by default. Earlier target frameworks work too — set `<TargetFramework>net8.0</TargetFramework>` (or similar) in your `.ghulproj` and pin `ghul.runtime` to a net8.0-compatible release (e.g. `3.0.19`), since the 4.x line is net10.0-only.
 
 ## Getting the compiler
 
@@ -67,7 +67,7 @@ dotnet run
 
 ### Runtime dependencies for ghūl applications
 
-Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.com/download/dotnet/8.0) runtime
+Applications written in ghūl require the .NET runtime matching whatever target framework you built for — the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0) by default, or e.g. the [.NET 8 runtime](https://dotnet.microsoft.com/download/dotnet/8.0) if you targeted `net8.0`.
 
 ## Development environment
 
@@ -77,7 +77,7 @@ Applications written in ghūl require the [.NET 8.0](https://dotnet.microsoft.co
 
 ### Dev container
 
-Any dev container image with the .NET 8 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:8.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
+Any dev container image with the .NET 10 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:10.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
 
 ## Basic ghūl language tutorial
 
