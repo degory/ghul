@@ -30,7 +30,7 @@ export ANALYSER_EXTRA_ARGS="--show-analysis-stats --no-analysis-heap-watchdog --
 echo "==> building analysis-profiler (and the compiler under test)"
 dotnet build analysis-profiler.ghulproj -c Debug
 
-PROFILER_DLL="$(find bin -name analysis-profiler.dll -path '*net8.0*' | head -1)"
+PROFILER_DLL="$(find bin -name analysis-profiler.dll -path '*net10.0*' | head -1)"
 if [ -z "$PROFILER_DLL" ]; then
   echo "could not locate analysis-profiler.dll after build" >&2
   exit 1
