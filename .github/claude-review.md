@@ -142,7 +142,7 @@ Bump table:
 - **Minor (X.Y.0).** New language features that don't conflict with existing source. New compiler flags or opt-in behaviour. New analysis-mode protocol messages or fields the VSCE can ignore. New warnings (always default-on — no per-warning suppression flag).
 - **Patch (X.Y.Z).** Bug fixes aligning behaviour with the documented/intended spec. Rejecting source that was previously accepted but demonstrably wrong (bad IL, undefined semantics, runtime corruption, unsafe operation). Promoting a warning to an error when analysis becomes confident enough to insist. IL/codegen improvements with no observable semantic change. Internal refactors, tests, docs, CI.
 
-Mechanism: default is patch. A non-patch release is cut by **raising the `VERSION` file** in the PR (code-owned via `.github/CODEOWNERS` — requires the code owner's approval). `#minor`/`#major` markers in the PR body are no-ops; don't add them. A `workflow_dispatch` `version` input overrides outright (emergencies only).
+Mechanism: default is patch. A non-patch release is cut by **raising the `VERSION` file** in the PR (code-owned via `.github/CODEOWNERS` — requires the code owner's approval). `#minor`/`#major` markers in the PR body are no-ops; don't add them.
 
 Flag when:
 
