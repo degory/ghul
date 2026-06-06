@@ -19,6 +19,14 @@ namespace Syntax.Process is
 
         _have_hit: bool;
 
+        // Sticky: set to true when the cursor sits inside any
+        // type-expression node, so the final result set can be
+        // filtered down to type-like kinds (classes, traits,
+        // structs, enums, namespaces, type parameters). Values
+        // — locals, fields, functions, properties, constants —
+        // never belong in a type-expression position.
+        _in_type_position: bool;
+
         keyword_results: Collections.Iterable[string] => _keyword_results;
 
         init(
@@ -35,6 +43,7 @@ namespace Syntax.Process is
 
         find_completions(root: Trees.Node, target_line: int, target_column: int) -> Collections.Iterable[Pair[string,Semantic.Symbols.Symbol]] is
             _have_hit = false;
+            _in_type_position = false;
 
             _target_line = target_line;
             _target_column = target_column;
@@ -44,8 +53,53 @@ namespace Syntax.Process is
 
             root.walk(self);
 
+            _apply_type_position_filter();
+
             return _results;
         si
+
+        // Note when the cursor sits inside a type-expression node.
+        // The flag is sticky once set: every TypeExpression pre
+        // override below funnels through here, and the cursor can
+        // only sit inside one of them at a time.
+        _check_type_position(node: Trees.Node) is
+            if !_in_type_position /\ node.location.contains(_target_line, _target_column) then
+                _in_type_position = true;
+            fi
+        si
+
+        // If the cursor settled in a type-expression position, drop
+        // every non-type-like symbol from the result set. Allowed
+        // kinds: CLASS, INTERFACE (traits), STRUCT, ENUM, MODULE
+        // (namespaces), TYPE_PARAMETER. Locals, fields, functions,
+        // properties, constants, enum members and operators are
+        // never useful in a type expression. Statement keywords
+        // (`if`, `while`, `let`, …) get cleared too — none of them
+        // start a type expression.
+        _apply_type_position_filter() is
+            if !_in_type_position then
+                return;
+            fi
+
+            let kept = Collections.MAP[string,Semantic.Symbols.Symbol]();
+
+            for pair in _results do
+                if _is_type_like(pair.value.completion_kind) then
+                    kept.add(pair.key, pair.value);
+                fi
+            od
+
+            _results = kept;
+            _keyword_results = Collections.LIST[string]();
+        si
+
+        _is_type_like(kind: Semantic.Symbols.COMPLETION_KIND) -> bool =>
+            kind == Semantic.Symbols.COMPLETION_KIND.CLASS \/
+            kind == Semantic.Symbols.COMPLETION_KIND.INTERFACE \/
+            kind == Semantic.Symbols.COMPLETION_KIND.STRUCT \/
+            kind == Semantic.Symbols.COMPLETION_KIND.ENUM \/
+            kind == Semantic.Symbols.COMPLETION_KIND.MODULE \/
+            kind == Semantic.Symbols.COMPLETION_KIND.TYPE_PARAMETER;
 
         leave_scope(node: Trees.Node) is
             if !_have_hit /\ node.location.contains(_target_line, _target_column) then
@@ -227,6 +281,99 @@ namespace Syntax.Process is
             fi
 
             symbol.find_member_matches("", _results);
+        si
+
+        // Type-expression pre overrides — every subclass funnels
+        // through `_check_type_position` so the sticky type-position
+        // flag is set whenever the cursor lands in one. The walk
+        // continues into children normally (return false).
+        pre(named: Trees.TypeExpressions.NAMED) -> bool is _check_type_position(named); return false; si
+        pre(generic: Trees.TypeExpressions.GENERIC) -> bool is _check_type_position(generic); return false; si
+        pre(member: Trees.TypeExpressions.MEMBER) -> bool is _check_type_position(member); return false; si
+        pre(function: Trees.TypeExpressions.FUNCTION) -> bool is _check_type_position(function); return false; si
+        pre(functions: Trees.TypeExpressions.FUNCTION_GROUP) -> bool is _check_type_position(functions); return false; si
+        pre(tuple: Trees.TypeExpressions.TUPLE) -> bool is _check_type_position(tuple); return false; si
+        pre(array: Trees.TypeExpressions.ARRAY_) -> bool is _check_type_position(array); return false; si
+        pre(pointer: Trees.TypeExpressions.POINTER) -> bool is _check_type_position(pointer); return false; si
+        pre(optional: Trees.TypeExpressions.OPTIONAL) -> bool is _check_type_position(optional); return false; si
+        pre(reference: Trees.TypeExpressions.REFERENCE) -> bool is _check_type_position(reference); return false; si
+        pre(infer: Trees.TypeExpressions.INFER) -> bool is _check_type_position(infer); return false; si
+        pre(undefined: Trees.TypeExpressions.UNDEFINED) -> bool is _check_type_position(undefined); return false; si
+        pre(constraint: Trees.TypeExpressions.TYPE_PARAMETER_CONSTRAINT) -> bool is _check_type_position(constraint); return false; si
+
+        // A NAMED_TUPLE_ELEMENT is either a tuple element (`(x: int,
+        // y: int)`), a function literal parameter (`(x: int) -> int`),
+        // or a generic type parameter declaration (`[T: Foo]`). The
+        // `name` slot in every one of those is a name the user is
+        // *introducing* — not a position to suggest existing symbols.
+        // When the cursor sits there, claim the hit and block the
+        // walk into children so the scope fallback can't dump.
+        // Otherwise treat the element as ordinary type-position
+        // context.
+        pre(element: Trees.TypeExpressions.NAMED_TUPLE_ELEMENT) -> bool is
+            if element.name? /\ element.name.location.contains(_target_line, _target_column) then
+                _have_hit = true;
+                return true;
+            fi
+
+            _check_type_position(element);
+            return false;
+        si
+
+        // When the user has typed `let x:` with nothing after, the
+        // parser produces an UNDEFINED type expression sitting on
+        // the next concrete token (often a line below) — its
+        // location doesn't cover the cursor, so the type-expression
+        // pre hooks above never fire. Recognise the type-position
+        // gap explicitly: a VARIABLE whose declared type is
+        // explicit, where the cursor is strictly past the variable
+        // name's end and strictly before the initializer's start
+        // (or there is no initializer), must be in the type slot.
+        pre(variable: Trees.Variables.VARIABLE) -> bool is
+            if !variable.is_explicit_type \/ !variable.location.contains(_target_line, _target_column) then
+                return false;
+            fi
+
+            let cursor = Source.LOCATION.pair(_target_line, _target_column);
+
+            if variable.left? /\ variable.left.location.end >= cursor then
+                return false;
+            fi
+
+            if variable.initializer? /\ variable.initializer.location.start <= cursor then
+                return false;
+            fi
+
+            _in_type_position = true;
+            return false;
+        si
+
+        // Mirror the VARIABLE gap rule for a function's return type:
+        // the parser may park an UNDEFINED return type on the next
+        // token, away from the cursor. When the cursor sits inside
+        // the FUNCTION but strictly past the arguments' close-paren
+        // and strictly before the body's start (or there is no
+        // body), it's in the return-type slot. Forward to super so
+        // the function's scope still gets entered.
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            let result = super.pre(function);
+
+            if !function.location.contains(_target_line, _target_column) then
+                return result;
+            fi
+
+            let cursor = Source.LOCATION.pair(_target_line, _target_column);
+
+            if function.arguments? /\ function.arguments.location.end >= cursor then
+                return result;
+            fi
+
+            if function.body? /\ function.body.location.start <= cursor then
+                return result;
+            fi
+
+            _in_type_position = true;
+            return result;
         si
 
         // Resolve the LHS of a member-access expression to the symbol
