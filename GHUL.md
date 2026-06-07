@@ -128,7 +128,9 @@ let first = pair.`0;                       // positional access
 let (name, age) = ("alice", 30);           // destructuring
 ```
 
-Destructuring extends beyond tuples. A target list is matched against the source in this order: a value-tuple of matching arity; a `deconstruct(...)` instance method whose parameters are all `T ref`; the conventionally-named positional members `` `0 ``, `` `1 ``, ...; finally each target name resolved as a member of the source. The `deconstruct` route covers .NET types like `Collections.KeyValuePair[K, V]`, ghūl-defined classes that write one through each `T ref` parameter with postfix `!`, and classes with a primary constructor that get an auto-synthesised `deconstruct` (see [primary constructors](#primary-constructors)):
+Destructuring comes in two forms: **positional** and **by-name**, distinguished syntactically.
+
+A **positional** target list `(a, b, ...)` is matched against the source in this order: a value-tuple of matching arity; a `deconstruct(...)` instance method whose parameters are all `T ref`; the conventionally-named positional members `` `0 ``, `` `1 ``, .... The `deconstruct` route covers .NET types like `Collections.KeyValuePair[K, V]`, ghūl-defined classes that write through each `T ref` parameter with postfix `!`, and classes with a primary constructor that get an auto-synthesised `deconstruct` (see [primary constructors](#primary-constructors)). A type without one of those shapes is not destructurable positionally — use the by-name form below.
 
 ```ghul
 for (key, value) in dict do          // KeyValuePair.Deconstruct
@@ -146,6 +148,14 @@ si
 
 let (px, py) = POINT(3, 7);
 ```
+
+A **by-name** target list `(local = field, ...)` pulls each element from the named field of the source — `local` becomes the new binding, `field` names the member on the right-hand side. The same `=` reads in both directions: `(x = x, y = y) = point` is no-rename ("local x gets field x"); `(new_x = x, new_y = y) = point` renames the bound locals. Each `(...)` group is either entirely positional or entirely by-name — mixing is a parse error. Nested groups choose independently:
+
+```ghul
+let (a, (bb = b, cc = d), d) = triple;   // outer positional, middle by-name
+```
+
+In refutable contexts (`if let`, `case`-when patterns), a literal on the left-hand side adds a value-equality test rather than a binding — `("Alice" = name, a = age)` matches when `source.name == "Alice"` and binds `a` to `source.age`. The rule throughout: the LHS of `=` says what to do with the value (bind it, or match it against a literal), the RHS names the field to pull.
 
 Postfix `!` on a `T ref` derefs the pointee: `p!` reads the value, `p! = v` writes through. On a `T?` it asserts presence and projects out the value (see [optional types](#optional-types)); the parser produces the same node in both cases and the meaning is settled by the operand type. Outside `deconstruct` bodies the deref form is rarely needed — ghūl code usually takes refs only to pass them to .NET methods that follow the try-pattern.
 
