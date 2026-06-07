@@ -135,7 +135,7 @@ for (key, value) in dict do          // KeyValuePair.Deconstruct
     write_line("{key}={value}");
 od
 
-class Point is
+class POINT is
     x: int; y: int;
     init(x: int, y: int) is self.x = x; self.y = y; si
     deconstruct(a: int ref, b: int ref) is
@@ -144,7 +144,7 @@ class Point is
     si
 si
 
-let (px, py) = Point(3, 7);
+let (px, py) = POINT(3, 7);
 ```
 
 Postfix `^` is the deref operator on any `T ref`: `p^` reads the pointee, and `p^ = v` writes through it. Outside `deconstruct` bodies it's rarely needed; ghūl code usually takes refs only to pass them to .NET methods that follow the try-pattern.
