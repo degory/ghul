@@ -1,0 +1,511 @@
+namespace Syntax.Process is
+    use Logging;
+    use Source.LOCATION;
+
+    use Semantic.Types.Type;
+    use Semantic.Symbols.Classy;
+
+    // Closed-domain exhaustiveness / redundancy check over a `case`
+    // statement or expression. The check runs once after every arm's
+    // pattern and statements have been compiled, so the scrutinee's
+    // type and each arm's classification are settled. The three
+    // emitted warnings — `non-exhaustive-case`, `redundant-case-arm`,
+    // `dead-case-else` — are all derived from the same per-arm
+    // coverage walk over a small closed domain (union, bool, and the
+    // optional-wrapped variants of each). Scrutinee types whose value
+    // space is open (int, string, non-union class hierarchies, tuples)
+    // produce no warnings — `else` is the only way to be exhaustive
+    // there, and a missing one is the user's deliberate choice.
+    class CASE_EXHAUSTIVENESS_CHECKER is
+        _logger: Logger;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+
+        init(
+            logger: Logger,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
+        ) is
+            super.init();
+
+            _logger = logger;
+            _innate_symbol_lookup = innate_symbol_lookup;
+        si
+
+        check(`case: Trees.Statements.CASE) is
+            if !`case.expression? \/ !`case.expression.value? then
+                return;
+            fi
+
+            let scrutinee_type = `case.expression.value.type;
+
+            if !scrutinee_type? \/ !scrutinee_type.is_settled then
+                return;
+            fi
+
+            let domain = _classify_domain(scrutinee_type);
+
+            if !domain? then
+                return;
+            fi
+
+            let covered = CASE_COVERAGE(domain);
+            let else_arm: Trees.Statements.CASE_MATCH? mut = null;
+
+            for arm in `case.matches do
+                if _is_else_arm(arm) then
+                    if !else_arm? then
+                        else_arm = arm;
+                    fi
+                    continue;
+                fi
+
+                let arm_coverage = _arm_coverage(arm, domain);
+
+                if !arm_coverage? \/ arm_coverage.is_empty then
+                    continue;
+                fi
+
+                if !arm_coverage.adds_to(covered) then
+                    _logger.warn(
+                        arm.location,
+                        "redundant-case-arm",
+                        "this arm is already covered by a preceding arm"
+                    );
+                fi
+
+                covered.absorb(arm_coverage);
+            od
+
+            if covered.is_complete then
+                `case.is_exhaustive = true;
+            fi
+
+            if else_arm? then
+                if covered.is_complete then
+                    _logger.warn(
+                        else_arm.location,
+                        "dead-case-else",
+                        "all cases are already covered before this else"
+                    );
+                fi
+            elif !covered.is_complete then
+                _logger.warn(
+                    `case.location,
+                    "non-exhaustive-case",
+                    "case is not exhaustive: missing {covered.describe_missing()}"
+                );
+            fi
+        si
+
+        _is_else_arm(arm: Trees.Statements.CASE_MATCH) -> bool =>
+            !arm.expressions? /\ !arm.pattern?;
+
+        _classify_domain(scrutinee_type: Type) -> CASE_DOMAIN? is
+            let bool_type = _innate_symbol_lookup.get_bool_type();
+
+            let is_optional = scrutinee_type.is_optional;
+            let core = if is_optional then scrutinee_type.as_non_optional() else scrutinee_type fi;
+
+            if bool_type? /\ core? /\ core =~ bool_type then
+                return CASE_DOMAIN.for_bool(is_optional);
+            fi
+
+            let one_of = cast Semantic.Types.ONE_OF(core);
+
+            if one_of? then
+                let underlying_classy = cast Classy(one_of.underlying_type.unspecialized_symbol);
+
+                if !underlying_classy? then
+                    return null;
+                fi
+
+                let variants = Collections.LIST[Classy]();
+                for v in one_of.variants do
+                    variants.add(v);
+                od
+                return CASE_DOMAIN.for_union(underlying_classy, variants, is_optional);
+            fi
+
+            let union_classy = _try_get_union_classy(core);
+
+            if union_classy? then
+                let variants = Collections.LIST[Classy]();
+                for sym in union_classy.symbols do
+                    let variant_classy = cast Classy(sym);
+                    if variant_classy? /\ sym.is_variant then
+                        variants.add(variant_classy);
+                    fi
+                od
+
+                if variants.count == 0 then
+                    return null;
+                fi
+
+                return CASE_DOMAIN.for_union(union_classy, variants, is_optional);
+            fi
+
+            return null;
+        si
+
+        _try_get_union_classy(type: Type) -> Classy? is
+            if !type? then
+                return null;
+            fi
+
+            let named = cast Semantic.Types.NAMED(type);
+
+            if !named? \/ !named.symbol? then
+                return null;
+            fi
+
+            let classy = cast Classy(named.symbol.unspecialized_symbol);
+
+            if !classy? \/ !classy.is_union then
+                return null;
+            fi
+
+            return classy;
+        si
+
+        _arm_coverage(arm: Trees.Statements.CASE_MATCH, domain: CASE_DOMAIN) -> ARM_COVERAGE? is
+            if arm.pattern? then
+                return _pattern_arm_coverage(arm.pattern, domain);
+            elif arm.expressions? then
+                return _literal_arm_coverage(arm.expressions, domain);
+            fi
+
+            return null;
+        si
+
+        _pattern_arm_coverage(
+            pattern: Trees.Variables.VARIABLE,
+            domain: CASE_DOMAIN
+        ) -> ARM_COVERAGE is
+            let result = ARM_COVERAGE();
+
+            if !pattern.is_explicit_type then
+                // A bare destructure or bare bind on a `case` arm is
+                // irrefutable on the non-null half of the scrutinee.
+                // For a non-optional scrutinee that's everything; for
+                // an optional scrutinee it leaves the null half open.
+                if domain.is_optional then
+                    result.covers_all_variants(domain);
+                else
+                    result.covers_universe = true;
+                fi
+
+                return result;
+            fi
+
+            let target = if pattern.type_expression? then pattern.type_expression.type else null fi;
+
+            if !target? \/ !target.is_settled then
+                return result;
+            fi
+
+            let target_optional = target.is_optional;
+            let target_core = if target_optional then target.as_non_optional() else target fi;
+
+            if target_optional /\ domain.is_optional then
+                result.covers_null = true;
+            fi
+
+            let target_classy = _try_get_classy(target_core);
+
+            if !target_classy? then
+                return result;
+            fi
+
+            if domain.union_symbol? then
+                if target_classy =~ domain.union_symbol then
+                    result.covers_all_variants(domain);
+                elif target_classy.is_variant /\ domain.contains_variant(target_classy) then
+                    result.covered_variants.add(target_classy);
+                fi
+            fi
+
+            return result;
+        si
+
+        _try_get_classy(type: Type) -> Classy? is
+            if !type? then
+                return null;
+            fi
+
+            let named = cast Semantic.Types.NAMED(type);
+
+            if !named? \/ !named.symbol? then
+                return null;
+            fi
+
+            return cast Classy(named.symbol.unspecialized_symbol);
+        si
+
+        _literal_arm_coverage(
+            expressions: Trees.Expressions.LIST,
+            domain: CASE_DOMAIN
+        ) -> ARM_COVERAGE is
+            let result = ARM_COVERAGE();
+
+            if !expressions? then
+                return result;
+            fi
+
+            for expr in expressions.expressions do
+                if isa Trees.Expressions.NULL(expr) then
+                    if domain.is_optional then
+                        result.covers_null = true;
+                    fi
+                elif isa Trees.Expressions.Literals.BOOLEAN(expr) then
+                    let bool_lit = cast Trees.Expressions.Literals.BOOLEAN(expr);
+
+                    if bool_lit.value_string =~ "true" then
+                        result.covers_true = true;
+                    elif bool_lit.value_string =~ "false" then
+                        result.covers_false = true;
+                    fi
+                fi
+            od
+
+            return result;
+        si
+    si
+
+    // Closed-set classification of a `case` scrutinee's type. Only
+    // unions and bool — each optionally wrapped — produce a domain
+    // worth checking; everything else returns null from the
+    // classifier and the case is skipped silently.
+    class CASE_DOMAIN is
+        union_symbol: Classy? public;
+        variants: Collections.LIST[Classy]? public;
+        is_bool: bool public;
+        is_optional: bool public;
+
+        init(
+            union_symbol: Classy?,
+            variants: Collections.LIST[Classy]?,
+            is_bool: bool,
+            is_optional: bool
+        ) is
+            super.init();
+
+            self.union_symbol = union_symbol;
+            self.variants = variants;
+            self.is_bool = is_bool;
+            self.is_optional = is_optional;
+        si
+
+        for_union(symbol: Classy, variants: Collections.LIST[Classy], is_optional: bool) -> CASE_DOMAIN static =>
+            CASE_DOMAIN(symbol, variants, false, is_optional);
+
+        for_bool(is_optional: bool) -> CASE_DOMAIN static =>
+            CASE_DOMAIN(null, null, true, is_optional);
+
+        contains_variant(variant: Classy) -> bool is
+            if !variants? \/ !variant? then
+                return false;
+            fi
+
+            for v in variants do
+                if v =~ variant then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+    si
+
+    // Per-arm and accumulated coverage state. The same shape models
+    // an individual arm's contribution and the running union of all
+    // arms seen so far; `adds_to` and `absorb` are the merge ops.
+    class ARM_COVERAGE is
+        covered_variants: Collections.LIST[Classy] public;
+        covers_null: bool public;
+        covers_true: bool public;
+        covers_false: bool public;
+        covers_universe: bool public;
+
+        init() is
+            super.init();
+
+            covered_variants = Collections.LIST[Classy]();
+            covers_null = false;
+            covers_true = false;
+            covers_false = false;
+            covers_universe = false;
+        si
+
+        is_empty: bool =>
+            covered_variants.count == 0 /\
+            !covers_null /\
+            !covers_true /\
+            !covers_false /\
+            !covers_universe;
+
+        contains_variant(variant: Classy) -> bool is
+            if !variant? then
+                return false;
+            fi
+
+            for v in covered_variants do
+                if v =~ variant then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        covers_all_variants(domain: CASE_DOMAIN) is
+            if !domain.variants? then
+                return;
+            fi
+
+            for v in domain.variants do
+                if !contains_variant(v) then
+                    covered_variants.add(v);
+                fi
+            od
+        si
+
+        adds_to(prior: CASE_COVERAGE) -> bool is
+            if covers_universe /\ !prior.coverage.covers_universe then
+                return true;
+            fi
+
+            if covers_null /\ !prior.coverage.covers_null then
+                return true;
+            fi
+
+            if covers_true /\ !prior.coverage.covers_true then
+                return true;
+            fi
+
+            if covers_false /\ !prior.coverage.covers_false then
+                return true;
+            fi
+
+            for v in covered_variants do
+                if !prior.coverage.contains_variant(v) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+    si
+
+    // Accumulator of arm coverage against a particular domain. Owns
+    // the `is_complete` and `describe_missing` queries the checker
+    // uses to pick the right warning at the end of the arms list.
+    class CASE_COVERAGE is
+        domain: CASE_DOMAIN public;
+        coverage: ARM_COVERAGE public;
+
+        init(domain: CASE_DOMAIN) is
+            super.init();
+
+            self.domain = domain;
+            self.coverage = ARM_COVERAGE();
+        si
+
+        absorb(arm: ARM_COVERAGE) is
+            if arm.covers_universe then
+                coverage.covers_universe = true;
+            fi
+
+            if arm.covers_null then
+                coverage.covers_null = true;
+            fi
+
+            if arm.covers_true then
+                coverage.covers_true = true;
+            fi
+
+            if arm.covers_false then
+                coverage.covers_false = true;
+            fi
+
+            for v in arm.covered_variants do
+                if !coverage.contains_variant(v) then
+                    coverage.covered_variants.add(v);
+                fi
+            od
+        si
+
+        is_complete: bool is
+            if coverage.covers_universe then
+                return true;
+            fi
+
+            if domain.is_bool then
+                if !coverage.covers_true \/ !coverage.covers_false then
+                    return false;
+                fi
+
+                if domain.is_optional /\ !coverage.covers_null then
+                    return false;
+                fi
+
+                return true;
+            fi
+
+            if domain.variants? then
+                if domain.is_optional /\ !coverage.covers_null then
+                    return false;
+                fi
+
+                for v in domain.variants do
+                    if !coverage.contains_variant(v) then
+                        return false;
+                    fi
+                od
+
+                return true;
+            fi
+
+            return false;
+        si
+
+        describe_missing() -> string is
+            let buffer = System.Text.StringBuilder();
+            let count: int mut = 0;
+
+            if domain.is_optional /\ !coverage.covers_null /\ !coverage.covers_universe then
+                _append_with_comma(buffer, count, "null");
+                count = count + 1;
+            fi
+
+            if domain.is_bool /\ !coverage.covers_universe then
+                if !coverage.covers_false then
+                    _append_with_comma(buffer, count, "false");
+                    count = count + 1;
+                fi
+
+                if !coverage.covers_true then
+                    _append_with_comma(buffer, count, "true");
+                    count = count + 1;
+                fi
+            fi
+
+            if domain.variants? /\ !coverage.covers_universe then
+                for v in domain.variants do
+                    if !coverage.contains_variant(v) then
+                        _append_with_comma(buffer, count, v.name);
+                        count = count + 1;
+                    fi
+                od
+            fi
+
+            return buffer.to_string();
+        si
+
+        _append_with_comma(buffer: System.Text.StringBuilder, count: int, name: string) static is
+            if count > 0 then
+                buffer.append(", ");
+            fi
+
+            buffer.append(name);
+        si
+    si
+si
