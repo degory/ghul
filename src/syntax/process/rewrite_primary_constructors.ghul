@@ -378,6 +378,24 @@ namespace Syntax.Process is
                 kept.add(f);
             od
 
+            // Auto-deconstruct synthesis. When the user has not written a
+            // `deconstruct(...)` method and has not exposed any
+            // conventionally-named positional members (`0`, `1`, ...),
+            // synthesise a `deconstruct` exposing every public-readable
+            // capture in primary-header order. The resolver's precedence
+            // (tuple > deconstruct > positional > by-name) means a
+            // user-supplied `0`/`1`/... continues to be the explicit opt-in
+            // to positional access — co-existing with the synthesised
+            // method would make it unreachable.
+            _maybe_synthesise_deconstruct(
+                classy,
+                class_location,
+                primary_params,
+                param_for_capture,
+                already_captured_param_names,
+                kept
+            );
+
             // Replace the body's contents with the curated list.
             classy.body.clear_definitions();
 
@@ -639,6 +657,202 @@ namespace Syntax.Process is
             fi
 
             return Trees.Modifiers.LIST(loc, access, storage);
+        si
+
+        // See `DESTRUCTURE_RESOLVER` for the precedence the synthesised
+        // deconstruct slots into. Guard preconditions:
+        //   - User wrote no `deconstruct` of any arity in this class body.
+        //   - User exposed no backtick-numeric property (`0`, `1`, ...).
+        //   - At least one public-readable capture exists to expose.
+        // The synthesised method is `public`, instance, with one `T ref`
+        // parameter per included capture (named after the capture so the
+        // body reads naturally; the destructure call site only ever
+        // matches by arity + ref-ness).
+        _maybe_synthesise_deconstruct(
+            classy: Trees.Definitions.Classy,
+            class_location: LOCATION,
+            primary_params: Trees.Variables.LIST,
+            param_for_capture: Collections.MAP[Trees.Definitions.PROPERTY, Trees.Variables.VARIABLE],
+            already_captured_param_names: Collections.SET[string],
+            kept: Collections.MutableList[Trees.Definitions.Definition]
+        ) is
+            for d in classy.body do
+                if isa Trees.Definitions.FUNCTION(d) then
+                    let f = cast Trees.Definitions.FUNCTION(d);
+                    if f.name? /\ f.name.name =~ "deconstruct" then
+                        return;
+                    fi
+                elif isa Trees.Definitions.PROPERTY(d) then
+                    let p = cast Trees.Definitions.PROPERTY(d);
+                    if p.name? /\ _is_positional_property_name(p.name.name) then
+                        return;
+                    fi
+                fi
+            od
+
+            // Reverse-lookup table: primary-ctor parameter name -> its
+            // capture property. Built once so the capture-collection loop
+            // below stays O(captures).
+            let capture_for_param_name = Collections.MAP[string, Trees.Definitions.PROPERTY]();
+            for kvp in param_for_capture do
+                let cap = kvp.key;
+                let param = kvp.value;
+                if param.name? then
+                    capture_for_param_name[param.name.name] = cap;
+                fi
+            od
+
+            let deconstruct_captures = Collections.LIST[Trees.Definitions.PROPERTY]();
+            for p in primary_params do
+                if !p.name? then
+                    continue;
+                fi
+                if !already_captured_param_names.contains(p.name.name) then
+                    continue;
+                fi
+                if !capture_for_param_name.contains_key(p.name.name) then
+                    continue;
+                fi
+                let capture = capture_for_param_name[p.name.name];
+                if !_is_public_readable_capture(capture) then
+                    continue;
+                fi
+                deconstruct_captures.add(capture);
+            od
+
+            if deconstruct_captures.count == 0 then
+                return;
+            fi
+
+            let deconstruct = _synthesise_deconstruct(class_location, deconstruct_captures);
+
+            // Wrap in an @IL.name("Deconstruct") pragma so the method
+            // satisfies the standard .NET `Deconstruct` contract used by
+            // C# positional patterns and other cross-language consumers.
+            kept.add(_wrap_in_il_name_pragma(class_location, "Deconstruct", deconstruct));
+        si
+
+        _is_positional_property_name(name: string) -> bool is
+            // The canonical destructure-member name is backtick-prefixed
+            // (`Symbols.Symbol.get_destructure_member_name`: "`{index}").
+            // A backtick + non-empty all-decimal tail matches.
+            if !name? \/ name.length < 2 \/ name.get_chars(0) != '`' then
+                return false;
+            fi
+            for i in 1..name.length do
+                let c = name.get_chars(i);
+                if c < '0' \/ c > '9' then
+                    return false;
+                fi
+            od
+            return true;
+        si
+
+        _is_public_readable_capture(p: Trees.Definitions.PROPERTY) -> bool is
+            if !p.modifiers? \/ !p.modifiers.access_modifier? then
+                return true;
+            fi
+            return !p.modifiers.access_modifier.is_private;
+        si
+
+        _synthesise_deconstruct(
+            class_location: LOCATION,
+            captures: Collections.List[Trees.Definitions.PROPERTY]
+        ) -> Trees.Definitions.FUNCTION is
+            let arg_vars = Collections.LIST[Trees.Variables.VARIABLE]();
+            let body_stmts = Collections.LIST[Trees.Statements.Statement]();
+
+            for capture in captures do
+                let cap_loc = capture.location;
+                let arg_type =
+                    Trees.TypeExpressions.REFERENCE(
+                        cap_loc,
+                        capture.type_expression.copy()
+                    );
+                let arg =
+                    Trees.Variables.VARIABLE(
+                        cap_loc,
+                        capture.name.copy(),
+                        arg_type,
+                        false,
+                        true,
+                        null
+                    );
+                arg.mark_argument();
+                arg_vars.add(arg);
+
+                body_stmts.add(_make_deconstruct_assignment(capture));
+            od
+
+            let arg_list = Trees.Variables.LIST(class_location, arg_vars);
+            let body =
+                Trees.Bodies.BLOCK(
+                    class_location,
+                    Trees.Statements.LIST(class_location, body_stmts)
+                );
+            let modifiers =
+                Trees.Modifiers.LIST(
+                    class_location,
+                    Trees.Modifiers.PUBLIC(class_location),
+                    null
+                );
+
+            return
+                Trees.Definitions.FUNCTION(
+                    class_location,
+                    Trees.Identifiers.Identifier(class_location, "deconstruct"),
+                    null,
+                    arg_list,
+                    Trees.TypeExpressions.INFER(class_location),
+                    modifiers,
+                    body
+                );
+        si
+
+        _make_deconstruct_assignment(
+            capture: Trees.Definitions.PROPERTY
+        ) -> Trees.Statements.Statement is
+            let loc = capture.location;
+
+            // <capture-name>! = self.<capture-name>;
+            //
+            // Postfix `!` on a `T ref` value is the write-through-ref
+            // operator — its LHS form lowers to a `stobj <T>` (see
+            // ghul#1509). Without it, `<capture-name> = self.<...>`
+            // would error with "Ghul.T is not assignable to Ghul.T ref".
+            let arg_ref =
+                Trees.Expressions.IDENTIFIER(loc, capture.name.copy());
+            let unwrap = Trees.Expressions.UNWRAP(loc, arg_ref);
+            let left = Trees.Expressions.SIMPLE_LEFT_EXPRESSION(loc, unwrap);
+
+            let self_expr = Trees.Expressions.SELF(loc);
+            let right =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    capture.name.copy(),
+                    loc
+                );
+
+            return Trees.Statements.ASSIGNMENT(loc, left, right);
+        si
+
+        _wrap_in_il_name_pragma(
+            loc: LOCATION,
+            il_name: string,
+            definition: Trees.Definitions.Definition
+        ) -> Trees.Definitions.PRAGMA is
+            let name_literal = Trees.Expressions.Literals.STRING(loc, il_name);
+            let args = Collections.LIST[Trees.Expressions.Expression]();
+            args.add(name_literal);
+            let pragma =
+                Trees.Pragmas.PRAGMA(
+                    loc,
+                    Trees.Identifiers.Identifier(loc, "IL.name"),
+                    Trees.Expressions.LIST(loc, args),
+                    null
+                );
+            return Trees.Definitions.PRAGMA(loc, pragma, definition);
         si
 
         _make_super_init_call(
