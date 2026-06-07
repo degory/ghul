@@ -128,13 +128,26 @@ let first = pair.`0;                       // positional access
 let (name, age) = ("alice", 30);           // destructuring
 ```
 
-Destructuring extends beyond tuples. A target list is matched against the source in this order: a value-tuple of matching arity; a `deconstruct(...)` instance method whose parameters are all `T ref` (notably .NET types like `Collections.KeyValuePair[K, V]`, or anything that defines `Deconstruct` in C#); the conventionally-named positional members `` `0 ``, `` `1 ``, ...; finally each target name resolved as a member of the source.
+Destructuring extends beyond tuples. A target list is matched against the source in this order: a value-tuple of matching arity; a `deconstruct(...)` instance method whose parameters are all `T ref`; the conventionally-named positional members `` `0 ``, `` `1 ``, ...; finally each target name resolved as a member of the source. The `deconstruct` route covers .NET types like `Collections.KeyValuePair[K, V]` and ghūl-defined classes that opt in by writing through each `T ref` parameter with the postfix `^` operator:
 
 ```ghul
 for (key, value) in dict do          // KeyValuePair.Deconstruct
     write_line("{key}={value}");
 od
+
+class Point is
+    x: int; y: int;
+    init(x: int, y: int) is self.x = x; self.y = y; si
+    deconstruct(a: int ref, b: int ref) is
+        a^ = x;
+        b^ = y;
+    si
+si
+
+let (px, py) = Point(3, 7);
 ```
+
+Postfix `^` is the deref operator on any `T ref`: `p^` reads the pointee, and `p^ = v` writes through it. Outside `deconstruct` bodies it's rarely needed; ghūl code usually takes refs only to pass them to .NET methods that follow the try-pattern.
 
 ## functions
 
