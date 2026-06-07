@@ -590,19 +590,19 @@ assert index < array.count else "index out of range";
 
 ### asynchronous code
 
-A function is asynchronous when its declared return type is `Tasks.TASK[T]` (the .NET `Task<T>`) or `Tasks.TASK` (the non-generic `Task`). Inside such a function, `let await x = e;` waits for the task `e` to complete; `x` is then initialized to its result and the rest of the function continues:
+A function is asynchronous when its declared return type is `Tasks.TASK[T]` (the .NET `Task<T>`) or `Tasks.TASK` (the non-generic `Task`). Inside such a function, `await e` is an expression that waits for the task `e` to complete and evaluates to its result, so `let x = await e;` initializes `x` to that result and the rest of the function continues:
 
 ```ghul
 compute() -> Tasks.TASK[int] is
-    let await a = double_async(10);
-    let await b = add_async(a, 1);
+    let a = await double_async(10);
+    let b = await add_async(a, 1);
     return b;
 si
 ```
 
-The source reads top-to-bottom even though execution suspends at each `let await`. `await e;` is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T` and the compiler wraps it as `Tasks.TASK.from_result(...)` automatically.
+The source reads top-to-bottom even though execution suspends at each `await`. `await e;` on its own is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T` and the compiler wraps it as `Tasks.TASK.from_result(...)` automatically.
 
-`let await` and `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch` surrounding code that awaits is not yet supported; wrap the call at the call site — reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
+`await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch` surrounding code that awaits is not yet supported; wrap the call at the call site — reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 
 ## collections and pipes
 
