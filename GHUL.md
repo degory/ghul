@@ -321,7 +321,7 @@ elif let leaf: Tree.LEAF = tree then
 fi
 ```
 
-`isa V(x)` also narrows `x` itself inside the then-arm and inside guard-then-return tails, and on a two-variant union narrows the `else` branch to the other variant. Variant-name dispatch is not checked for exhaustiveness yet — the compiler knows the full variant set but won't error on a missing arm.
+`isa V(x)` also narrows `x` itself inside the then-arm and inside guard-then-return tails, and on a two-variant union narrows the `else` branch to the other variant. A `case` over a union scrutinee is checked for exhaustiveness: missing variants are warned (`non-exhaustive-case`), a `redundant-case-arm` arm fires when a later arm matches nothing the prior arms didn't already cover, and `dead-case-else` fires when the `else` arm is unreachable because the preceding arms cover the domain. The warnings also fire on `bool` and `bool?` scrutinees and on `T?` of a union.
 
 Unions compare by structural equality through the `=~` operator — two union values are `=~` when they hold the same variant with memberwise-equal fields.
 
@@ -503,7 +503,7 @@ else
 esac
 ```
 
-`case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` requires an `else` arm so every match path produces a value:
+`case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` needs either an `else` arm or arms that cover the scrutinee's closed domain (a union's full variant set, both bool branches, etc.) so every match path produces a value:
 
 ```ghul
 let label = case status
