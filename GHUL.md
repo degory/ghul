@@ -335,7 +335,27 @@ union Tree is
 si
 ```
 
-A variant is constructed through the union name (`Tree.LEAF(123)`). Discriminate a union value with `isa V(x)` or `if let v: V = x` — both test the runtime variant, and `if let` binds the value at the narrower variant type for use in the then-arm:
+A variant is constructed through the union name (`Tree.LEAF(123)`). A variant with no fields — a *unit variant* — is referenced by name without parentheses, and is interned to a single shared instance per generic instantiation:
+
+```ghul
+union Color is
+    RED;
+    GREEN;
+si
+
+union Option[T] is
+    SOME(value: T);
+    NONE;
+si
+
+let c: Color = Color.RED;
+let n: Option[int] = Option.NONE;
+let n2: Option[int] = Option.NONE[int];
+```
+
+Type arguments on a unit-variant reference are inferred from the surrounding context (declared LHS type, function-argument slot, return slot) the same way the parenthesised constructor form infers them; the explicit `[int]` is only needed when no context is available. The parenthesised form (`Color.RED()`, `Option.NONE()`) still works and yields the same interned value.
+
+Discriminate a union value with `isa V(x)` or `if let v: V = x` — both test the runtime variant, and `if let` binds the value at the narrower variant type for use in the then-arm:
 
 ```ghul
 if let node: Tree.NODE = tree then
