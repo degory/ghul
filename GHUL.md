@@ -85,6 +85,7 @@ ghūl exposes the .NET primitive types under lowercase names:
 
 - integers — `byte`, `ubyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `word`, `uword`
 - floating-point — `single`, `double`
+- fixed-point — `decimal`
 - `bool`, `char`, `void`
 
 `string` and `object` are reference types from the .NET base class library.
@@ -96,11 +97,12 @@ let big = 1_000_000_000L;      // long
 let b = 99b;                   // byte
 let ratio = 123.456;           // single
 let precise = 123.456D;        // double
+let price = 19.99m;            // decimal
 let letter = 'c';              // char
 let greeting = "hello";        // string
 ```
 
-Digits may be grouped with `_`. An integer literal can carry a radix prefix (`0x`) and a type suffix (`L`, `UL`, `b`); a fractional literal is a `single` unless suffixed `D` for `double`.
+Digits may be grouped with `_`. An integer literal can carry a radix prefix (`0x`) and a type suffix (`L`, `UL`, `b`); a fractional literal is a `single` unless suffixed `D` for `double` or `M` for `decimal`. The `M`/`m` suffix is also accepted on a digit-only literal to write an integral decimal (`100m`).
 
 ghūl does not convert between scalar types implicitly — a mixed-type arithmetic expression is a compile-time error, and a `cast` is required. Upcasting is implicit: a value is assignment-compatible with any ancestor type, so a `string` can be assigned to an `object` with no cast.
 
