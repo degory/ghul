@@ -630,6 +630,14 @@ yrt
 assert index < array.count else "index out of range";
 ```
 
+In expression position, `assert cond else "msg" in expr` guards a value and chains like `let X in expr`: a failing assert throws, a passing assert yields the inner expression. The narrowing applied by the condition flows into the inner expression, so the guarded value can be used there directly:
+
+```ghul
+lookup(key: string) -> int =>
+    assert key? else "key is null" in
+    table[key];
+```
+
 `return value;` returns from a block-body function, `return;` from a void one.
 
 ### asynchronous code
