@@ -79,33 +79,40 @@ namespace Syntax.Process is
                 frame.branch_exits.add(_flow.current_env.copy());
                 frame.running_else = facts.else_env;
             elif `if.binding? then
-                // `if let` branch: the binding's initializer is checked
-                // and the binding's symbol typed by PATTERN_CHECKER. It
-                // narrows only its own then-scoped binding, so the
-                // running-else environment is left unchanged.
+                // `if let` branch. Semantically equivalent to
+                //     if isa V(scrutinee) /\ <bind pattern from scrutinee>
+                // when the binding has `: V`, or just a `?` presence
+                // test plus a bind from the unwrapped value for the
+                // bare form. Both shapes are handled inline off the
+                // REFUTABLE_BINDING node so that the scrutinee remains
+                // visible to flow narrowing and to the destructure's
+                // DESTRUCTURE_CONSTRAINT path — that visibility is
+                // what gives recursive-lambda inference parity with
+                // the hand-written `isa V(t) ... let p = t` shape.
                 _flow.set_env(frame.running_else);
 
-                _pattern_checker.check_binding(`if.binding);
+                // Snapshot the scrutinee's pre-narrow receiver type
+                // for the else-arm complement computation. The
+                // then-arm narrowing inside `_check_refutable_binding`
+                // mutates the symbol's `.type` to the cast target;
+                // computing the complement against that would see a
+                // variant, not the union it belongs to.
+                let else_receiver = _resolve_scrutinee_receiver_type(`if.binding);
 
-                // `if let x = e /\ guard then` — the guard expression
-                // runs after the binding's `?` test succeeds and the
-                // bound names are in scope and narrowed. The guard's
-                // own narrowing facts apply only to the then-arm; the
-                // running-else env is unchanged (the binding's names
-                // are out of scope on the else path).
-                if `if.condition? then
-                    `if.condition.walk(_visitor);
-
-                    let facts = _condition_analyzer.analyze_condition(`if.condition, _flow.current_env);
-
-                    _flow.set_env(facts.then_env);
-                fi
+                _check_refutable_binding(`if.binding);
 
                 if `if.body? then
                     `if.body.walk(_visitor);
                 fi
 
                 frame.branch_exits.add(_flow.current_env.copy());
+
+                frame.running_else =
+                    _condition_analyzer.apply_refutable_binding_else_narrow(
+                        `if.binding,
+                        else_receiver,
+                        frame.running_else
+                    );
             else
                 _flow.set_env(frame.running_else);
 
@@ -118,6 +125,179 @@ namespace Syntax.Process is
             fi
 
             return true;
+        si
+
+        // Resolve the scrutinee variable's declared (pre-narrow)
+        // type for the else-arm complement computation. Returns null
+        // when the scrutinee isn't a simple-identifier local —
+        // complement narrowing has nothing to attach to in that case.
+        _resolve_scrutinee_receiver_type(rb: Trees.Statements.REFUTABLE_BINDING) -> Type? is
+            if !rb? \/ !rb.scrutinee? then
+                return null;
+            fi
+
+            let target = _visitor.try_get_narrowing_target(rb.scrutinee);
+
+            if !target? then
+                return null;
+            fi
+
+            let declared = _flow.declared_type_of(target);
+
+            if !declared? then
+                return null;
+            fi
+
+            if isa Semantic.Types.INFERRED_VARIABLE_TYPE(declared) then
+                let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(declared);
+                let resolved = placeholder.origin.try_get_inferred_type();
+
+                if resolved? /\ !resolved.is_sentinel then
+                    return resolved;
+                fi
+
+                return null;
+            fi
+
+            return declared;
+        si
+
+        // Process a REFUTABLE_BINDING (the AST shape of an `if let`
+        // arm). Mirrors what `isa V(scrutinee) ... let p = scrutinee`
+        // would do — walk the narrow target, narrow the scrutinee on
+        // the then-edge, walk the scrutinee under the narrowed env,
+        // hand its value down to the pattern as the destructure
+        // source, and walk the pattern + optional guard.
+        //
+        // The narrowing reuses the same `_apply_one` machinery the
+        // isa form uses, so the destructure walks against the same
+        // shape (INFERRED in iter 1 → DESTRUCTURE_CONSTRAINT path on
+        // the placeholder origin; concrete in later iters → normal
+        // destructure of the narrowed type) — which is what gives
+        // `if let` inference parity with `isa`.
+        _check_refutable_binding(rb: Trees.Statements.REFUTABLE_BINDING) is
+            if !rb? then
+                return;
+            fi
+
+            // 1. Resolve the narrow type (when ascribed).
+            if rb.narrow_type_expression? then
+                rb.narrow_type_expression.walk(_visitor);
+            fi
+
+            let narrow_type: Type? mut = null;
+            if
+                rb.narrow_type_expression? /\
+                rb.narrow_type_expression.type?
+            then
+                narrow_type = rb.narrow_type_expression.type;
+            fi
+
+            // 2. Apply isa-style narrowing on the scrutinee BEFORE
+            //    walking it. The narrowing mutates the scrutinee's
+            //    symbol type via `_apply_one`; the subsequent load
+            //    picks up the narrowed type, which propagates into
+            //    the destructure source.
+            if narrow_type? then
+                let then_env =
+                    _condition_analyzer.apply_refutable_binding_then_narrow(
+                        rb.scrutinee,
+                        narrow_type,
+                        _flow.current_env
+                    );
+
+                _flow.set_env(then_env);
+            fi
+
+            // 3. Walk the scrutinee under the (possibly narrowed)
+            //    env — produces `rb.scrutinee.value`.
+            rb.scrutinee.walk(_visitor);
+
+            // 4. Hand the scrutinee value down to the pattern as the
+            //    destructure source. For an optional source the
+            //    presence test in generate_il unwraps the value
+            //    before the pattern destructures it.
+            let pattern = rb.pattern;
+
+            pattern.mark_refutable_recursive();
+
+            // For a simple-name pattern, pin the binding's static
+            // type to the narrow target — specialised against the
+            // scrutinee's receiver type so a bare variant target
+            // (`Maybe.YES`) becomes its closed-generic form
+            // (`Maybe.YES[int]`) rather than the open generic
+            // (which IL gen would emit as an unloadable class
+            // reference). Falls back to the unspecialised written
+            // form when no receiver is available.
+            //
+            // Destructure patterns leave `explicit_type` unset so
+            // pre(DESTRUCTURING_VARIABLE_LEFT)'s constraint path
+            // can fire when the scrutinee's type is still inferred —
+            // that's what gives recursive lambdas inference parity
+            // with `isa V(x) ... let (a, b) = x`.
+            if narrow_type? /\ pattern.is_simple_name then
+                let specialized_narrow: Type mut = narrow_type;
+
+                if rb.scrutinee.value? /\ rb.scrutinee.value.type? then
+                    specialized_narrow =
+                        _condition_analyzer.specialize_variant_for_receiver(
+                            rb.scrutinee.value.type,
+                            narrow_type
+                        );
+                fi
+
+                pattern.explicit_type = specialized_narrow;
+            fi
+
+            let source_value: IR.Values.Value mut =
+                if rb.scrutinee.value? then
+                    rb.scrutinee.value!;
+                else
+                    IR.Values.DUMMY(Semantic.Types.ERROR(), rb.scrutinee.location);
+                fi;
+
+            pattern.right_value = source_value;
+            pattern.variable_location = rb.location;
+            pattern.right_location = rb.scrutinee.location;
+
+            // 5. Walk the pattern. Destructure operates on
+            //    `source_value.type` (the scrutinee's narrowed type).
+            pattern.walk(_visitor);
+
+            // 6. Diagnostics: redundancy / impossibility warnings
+            //    (`narrowing-always-succeeds`, value-type-narrow
+            //    error, etc.). Use the scrutinee variable's
+            //    DECLARED type (pre-narrow) as the source — passing
+            //    the already-narrowed `scrutinee.value.type` here
+            //    would make every narrow look like a no-op and
+            //    spuriously fire the redundancy warning.
+            let source_type: Type? mut = null;
+            let target_variable = _visitor.try_get_narrowing_target(rb.scrutinee);
+
+            if target_variable? then
+                source_type = _flow.declared_type_of(target_variable);
+            elif rb.scrutinee.value? then
+                source_type = rb.scrutinee.value.type;
+            fi
+
+            _pattern_checker.check_pattern(
+                pattern,
+                source_type,
+                narrow_type,
+                rb.location,
+                true
+            );
+
+            // 7. Guard expression — walked after the binding's names
+            //    are in scope, under the then-arm env. Narrowing
+            //    inside the guard applies to the then-arm only.
+            if rb.guard? then
+                rb.guard.walk(_visitor);
+
+                let facts = _condition_analyzer.analyze_condition(rb.guard, _flow.current_env);
+
+                _flow.set_env(facts.then_env);
+            fi
         si
 
         visit_if_branch(`if: Trees.Statements.IF_BRANCH) is
