@@ -2465,6 +2465,78 @@ namespace Syntax.Process is
             fi
         si
 
+        // Drill a Type to its underlying Classy (peeling
+        // Symbols.GENERIC wrapping for specialised generics) — same
+        // shape as CONDITION_ANALYZER.get_classy_for_narrowing but
+        // inlined here so generate_il doesn't need a back-reference
+        // to compile-phase services. Returns null when `t` isn't
+        // a NAMED of a Classy.
+        _classy_of_type(t: Semantic.Types.Type) -> Semantic.Symbols.Classy? is
+            if !t? then
+                return null;
+            fi
+
+            if !isa Semantic.Types.NAMED(t) then
+                return null;
+            fi
+
+            let named = cast Semantic.Types.NAMED(t);
+            let symbol mut = named.symbol;
+
+            if isa Semantic.Symbols.GENERIC(symbol) then
+                symbol = symbol.symbol;
+            fi
+
+            return cast Semantic.Symbols.Classy(symbol);
+        si
+
+        // `if let` pattern's bound names are declared as CLR locals
+        // here — same as `pre(VARIABLE)` does for a plain let. The
+        // store IL itself is emitted later by
+        // `gen_destructuring_initialize` in the if-branch handler.
+        pre(rb: Statements.REFUTABLE_BINDING) -> bool is
+            if !rb.pattern? then
+                return false;
+            fi
+
+            let sm_for_function = Semantic.Symbols.state_machine_for(current_function);
+
+            if sm_for_function? /\ sm_for_function.frame? then
+                return false;
+            fi
+
+            let async_sm = Semantic.Symbols.async_state_machine_for(current_function);
+
+            if async_sm? /\ async_sm.frame? then
+                return false;
+            fi
+
+            let buffer = System.Text.StringBuilder();
+
+            for name in rb.pattern.names do
+                if !name? then
+                    continue;
+                fi
+
+                let symbol = find(name);
+
+                if !symbol? then
+                    continue;
+                fi
+
+                symbol!.gen_definition_header(buffer);
+            od
+
+            if buffer.length > 0 /\ _block_context.is_in_block then
+                current_block.add(buffer.to_string());
+            fi
+
+            return false;
+        si
+
+        visit(rb: Statements.REFUTABLE_BINDING) is
+        si
+
         gen_destructuring_default(left: Variables.VariableLeft) is
             if left.is_simple_name then
                 let symbol = find(left.name);
@@ -3131,16 +3203,73 @@ namespace Syntax.Process is
                     else
                         brancher.branch(BRANCH.Z, b.condition.value, next, "elif");
                     fi
-                elif b.binding? /\ b.binding.initializer? then
-                    // `if let` branch: evaluate the binding initializer
-                    // once into a temp, branch past this arm if it has no
-                    // value, then bind the pattern inside the arm scope.
-                    b.binding.initializer.walk(self);
+                elif b.binding? /\ b.binding.scrutinee? then
+                    // `if let` branch: evaluate the scrutinee once
+                    // into a temp, run an isinst when the binding
+                    // carries `: V` (the cast that used to live in
+                    // the AST is emitted here instead), branch past
+                    // this arm if the result has no value, then bind
+                    // the pattern inside the arm scope.
+                    b.binding.scrutinee.walk(self);
 
-                    if b.binding.initializer.value? then
-                        if_let_temp = TEMP(current_block, "if_let", b.binding.initializer.value);
+                    if b.binding.scrutinee.value? then
+                        let scrutinee_value = b.binding.scrutinee.value!;
+                        let typed_value: Value mut = scrutinee_value;
 
-                        let init_type = b.binding.initializer.value.type;
+                        if
+                            b.binding.narrow_type_expression? /\
+                            b.binding.narrow_type_expression.type?
+                        then
+                            // The scrutinee's value type already
+                            // reflects the then-edge narrowing applied
+                            // in compile_conditionals — when the
+                            // scrutinee is an identifier and the
+                            // narrow target is a variant, narrowing
+                            // specialises (e.g. `CONS` -> `CONS[int]`)
+                            // by mutating the symbol type via
+                            // NARROWING_FLOW. Use that specialised
+                            // form as the isinst target so the
+                            // runtime test references the closed-
+                            // generic variant. Detect "specialised
+                            // form" by checking the value-type and
+                            // the written narrow type share the same
+                            // classy (i.e. the value type is the
+                            // narrow target with type args bound).
+                            // Otherwise — e.g. the scrutinee is a
+                            // member access typed wider than the
+                            // narrow target — use the written narrow
+                            // type itself, so the isinst tests the
+                            // target.
+                            let written_narrow = b.binding.narrow_type_expression.type;
+                            let scrutinee_classy = _classy_of_type(scrutinee_value.type);
+                            let written_classy = _classy_of_type(written_narrow);
+
+                            let narrow_target =
+                                if
+                                    scrutinee_value.type? /\
+                                    !scrutinee_value.type.is_inferred /\
+                                    !scrutinee_value.type.is_error /\
+                                    scrutinee_classy? /\
+                                    written_classy? /\
+                                    scrutinee_classy == written_classy
+                                then
+                                    scrutinee_value.type;
+                                else
+                                    written_narrow;
+                                fi;
+
+                            typed_value =
+                                _type_caster.cast_value(
+                                    b.binding.location,
+                                    scrutinee_value,
+                                    narrow_target,
+                                    true
+                                );
+                        fi
+
+                        if_let_temp = TEMP(current_block, "if_let", typed_value);
+
+                        let init_type = typed_value.type;
 
                         // The presence test: a reference type is absent
                         // when null; an option-shaped value type is
@@ -3178,29 +3307,29 @@ namespace Syntax.Process is
                     // A reference binding takes the value as-is; an
                     // option-shaped value type binds the unwrapped
                     // `.value` member.
-                    let init_type = b.binding.initializer.value.type;
+                    let init_type = if_let_temp.load().type;
 
                     if init_type? /\ init_type.is_value_type then
                         let value_member = init_type.find_member("value");
 
                         if value_member? then
                             gen_destructuring_initialize(
-                                b.binding.left,
+                                b.binding.pattern,
                                 value_member.load(LOCATION.internal, if_let_temp.load(), _symbol_loader),
                                 next
                             );
                         fi
                     else
-                        gen_destructuring_initialize(b.binding.left, if_let_temp.load(), next);
+                        gen_destructuring_initialize(b.binding.pattern, if_let_temp.load(), next);
                     fi
                 fi
 
                 // `if let x = e /\ guard then` — emit the guard after
                 // the binding is in scope. Failure branches to `next`
                 // exactly like the presence test does.
-                if b.binding? /\ b.condition? then
-                    b.condition.walk(self);
-                    brancher.branch(BRANCH.Z, b.condition.value, next, "if-let-guard");
+                if b.binding? /\ b.binding.guard? then
+                    b.binding.guard.walk(self);
+                    brancher.branch(BRANCH.Z, b.binding.guard.value, next, "if-let-guard");
                 fi
 
                 if b.body? then
