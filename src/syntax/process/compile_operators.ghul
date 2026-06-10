@@ -18,6 +18,7 @@ namespace Syntax.Process is
         _overload_resolver: Semantic.OVERLOAD_RESOLVER;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _function_caller: Semantic.FUNCTION_CALLER;
+        _calls: COMPILE_CALLS;
         _flow: NARROWING_FLOW;
         _condition_analyzer: CONDITION_ANALYZER;
         _visitor: ScopedVisitor;
@@ -29,6 +30,7 @@ namespace Syntax.Process is
             overload_resolver: Semantic.OVERLOAD_RESOLVER,
             symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS,
             function_caller: Semantic.FUNCTION_CALLER,
+            calls: COMPILE_CALLS,
             flow: NARROWING_FLOW,
             condition_analyzer: CONDITION_ANALYZER,
             visitor: ScopedVisitor
@@ -41,6 +43,7 @@ namespace Syntax.Process is
             _overload_resolver = overload_resolver;
             _symbol_use_locations = symbol_use_locations;
             _function_caller = function_caller;
+            _calls = calls;
             _flow = flow;
             _condition_analyzer = condition_analyzer;
             _visitor = visitor;
@@ -50,31 +53,41 @@ namespace Syntax.Process is
             unary.value = null;
 
             if unary.right.value? then
-                let arguments = Collections.LIST[Type]([unary.right.value.type]);
-
                 // TODO do we need to search members and globals like we do with binary operators
                 // or if not, can we simplify the binary operator function search to match this?
 
-                let function_group = _visitor.find(unary.operation);
+                let function_group_symbol = _visitor.find(unary.operation);
 
-                if function_group == null \/ !isa Semantic.Symbols.FUNCTION_GROUP(function_group) then
+                if function_group_symbol == null \/ !isa Semantic.Symbols.FUNCTION_GROUP(function_group_symbol) then
                     _logger.error(unary.operation.location, "no unary operator {unary.operation} found");
 
                     unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
                     return;
                 fi
 
-                let overload_result =
-                    _overload_resolver.resolve(
+                let function_group = cast Semantic.Symbols.FUNCTION_GROUP(function_group_symbol);
+                let want_instance = unary.right.value.is_consumable;
+
+                let argument_values = Collections.LIST[Value]([unary.right.value]);
+                let argument_types = Collections.LIST[Type]([unary.right.value.type]);
+                let argument_expressions = Collections.LIST[Trees.Expressions.Expression]([unary.right]);
+
+                let (overload_result, errors) =
+                    _resolve_with_retry(
                         unary.location,
                         function_group,
-                        arguments,
-                        false,
-                        unary.right.value.is_consumable, // FIXME: this doesn't seem right
-                        false
+                        argument_values,
+                        argument_types,
+                        argument_expressions,
+                        want_instance,
+                        unary
                     );
 
                 if overload_result == null then
+                    if errors? /\ errors.count > 0 then
+                        _logger.merge(errors);
+                    fi
+
                     unary.value = DUMMY(Semantic.Types.ERROR(), unary.location);
                     return;
                 fi
@@ -87,10 +100,82 @@ namespace Syntax.Process is
 
                 _symbol_use_locations.add_symbol_use(unary.operation.location, function);
 
-                let value = function.call(unary.location, null, Collections.LIST[Value]([unary.right.value]), null, _function_caller);
+                let value = function.call(unary.location, null, argument_values, null, _function_caller);
 
                 unary.value = value;
             fi
+        si
+
+        // Resolve an operator overload with the same constraint-push
+        // retry sequence visit_call uses: initial type-based resolve,
+        // then on null or PARTIAL re-walk function-literal operands
+        // with the chosen formal pushed as expected_type so a lambda
+        // whose parameter type was unknown on the first walk can
+        // infer it from the operator's signature.
+        //
+        // Operates inside its own speculation snapshot: the retry's
+        // re-walks update operand `.value` fields in place but the
+        // logger diagnostics from speculation are scrubbed when the
+        // snapshot backtracks, matching the visit_call pattern.
+        _resolve_with_retry(
+            location: Source.LOCATION,
+            function_group: Semantic.Symbols.FUNCTION_GROUP,
+            argument_values: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type],
+            argument_expressions: Collections.List[Trees.Expressions.Expression],
+            want_instance: bool,
+            cache_key: Trees.Node
+        ) -> (Semantic.OVERLOAD_RESOLVE_RESULT?, Logging.DIAGNOSTICS_STATE?) is
+            let use logger_snapshot = _logger.speculate_then_backtrack();
+
+            let overload_result mut =
+                _overload_resolver.resolve(
+                    location,
+                    function_group,
+                    argument_types,
+                    false,
+                    want_instance,
+                    false
+                );
+
+            if !overload_result? then
+                let retry = _calls.try_overload_after_null(
+                    function_group,
+                    argument_values,
+                    argument_types,
+                    want_instance,
+                    null,
+                    argument_expressions,
+                    location,
+                    cache_key
+                );
+
+                if retry? then
+                    overload_result = retry;
+                fi
+            fi
+
+            if overload_result? /\ overload_result.score == Semantic.Types.MATCH.PARTIAL then
+                let retry = _calls.try_overload_on_partial(
+                    overload_result!,
+                    function_group,
+                    argument_values,
+                    argument_types,
+                    want_instance,
+                    null,
+                    argument_expressions,
+                    location,
+                    cache_key
+                );
+
+                if retry? then
+                    overload_result = retry;
+                fi
+            fi
+
+            let errors = logger_snapshot.backtrack();
+
+            return (overload_result, errors);
         si
 
         pre_binary(binary: Trees.Expressions.BINARY) -> bool is
@@ -139,31 +224,38 @@ namespace Syntax.Process is
             let left_is_consumable = binary.left.value.check_is_consumable(_logger, binary.left.location);
             let right_is_consumable = binary.right.value.check_is_consumable(_logger, binary.right.location);
 
+            // Two separate value/type/expression lists. The free-function
+            // path takes both operands as arguments; the member-call path
+            // takes only the right operand (left is the receiver). The
+            // retry helper updates the lists in place when it re-walks,
+            // so the two paths can't share storage.
+            let binary_argument_values = Collections.LIST[Value]([binary.left.value, binary.right.value]);
+            let binary_argument_types = Collections.LIST[Type]([binary.left.value.type, binary.right.value.type]);
+            let binary_argument_expressions = Collections.LIST[Trees.Expressions.Expression]([binary.left, binary.right]);
+
+            let member_argument_values = Collections.LIST[Value]([binary.right.value]);
+            let member_argument_types = Collections.LIST[Type]([binary.right.value.type]);
+            let member_argument_expressions = Collections.LIST[Trees.Expressions.Expression]([binary.right]);
+
             let binary_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
             let binary_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
             let binary_errors: Logging.DIAGNOSTICS_STATE mut = default;
-
-            let binary_name = binary.operation.name.to_string();
 
             let binary_function_symbol = _visitor.find(binary.operation.name);
 
             if binary_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(binary_function_symbol) then
                 binary_function_group = binary_function_symbol;
 
-                let use logger_snapshot = _logger.speculate_then_backtrack();
-
-                binary_overload_result =
-                    _overload_resolver
-                        .resolve(
-                            binary.location,
-                            binary_function_group,
-                            Collections.LIST[Type]([binary.left.value.type, binary.right.value.type]),
-                            false,
-                            _symbol_table.current_instance_context?,
-                            false
-                        );
-
-                binary_errors = logger_snapshot.backtrack();
+                (binary_overload_result, binary_errors) =
+                    _resolve_with_retry(
+                        binary.location,
+                        binary_function_group,
+                        binary_argument_values,
+                        binary_argument_types,
+                        binary_argument_expressions,
+                        _symbol_table.current_instance_context?,
+                        binary
+                    );
             fi
 
             let member_overload_result: Semantic.OVERLOAD_RESOLVE_RESULT mut = default;
@@ -177,20 +269,16 @@ namespace Syntax.Process is
                 if member_function_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(member_function_symbol) then
                     member_function_group = member_function_symbol;
 
-                    let use logger_snapshot = _logger.speculate_then_backtrack();
-
-                    member_overload_result =
-                        _overload_resolver
-                            .resolve(
-                                binary.location,
-                                cast Semantic.Symbols.FUNCTION_GROUP(member_function_group),
-                                Collections.LIST[Type]([binary.right.value.type]),
-                                false,
-                                binary.left.value.is_consumable,
-                                false
-                            );
-
-                    member_errors = logger_snapshot.backtrack();
+                    (member_overload_result, member_errors) =
+                        _resolve_with_retry(
+                            binary.location,
+                            cast Semantic.Symbols.FUNCTION_GROUP(member_function_group),
+                            member_argument_values,
+                            member_argument_types,
+                            member_argument_expressions,
+                            binary.left.value.is_consumable,
+                            binary
+                        );
                 fi
             fi
 
@@ -263,10 +351,16 @@ namespace Syntax.Process is
                     _logger.warn(binary.location, "unchecked-constraints", "call to {function} has unchecked constraints");
                 fi
 
+                // Pass the path-specific argument-value list so the
+                // values used for the call reflect the retry's re-walks
+                // for whichever group was selected — without this, a
+                // member-path retry that re-walked the right operand
+                // would overwrite values the binary-path retry already
+                // committed to its own list (and vice versa).
                 if function.is_instance then
-                    value = function.call(binary.location, binary.left.value, Collections.LIST[Value]([binary.right.value]), force_type,_function_caller);
+                    value = function.call(binary.location, binary.left.value, member_argument_values, force_type, _function_caller);
                 else
-                    value = function.call(binary.location, null, Collections.LIST[Value]([binary.left.value, binary.right.value]), force_type,_function_caller);
+                    value = function.call(binary.location, null, binary_argument_values, force_type, _function_caller);
 
                     if isa Call.INNATE(value) then
                         let innate_value = value;
