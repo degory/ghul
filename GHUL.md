@@ -212,6 +212,39 @@ si
 
 A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`, and classes compare by reference identity unless equality is overridden.
 
+Two postfix modifiers shape the hierarchy:
+
+- **`open`** lifts the default closed-to-assembly rule. Without `open`, a class can only be subclassed from within the assembly it was declared in; consumers in another assembly that try to extend it are rejected at compile time. `open` opts in to cross-assembly subclassing — the right choice when a library class is genuinely a hook for downstream code, the wrong choice (and the harder one to take back) when it isn't. The closure also feeds type narrowing: the compiler can enumerate a closed root's subclasses on the else edge of an `isa` test.
+- **`abstract`** says the class itself can't appear as a runtime instance — only its subclasses can. A direct constructor call (`Animal()`) on an abstract class is rejected at compile time; subclasses still call `super.init(...)` for shared initialisation. Closed-narrowing relies on this: when the root is `abstract`, the else edge of `isa Cat(a)` excludes the root from the in-set and can collapse to the singleton sibling.
+
+```ghul
+class Animal abstract is
+    init() is si
+si
+
+class Cat: Animal is
+    init() is super.init(); si
+    purr() -> string => "purr";
+si
+
+class Dog: Animal is
+    init() is super.init(); si
+    bark() -> string => "bark";
+si
+
+describe(a: Animal) is
+    if isa Cat(a) then
+        write_line(a.purr());
+    else
+        // `Animal` is abstract and `Cat`/`Dog` are the only subclasses,
+        // so the compiler knows `a` is `Dog` here.
+        write_line(a.bark());
+    fi
+si
+```
+
+The two modifiers are independent: `open` controls who can extend, `abstract` controls who can be instantiated. They can be combined (`class Animal abstract open is ... si` is an extensible abstract base) or stand alone.
+
 ### structs
 
 A struct defines a value type. The syntax mirrors a class, but a struct has no superclass (it may still implement traits). Copying a struct copies all of its fields, and `==` on a struct is a memberwise equality check:
@@ -458,7 +491,9 @@ if isa Cat(a) then
 fi
 ```
 
-For a two-variant union the `else` branch is narrowed to the other variant. Narrowing is flow-sensitive: if a guard rejects a type and then leaves the block — by `return`, `throw`, `break`, or `continue` — the code after the guard is narrowed too.
+For a two-variant union the `else` branch is narrowed to the other variant. The same applies to a class hierarchy declared in this assembly without `open` — eliminating one direct subclass on the else edge narrows to the others. If the root is `abstract` (only its subclasses can exist at runtime) the chain can collapse to a singleton and reach subtype-only members; a concrete root stays in the in-set, so the narrow is sound but reaches only members the root itself defines.
+
+Narrowing is flow-sensitive: if a guard rejects a type and then leaves the block — by `return`, `throw`, `break`, or `continue` — the code after the guard is narrowed too.
 
 Narrowing applies to local variables, including a function's own parameters — never to a field or property. To narrow a field, copy it into a local variable first, or use `if let`, which introduces one.
 
