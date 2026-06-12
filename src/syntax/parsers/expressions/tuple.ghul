@@ -39,10 +39,98 @@ namespace Syntax.Parsers.Expressions is
                     return parse_statement_starting_block(context, start);
                 fi
 
-                let expressions = expression_list_parser.parse(context);
+                // Speculate as an expression list. The token sequence after
+                // `(` falls into one of four shapes:
+                //
+                //   `(expression)`           — parenthesised expression
+                //   `(stmt; …)` / `(stmt)`   — block expression
+                //   `(elem, elem, …)`        — tuple (named elements allowed)
+                //   `(formals) =>/is/rec …`  — lambda formal list
+                //
+                // The expression-list parse with tuple-element naming on
+                // succeeds for the first, third, and fourth shapes, but it
+                // also silently succeeds for `(name = value)` and similar
+                // single-element named-tuple-element shapes that don't have
+                // a valid 1-tuple reading. Disambiguate after the probe:
+                //
+                //   - Expression list didn't end at `;` or `)`         → not
+                //     a valid expression-list parse (e.g. `=` after a
+                //     qualified-name LHS). Backtrack to the statement parser.
+                //
+                //   - Single VARIABLE without an initialiser + closing `)`
+                //     followed by `=>` / `is` / `arrow_thin` / `rec`   →
+                //     lambda formal list (`(n: int) => body`, etc.). Keep
+                //     the TUPLE wrapper so the secondary parser can pick
+                //     the formals up. A VARIABLE *with* an initialiser is
+                //     never a valid formal — ghūl has no default formal
+                //     values — so the initialiser form falls through to
+                //     the statement-parser path even when a lambda token
+                //     follows.
+                //
+                //   - Other single VARIABLE element + closing `)`      → not
+                //     a valid expression (no 1-tuples and the only sensible
+                //     statement interpretation is assignment, or — for
+                //     `(n: int)` outside lambda position — a syntactically
+                //     dead form that the statement parser will reject).
+                //     Backtrack to the statement parser.
+                //
+                //   - Single element + closing `)`, non-VARIABLE       →
+                //     `(expression)`. Collapse to the bare inner expression.
+                //
+                //   - Single element + closing `;`, non-VARIABLE       →
+                //     block whose first item is an expression-statement.
+                //
+                //   - Single element + closing `;`, VARIABLE           →
+                //     backtrack to the statement parser (block whose first
+                //     statement is an assignment).
+                //
+                //   - 2+ elements + closing `)` or `;`                 →
+                //     tuple or mixed-block (the existing block path raises
+                //     the `,`/`;` mix error).
+                let use tokenizer_snapshot = context.tokenizer_speculate_then_commit();
+                let use logger_snapshot = context.logger_speculate_then_commit();
 
-                if context.current_token == Lexical.TOKEN.SEMICOLON then
+                let expressions = expression_list_parser.parse(context);
+                let inner = context.current_token;
+
+                let single_variable_without_initializer =
+                    expressions.count == 1 /\
+                    if let v: Trees.Expressions.VARIABLE = expressions.expressions[0] then
+                        !v.initializer?
+                    else
+                        false
+                    fi;
+
+                let single_variable =
+                    expressions.count == 1 /\
+                    isa Trees.Expressions.VARIABLE(expressions.expressions[0]);
+
+                let lambda_position =
+                    single_variable_without_initializer /\
+                    inner == Lexical.TOKEN.PAREN_CLOSE /\
+                    _peek_lambda_token_after_close(context);
+
+                let ends_cleanly =
+                    inner == Lexical.TOKEN.PAREN_CLOSE \/
+                    inner == Lexical.TOKEN.SEMICOLON;
+
+                if !ends_cleanly \/ (single_variable /\ !lambda_position) then
+                    tokenizer_snapshot.backtrack();
+                    logger_snapshot.backtrack();
+                    return parse_statement_starting_block(context, start);
+                fi
+
+                if inner == Lexical.TOKEN.SEMICOLON then
                     return parse_block_after_expressions(context, start, expressions);
+                fi
+
+                if expressions.count == 1 /\ !lambda_position then
+                    // Single-element `(...)` is a parenthesised expression,
+                    // not a 1-tuple: collapse to the inner expression here
+                    // rather than wrapping in a TUPLE node that downstream
+                    // passes would unwrap anyway.
+                    context.next_token(Lexical.TOKEN.PAREN_CLOSE, syntax_error_message);
+                    return expressions.expressions[0];
                 fi
 
                 expressions.rewrite_as_tuple_elements();
@@ -52,6 +140,28 @@ namespace Syntax.Parsers.Expressions is
                 return Trees.Expressions.TUPLE(start::context.location, expressions, false);
             fi
             return null;
+        si
+
+        // Peek past the current `)` to see whether one of the lambda-body
+        // intro tokens follows. Used to keep `(formals) => body` (and the
+        // `is` / `arrow_thin` / `rec` variants) on the TUPLE-wrapped
+        // expression path so the secondary parser can pick the formals up,
+        // including the named-tuple-element shape `(name = value) => body`
+        // that would otherwise look like a stray 1-tuple to the
+        // disambiguator. The current token is required to be `)`.
+        _peek_lambda_token_after_close(context: CONTEXT) -> bool is
+            let use tokenizer_snapshot = context.tokenizer_speculate_then_backtrack();
+            let use logger_snapshot = context.logger_speculate_then_backtrack();
+
+            context.next_token();
+
+            let beyond = context.current_token;
+
+            return
+                beyond == Lexical.TOKEN.ARROW_FAT \/
+                beyond == Lexical.TOKEN.ARROW_THIN \/
+                beyond == Lexical.TOKEN.IS \/
+                beyond == Lexical.TOKEN.REC;
         si
 
         // Speculatively parse `let [use] variable_list` and report whether
