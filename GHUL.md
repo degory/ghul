@@ -621,32 +621,6 @@ esac
 
 A bare identifier without `:` or `(...)` is still an expression — `when v then` tests equality against the value of `v` in scope, it does not bind a new local. Bindings carry shape information.
 
-### block expressions
-
-Parentheses can also wrap a `;`-separated sequence of statements. The block's value is the value of the last value-providing statement — the same rule used by `if`/`case` arms — so a block expression composes anywhere a value is wanted:
-
-```ghul
-let n = (
-    let x = compute();
-    let y = derive(x);
-    x + y
-);
-```
-
-A leading `let` is a binding statement that scopes over the rest of the block, so block expressions are the place to interleave bindings with side effects:
-
-```ghul
-let result = (
-    let raw = fetch();
-    log("fetched {raw.length} bytes");
-    parse(raw)
-);
-```
-
-`,` makes the parentheses a tuple; `;` makes them a block. The first separator decides — mixing the two is rejected. A trailing `;` immediately before `)` is allowed.
-
-`let x = e in body` remains the form for the common bind-and-use case — it groups one or more bindings (`let x = e1, y = e2 in body`) and a single body expression, without the visual weight of a block.
-
 ### exceptions
 
 `throw` raises an exception, which must derive from `System.Exception`. Exception handling runs `try` ... `yrt`, with `catch` clauses and an optional `finally`. A `catch` names an exception variable and a type, and handles that type or any subtype; `finally` always runs, including before a `return` leaves the `try`:
