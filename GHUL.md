@@ -621,6 +621,30 @@ esac
 
 A bare identifier without `:` or `(...)` is still an expression — `when v then` tests equality against the value of `v` in scope, it does not bind a new local. Bindings carry shape information.
 
+### val ... lav
+
+`val ... lav` is a block expression: a sequence of statements whose value is the value of the last statement. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
+
+```ghul
+let x = val let y = 5; y * 2 lav;          // x = 10
+let z = val let a = 3; let b = 4; a + b lav;  // z = 7
+let n = val write_line("setup"); 42 lav;   // n = 42
+```
+
+A common use is loop-as-expression — fold an iterable into a value with the loop body updating a `mut` accumulator and the tail expression handing back the result:
+
+```ghul
+let sum_1_to_5 = val
+    let acc mut = 0;
+    for i in 1..6 do
+        acc = acc + i;
+    od;
+    acc
+lav;
+```
+
+If the last statement does not provide a value (a `let`, `for`, `while`, `assert`, ...), the block is void. Void blocks are accepted in any context that tolerates void — an expression-statement, the `=>` body of a void-returning function. A value-required position (typed `let` initializer, function argument, `=>` body of a value-returning function) requires the last statement to be value-producing.
+
 ### exceptions
 
 `throw` raises an exception, which must derive from `System.Exception`. Exception handling runs `try` ... `yrt`, with `catch` clauses and an optional `finally`. A `catch` names an exception variable and a type, and handles that type or any subtype; `finally` always runs, including before a `return` leaves the `try`:
