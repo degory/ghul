@@ -621,31 +621,29 @@ esac
 
 A bare identifier without `:` or `(...)` is still an expression — `when v then` tests equality against the value of `v` in scope, it does not bind a new local. Bindings carry shape information.
 
-### block expressions
+### val ... lav
 
-Parentheses can also wrap a `;`-separated sequence of statements. The block's value is the value of the last value-providing statement — the same rule used by `if`/`case` arms — so a block expression composes anywhere a value is wanted:
-
-```ghul
-let n = (
-    let x = compute();
-    let y = derive(x);
-    x + y
-);
-```
-
-A leading `let` is a binding statement that scopes over the rest of the block, so block expressions are the place to interleave bindings with side effects:
+`val ... lav` is a block expression: a sequence of statements whose value is the value of the last statement. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
 
 ```ghul
-let result = (
-    let raw = fetch();
-    log("fetched {raw.length} bytes");
-    parse(raw)
-);
+let x = val let y = 5; y * 2 lav;          // x = 10
+let z = val let a = 3; let b = 4; a + b lav;  // z = 7
+let n = val write_line("setup"); 42 lav;   // n = 42
 ```
 
-`,` makes the parentheses a tuple; `;` makes them a block. The first separator decides — mixing the two is rejected. A trailing `;` immediately before `)` is allowed.
+A common use is loop-as-expression — fold an iterable into a value with the loop body updating a `mut` accumulator and the tail expression handing back the result:
 
-`let x = e in body` remains the form for the common bind-and-use case — it groups one or more bindings (`let x = e1, y = e2 in body`) and a single body expression, without the visual weight of a block.
+```ghul
+let sum_1_to_5 = val
+    let acc mut = 0;
+    for i in 1..6 do
+        acc = acc + i;
+    od;
+    acc
+lav;
+```
+
+If the last statement does not provide a value (a `let`, `for`, `while`, `assert`, ...), the block is void. Void blocks are accepted in any context that tolerates void — an expression-statement, the `=>` body of a void-returning function. A value-required position (typed `let` initializer, function argument, `=>` body of a value-returning function) requires the last statement to be value-producing.
 
 ### exceptions
 
