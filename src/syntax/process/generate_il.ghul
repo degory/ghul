@@ -76,16 +76,18 @@ namespace Syntax.Process is
     // expressions; void means no value-push. is_void is cached to
     // skip the lookup at every return emission. enclosing_try_count
     // is the number of `.try` entries on the loop-label stack at
-    // val-block entry — a return inside the body whose current try
-    // count exceeds this opened a try INSIDE the val-block, so its
-    // `br end_label` would cross that try's boundary and produce
-    // invalid IL.
+    // val-block entry — a return whose current try count exceeds
+    // this opened a try INSIDE the val-block body and needs `leave`
+    // instead of `br` to exit the protected region. value_block is
+    // the captured IR BLOCK used in capture mode; the cross-try
+    // fields below allocate their TEMP and label on it lazily.
     class VAL_BLOCK_IL is
         block: Trees.Expressions.VAL_BLOCK;
         end_label: IR.LABEL;
         result_type: Semantic.Types.Type?;
         is_void: bool;
         enclosing_try_count: int;
+        value_block: IR.Values.BLOCK?;
 
         // Non-null when generate-il is spilling this val-block to a
         // frame field (body contains a state-machine suspend). Val-
@@ -94,12 +96,38 @@ namespace Syntax.Process is
         // end_label with the value in the field and an empty stack.
         spill_field: Semantic.Symbols.Field? public;
 
+        // Capture-mode cross-try state. The TEMP and label must be
+        // allocated BEFORE the body walk so the `.locals init`
+        // appears in value_block's IL stream OUTSIDE any inner
+        // `.try` the body opens — ilasm scopes locals declared
+        // inside `.try {}` to that block, so a load at the post-
+        // body join site can't find them. VAL_BLOCK.pre pre-
+        // allocates both eagerly when value_block has a non-void
+        // result type and is not spilling.
+        //
+        // A val-targeted `return E` inside an inner `.try` can't
+        // `br end_label` (invalid IL across a protected region)
+        // and can't carry its value across `leave` (empty-stack
+        // precondition). The fix mirrors the function-return-from-
+        // try pattern: stash the value into `cross_try_temp`,
+        // `leave cross_try_join_label`, and at the join `ldloc`
+        // the temp back onto the stack so it falls through into
+        // end_label. `cross_try_used` flags whether the join
+        // block needs to be emitted at all — otherwise the
+        // unconditional `br end_label; join: ldloc; end_label`
+        // would push uninitialised data onto the stack on the
+        // natural path's divergent variants.
+        cross_try_temp: IR.TEMP? public;
+        cross_try_join_label: IR.LABEL? public;
+        cross_try_used: bool public;
+
         init(
             block: Trees.Expressions.VAL_BLOCK,
             end_label: IR.LABEL,
             result_type: Semantic.Types.Type?,
             is_void: bool,
-            enclosing_try_count: int
+            enclosing_try_count: int,
+            value_block: IR.Values.BLOCK?
         ) is
             assert block? else "val block is null";
             assert end_label? else "val block end label is null";
@@ -109,6 +137,7 @@ namespace Syntax.Process is
             self.result_type = result_type;
             self.is_void = is_void;
             self.enclosing_try_count = enclosing_try_count;
+            self.value_block = value_block;
         si
     si
 
@@ -2538,8 +2567,33 @@ namespace Syntax.Process is
                 let result_type = value_block.type;
                 let is_void = result_type? /\ result_type =~ _innate_symbol_lookup.get_void_type();
 
-                let frame_il = VAL_BLOCK_IL(block, end_label, result_type, is_void, _loops.open_try_count);
+                let frame_il = VAL_BLOCK_IL(
+                    block,
+                    end_label,
+                    result_type,
+                    is_void,
+                    _loops.open_try_count,
+                    value_block
+                );
                 frame_il.spill_field = spiller.spill_field;
+
+                // Eagerly allocate the capture-mode cross-try TEMP
+                // so its `.locals init` appears at the head of
+                // value_block's IL stream, before any inner `.try`
+                // the body might open. ilasm scopes locals
+                // declared inside `.try {}` to that block; lazy
+                // allocation mid-body would leave the post-body
+                // ldloc without a visible declaration. The TEMP is
+                // unused (and the join block un-emitted) when no
+                // val-targeted return crosses an inner try — set
+                // `cross_try_used` then drives the post-body
+                // emission. Spill mode doesn't need either: the
+                // frame field handles cross-try directly.
+                if !is_void /\ !spiller.is_spilling /\ value_block.type? then
+                    frame_il.cross_try_temp = IR.TEMP(value_block, "val_cross_try", value_block.type);
+                    frame_il.cross_try_join_label = LABEL();
+                fi
+
                 _val_block_il_stack.add(frame_il);
 
                 try
@@ -2571,6 +2625,22 @@ namespace Syntax.Process is
                     assert _val_block_il_stack.count > 0 else "val_block_il_stack underflow";
                     _val_block_il_stack.remove_at(_val_block_il_stack.count - 1);
                 yrt
+
+                // Capture-mode cross-try paths stashed their value
+                // into cross_try_temp and `leave`d to cross_try_
+                // join_label. Skip over the join block on the
+                // natural path (tail value already on the stack)
+                // and emit it before end_label so the join paths
+                // ldloc the value back on and fall through. Only
+                // emit when the join was actually targeted —
+                // otherwise the unconditional ldloc would push an
+                // uninitialised value onto end_label's stack on
+                // divergent natural paths.
+                if frame_il.cross_try_used then
+                    get_brancher_for_block().branch(end_label);
+                    get_brancher_for_block().label(frame_il.cross_try_join_label!);
+                    add(frame_il.cross_try_temp!.load());
+                fi
 
                 get_brancher_for_block().label(end_label);
             finally
@@ -3193,28 +3263,31 @@ namespace Syntax.Process is
         // Emit IL for a `return E` whose target is a `val ... lav`
         // block (innermost wins, recorded by compile-expressions on
         // the RETURN AST node). The frame on `_val_block_il_stack`
-        // matches `target` by identity. Two shapes:
+        // matches `target` by identity. Three shapes vary by where
+        // the value lives across the exit:
         //
-        // Capture mode (no suspend in the val-block body): push
-        // the value onto the evaluation stack and `br` to the
-        // frame's end_label — same shape `if`/`case`-in-expression
-        // branches use.
+        // Capture mode, no inner `.try`: push the value onto the
+        // evaluation stack and `br` to the frame's end_label —
+        // same shape `if` / `case`-in-expression branches use.
         //
         // Spill mode (val-block body contains an `await` / `yield`,
         // so VAL_BLOCK.pre allocated a spill field on the state-
         // machine frame): `stfld` the value into that field. The
-        // stack ends up empty, so `leave` is well-formed; the
-        // val-block's BLOCK contents end up as a `ldfld` of the
-        // same field, so all paths converge with the value in the
-        // field. Used both when the return sits inside an enclosing
-        // `.try` opened in the val-block body — the cross-try case
-        // — and when it doesn't.
+        // stack ends up empty so `leave` is well-formed even
+        // across an inner `.try`; the val-block's BLOCK contents
+        // become a `ldfld` of the same field, so all paths
+        // converge with the value in the field.
         //
-        // The remaining hard case is capture-mode cross-try: a `br`
-        // out of the protected region is invalid IL; the CLR
-        // requires `leave`, which in turn requires an empty stack
-        // we can't deliver while carrying the value. That case is
-        // rejected at compile time.
+        // Capture mode crossing an inner `.try`: a `br` across a
+        // protected region is invalid IL; `leave` requires an
+        // empty stack we can't deliver while carrying the value.
+        // Mirrors the function-return-from-try pattern — stash
+        // the value into a lazily-allocated CLR-local TEMP on the
+        // frame, `leave` to a cross-try join label that sits
+        // outside any inner try, `ldloc` the TEMP at the join,
+        // and fall through into end_label with the value on the
+        // stack. Void val-blocks skip the TEMP and `leave`
+        // end_label directly.
         _gen_val_block_targeted_return(r: Statements.RETURN, target: Trees.Expressions.VAL_BLOCK) is
             let frame: VAL_BLOCK_IL? mut = null;
 
@@ -3231,82 +3304,74 @@ namespace Syntax.Process is
 
             assert frame? else "val_block_target stamped on return has no matching IL frame";
 
-            // A `.try` opened INSIDE the val-block body would be
-            // open here too — `_loops.open_try_count` exceeds the
-            // count we cached at val-block entry. Crossing that
-            // try with `br end_label` is invalid IL; the CLR
-            // requires `leave`, which in turn requires an empty
-            // evaluation stack at the suspend point.
-            //
-            // In spill mode the stack IS empty after the stfld, so
-            // emit `leave` and we're done. In capture mode we have
-            // a value sitting on the stack to feed end_label, so
-            // `leave` would have to discard it — currently
-            // rejected.
+            // A `.try` opened INSIDE the val-block body is still
+            // open at this return — `_loops.open_try_count`
+            // exceeds the count we cached at val-block entry.
             let crosses_try = _loops.open_try_count > frame.enclosing_try_count;
 
-            if crosses_try /\ !frame.spill_field? then
-                _logger.error(
-                    r.location,
-                    "return from val-block crossing a try boundary is not yet supported"
-                );
-                return;
-            fi
-
+            // Resolve the value to deliver. Bare `return;` in a
+            // value-required val-block defers its diagnostic to
+            // visit_return (inferred-return lambdas need the body
+            // walk to settle first); emit the result type's
+            // default so the IL verifies — matches the bare-
+            // return-from-non-void-function path at visit(RETURN).
+            let value: IR.Values.Value? mut = null;
             if !frame.is_void /\ frame.result_type? then
-                let result_type = frame.result_type;
+                let result_type = frame.result_type!;
 
-                if let spill_field = frame.spill_field then
-                    // Spill mode (body contains a state-machine
-                    // suspend): stash the value into the val-block's
-                    // spill field, not on the eval stack. All paths
-                    // converge at end_label with the value in the
-                    // field and the stack empty; the val-block's
-                    // BLOCK gens a clean ldfld at consumer time.
-                    add(IR.RAW("ldarg.0"));
-
-                    if let expression = r.expression then
-                        if let value = expression.value then
-                            let boxed_value = _boxer.box_if_needed(value, result_type);
-                            add(boxed_value);
-                        else
-                            add(IR.Values.DEFAULT(result_type));
-                        fi
+                if let expression = r.expression then
+                    if let v = expression.value then
+                        value = _boxer.box_if_needed(v, result_type);
                     else
-                        add(IR.Values.DEFAULT(result_type));
+                        value = IR.Values.DEFAULT(result_type);
                     fi
-
-                    add("stfld {spill_field.get_il_reference()}");
                 else
-                    if let expression = r.expression then
-                        if let value = expression.value then
-                            let boxed_value = _boxer.box_if_needed(value, result_type);
-                            add(boxed_value);
-                        else
-                            add(IR.Values.DEFAULT(result_type));
-                        fi
-                    else
-                        // Bare `return;` in a value-required val-
-                        // block. visit_return defers the diagnosis
-                        // (inferred-return lambdas need the body
-                        // walk to settle first); push the default
-                        // of the result type so the IL verifies —
-                        // matches the bare-return-from-non-void-
-                        // function path at visit(RETURN).
-                        add(IR.Values.DEFAULT(result_type));
-                    fi
+                    value = IR.Values.DEFAULT(result_type);
                 fi
             fi
 
-            // `leave` for the spill-and-cross-try path (mandatory
-            // when exiting a protected region); `br` otherwise. In
-            // capture mode the stack carries the value to feed
-            // end_label, so `leave` would clobber it; the gate
-            // above already rejected capture-mode-across-try.
-            if frame.spill_field? /\ crosses_try then
+            if let spill_field = frame.spill_field then
+                // Spill mode: stfld into the val-block's spill
+                // field. Stack is empty after stfld so `leave`
+                // and `br` are both valid; use `leave` only when
+                // crossing an inner try (where `br` would be
+                // invalid IL).
+                add(IR.RAW("ldarg.0"));
+                if let v = value then
+                    add(v);
+                fi
+                add("stfld {spill_field.get_il_reference()}");
+
+                if crosses_try then
+                    get_brancher_for_block().leave(frame.end_label);
+                else
+                    get_brancher_for_block().branch(frame.end_label);
+                fi
+            elif !crosses_try then
+                // Capture mode no-cross-try: push the value and
+                // `br` end_label — the join shape if / case use.
+                if let v = value then
+                    add(v);
+                fi
+                get_brancher_for_block().branch(frame.end_label);
+            elif !value? then
+                // Capture mode cross-try, void val-block: nothing
+                // to carry, `leave end_label` directly. (end_label
+                // sits outside any inner try because the frame
+                // cached enclosing_try_count.)
                 get_brancher_for_block().leave(frame.end_label);
             else
-                get_brancher_for_block().branch(frame.end_label);
+                // Capture mode cross-try, value val-block: stash
+                // value into the pre-allocated cross_try_temp,
+                // `leave` to cross_try_join_label. VAL_BLOCK.pre's
+                // post-body emission `ldloc`s the TEMP at the join
+                // and falls into end_label.
+                assert frame.cross_try_temp? else "capture-mode val-block missing cross-try TEMP";
+                assert frame.cross_try_join_label? else "capture-mode val-block missing cross-try join label";
+
+                frame.cross_try_used = true;
+                frame.cross_try_temp!.store(value!);
+                get_brancher_for_block().leave(frame.cross_try_join_label!);
             fi
         si
 
