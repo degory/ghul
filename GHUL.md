@@ -419,6 +419,18 @@ si
 
 `r?` is then true when `r` holds `OK`, and `r!` unwraps the `OK` payload, throwing if `r` holds `ERROR`. A default variant with one field unwraps to that field positionally — the field name does not have to be `value` — and with several fields, it unwraps to the variant.
 
+A union may declare a **primary-constructor header** for state shared across every variant. Each variant then splices the shared parameters into its field list with `..`:
+
+```ghul
+union TRIVIA(location: LOCATION) is
+    LINE_COMMENT(text: string, ..);
+    BLOCK_COMMENT(text: string, ..);
+    BLANK_LINE(..);
+si
+```
+
+The primary parameters become fields on the union base, so `t.location` reads through on any `TRIVIA` value regardless of variant; variant-declared fields like `text` stay variant-only. The `..` may appear at any position in the variant's field list; field order in the synthesised constructor and in positional destructure (`let (a, b) = trivia`) follows source order. Each variant must include exactly one `..` when the union declares a primary header. The mechanism mirrors the class secondary-init splice ([primary constructors](#primary-constructors)).
+
 ### enums
 
 An enum is a set of named integer constants, counting from 0 unless given explicit values, reached as `SUIT.HEARTS`:
