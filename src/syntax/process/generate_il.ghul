@@ -87,6 +87,13 @@ namespace Syntax.Process is
         is_void: bool;
         enclosing_try_count: int;
 
+        // Non-null when generate-il is spilling this val-block to a
+        // frame field (body contains a state-machine suspend). Val-
+        // targeted returns then `stfld $spill_field` instead of
+        // leaving the value on the stack, so all paths converge at
+        // end_label with the value in the field and an empty stack.
+        spill_field: Semantic.Symbols.Field? public;
+
         init(
             block: Trees.Expressions.VAL_BLOCK,
             end_label: IR.LABEL,
@@ -1392,6 +1399,112 @@ namespace Syntax.Process is
             fi
         si
 
+        // The state-machine frame for the current function — async
+        // or generator, whichever applies. Used by the BLOCK-with-
+        // suspend spill in `LIST.visit` / `visit(IF)` / `visit(CASE)`
+        // (in expression position) to allocate spill fields that
+        // survive across MoveNext re-entries.
+        _current_state_machine_frame() -> Semantic.Symbols.STATE_MACHINE_FRAME_BASE? is
+            if _current_async_state_machine? /\ _current_async_state_machine.frame? then
+                return _current_async_state_machine.frame;
+            fi
+
+            let sm = Semantic.Symbols.state_machine_for(current_function);
+            if sm? /\ sm.frame? then
+                return sm.frame;
+            fi
+
+            return null;
+        si
+
+        // Does `node` contain a state-machine suspend (`await` or
+        // `yield`) outside any nested function literal? Drives the
+        // decision in `LIST.visit` / IF / CASE composite handlers
+        // whether to spill their BLOCK value to a frame field.
+        _contains_suspend(node: Trees.Node) -> bool is
+            let scanner = Syntax.Process.CONTAINS_SUSPEND_SCANNER();
+            node.walk(scanner);
+            return scanner.found;
+        si
+
+        // Build the IR Value that loads from `field` on the current
+        // state-machine frame — used as the spilled BLOCK's stand-in
+        // value. The consumer that does `add(block)` reads this
+        // load when the BLOCK gens, in place of the original body
+        // IL.
+        _build_frame_field_load(frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE, spill_field: Semantic.Symbols.Field) -> IR.Values.Value =>
+            IR.Values.Load.INSTANCE_FIELD(
+                IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                spill_field
+            );
+
+        // Recursive BLOCK-with-suspend spill for `Statements.LIST`
+        // in expression position. Returns true if the spill path
+        // ran (caller should skip the ordinary capture path); false
+        // otherwise.
+        _try_spill_block_with_suspend(list: Statements.LIST) -> bool is
+            if !list.value? \/ list.want_dispose then
+                return false;
+            fi
+
+            let frame = _current_state_machine_frame();
+            if !frame? then
+                return false;
+            fi
+
+            if !_contains_suspend(list) then
+                return false;
+            fi
+
+            let value_block = cast IR.Values.BLOCK(list.value);
+            if !value_block? then
+                return false;
+            fi
+
+            // Void-typed value BLOCK: declare_anonymous_field on a
+            // void type produces invalid IL, and the surrounding
+            // `ldarg.0 / <void value> / stfld` would itself be bogus.
+            // Fall through to the ordinary capture path — the void
+            // value carries no data across the join and doesn't need
+            // spill machinery. Mirrors the guards in VAL_BLOCK / IF /
+            // CASE.
+            if !value_block.type? \/ value_block.type.is_void then
+                return false;
+            fi
+
+            // Walk body in outer current_block. Statement IL —
+            // including visit(AWAIT) / visit(YIELD) suspend
+            // emissions and nested composites' own spills — lands
+            // in outer, in the same flat stream as the SM
+            // dispatcher.
+            for s in list.statements do
+                s.walk(self);
+            od
+
+            // Tail-evaluate-and-spill. By now the tail's value is a
+            // clean load (any tail-internal suspends already
+            // hoisted by visit(AWAIT) / visit(YIELD), and any
+            // tail-internal composites already spilled themselves),
+            // so the ldarg.0 / value-IL / stfld sequence has no
+            // suspend between receiver push and stfld.
+            if list.last? /\ list.last.value? then
+                let spill_field = frame.declare_anonymous_field("spill", value_block.type);
+
+                add(IR.RAW("ldarg.0"));
+                add(list.last.value);
+                add("stfld {spill_field.get_il_reference()}");
+
+                // Rewrite the BLOCK's contents to the field load.
+                // Consumers' `add(list.value)` plus BLOCK.gen()
+                // now emit a clean ldfld at the consumer's site —
+                // no body IL, no replayed suspend.
+                value_block.add(_build_frame_field_load(frame, spill_field));
+            fi
+
+            return true;
+        si
+
+
         // Record a (state, resume_label) pair with the innermost
         // open dispatch holder, so its dispatch block (at the top
         // of its `.try` body OR at MoveNext outer scope) routes
@@ -2323,7 +2436,30 @@ namespace Syntax.Process is
             fi
 
             let value_block = cast Values.BLOCK(block.value);
-            enter_block(value_block);
+
+            // BLOCK-with-suspend spill (mirrors LIST.visit / IF /
+            // CASE). When body contains an `await` or `yield` AND
+            // we're in an SM, spill the val-block's result to a
+            // frame field instead of capturing body IL inside
+            // value_block. The body — including the suspend IL and
+            // any val-targeted-return stores — flows to outer
+            // current_block in the same flat MoveNext stream, and
+            // value_block ends up with just a load of the spill
+            // field. Consumers (let-init, field set, call arg, ...)
+            // then see a clean ldfld with no replayed suspend.
+            let sm_frame = _current_state_machine_frame();
+            let spill_field: Semantic.Symbols.Field? mut = null;
+            if sm_frame? /\ _contains_suspend(block) then
+                let result_type = value_block.type;
+                let is_void = result_type? /\ result_type =~ _innate_symbol_lookup.get_void_type();
+                if !is_void then
+                    spill_field = sm_frame.declare_anonymous_field("spill", result_type);
+                fi
+            fi
+
+            if !spill_field? then
+                enter_block(value_block);
+            fi
 
             try
                 let end_label = LABEL();
@@ -2332,7 +2468,9 @@ namespace Syntax.Process is
                 let result_type = value_block.type;
                 let is_void = result_type? /\ result_type =~ _innate_symbol_lookup.get_void_type();
 
-                _val_block_il_stack.add(VAL_BLOCK_IL(block, end_label, result_type, is_void, _loops.open_try_count));
+                let frame_il = VAL_BLOCK_IL(block, end_label, result_type, is_void, _loops.open_try_count);
+                frame_il.spill_field = spill_field;
+                _val_block_il_stack.add(frame_il);
 
                 try
                     for s in block.body.statements do
@@ -2349,13 +2487,22 @@ namespace Syntax.Process is
                     // mode visit(Statements.EXPRESSION) suppresses
                     // its own emission so the consuming context can
                     // emit the tail value. Val-block bypasses LIST,
-                    // so we emit it here — for both value and void
-                    // cases the IL for the tail value runs (its
-                    // side effects matter), and in the value case
-                    // it leaves the value on the stack ready to fall
-                    // into end_label.
+                    // so we emit it here.
                     if block.body.last? /\ block.body.last.value? then
-                        add(block.body.last.value);
+                        if spill_field? then
+                            // Spill mode: stash tail to the spill
+                            // field instead of leaving on the stack.
+                            // Val-targeted returns use the same
+                            // pattern (see _gen_val_block_targeted
+                            // _return), so all paths converge at
+                            // end_label with the value in the field
+                            // and the stack empty.
+                            add(IR.RAW("ldarg.0"));
+                            add(block.body.last.value);
+                            add("stfld {spill_field.get_il_reference()}");
+                        else
+                            add(block.body.last.value);
+                        fi
                     fi
                 finally
                     assert _val_block_il_stack.count > 0 else "val_block_il_stack underflow";
@@ -2364,8 +2511,17 @@ namespace Syntax.Process is
 
                 get_brancher_for_block().label(end_label);
             finally
-                leave_block();
+                if !spill_field? then
+                    leave_block();
+                fi
             yrt
+
+            if spill_field? then
+                // Replace value_block's contents with the load. The
+                // consumer's add(block.value) -> BLOCK.gen() emits
+                // a clean ldfld at the consumer's IL site.
+                value_block.add(_build_frame_field_load(sm_frame, spill_field));
+            fi
 
             return true;
         si
@@ -3029,21 +3185,45 @@ namespace Syntax.Process is
             if !frame.is_void /\ frame.result_type? then
                 let result_type = frame.result_type;
 
-                if let expression = r.expression then
-                    if let value = expression.value then
-                        let boxed_value = _boxer.box_if_needed(value, result_type);
-                        add(boxed_value);
+                if let spill_field = frame.spill_field then
+                    // Spill mode (body contains a state-machine
+                    // suspend): stash the value into the val-block's
+                    // spill field, not on the eval stack. All paths
+                    // converge at end_label with the value in the
+                    // field and the stack empty; the val-block's
+                    // BLOCK gens a clean ldfld at consumer time.
+                    add(IR.RAW("ldarg.0"));
+
+                    if let expression = r.expression then
+                        if let value = expression.value then
+                            let boxed_value = _boxer.box_if_needed(value, result_type);
+                            add(boxed_value);
+                        else
+                            add(IR.Values.DEFAULT(result_type));
+                        fi
                     else
                         add(IR.Values.DEFAULT(result_type));
                     fi
+
+                    add("stfld {spill_field.get_il_reference()}");
                 else
-                    // Bare `return;` in a value-required val-block.
-                    // visit_return defers the diagnosis (inferred-
-                    // return lambdas need the body walk to settle
-                    // first); push the default of the result type
-                    // so the IL verifies — matches the bare-return-
-                    // from-non-void-function path at visit(RETURN).
-                    add(IR.Values.DEFAULT(result_type));
+                    if let expression = r.expression then
+                        if let value = expression.value then
+                            let boxed_value = _boxer.box_if_needed(value, result_type);
+                            add(boxed_value);
+                        else
+                            add(IR.Values.DEFAULT(result_type));
+                        fi
+                    else
+                        // Bare `return;` in a value-required val-
+                        // block. visit_return defers the diagnosis
+                        // (inferred-return lambdas need the body
+                        // walk to settle first); push the default
+                        // of the result type so the IL verifies —
+                        // matches the bare-return-from-non-void-
+                        // function path at visit(RETURN).
+                        add(IR.Values.DEFAULT(result_type));
+                    fi
                 fi
             fi
 
@@ -3328,6 +3508,31 @@ namespace Syntax.Process is
         si
 
         visit(list: Statements.LIST) is
+            // BLOCK-with-suspend spill. When the LIST is in a value-
+            // required position (list.value non-null) AND we're in
+            // a state machine AND any statement (outside nested
+            // function literals) contains an `await` or `yield`, the
+            // captured-IL pattern would trap the suspend's `leave` /
+            // `ret` inside list.value's BLOCK; when the consumer
+            // later gens that BLOCK, the suspend replays wrapped in
+            // the consumer's stack setup (receiver on stack at leave
+            // is invalid IL; state lost across yield's MoveNext re-
+            // entry breaks the next stfld). Spill the BLOCK's value
+            // to a frame field: body IL (including the suspend)
+            // flows to outer current_block in the same flat MoveNext-
+            // body stream as the dispatcher; the BLOCK is rewritten
+            // to a load of the spill field. The recursive case (val-
+            // block inside `if` in expression position, etc.) works
+            // because each composite's spill produces a clean load
+            // for its enclosing composite.
+            //
+            // The `want_dispose` (RAII) path keeps the existing .try
+            // wrapping — its body must live inside the protected
+            // region.
+            if _try_spill_block_with_suspend(list) then
+                return;
+            fi
+
             if list.value? then
                 enter_block(cast IR.Values.BLOCK(list.value))
             fi;
@@ -3572,7 +3777,32 @@ namespace Syntax.Process is
 
             let end = LABEL();
 
-            if `if.value? then
+            // BLOCK-with-suspend spill (mirrors VAL_BLOCK / LIST).
+            // When the IF expression is in value-required position
+            // AND we're in an SM AND any branch contains an `await`
+            // or `yield`, capture-by-enter_block would trap the
+            // suspend IL inside `if.value`'s BLOCK; the consumer
+            // would replay the suspend wrapped in its own stack
+            // setup. Instead, emit the IF inline in outer current
+            // _block and spill each branch's value to a frame field;
+            // `if.value`'s BLOCK ends with just a load of that
+            // field. Recursive: inner composites (val-blocks, nested
+            // IFs) handle their own suspends the same way.
+            let sm_frame = _current_state_machine_frame();
+            let if_spill_field: Semantic.Symbols.Field? mut = null;
+            if
+                `if.value? /\
+                sm_frame? /\
+                `if.want_value /\
+                _contains_suspend(`if)
+            then
+                let value_block = cast IR.Values.BLOCK(`if.value);
+                if value_block? /\ value_block.type? /\ !value_block.type.is_void then
+                    if_spill_field = sm_frame.declare_anonymous_field("spill", value_block.type);
+                fi
+            fi
+
+            if `if.value? /\ !if_spill_field? then
                 enter_block(cast IR.Values.BLOCK(`if.value));
             fi
 
@@ -3656,10 +3886,21 @@ namespace Syntax.Process is
                 b.accept(self);
 
                 if `if.want_value /\ b.body.value? then
-                    add(b.body.value);
+                    if if_spill_field? then
+                        // Spill mode: stash the branch value into
+                        // the IF's spill field instead of leaving on
+                        // the stack. All branches converge at `end`
+                        // with the value in the field and an empty
+                        // stack.
+                        add(IR.RAW("ldarg.0"));
+                        add(b.body.value);
+                        add("stfld {if_spill_field.get_il_reference()}");
+                    else
+                        add(b.body.value);
 
-                    if `if.expected_type? /\ `if.expected_type.is_void /\ !b.body.value.type.is_void then
-                        add("pop");
+                        if `if.expected_type? /\ `if.expected_type.is_void /\ !b.body.value.type.is_void then
+                            add("pop");
+                        fi
                     fi
                 fi
 
@@ -3673,7 +3914,13 @@ namespace Syntax.Process is
 
             super.visit(`if);
 
-            if `if.value? then
+            if if_spill_field? then
+                // Replace if.value's BLOCK content with a load of
+                // the spill field. Consumer's add(if.value) ->
+                // BLOCK.gen() emits a clean ldfld at its IL site.
+                let value_block = cast IR.Values.BLOCK(`if.value);
+                value_block.add(_build_frame_field_load(sm_frame, if_spill_field));
+            elif `if.value? then
                 leave_block();
             fi
         si
@@ -3688,7 +3935,26 @@ namespace Syntax.Process is
             assert `case.expression?;
             assert `case.matches?;
 
-            if `case.value? then
+            // BLOCK-with-suspend spill (mirrors VAL_BLOCK / IF /
+            // LIST). See visit(IF) for the rationale. Same pattern:
+            // emit the CASE inline in outer current_block, stash
+            // each arm's value into a frame field, and replace
+            // `case.value`'s BLOCK content with a load of the field.
+            let case_sm_frame = _current_state_machine_frame();
+            let case_spill_field: Semantic.Symbols.Field? mut = null;
+            if
+                `case.value? /\
+                case_sm_frame? /\
+                `case.want_value /\
+                _contains_suspend(`case)
+            then
+                let value_block = cast IR.Values.BLOCK(`case.value);
+                if value_block? /\ value_block.type? /\ !value_block.type.is_void then
+                    case_spill_field = case_sm_frame.declare_anonymous_field("spill", value_block.type);
+                fi
+            fi
+
+            if `case.value? /\ !case_spill_field? then
                 enter_block(cast IR.Values.BLOCK(`case.value));
             fi
 
@@ -3790,10 +4056,16 @@ namespace Syntax.Process is
                 fi
 
                 if `case.want_value /\ m.statements.value? then
-                    add(m.statements.value);
+                    if case_spill_field? then
+                        add(IR.RAW("ldarg.0"));
+                        add(m.statements.value);
+                        add("stfld {case_spill_field.get_il_reference()}");
+                    else
+                        add(m.statements.value);
 
-                    if `case.expected_type? /\ `case.expected_type.is_void /\ !m.statements.value.type.is_void then
-                        add("pop");
+                        if `case.expected_type? /\ `case.expected_type.is_void /\ !m.statements.value.type.is_void then
+                            add("pop");
+                        fi
                     fi
                 fi
 
@@ -3824,7 +4096,10 @@ namespace Syntax.Process is
 
             super.visit(`case);
 
-            if `case.value? then
+            if case_spill_field? then
+                let value_block = cast IR.Values.BLOCK(`case.value);
+                value_block.add(_build_frame_field_load(case_sm_frame, case_spill_field));
+            elif `case.value? then
                 leave_block();
             fi
         si
