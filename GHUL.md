@@ -661,7 +661,7 @@ If the last statement does not provide a value (a `let`, `for`, `while`, `assert
 
 `return E` inside a `val ... lav` block in expression position exits the **block**, not the enclosing function. The block's value is the least-upper-bound of every `return E` inside it and the tail expression (if any), so an early return can short-circuit out of the block with a value while a different path falls through to the tail. Nesting follows the innermost rule — a `return` inside an inner `val` exits only that inner block, leaving the outer block's walk to continue.
 
-When a `val ... lav` is the *entire* body of an expression-bodied function/method/lambda (the `=> body`), it elides itself: `return` inside flows to the enclosing function, exactly as if the body had been written `is ... si`. Existing `try` / `catch` / `finally` composition works as in any function body, and a body whose every reachable path returns needs no separate value-providing tail:
+A `val ... lav` is fine as the *entire* body of an expression-bodied function/method/lambda (the `=> body`). The innermost-block rule still applies — `return` inside targets the val-block — but the val-block's value flows back out as the function's expression-body value, so observable behaviour matches `is ... si`. `try` / `catch` / `finally` composes the same way as in any function body, including `return` from inside a `try` (the finally fires before the value is delivered), and a body whose every reachable path returns needs no separate value-providing tail:
 
 ```ghul
 sign_label(n: int) -> string =>
