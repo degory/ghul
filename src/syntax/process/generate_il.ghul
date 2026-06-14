@@ -62,6 +62,49 @@ namespace Syntax.Process is
         si
     si
 
+    // IL-emission frame for a `val ... lav` block currently in
+    // scope. Returns inside the body whose val_block_target is this
+    // block push their value and `br` to `end_label`; the natural
+    // fall-through emits the tail value and falls into the same
+    // label. All paths converge at end_label with exactly one value
+    // on the evaluation stack (or empty for a void block). No value
+    // ever lives in a CLR local or frame field at a suspension
+    // point, so async-await and generator-yield compose without
+    // bespoke handling.
+    //
+    // result_type is the resolved block value type from compile-
+    // expressions; void means no value-push. is_void is cached to
+    // skip the lookup at every return emission. enclosing_try_count
+    // is the number of `.try` entries on the loop-label stack at
+    // val-block entry — a return inside the body whose current try
+    // count exceeds this opened a try INSIDE the val-block, so its
+    // `br end_label` would cross that try's boundary and produce
+    // invalid IL.
+    class VAL_BLOCK_IL is
+        block: Trees.Expressions.VAL_BLOCK;
+        end_label: IR.LABEL;
+        result_type: Semantic.Types.Type?;
+        is_void: bool;
+        enclosing_try_count: int;
+
+        init(
+            block: Trees.Expressions.VAL_BLOCK,
+            end_label: IR.LABEL,
+            result_type: Semantic.Types.Type?,
+            is_void: bool,
+            enclosing_try_count: int
+        ) is
+            assert block? else "val block is null";
+            assert end_label? else "val block end label is null";
+
+            self.block = block;
+            self.end_label = end_label;
+            self.result_type = result_type;
+            self.is_void = is_void;
+            self.enclosing_try_count = enclosing_try_count;
+        si
+    si
+
     // Placeholder block sitting at the top of one protected region's
     // body (MoveNext's outer try, or any inner let-use / user `.try`).
     // While the region's body walks, AWAIT_SUSPENDs / YIELDs that
@@ -167,6 +210,18 @@ namespace Syntax.Process is
         // in the same `.try`, never crossing a region boundary.
         _async_dispatch_stack: Collections.LIST[ASYNC_DISPATCH_HOLDER];
 
+        // Stack of `val ... lav` IL frames, parallel to the
+        // val_block_target stamped on RETURN nodes by compile-
+        // expressions. Each entry holds the block's end_label, the
+        // resolved result_type, and the open-`.try` count cached at
+        // val-block entry. visit(RETURN) reads the top via the
+        // node's val_block_target identity to emit "push value;
+        // `br end_label`" instead of `ret`; a try opened inside the
+        // block is rejected at the return site (CLR `br` would
+        // cross the protected region and `leave` requires an empty
+        // stack).
+        _val_block_il_stack: Collections.LIST[VAL_BLOCK_IL];
+
         current_block: Values.BLOCK => _block_context.current_block;
 
         init(
@@ -208,6 +263,7 @@ namespace Syntax.Process is
             _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
             _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
             _async_dispatch_stack = Collections.LIST[ASYNC_DISPATCH_HOLDER]();
+            _val_block_il_stack = Collections.LIST[VAL_BLOCK_IL]();
         si
 
         ensure_runtime_symbols_are_materialized() is
@@ -2224,6 +2280,86 @@ namespace Syntax.Process is
         visit(statement: Expressions.STATEMENT) is
         si
 
+        // `val ... lav` emits as the IL contained in block.value
+        // (the BLOCK Value set by compile-expressions). The shape
+        // mirrors how `if`/`case`-in-expression emit:
+        //
+        //   <body statements' IL>
+        //   <tail value's IL>      ; pushes value (or empty for void)
+        //   <return-targeted return inside body>: push value; br end
+        //   end:                   ; value (or empty) on the stack
+        //
+        // The natural fall-through emits the tail's value at the end
+        // of the body and falls into the label. Return-targeted
+        // returns push their value and `br` to the same label. No
+        // CLR local or frame field carries the value across the
+        // join — so an async/yield suspend point inside the body
+        // composes with the existing state-machine rewriting
+        // without bespoke handling.
+        pre(block: Trees.Expressions.VAL_BLOCK) -> bool is
+            super.pre(block);
+
+            if !block.value? \/ !isa Values.BLOCK(block.value) then
+                // No usable value from compile-expressions (a
+                // poisoned block, or a void-tolerant block whose
+                // BLOCK has been set with void type — both still
+                // need their body's IL to run for side effects).
+                // Fall back to a plain walk; returns inside will
+                // dispatch via val_block_target either way.
+                return false;
+            fi
+
+            let value_block = cast Values.BLOCK(block.value);
+            enter_block(value_block);
+
+            try
+                let end_label = LABEL();
+                block.end_label = end_label;
+
+                let result_type = value_block.type;
+                let is_void = result_type? /\ result_type =~ _innate_symbol_lookup.get_void_type();
+
+                _val_block_il_stack.add(VAL_BLOCK_IL(block, end_label, result_type, is_void, _loops.open_try_count));
+
+                try
+                    for s in block.body.statements do
+                        self.enter_node(s);
+                        try
+                            s.walk(self);
+                        finally
+                            self.leave_node(s);
+                        yrt
+                    od
+
+                    // Natural fall-through. The tail statement is
+                    // the last EXPRESSION in the body; in want_value
+                    // mode visit(Statements.EXPRESSION) suppresses
+                    // its own emission so the consuming context can
+                    // emit the tail value. Val-block bypasses LIST,
+                    // so we emit it here — for both value and void
+                    // cases the IL for the tail value runs (its
+                    // side effects matter), and in the value case
+                    // it leaves the value on the stack ready to fall
+                    // into end_label.
+                    if block.body.last? /\ block.body.last.value? then
+                        add(block.body.last.value);
+                    fi
+                finally
+                    assert _val_block_il_stack.count > 0 else "val_block_il_stack underflow";
+                    _val_block_il_stack.remove_at(_val_block_il_stack.count - 1);
+                yrt
+
+                get_brancher_for_block().label(end_label);
+            finally
+                leave_block();
+            yrt
+
+            return true;
+        si
+
+        visit(block: Trees.Expressions.VAL_BLOCK) is
+        si
+
         // Override CALL.walk's default args-first order so SPILLs in
         // the receiver position emit before AWAIT_SUSPENDs in the
         // argument position — needed for source-order side effects
@@ -2731,6 +2867,16 @@ namespace Syntax.Process is
         visit(r: Statements.RETURN) is
             super.visit(r);
 
+            // Val-block-targeted return: push the value onto the
+            // evaluation stack and `br` to the block's end_label
+            // rather than emitting `ret`. The val-block frame is on
+            // the IL stack with the same AST node identity stamped
+            // on r.val_block_target.
+            if let target = r.val_block_target then
+                _gen_val_block_targeted_return(r, target);
+                return;
+            fi
+
             let function = current_function;
 
             // State-machine async return: stash the value into
@@ -2817,6 +2963,76 @@ namespace Syntax.Process is
 
                 add("ret");
             fi
+        si
+
+        // Emit IL for a `return E` whose target is a `val ... lav`
+        // block (innermost wins, recorded by compile-expressions on
+        // the RETURN AST node). The frame on `_val_block_il_stack`
+        // matches `target` by identity; we push the value onto the
+        // evaluation stack and `br` to the frame's end_label —
+        // exactly the shape `if`/`case`-in-expression branches use.
+        //
+        // A `br` from inside an enclosing `.try` whose end is
+        // outside the try is invalid IL; the CLR requires `leave`
+        // there, but `leave` requires an empty stack so we can't
+        // also carry a value. That case is currently rejected at
+        // compile time; future work could spill to a try-local
+        // stash before `leave`-ing.
+        _gen_val_block_targeted_return(r: Statements.RETURN, target: Trees.Expressions.VAL_BLOCK) is
+            let frame: VAL_BLOCK_IL? mut = null;
+
+            let i mut = _val_block_il_stack.count - 1;
+            while i >= 0 do
+                let candidate = _val_block_il_stack[i];
+                if candidate.block == target then
+                    frame = candidate;
+                    i = -1;
+                else
+                    i = i - 1;
+                fi
+            od
+
+            assert frame? else "val_block_target stamped on return has no matching IL frame";
+
+            // Reject only when a `.try` is open BETWEEN this return
+            // and the block's end_label — i.e. one opened inside the
+            // val-block body, not one the val-block itself sits
+            // inside. `_loops.open_try_count` is the count of open
+            // tries right now; the frame cached the count at val-
+            // block entry. Any excess means a try started inside
+            // and is still open, so `br end_label` would cross its
+            // protected region (invalid IL); `leave` would work but
+            // requires an empty stack and we have a value to push.
+            if _loops.open_try_count > frame.enclosing_try_count then
+                _logger.error(
+                    r.location,
+                    "return from val-block crossing a try boundary is not yet supported"
+                );
+                return;
+            fi
+
+            if !frame.is_void /\ frame.result_type? then
+                let result_type = frame.result_type;
+
+                if let expression = r.expression then
+                    if let value = expression.value then
+                        let boxed_value = _boxer.box_if_needed(value, result_type);
+                        add(boxed_value);
+                    else
+                        add(IR.Values.DEFAULT(result_type));
+                    fi
+                else
+                    // Bare `return;` in a value-required val-block.
+                    // visit_return defers the diagnosis (inferred-
+                    // return lambdas need the body walk to settle
+                    // first); push the default of the result type
+                    // so the IL verifies — matches the bare-return-
+                    // from-non-void-function path at visit(RETURN).
+                    add(IR.Values.DEFAULT(result_type));
+                fi
+            fi
+
+            get_brancher_for_block().branch(frame.end_label);
         si
 
         // Generator yield IL emission:
@@ -4061,7 +4277,7 @@ namespace Syntax.Process is
 
         get_current_try() -> LOOP_LABELS? is
             let index: int mut = loops.count - 1;
-            
+
             while index >= 0 do
                 let result = loops[index];
 
@@ -4072,6 +4288,20 @@ namespace Syntax.Process is
                 index = index - 1;
             od
             return null;
+        si
+
+        // Number of `is_try` entries currently on the stack. Cached
+        // at val-block entry; a return inside the body whose count
+        // exceeds the cached value opened a try INSIDE the block,
+        // so `br end_label` would cross the try's boundary.
+        open_try_count: int is
+            let count mut = 0;
+            for l in loops do
+                if l.is_try then
+                    count = count + 1;
+                fi
+            od
+            return count;
         si
 
         get_current_loop() -> LOOP_LABELS? is
