@@ -74,6 +74,26 @@ namespace Syntax.Process is
     // MoveNext entry — `'.async_state'` for async state machines,
     // `'.gen_state'` for generators. Both nest under the same
     // dispatch-holder machinery; only the local name differs.
+    // IL-emission frame for a `val ... lav` block currently in
+    // scope. The block AST node carries its end_label / return_temp /
+    // want_value, but we cache them on the frame so the lookup at
+    // RETURN emission doesn't dereference an AST node that may be
+    // partway through walk state changes.
+    class VAL_BLOCK_IL is
+        block: Trees.Expressions.VAL_BLOCK;
+        end_label: IR.LABEL;
+        return_temp: IR.TEMP?;
+
+        init(block: Trees.Expressions.VAL_BLOCK, end_label: IR.LABEL, return_temp: IR.TEMP?) is
+            assert block? else "val block is null";
+            assert end_label? else "val block end label is null";
+
+            self.block = block;
+            self.end_label = end_label;
+            self.return_temp = return_temp;
+        si
+    si
+
     class ASYNC_DISPATCH_HOLDER is
         block: IR.Values.BLOCK;
         state_local_il: string;
@@ -167,6 +187,14 @@ namespace Syntax.Process is
         // in the same `.try`, never crossing a region boundary.
         _async_dispatch_stack: Collections.LIST[ASYNC_DISPATCH_HOLDER];
 
+        // Stack of `val ... lav` IL frames, parallel to the
+        // val_block_target stamped on RETURN nodes by
+        // compile-expressions. Each entry holds the block's end
+        // label and stash TEMP; visit(RETURN) reads the top via the
+        // node's val_block_target identity to emit "store + br/leave
+        // end_label" instead of `ret`.
+        _val_block_il_stack: Collections.LIST[VAL_BLOCK_IL];
+
         current_block: Values.BLOCK => _block_context.current_block;
 
         init(
@@ -208,6 +236,7 @@ namespace Syntax.Process is
             _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
             _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
             _async_dispatch_stack = Collections.LIST[ASYNC_DISPATCH_HOLDER]();
+            _val_block_il_stack = Collections.LIST[VAL_BLOCK_IL]();
         si
 
         ensure_runtime_symbols_are_materialized() is
@@ -2224,6 +2253,100 @@ namespace Syntax.Process is
         visit(statement: Expressions.STATEMENT) is
         si
 
+        // `val ... lav` emits as the IL contained in block.value
+        // (the BLOCK Value set in compile-expressions). We take over
+        // walking the body so the TEMP declaration, body statements,
+        // tail-stash, end_label, and TEMP load all land in a single
+        // BLOCK in source order. Returns inside the body that target
+        // this block see the IL frame in `_val_block_il_stack` and
+        // stash + branch to end_label rather than emitting `ret`.
+        pre(block: Trees.Expressions.VAL_BLOCK) -> bool is
+            super.pre(block);
+
+            if !block.value? \/ !isa Values.BLOCK(block.value) then
+                // No usable value from compile-expressions (a
+                // poisoned block, or a void-tolerant block whose
+                // BLOCK has been set with void type — both still
+                // need their body's IL to run for side effects).
+                // Fall back to a plain walk; returns inside will
+                // dispatch via val_block_target either way.
+                return false;
+            fi
+
+            let value_block = cast Values.BLOCK(block.value);
+            enter_block(value_block);
+
+            try
+                let end_label = LABEL();
+                block.end_label = end_label;
+
+                let result_type = value_block.type;
+                let is_void = result_type? /\ result_type =~ _innate_symbol_lookup.get_void_type();
+
+                let return_temp: TEMP? mut = null;
+                if !is_void /\ result_type? then
+                    return_temp = TEMP(current_block, "val", result_type);
+                fi
+                block.return_temp = return_temp;
+
+                _val_block_il_stack.add(VAL_BLOCK_IL(block, end_label, return_temp));
+
+                try
+                    for s in block.body.statements do
+                        self.enter_node(s);
+                        try
+                            s.walk(self);
+                        finally
+                            self.leave_node(s);
+                        yrt
+                    od
+
+                    // Natural fall-through. The tail statement is
+                    // the last EXPRESSION in the body; in want_value
+                    // mode visit(Statements.EXPRESSION) suppresses
+                    // its own emission so the consuming LIST can add
+                    // the tail value at end-of-block. Val-block
+                    // bypasses LIST, so emit the tail here:
+                    //   value case — stash to TEMP (store emits
+                    //   value + stloc) so this path and the return-
+                    //   targeted path converge with the value in
+                    //   TEMP at end_label.
+                    //   void case — add the tail value's IL for its
+                    //   side effects; void values don't push to the
+                    //   stack so no stloc is needed.
+                    // When every path returns, fall-through is dead
+                    // code; the IL still verifies (the stack shape
+                    // matches at end_label either way).
+                    if block.body.last? /\ block.body.last.value? then
+                        let tail_value = block.body.last.value;
+
+                        if return_temp? then
+                            return_temp.store(tail_value);
+                        else
+                            add(tail_value);
+                        fi
+                    fi
+                finally
+                    assert _val_block_il_stack.count > 0 else "val_block_il_stack underflow";
+                    _val_block_il_stack.remove_at(_val_block_il_stack.count - 1);
+                yrt
+
+                let brancher = get_brancher_for_block();
+                brancher.label(end_label);
+
+                if return_temp? then
+                    add(return_temp.load());
+                fi
+            finally
+                leave_block();
+            yrt
+
+            return true;
+        si
+
+        visit(block: Trees.Expressions.VAL_BLOCK) is
+        si
+
         // Override CALL.walk's default args-first order so SPILLs in
         // the receiver position emit before AWAIT_SUSPENDs in the
         // argument position — needed for source-order side effects
@@ -2731,6 +2854,16 @@ namespace Syntax.Process is
         visit(r: Statements.RETURN) is
             super.visit(r);
 
+            // Val-block-targeted return: store value into the
+            // block's stash TEMP and br/leave to the block's
+            // end_label rather than emitting `ret`. The val-block
+            // frame is on the IL stack with the same AST node
+            // identity stamped on r.val_block_target.
+            if let target = r.val_block_target then
+                _gen_val_block_targeted_return(r, target);
+                return;
+            fi
+
             let function = current_function;
 
             // State-machine async return: stash the value into
@@ -2816,6 +2949,62 @@ namespace Syntax.Process is
                 fi
 
                 add("ret");
+            fi
+        si
+
+        // Emit IL for a `return E` whose target is a `val ... lav`
+        // block (innermost wins, recorded by compile-expressions on
+        // the RETURN AST node). The frame on `_val_block_il_stack`
+        // matches `target` by identity; we store the value into the
+        // frame's stash TEMP and br/leave to its end_label. `leave`
+        // is required if there's an enclosing `.try` between this
+        // return and the end_label, so the intervening finally runs
+        // (CLR `br` from inside a protected region is invalid IL).
+        _gen_val_block_targeted_return(r: Statements.RETURN, target: Trees.Expressions.VAL_BLOCK) is
+            let frame: VAL_BLOCK_IL? mut = null;
+
+            let i mut = _val_block_il_stack.count - 1;
+            while i >= 0 do
+                let candidate = _val_block_il_stack[i];
+                if candidate.block == target then
+                    frame = candidate;
+                    i = -1;
+                else
+                    i = i - 1;
+                fi
+            od
+
+            assert frame? else "val_block_target stamped on return has no matching IL frame";
+
+            if let temp = frame.return_temp then
+                if let expression = r.expression then
+                    if let value = expression.value then
+                        let boxed_value =
+                            _boxer.box_if_needed(
+                                value,
+                                temp.type
+                            );
+
+                        temp.store(boxed_value);
+                    fi
+                else
+                    // Bare `return;` in a value-required val-block.
+                    // visit_return defers the diagnosis (inferred-
+                    // return lambdas need the body walk to settle
+                    // first); push the default of the result type
+                    // so the IL verifies — matches the bare-return-
+                    // from-non-void-function path at visit(RETURN).
+                    temp.store(IR.Values.DEFAULT(temp.type));
+                fi
+            fi
+
+            let brancher = get_brancher_for_block();
+            let current_try = _loops.get_current_try();
+
+            if current_try? then
+                brancher.leave(frame.end_label);
+            else
+                brancher.branch(frame.end_label);
             fi
         si
 

@@ -85,6 +85,25 @@ namespace Syntax.Process is
         // conservatively (an exception can leave the body anywhere).
         _try_flow_stack: Collections.LIST[TRY_FLOW_FRAME];
 
+        // Stack of `val ... lav` blocks currently being walked. A
+        // `return E` inside a val-block targets the innermost — top
+        // of stack — block rather than the enclosing function. The
+        // block accumulates return types into its `return_types`
+        // list; visit(VAL_BLOCK) LUBs them with the tail expression's
+        // value type to settle the block's own value type.
+        _val_block_stack: Collections.LIST[Trees.Expressions.VAL_BLOCK];
+
+        // Public accessor used by compile_bindings.pre_return /
+        // visit_return to decide whether a `return` targets a
+        // val-block (top of stack) or the enclosing function (empty
+        // stack).
+        innermost_val_block: Trees.Expressions.VAL_BLOCK? =>
+            if _val_block_stack.count > 0 then
+                _val_block_stack[_val_block_stack.count - 1]
+            else
+                null
+            fi;
+
         current_statement_list: Trees.Statements.LIST;
 
         init(
@@ -185,6 +204,7 @@ namespace Syntax.Process is
             _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
             _loop_kept_stack = Collections.LIST[NARROW_ENV]();
             _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
+            _val_block_stack = Collections.LIST[Trees.Expressions.VAL_BLOCK]();
 
             _conditionals = COMPILE_CONDITIONALS(
                 logger,
@@ -870,13 +890,15 @@ namespace Syntax.Process is
         pre(expression: Trees.Statements.EXPRESSION) -> bool is
             super.pre(expression);
 
-            // A `val ... lav` block (or any Expressions.STATEMENT-
-            // shaped expression) wrapped in an expression-statement is
-            // value-required only if the surrounding list demands a
-            // value at this slot. Push that down so a void-tail block
+            // A STATEMENT- or VAL_BLOCK-shaped expression wrapped in
+            // an expression-statement is value-required only if the
+            // surrounding list demands a value at this slot. Push
+            // that down so a void-tail block / `if`-arm with no value
             // in expression-statement position is accepted silently.
             if let statement_expression: Trees.Expressions.STATEMENT = expression.expression then
                 statement_expression.want_value = expression.want_value;
+            elif let val_block: Trees.Expressions.VAL_BLOCK = expression.expression then
+                val_block.want_value = expression.want_value;
             fi
 
             return false;
@@ -1199,12 +1221,14 @@ namespace Syntax.Process is
             expression.expression.set_expected_type(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
 
             // A void-returning `=> body` doesn't need its body to yield
-            // a value. Push that down into any STATEMENT-shaped body
-            // (`val ... lav`, `if/case` in expression position) so a
-            // non-value-providing tail is accepted silently.
+            // a value. Push that down into any STATEMENT- / VAL_BLOCK-
+            // shaped body so a non-value-providing tail is accepted
+            // silently.
             if function.return_type.is_void then
                 if let statement_expression: Trees.Expressions.STATEMENT = expression.expression then
                     statement_expression.want_value = false;
+                elif let val_block: Trees.Expressions.VAL_BLOCK = expression.expression then
+                    val_block.want_value = false;
                 fi
             fi
 
@@ -2461,13 +2485,109 @@ namespace Syntax.Process is
                 statement.value = statement.statement.value;
             elif !statement.want_value then
                 // Void-tolerant position (expression-statement, void-
-                // returning `=>` body) with a non-value-providing inner
-                // (e.g. a `val ... lav` block whose tail is a
-                // `let`/`for`): synthesise a void block value so the
-                // consumer has something to thread through rather than
-                // a null that downstream passes treat as an error.
+                // returning `=>` body) with an `if`/`case` whose
+                // branches don't all provide values: synthesise a void
+                // block value so the consumer has something to thread
+                // through rather than a null that downstream passes
+                // treat as an error.
                 statement.value = IR.Values.BLOCK(
                     _innate_symbol_lookup.get_void_type()
+                );
+            fi
+        si
+
+        pre(block: Trees.Expressions.VAL_BLOCK) -> bool is
+            super.pre(block);
+
+            // Push this block as the innermost return target before
+            // walking its body. Returns inside read the top of stack
+            // in pre_return / visit_return; nested val-blocks override
+            // the current top while their own body is walked.
+            _val_block_stack.add(block);
+
+            // The body's tail is the only fall-through value
+            // contributor. Push want_value down through the LIST to
+            // its last statement so it must provide a value when this
+            // block is consumed; the surrounding context (expression-
+            // statement, void-returning `=>` body) may also write
+            // false here to allow a void tail.
+            block.body.want_value = block.want_value;
+
+            return false;
+        si
+
+        visit(block: Trees.Expressions.VAL_BLOCK) is
+            // Pop ourselves off the val-block stack regardless of
+            // outcome — every push in pre must be balanced by a pop
+            // here, otherwise an outer return-target lookup picks up
+            // a stale inner block.
+            assert _val_block_stack.count > 0 else "val_block_stack underflow";
+            assert _val_block_stack[_val_block_stack.count - 1] == block else "val_block_stack head is not the block being visited";
+            _val_block_stack.remove_at(_val_block_stack.count - 1);
+
+            if !block.want_value then
+                // Void-tolerant position: yield a void block value so
+                // the consumer (expression-statement, void-returning
+                // `=>` body) has something to thread through. Returns
+                // from inside the block are still emitted as branches
+                // by generate-il; the value here is the fall-through
+                // type, which is void in this branch.
+                block.value = IR.Values.BLOCK(
+                    _innate_symbol_lookup.get_void_type()
+                );
+                return;
+            fi
+
+            // LUB over every value-contributing source: returns
+            // targeting us (recorded by visit_return as we walked the
+            // body) and the tail expression's value type (if the tail
+            // provides one). When the tail itself diverges (every
+            // path returns from us), block.body.value may still be
+            // set by the LIST visitor — it conservatively types as
+            // BLOCK(last.value.type) — but the LUB shape below
+            // tolerates either presence.
+            let lub = LEAST_UPPER_BOUND_MAP();
+
+            for t in block.return_types do
+                if t? /\ !t.is_error then
+                    lub.add(t);
+                fi
+            od
+
+            if block.body.value? /\ block.body.value.type? /\ !block.body.value.type.is_error then
+                lub.add(block.body.value.type);
+            fi
+
+            let lub_type = lub.get_result();
+
+            if lub_type? then
+                block.value = IR.Values.BLOCK(lub_type);
+            elif block.body.value? then
+                // No usable LUB contributions but the body produced a
+                // value of some sentinel / error type — pass it
+                // through so downstream phases see a real Value and
+                // diagnose at the original location.
+                block.value = block.body.value;
+            else
+                // Body's tail doesn't provide a value and there are
+                // no returns to LUB with. The body walk has already
+                // emitted "expected a value" at the offending
+                // statement (compile_expressions.visit(Statements
+                // .LIST) — the val-block contract is the same as
+                // the LIST contract there); add the parallel "no
+                // value" warning the if/case-in-expression form
+                // emits in the same situation, and stand up a DUMMY
+                // value so downstream walks have a typed Value.
+                _logger.warn(
+                    block.location,
+                    "statement-expression-no-value",
+                    "statement expression has no value"
+                );
+
+                block.value = IR.Values.DUMMY_BLOCK(
+                    Semantic.Types.ERROR(),
+                    block.location,
+                    "val block produced no value"
                 );
             fi
         si
