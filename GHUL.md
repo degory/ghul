@@ -551,6 +551,20 @@ fi
 
 The binding's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The binding's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
 
+A single `if let` can chain several comma-separated bindings; every clause's presence test and optional `/\` guard must succeed for the then-arm to fire. Later clauses' scrutinees see earlier clauses' bindings, so the value flows left to right:
+
+```ghul
+if let outer = holder, inner = outer.value then
+    write_line("inner: {inner.label}");
+fi
+
+if let c: Cat = a, d: Dog = b then
+    write_line("a cat and a dog: {c.name} and {d.name}");
+fi
+```
+
+A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' bindings then aren't in scope.
+
 ghūl has no dedicated `match` construct; variant tags, narrowing, and `if let` cover that ground.
 
 ### loops

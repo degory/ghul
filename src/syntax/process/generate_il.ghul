@@ -2659,15 +2659,11 @@ namespace Syntax.Process is
             return cast Semantic.Symbols.Classy(symbol);
         si
 
-        // `if let` pattern's bound names are declared as CLR locals
+        // `if let` clauses' bound names are declared as CLR locals
         // here — same as `pre(VARIABLE)` does for a plain let. The
         // store IL itself is emitted later by
         // `gen_destructuring_initialize` in the if-branch handler.
         pre(rb: Statements.REFUTABLE_BINDING) -> bool is
-            if !rb.pattern? then
-                return false;
-            fi
-
             let sm_for_function = Semantic.Symbols.state_machine_for(current_function);
 
             if sm_for_function? /\ sm_for_function.frame? then
@@ -2682,18 +2678,24 @@ namespace Syntax.Process is
 
             let buffer = System.Text.StringBuilder();
 
-            for name in rb.pattern.names do
-                if !name? then
+            for c in rb.clauses do
+                if !c.pattern? then
                     continue;
                 fi
 
-                let symbol = find(name);
+                for name in c.pattern.names do
+                    if !name? then
+                        continue;
+                    fi
 
-                if !symbol? then
-                    continue;
-                fi
+                    let symbol = find(name);
 
-                symbol!.gen_definition_header(buffer);
+                    if !symbol? then
+                        continue;
+                    fi
+
+                    symbol!.gen_definition_header(buffer);
+                od
             od
 
             if buffer.length > 0 /\ _block_context.is_in_block then
@@ -3422,6 +3424,129 @@ namespace Syntax.Process is
             fi
         si
 
+        // Emit the scrutinee evaluation, optional isinst cast, the
+        // presence test, and the branch-to-fail for one `if let`
+        // clause. Returns the temp holding the (possibly cast)
+        // scrutinee value so the caller can bind the clause's
+        // pattern from it; returns null when there is nothing to
+        // bind (a missing scrutinee value, defensive).
+        _emit_if_let_clause_test(
+            c: Statements.REFUTABLE_BINDING_CLAUSE,
+            fail: LABEL,
+            is_first: bool,
+            brancher: BLOCK_BRANCHER
+        ) -> TEMP? is
+            if !c.scrutinee? then
+                return null;
+            fi
+
+            c.scrutinee.walk(self);
+
+            if !c.scrutinee.value? then
+                return null;
+            fi
+
+            let scrutinee_value = c.scrutinee.value!;
+            let typed_value: Value mut = scrutinee_value;
+
+            if c.narrow_type_expression? /\ c.narrow_type_expression.type? then
+                // The scrutinee's value type already reflects the
+                // then-edge narrowing applied in compile_conditionals
+                // — when the scrutinee is an identifier and the
+                // narrow target is a variant, narrowing specialises
+                // (e.g. `CONS` -> `CONS[int]`) by mutating the
+                // symbol type via NARROWING_FLOW. Use that
+                // specialised form as the isinst target so the
+                // runtime test references the closed-generic
+                // variant. Detect "specialised form" by checking the
+                // value-type and the written narrow type share the
+                // same classy (i.e. the value type is the narrow
+                // target with type args bound). Otherwise — e.g. the
+                // scrutinee is a member access typed wider than the
+                // narrow target — use the written narrow type
+                // itself, so the isinst tests the target.
+                let written_narrow = c.narrow_type_expression.type;
+                let scrutinee_classy = _classy_of_type(scrutinee_value.type);
+                let written_classy = _classy_of_type(written_narrow);
+
+                let narrow_target =
+                    if
+                        scrutinee_value.type? /\
+                        !scrutinee_value.type.is_inferred /\
+                        !scrutinee_value.type.is_error /\
+                        scrutinee_classy? /\
+                        written_classy? /\
+                        scrutinee_classy == written_classy
+                    then
+                        scrutinee_value.type;
+                    else
+                        written_narrow;
+                    fi;
+
+                typed_value =
+                    _type_caster.cast_value(
+                        c.location,
+                        scrutinee_value,
+                        narrow_target,
+                        true
+                    );
+            fi
+
+            let temp = TEMP(current_block, "if_let", typed_value);
+
+            let init_type = typed_value.type;
+
+            // The presence test: a reference type is absent when
+            // null; an option-shaped value type is absent when its
+            // `has_value` member is false.
+            let presence: Value? mut = null;
+
+            if init_type? /\ init_type.is_value_type then
+                let has_value_member = init_type.find_member("has_value");
+
+                if has_value_member? then
+                    presence = has_value_member.load(LOCATION.internal, temp.load(), _symbol_loader);
+                fi
+            else
+                presence = temp.load();
+            fi
+
+            if presence? then
+                if is_first then
+                    brancher.branch(BRANCH.Z, presence, fail, "if");
+                else
+                    brancher.branch(BRANCH.Z, presence, fail, "elif");
+                fi
+            fi
+
+            return temp;
+        si
+
+        // Bind one clause's pattern from the temp produced by the
+        // clause's test. Reference bindings take the value as-is;
+        // option-shaped value-type bindings unwrap `.value` first.
+        _emit_if_let_clause_bind(
+            c: Statements.REFUTABLE_BINDING_CLAUSE,
+            temp: TEMP,
+            fail: LABEL
+        ) is
+            let init_type = temp.load().type;
+
+            if init_type? /\ init_type.is_value_type then
+                let value_member = init_type.find_member("value");
+
+                if value_member? then
+                    gen_destructuring_initialize(
+                        c.pattern,
+                        value_member.load(LOCATION.internal, temp.load(), _symbol_loader),
+                        fail
+                    );
+                fi
+            else
+                gen_destructuring_initialize(c.pattern, temp.load(), fail);
+            fi
+        si
+
         pre(i: Statements.IF) -> bool is
             super.pre(i);
 
@@ -3442,7 +3567,7 @@ namespace Syntax.Process is
 
             for b in `if.branches do
                 let next = LABEL();
-                let if_let_temp: TEMP? mut = null;
+                let first_clause_temp: TEMP? mut = null;
 
                 if b.condition? /\ !b.binding? then
                     b.condition.walk(self);
@@ -3452,96 +3577,23 @@ namespace Syntax.Process is
                     else
                         brancher.branch(BRANCH.Z, b.condition.value, next, "elif");
                     fi
-                elif b.binding? /\ b.binding.scrutinee? then
-                    // `if let` branch: evaluate the scrutinee once
-                    // into a temp, emit an isinst for the type test
-                    // when the binding carries `: V`, branch past
-                    // this arm if the result has no value, then bind
-                    // the pattern inside the arm scope.
-                    b.binding.scrutinee.walk(self);
-
-                    if b.binding.scrutinee.value? then
-                        let scrutinee_value = b.binding.scrutinee.value!;
-                        let typed_value: Value mut = scrutinee_value;
-
-                        if
-                            b.binding.narrow_type_expression? /\
-                            b.binding.narrow_type_expression.type?
-                        then
-                            // The scrutinee's value type already
-                            // reflects the then-edge narrowing applied
-                            // in compile_conditionals — when the
-                            // scrutinee is an identifier and the
-                            // narrow target is a variant, narrowing
-                            // specialises (e.g. `CONS` -> `CONS[int]`)
-                            // by mutating the symbol type via
-                            // NARROWING_FLOW. Use that specialised
-                            // form as the isinst target so the
-                            // runtime test references the closed-
-                            // generic variant. Detect "specialised
-                            // form" by checking the value-type and
-                            // the written narrow type share the same
-                            // classy (i.e. the value type is the
-                            // narrow target with type args bound).
-                            // Otherwise — e.g. the scrutinee is a
-                            // member access typed wider than the
-                            // narrow target — use the written narrow
-                            // type itself, so the isinst tests the
-                            // target.
-                            let written_narrow = b.binding.narrow_type_expression.type;
-                            let scrutinee_classy = _classy_of_type(scrutinee_value.type);
-                            let written_classy = _classy_of_type(written_narrow);
-
-                            let narrow_target =
-                                if
-                                    scrutinee_value.type? /\
-                                    !scrutinee_value.type.is_inferred /\
-                                    !scrutinee_value.type.is_error /\
-                                    scrutinee_classy? /\
-                                    written_classy? /\
-                                    scrutinee_classy == written_classy
-                                then
-                                    scrutinee_value.type;
-                                else
-                                    written_narrow;
-                                fi;
-
-                            typed_value =
-                                _type_caster.cast_value(
-                                    b.binding.location,
-                                    scrutinee_value,
-                                    narrow_target,
-                                    true
-                                );
-                        fi
-
-                        if_let_temp = TEMP(current_block, "if_let", typed_value);
-
-                        let init_type = typed_value.type;
-
-                        // The presence test: a reference type is absent
-                        // when null; an option-shaped value type is
-                        // absent when its `has_value` member is false.
-                        let presence: Value? mut = null;
-
-                        if init_type? /\ init_type.is_value_type then
-                            let has_value_member = init_type.find_member("has_value");
-
-                            if has_value_member? then
-                                presence = has_value_member.load(LOCATION.internal, if_let_temp!.load(), _symbol_loader);
-                            fi
-                        else
-                            presence = if_let_temp!.load();
-                        fi
-
-                        if presence? then
-                            if is_first then
-                                brancher.branch(BRANCH.Z, presence, next, "if");
-                            else
-                                brancher.branch(BRANCH.Z, presence, next, "elif");
-                            fi
-                        fi
-                    fi
+                elif b.binding? then
+                    // `if let` branch: for each clause, evaluate its
+                    // scrutinee into a temp, emit an isinst for the
+                    // type test when the clause carries `: V`, branch
+                    // past this arm if the result has no value, then
+                    // bind the clause's pattern. Clauses chain left
+                    // to right; every clause's test and optional
+                    // guard must succeed for the then-arm to fire.
+                    //
+                    // The first clause's scrutinee evaluates BEFORE
+                    // the if-arm scope opens, so its own bindings are
+                    // not visible to it (matching the single-clause
+                    // shape). Subsequent clauses' scrutinees evaluate
+                    // INSIDE the scope after earlier clauses' bindings
+                    // are stored — letting `if let x = a, y = x.b`
+                    // chain values through.
+                    first_clause_temp = _emit_if_let_clause_test(b.binding.clauses[0], next, is_first, brancher);
                 else
                     seen_else = true;
                 fi
@@ -3549,35 +3601,38 @@ namespace Syntax.Process is
                 // enter if block scope:
                 self.pre(b);
 
-                if b.binding? /\ if_let_temp? then
+                if b.binding? then
+                    // Declare CLR locals for every clause's pattern
+                    // up front — pre(REFUTABLE_BINDING) iterates all
+                    // clauses.
                     self.pre(b.binding);
 
-                    // A reference binding takes the value as-is; an
-                    // option-shaped value type binds the unwrapped
-                    // `.value` member.
-                    let init_type = if_let_temp.load().type;
-
-                    if init_type? /\ init_type.is_value_type then
-                        let value_member = init_type.find_member("value");
-
-                        if value_member? then
-                            gen_destructuring_initialize(
-                                b.binding.pattern,
-                                value_member.load(LOCATION.internal, if_let_temp.load(), _symbol_loader),
-                                next
-                            );
-                        fi
-                    else
-                        gen_destructuring_initialize(b.binding.pattern, if_let_temp.load(), next);
+                    if first_clause_temp? then
+                        _emit_if_let_clause_bind(b.binding.clauses[0], first_clause_temp!, next);
                     fi
-                fi
 
-                // `if let x = e /\ guard then` — emit the guard after
-                // the binding is in scope. Failure branches to `next`
-                // exactly like the presence test does.
-                if b.binding? /\ b.binding.guard? then
-                    b.binding.guard.walk(self);
-                    brancher.branch(BRANCH.Z, b.binding.guard.value, next, "if-let-guard");
+                    if b.binding.clauses[0].guard? then
+                        b.binding.clauses[0].guard.walk(self);
+                        brancher.branch(BRANCH.Z, b.binding.clauses[0].guard.value, next, "if-let-guard");
+                    fi
+
+                    let i mut = 1;
+                    while i < b.binding.clauses.count do
+                        let clause = b.binding.clauses[i];
+
+                        let temp = _emit_if_let_clause_test(clause, next, false, brancher);
+
+                        if temp? then
+                            _emit_if_let_clause_bind(clause, temp!, next);
+                        fi
+
+                        if clause.guard? then
+                            clause.guard.walk(self);
+                            brancher.branch(BRANCH.Z, clause.guard.value, next, "if-let-guard");
+                        fi
+
+                        i = i + 1;
+                    od
                 fi
 
                 if b.body? then
