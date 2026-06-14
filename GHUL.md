@@ -657,9 +657,11 @@ let sum_1_to_5 = val
 lav;
 ```
 
-If the last statement does not provide a value (a `let`, `for`, `while`, `assert`, ...), the block is void. Void blocks are accepted in any context that tolerates void — an expression-statement, the `=>` body of a void-returning function. A value-required position (typed `let` initializer, function argument, `=>` body of a value-returning function) requires the last statement to be value-producing.
+If the last statement does not provide a value (a `let`, `for`, `while`, `assert`, ...), the block is void. Void blocks are accepted in any context that tolerates void — an expression-statement, the `=>` body of a void-returning function. A value-required position (typed `let` initializer, function argument, `=>` body of a value-returning function) requires the last statement to be value-producing, *unless* every reachable path through the body diverges (via `return`, `throw`, or a divergent inner `if`/`case`/`try`) — then the trailing statement is unreachable and the block's value comes from the divergence sites instead.
 
-`return E` inside a `val ... lav` block exits the **block**, not the enclosing function. The block's value is the least-upper-bound of every `return E` inside it and the tail expression (if any), so an early return can short-circuit out of the block with a value while a different path falls through to the tail. Nesting follows the innermost rule — a `return` inside an inner `val` exits only that inner block, leaving the outer block's walk to continue:
+`return E` inside a `val ... lav` block in expression position exits the **block**, not the enclosing function. The block's value is the least-upper-bound of every `return E` inside it and the tail expression (if any), so an early return can short-circuit out of the block with a value while a different path falls through to the tail. Nesting follows the innermost rule — a `return` inside an inner `val` exits only that inner block, leaving the outer block's walk to continue.
+
+When a `val ... lav` is the *entire* body of an expression-bodied function/method/lambda (the `=> body`), it elides itself: `return` inside flows to the enclosing function, exactly as if the body had been written `is ... si`. Existing `try` / `catch` / `finally` composition works as in any function body, and a body whose every reachable path returns needs no separate value-providing tail:
 
 ```ghul
 sign_label(n: int) -> string =>
@@ -671,6 +673,17 @@ sign_label(n: int) -> string =>
             return "zero";
         fi
         "pos"
+    lav;
+
+divide_or_default(n: int, d: int) -> int =>
+    val
+        try
+            return n / d;
+        catch e: System.DivideByZeroException
+            return 0;
+        finally
+            log("done");
+        yrt
     lav;
 ```
 

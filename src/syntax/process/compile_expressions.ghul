@@ -1216,6 +1216,23 @@ namespace Syntax.Process is
                 return false;
             fi
 
+            // A val-block that IS the function body elides itself:
+            // returns inside flow to the function via the ordinary
+            // function-return path. This lets existing try/catch +
+            // return composition just work — return inside a try
+            // inside a `=> val ... lav` body uses the same machinery
+            // as return inside a try inside an `is ... si` body. The
+            // val-block's value still passes through (block.value =
+            // body.value), so a value-providing tail flows back to
+            // the function return as before. Marked unconditionally
+            // — before the sentinel/inferred early-exit check below
+            // — so inferred-return lambdas with val bodies also get
+            // the elision (their returns settle the return type via
+            // the function-return path).
+            if let val_body: Trees.Expressions.VAL_BLOCK = expression.expression then
+                val_body.is_function_body = true;
+            fi
+
             let function = current_function;
 
             if
@@ -1254,6 +1271,33 @@ namespace Syntax.Process is
                 !expression.expression.value.type?
             then
                 super.visit(expression);
+
+                // Function-body val-block with a divergent body
+                // (every reachable path returned, so LIST tolerated
+                // a non-value-providing tail and didn't set body
+                // .value): the function's real return values came
+                // from the returns inside; the `=> body` value is
+                // unreachable. Set up a DUMMY of the function's
+                // already-known return type so generate-il can emit
+                // a trailing default-load + ret that verifies, even
+                // though that trailing IL is dead code.
+                let is_function_body_val =
+                    if let val_body: Trees.Expressions.VAL_BLOCK = expression.expression then
+                        val_body.is_function_body
+                    else
+                        false
+                    fi;
+
+                if
+                    function? /\
+                    function.return_type? /\
+                    !function.return_type.is_sentinel /\
+                    !function.return_type.is_inferred /\
+                    is_function_body_val
+                then
+                    expression.expression.value = IR.Values.DEFAULT(function.return_type);
+                    return;
+                fi
 
                 expression.expression.value = IR.Values.DUMMY(Semantic.Types.ERROR(), expression.expression.location);
 
@@ -2522,12 +2566,6 @@ namespace Syntax.Process is
         pre(block: Trees.Expressions.VAL_BLOCK) -> bool is
             super.pre(block);
 
-            // Push this block as the innermost return target before
-            // walking its body. Returns inside read the top of stack
-            // in pre_return / visit_return; nested val-blocks override
-            // the current top while their own body is walked.
-            _val_block_stack.add(block);
-
             // The body's tail is the only fall-through value
             // contributor. Push want_value down through the LIST to
             // its last statement so it must provide a value when this
@@ -2536,10 +2574,44 @@ namespace Syntax.Process is
             // false here to allow a void tail.
             block.body.want_value = block.want_value;
 
+            // Function-body val-block elides itself — returns inside
+            // flow to the enclosing function via the ordinary path
+            // (no stack push). visit(VAL_BLOCK) passes body.value
+            // through unchanged. The body walks under normal LIST
+            // semantics; a divergent tail (TRY-with-all-returns,
+            // etc.) is tolerated because every reachable path has
+            // already returned.
+            if block.is_function_body then
+                return false;
+            fi
+
+            // Push this block as the innermost return target before
+            // walking its body. Returns inside read the top of stack
+            // in pre_return / visit_return; nested val-blocks override
+            // the current top while their own body is walked.
+            _val_block_stack.add(block);
+
             return false;
         si
 
         visit(block: Trees.Expressions.VAL_BLOCK) is
+            // Function-body val-block: pass body.value through.
+            // Returns inside flowed to the function (no stack push
+            // in pre), so no return_types to LUB with — the block's
+            // value is just whatever the body produced (a tail
+            // value, or void for a void-tolerant body, or nothing
+            // for a divergent body).
+            if block.is_function_body then
+                if block.body.value? then
+                    block.value = block.body.value;
+                elif !block.want_value then
+                    block.value = IR.Values.BLOCK(
+                        _innate_symbol_lookup.get_void_type()
+                    );
+                fi
+                return;
+            fi
+
             // Pop ourselves off the val-block stack regardless of
             // outcome — every push in pre must be balanced by a pop
             // here, otherwise an outer return-target lookup picks up
@@ -2659,7 +2731,15 @@ namespace Syntax.Process is
                 fi
 
                 if !last.provides_value then
-                    _logger.error(last.location, "expected a value");
+                    // Tolerate a non-value-providing tail when every
+                    // path through the body has already diverged
+                    // (returned / thrown). Fall-through is dead
+                    // code; the consumer needs the IL emitted for
+                    // its side effects but no value need be left
+                    // on the stack.
+                    if !_flow.is_unreachable then
+                        _logger.error(last.location, "expected a value");
+                    fi
                     return;
                 fi
 
