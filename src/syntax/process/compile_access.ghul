@@ -389,9 +389,40 @@ namespace Syntax.Process is
             // `has_value` lookup hits the wrapper's bool field.
             has_value.left.value = IR.Values.NARROW_PROJECT.peel(has_value.left.value);
 
+            let bool_type = _innate_symbol_lookup.get_bool_type();
+
+            // Union `u?` → `isa Default(u)`. Both source-defined
+            // and cross-asm unions carry the default variant on the
+            // symbol; cross-asm unions get it via the
+            // `DEFAULT_VARIANT_ATTRIBUTE` marker read in
+            // `SYMBOL_FACTORY.materialize_variant`. A union without
+            // a default variant short-circuits to a bare null check
+            // — `value`/`has_value` are no longer the convention
+            // for unions.
+            if !has_value.left.value.type.is_value_type then
+                let classy = _condition_analyzer.get_classy_for_narrowing(has_value.left.value.type);
+
+                if classy? /\ (classy.is_union \/ classy.is_variant) then
+                    let default_variant = _get_default_variant_for_operand(classy);
+
+                    if default_variant? then
+                        has_value.value =
+                            _build_default_variant_isa(
+                                has_value.location,
+                                has_value.left.value,
+                                default_variant,
+                                bool_type
+                            );
+                    else
+                        has_value.value = HAS_VALUE(has_value.left.value, bool_type);
+                    fi
+
+                    return;
+                fi
+            fi
+
             let has_value_member =
                 has_value.left.value.type.find_member("has_value");
-            let bool_type = _innate_symbol_lookup.get_bool_type();
             let has_value_valid mut = false;
 
             if has_value_member? then
@@ -482,11 +513,21 @@ namespace Syntax.Process is
 
             if !unwrap_left_value.type.is_value_type then
                 let classy = _condition_analyzer.get_classy_for_narrowing(unwrap_left_value.type);
+                let default_variant = _get_default_variant_for_operand(classy);
 
-                if value_member? /\ classy? /\ classy.is_union then
-                    // a union exposes a synthesised `value` property for its
-                    // default variant — `!` unwraps to it
-                    unwrap.value = value_member.load(unwrap.location, unwrap_left_value, _symbol_loader);
+                if default_variant? then
+                    // Union `u!` → cast to the default variant (no
+                    // IL cast when the operand is already narrowed
+                    // to that variant), with single-field projection
+                    // so the canonical "unwrap to the sole field"
+                    // rule is preserved.
+                    unwrap.value =
+                        _build_default_variant_unwrap(
+                            unwrap.location,
+                            unwrap_left_value,
+                            classy,
+                            default_variant
+                        );
                 else
                     // a plain reference type: `!` only asserts non-null.
                     // The result type drops the `?` so an inferred `let`
@@ -599,6 +640,117 @@ namespace Syntax.Process is
             fi
 
             return null_check;
+        si
+
+        // For a `?` / `!` operand, identify the default variant to
+        // dispatch against. Returns the union's `default_variant`
+        // when the operand is the union (null when the union has
+        // no default — a source union without one, or an older
+        // cross-asm union compiled before the
+        // `DEFAULT_VARIANT_ATTRIBUTE` marker existed); returns the
+        // variant itself when the operand is already narrowed to
+        // its parent union's default variant so the caller can
+        // skip an extra cast. Null for any other shape — the
+        // caller's branch then short-circuits `?` to a bare null
+        // check and `!` to a non-null assert on the operand.
+        _get_default_variant_for_operand(
+            classy: Semantic.Symbols.Classy
+        ) -> Semantic.Symbols.VARIANT? is
+            if !classy? then
+                return null;
+            fi
+
+            if classy.is_union then
+                let union_classy = cast Semantic.Symbols.UNION(classy);
+                return union_classy.default_variant;
+            fi
+
+            if classy.is_variant then
+                let variant_classy = cast Semantic.Symbols.VARIANT(classy);
+
+                if !variant_classy.owner? \/ !isa Semantic.Symbols.UNION(variant_classy.owner) then
+                    return null;
+                fi
+
+                let owner_union = cast Semantic.Symbols.UNION(variant_classy.owner);
+
+                if owner_union.default_variant == variant_classy then
+                    return variant_classy;
+                fi
+            fi
+
+            return null;
+        si
+
+        // `u?` lowers to `isa Default(u)`. The receiver's type
+        // (often a generic instantiation of the union) drives
+        // specialisation of the variant target type so the emitted
+        // `isinst` references a loadable closed-generic class.
+        _build_default_variant_isa(
+            location: LOCATION,
+            operand: Value,
+            default_variant: Semantic.Symbols.VARIANT,
+            bool_type: Type
+        ) -> Value is
+            let variant_type =
+                _condition_analyzer.try_get_variant_type_for_classy(
+                    operand.type,
+                    default_variant
+                );
+
+            if !variant_type? then
+                return DUMMY(bool_type, location);
+            fi
+
+            return IR.Values.ISA(bool_type, variant_type, operand);
+        si
+
+        // `u!` lowers to `cast Default(u)`, with single-field
+        // projection so the existing rule "default variant with one
+        // field unwraps to that field" rides on the new lowering.
+        // When the operand is already narrowed to the default
+        // variant the cast is elided — the CLR accepts loading the
+        // field directly off the variant-shaped receiver.
+        _build_default_variant_unwrap(
+            location: LOCATION,
+            operand: Value,
+            classy: Semantic.Symbols.Classy,
+            default_variant: Semantic.Symbols.VARIANT
+        ) -> Value is
+            let variant_type =
+                _condition_analyzer.try_get_variant_type_for_classy(
+                    operand.type,
+                    default_variant
+                );
+
+            if !variant_type? then
+                return DUMMY(Semantic.Types.ERROR(), location);
+            fi
+
+            let variant_value: Value mut = operand;
+
+            if !classy.is_variant then
+                variant_value = IR.Values.CAST(variant_type, operand);
+            fi
+
+            // Single-field unwrap rides on the cast: a default
+            // variant declaring exactly one field — own or inherited
+            // from the union's primary header — projects to that
+            // field. Multi-field defaults return the variant itself
+            // so callers can read every field via member access.
+            if default_variant.field_count == 1 then
+                let field_name = default_variant.get_destructure_member_name(0);
+
+                if field_name? then
+                    let field_member = variant_type.find_member(field_name);
+
+                    if field_member? then
+                        return field_member.load(location, variant_value, _symbol_loader);
+                    fi
+                fi
+            fi
+
+            return variant_value;
         si
 
         // Warn when a value is dereferenced through a `T?` receiver —
