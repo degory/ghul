@@ -425,11 +425,11 @@ A union may declare a **primary-constructor header** for state shared across eve
 union TRIVIA(location: LOCATION) is
     LINE_COMMENT(text: string, ..);
     BLOCK_COMMENT(text: string, ..);
-    BLANK_LINE(..);
+    BLANK_LINE;
 si
 ```
 
-The primary parameters become fields on the union base, so `t.location` reads through on any `TRIVIA` value regardless of variant; variant-declared fields like `text` stay variant-only. The `..` may appear at any position in the variant's field list; field order in the synthesised constructor and in positional destructure (`let (a, b) = trivia`) follows source order. Each variant must include exactly one `..` when the union declares a primary header. The mechanism mirrors the class secondary-init splice ([primary constructors](#primary-constructors)).
+The primary parameters become fields on the union base, so `t.location` reads through on any `TRIVIA` value regardless of variant; variant-declared fields like `text` stay variant-only. The `..` may appear at any position in the variant's field list; field order in the synthesised constructor and in positional destructure (`let (a, b) = trivia`) follows source order. A variant that carries no additional fields can be written without a field list at all (`BLANK_LINE;`) and is treated as if it had written `(..)`. A variant with additional fields must include exactly one `..`. The mechanism mirrors the class secondary-init splice ([primary constructors](#primary-constructors)).
 
 A union may declare traits it implements after its header, with a leading `:` (and after any primary-constructor params):
 
