@@ -361,7 +361,7 @@ class NOISY: Logged is
 si
 ```
 
-A class extends one superclass but may implement many traits.
+A class extends one superclass but may implement many traits. Structs and unions implement traits the same way, with the same `: Trait, Other` header syntax — a union's trait members must all be defaulted or satisfied by a property the union itself supplies, since variants have no syntactic place for a method body.
 
 ### unions
 
@@ -430,6 +430,23 @@ si
 ```
 
 The primary parameters become fields on the union base, so `t.location` reads through on any `TRIVIA` value regardless of variant; variant-declared fields like `text` stay variant-only. The `..` may appear at any position in the variant's field list; field order in the synthesised constructor and in positional destructure (`let (a, b) = trivia`) follows source order. Each variant must include exactly one `..` when the union declares a primary header. The mechanism mirrors the class secondary-init splice ([primary constructors](#primary-constructors)).
+
+A union may declare traits it implements after its header, with a leading `:` (and after any primary-constructor params):
+
+```ghul
+trait NAMED is
+    name: string;
+    label() -> string => "[{name}]";
+si
+
+union COLOUR(name: string): NAMED is
+    RED(..);
+    GREEN(..);
+    BLUE(..);
+si
+```
+
+`NAMED.name` is satisfied by the property auto-synthesised from the union's `name` primary parameter, and `NAMED.label` is inherited by every variant. A `NAMED` reference accepts any `COLOUR` value, with dispatch going through the union base class. The traits-only restriction is strict: a union may not declare a base class. Every trait member used by a union must either be defaulted or be a property the union already supplies (typically through a primary parameter), since neither the union body nor its variants can carry method bodies.
 
 ### enums
 
