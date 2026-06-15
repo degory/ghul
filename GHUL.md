@@ -734,6 +734,14 @@ finally
 yrt
 ```
 
+`throw` can also stand alone as the body of an expression-bodied function, property, or indexer, which is handy for stubbing out code that is not written yet:
+
+```ghul
+not_done() -> int => throw System.Exception("not implemented");
+```
+
+The body always diverges, so it satisfies any declared return type — explicit, generic, or void — and an inferred return type settles as void.
+
 ### assert and return
 
 `assert` checks a condition and throws if it fails — the value after `else` is thrown, with a string wrapped in an `AssertionFailedException`:
