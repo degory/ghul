@@ -4,6 +4,7 @@ namespace Syntax.Process is
 
     use Semantic.Types.Type;
     use Semantic.Symbols.Classy;
+    use Semantic.Symbols.ENUM_STRUCT_MEMBER;
 
     // Closed-domain exhaustiveness / redundancy check over a `case`
     // statement or expression. The check runs once after every arm's
@@ -11,11 +12,12 @@ namespace Syntax.Process is
     // type and each arm's classification are settled. The three
     // emitted warnings — `non-exhaustive-case`, `redundant-case-arm`,
     // `dead-case-else` — are all derived from the same per-arm
-    // coverage walk over a small closed domain (union, bool, and the
-    // optional-wrapped variants of each). Scrutinee types whose value
-    // space is open (int, string, non-union class hierarchies, tuples)
-    // produce no warnings — `else` is the only way to be exhaustive
-    // there, and a missing one is the user's deliberate choice.
+    // coverage walk over a small closed domain (union, closed-class
+    // root, enum, bool, and the optional-wrapped variant of each).
+    // Scrutinee types whose value space is open (int, string, open
+    // class hierarchies, tuples) produce no warnings — `else` is the
+    // only way to be exhaustive there, and a missing one is the
+    // user's deliberate choice.
     class CASE_EXHAUSTIVENESS_CHECKER is
         _logger: Logger;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
@@ -118,35 +120,49 @@ namespace Syntax.Process is
                     return null;
                 fi
 
-                let variants = Collections.LIST[Classy]();
+                let alternatives = Collections.LIST[Classy]();
                 for v in one_of.subtypes do
-                    variants.add(v);
+                    alternatives.add(v);
                 od
-                return CASE_DOMAIN.for_union(underlying_classy, variants, is_optional);
+                return CASE_DOMAIN.for_closed_root(underlying_classy, alternatives, is_optional);
             fi
 
-            let union_classy = _try_get_union_classy(core);
+            let root_classy = _try_get_classy(core);
 
-            if union_classy? then
-                let variants = Collections.LIST[Classy]();
-                for sym in union_classy.symbols do
-                    let variant_classy = cast Classy(sym);
-                    if variant_classy? /\ sym.is_variant then
-                        variants.add(variant_classy);
+            if root_classy? then
+                if root_classy.is_closed_root then
+                    let alternatives = Collections.LIST[Classy]();
+                    for s in root_classy.closed_alternatives do
+                        alternatives.add(s);
+                    od
+
+                    if alternatives.count == 0 then
+                        return null;
                     fi
-                od
 
-                if variants.count == 0 then
-                    return null;
+                    return CASE_DOMAIN.for_closed_root(root_classy, alternatives, is_optional);
                 fi
 
-                return CASE_DOMAIN.for_union(union_classy, variants, is_optional);
+                if _is_enum_classy(root_classy) then
+                    let members = Collections.LIST[ENUM_STRUCT_MEMBER]();
+                    for sym in root_classy.symbols do
+                        if isa ENUM_STRUCT_MEMBER(sym) then
+                            members.add(cast ENUM_STRUCT_MEMBER(sym));
+                        fi
+                    od
+
+                    if members.count == 0 then
+                        return null;
+                    fi
+
+                    return CASE_DOMAIN.for_enum(root_classy, members, is_optional);
+                fi
             fi
 
             return null;
         si
 
-        _try_get_union_classy(type: Type) -> Classy? is
+        _try_get_classy(type: Type) -> Classy? is
             if !type? then
                 return null;
             fi
@@ -157,14 +173,11 @@ namespace Syntax.Process is
                 return null;
             fi
 
-            let classy = cast Classy(named.symbol.unspecialized_symbol);
-
-            if !classy? \/ !classy.is_union then
-                return null;
-            fi
-
-            return classy;
+            return cast Classy(named.symbol.unspecialized_symbol);
         si
+
+        _is_enum_classy(classy: Classy) -> bool =>
+            classy.symbol_kind == Semantic.Symbols.SYMBOL_KIND.ENUM;
 
         _arm_coverage(arm: Trees.Statements.CASE_MATCH, domain: CASE_DOMAIN) -> ARM_COVERAGE? is
             if arm.pattern? then
@@ -188,7 +201,7 @@ namespace Syntax.Process is
                 // For a non-optional scrutinee that's everything; for
                 // an optional scrutinee it leaves the null half open.
                 if domain.is_optional then
-                    result.covers_all_variants(domain);
+                    result.covers_all_alternatives(domain);
                 else
                     result.covers_universe = true;
                 fi
@@ -215,29 +228,15 @@ namespace Syntax.Process is
                 return result;
             fi
 
-            if domain.union_symbol? then
-                if target_classy =~ domain.union_symbol then
-                    result.covers_all_variants(domain);
-                elif target_classy.is_variant /\ domain.contains_variant(target_classy) then
-                    result.covered_variants.add(target_classy);
+            if domain.root_symbol? then
+                if target_classy =~ domain.root_symbol then
+                    result.covers_all_alternatives(domain);
+                elif domain.alternatives? /\ domain.contains_alternative(target_classy) then
+                    result.covered_alternatives.add(target_classy);
                 fi
             fi
 
             return result;
-        si
-
-        _try_get_classy(type: Type) -> Classy? is
-            if !type? then
-                return null;
-            fi
-
-            let named = cast Semantic.Types.NAMED(type);
-
-            if !named? \/ !named.symbol? then
-                return null;
-            fi
-
-            return cast Classy(named.symbol.unspecialized_symbol);
         si
 
         _literal_arm_coverage(
@@ -263,50 +262,93 @@ namespace Syntax.Process is
                     elif bool_lit.value_string =~ "false" then
                         result.covers_false = true;
                     fi
+                elif domain.enum_members? then
+                    let value_string = _try_get_enum_literal_value(expr, domain);
+                    if value_string? /\ !result.contains_enum_value(value_string) then
+                        result.covered_enum_values.add(value_string);
+                    fi
                 fi
             od
 
             return result;
         si
+
+        // For an enum-domain arm, recognise an expression that has
+        // been resolved to a numeric literal whose type matches the
+        // enum scrutinee. Returns the literal's value string so the
+        // checker can record coverage by enum-member value. The match
+        // tolerates `Color.RED` (member access), `cast Color(1)`, and
+        // any other shape that compile-expressions has lowered to a
+        // numeric literal — what matters is the resolved value.
+        _try_get_enum_literal_value(
+            expr: Trees.Expressions.Expression,
+            domain: CASE_DOMAIN
+        ) -> string? is
+            if !expr.value? then
+                return null;
+            fi
+
+            let number = cast IR.Values.Literal.NUMBER(expr.value);
+
+            if !number? \/ !number.type? \/ !domain.root_symbol? then
+                return null;
+            fi
+
+            let number_classy = _try_get_classy(number.type);
+
+            if !number_classy? \/ !(number_classy =~ domain.root_symbol) then
+                return null;
+            fi
+
+            return number.value;
+        si
     si
 
-    // Closed-set classification of a `case` scrutinee's type. Only
-    // unions and bool — each optionally wrapped — produce a domain
-    // worth checking; everything else returns null from the
-    // classifier and the case is skipped silently.
+    // Closed-set classification of a `case` scrutinee's type. Five
+    // shapes qualify, each optionally wrapped: bool, union (variants
+    // are the closed set), closed class (in-assembly subclasses are
+    // the closed set), and enum (literal members are the closed set).
+    // Open scrutinees (int, string, open class hierarchies, tuples)
+    // return null and the case is skipped silently.
     class CASE_DOMAIN is
-        union_symbol: Classy? public;
-        variants: Collections.LIST[Classy]? public;
+        root_symbol: Classy? public;
+        alternatives: Collections.LIST[Classy]? public;
+        enum_members: Collections.LIST[ENUM_STRUCT_MEMBER]? public;
         is_bool: bool public;
         is_optional: bool public;
 
         init(
-            union_symbol: Classy?,
-            variants: Collections.LIST[Classy]?,
+            root_symbol: Classy?,
+            alternatives: Collections.LIST[Classy]?,
+            enum_members: Collections.LIST[ENUM_STRUCT_MEMBER]?,
             is_bool: bool,
             is_optional: bool
         ) is
             super.init();
 
-            self.union_symbol = union_symbol;
-            self.variants = variants;
+            self.root_symbol = root_symbol;
+            self.alternatives = alternatives;
+            self.enum_members = enum_members;
             self.is_bool = is_bool;
             self.is_optional = is_optional;
         si
 
-        for_union(symbol: Classy, variants: Collections.LIST[Classy], is_optional: bool) -> CASE_DOMAIN static =>
-            CASE_DOMAIN(symbol, variants, false, is_optional);
+        for_closed_root(symbol: Classy, alternatives: Collections.LIST[Classy], is_optional: bool) -> CASE_DOMAIN static =>
+            CASE_DOMAIN(symbol, alternatives, null, false, is_optional);
+
+        for_enum(symbol: Classy, members: Collections.LIST[ENUM_STRUCT_MEMBER], is_optional: bool) -> CASE_DOMAIN static =>
+            CASE_DOMAIN(symbol, null, members, false, is_optional);
 
         for_bool(is_optional: bool) -> CASE_DOMAIN static =>
-            CASE_DOMAIN(null, null, true, is_optional);
+            CASE_DOMAIN(null, null, null, true, is_optional);
 
-        contains_variant(variant: Classy) -> bool is
-            if !variants? \/ !variant? then
+        contains_alternative(alternative: Classy) -> bool is
+            if !alternatives? \/ !alternative? then
                 return false;
             fi
 
-            for v in variants do
-                if v =~ variant then
+            for v in alternatives do
+                if v =~ alternative then
                     return true;
                 fi
             od
@@ -319,7 +361,8 @@ namespace Syntax.Process is
     // an individual arm's contribution and the running union of all
     // arms seen so far; `adds_to` and `absorb` are the merge ops.
     class ARM_COVERAGE is
-        covered_variants: Collections.LIST[Classy] public;
+        covered_alternatives: Collections.LIST[Classy] public;
+        covered_enum_values: Collections.LIST[string] public;
         covers_null: bool public;
         covers_true: bool public;
         covers_false: bool public;
@@ -328,7 +371,8 @@ namespace Syntax.Process is
         init() is
             super.init();
 
-            covered_variants = Collections.LIST[Classy]();
+            covered_alternatives = Collections.LIST[Classy]();
+            covered_enum_values = Collections.LIST[string]();
             covers_null = false;
             covers_true = false;
             covers_false = false;
@@ -336,19 +380,20 @@ namespace Syntax.Process is
         si
 
         is_empty: bool =>
-            covered_variants.count == 0 /\
+            covered_alternatives.count == 0 /\
+            covered_enum_values.count == 0 /\
             !covers_null /\
             !covers_true /\
             !covers_false /\
             !covers_universe;
 
-        contains_variant(variant: Classy) -> bool is
-            if !variant? then
+        contains_alternative(alternative: Classy) -> bool is
+            if !alternative? then
                 return false;
             fi
 
-            for v in covered_variants do
-                if v =~ variant then
+            for v in covered_alternatives do
+                if v =~ alternative then
                     return true;
                 fi
             od
@@ -356,16 +401,36 @@ namespace Syntax.Process is
             return false;
         si
 
-        covers_all_variants(domain: CASE_DOMAIN) is
-            if !domain.variants? then
-                return;
+        contains_enum_value(value: string) -> bool is
+            if !value? then
+                return false;
             fi
 
-            for v in domain.variants do
-                if !contains_variant(v) then
-                    covered_variants.add(v);
+            for v in covered_enum_values do
+                if v =~ value then
+                    return true;
                 fi
             od
+
+            return false;
+        si
+
+        covers_all_alternatives(domain: CASE_DOMAIN) is
+            if domain.alternatives? then
+                for v in domain.alternatives do
+                    if !contains_alternative(v) then
+                        covered_alternatives.add(v);
+                    fi
+                od
+            fi
+
+            if domain.enum_members? then
+                for m in domain.enum_members do
+                    if !contains_enum_value(m.value) then
+                        covered_enum_values.add(m.value);
+                    fi
+                od
+            fi
         si
 
         adds_to(prior: CASE_COVERAGE) -> bool is
@@ -385,8 +450,14 @@ namespace Syntax.Process is
                 return true;
             fi
 
-            for v in covered_variants do
-                if !prior.coverage.contains_variant(v) then
+            for v in covered_alternatives do
+                if !prior.coverage.contains_alternative(v) then
+                    return true;
+                fi
+            od
+
+            for v in covered_enum_values do
+                if !prior.coverage.contains_enum_value(v) then
                     return true;
                 fi
             od
@@ -426,9 +497,15 @@ namespace Syntax.Process is
                 coverage.covers_false = true;
             fi
 
-            for v in arm.covered_variants do
-                if !coverage.contains_variant(v) then
-                    coverage.covered_variants.add(v);
+            for v in arm.covered_alternatives do
+                if !coverage.contains_alternative(v) then
+                    coverage.covered_alternatives.add(v);
+                fi
+            od
+
+            for v in arm.covered_enum_values do
+                if !coverage.contains_enum_value(v) then
+                    coverage.covered_enum_values.add(v);
                 fi
             od
         si
@@ -450,13 +527,27 @@ namespace Syntax.Process is
                 return true;
             fi
 
-            if domain.variants? then
+            if domain.alternatives? then
                 if domain.is_optional /\ !coverage.covers_null then
                     return false;
                 fi
 
-                for v in domain.variants do
-                    if !coverage.contains_variant(v) then
+                for v in domain.alternatives do
+                    if !coverage.contains_alternative(v) then
+                        return false;
+                    fi
+                od
+
+                return true;
+            fi
+
+            if domain.enum_members? then
+                if domain.is_optional /\ !coverage.covers_null then
+                    return false;
+                fi
+
+                for m in domain.enum_members do
+                    if !coverage.contains_enum_value(m.value) then
                         return false;
                     fi
                 od
@@ -488,10 +579,19 @@ namespace Syntax.Process is
                 fi
             fi
 
-            if domain.variants? /\ !coverage.covers_universe then
-                for v in domain.variants do
-                    if !coverage.contains_variant(v) then
+            if domain.alternatives? /\ !coverage.covers_universe then
+                for v in domain.alternatives do
+                    if !coverage.contains_alternative(v) then
                         _append_with_comma(buffer, count, v.name);
+                        count = count + 1;
+                    fi
+                od
+            fi
+
+            if domain.enum_members? /\ !coverage.covers_universe then
+                for m in domain.enum_members do
+                    if !coverage.contains_enum_value(m.value) then
+                        _append_with_comma(buffer, count, m.name);
                         count = count + 1;
                     fi
                 od
