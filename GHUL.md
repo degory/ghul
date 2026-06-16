@@ -11,12 +11,18 @@ This file is a condensed single-file reference. The full documentation, with a p
 ghūl keywords are lowercase. Identifiers follow a convention that the compiler partly enforces:
 
 - `snake_case` — variables, functions, methods, properties
-- `PascalCase` — namespaces, traits, abstract classes
-- `MACRO_CASE` — concrete classes, structs, enums, unions, and union variants
+- `PascalCase` — namespaces, traits, abstract classes, unions, enums
+- `UPPER_SNAKE_CASE` — concrete classes, structs, variants, enum members
 
 A leading underscore (`_name`) marks a name as non-public. For methods and properties this is enforced. There are no `public`/`private` keywords; the naming convention carries that information.
 
-A `non-snake-case-member` warning fires on ghūl-source variable, function, property, method or function-argument declarations whose names contain any character other than lowercase letters, digits and underscores. Suppress per declaration, per file, or project-wide with `@suppress("non-snake-case-member")`.
+The compiler warns when a ghūl-source declaration doesn't match the convention for its kind. Each rule has its own slug, suppressible per declaration, per file, or project-wide:
+
+- `non-snake-case-name` — variables, functions, methods, properties.
+- `non-pascal-case-name` — abstract classes, traits, unions, enums.
+- `non-upper-snake-case-name` — concrete classes, structs, variants, enum members.
+
+A class with only `static` members (and no primary-constructor parameters) is treated as effectively abstract for naming purposes and follows the PascalCase rule.
 
 ## namespaces and `use`
 
