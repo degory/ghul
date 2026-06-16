@@ -406,7 +406,7 @@ elif let leaf: Tree.LEAF = tree then
 fi
 ```
 
-Both `isa V(x)` and `if let v: V = x` narrow `x` itself inside the then-arm and inside guard-then-return tails, and on a two-variant union narrow the `else` branch to the other variant — member access on the scrutinee in the else arm resolves against the complement variant. A `case` over a union scrutinee is checked for exhaustiveness: missing variants are warned (`non-exhaustive-case`), a `redundant-case-arm` arm fires when a later arm matches nothing the prior arms didn't already cover, and `dead-case-else` fires when the `else` arm is unreachable because the preceding arms cover the domain. The warnings also fire on `bool` and `bool?` scrutinees, on `T?` of a union, on closed class hierarchies (the in-assembly subclasses are the closed set — plus the root type itself when the root is concrete, since it is then constructible) and on enums.
+Both `isa V(x)` and `if let v: V = x` narrow `x` itself inside the then-arm and inside guard-then-return tails, and on a two-variant union narrow the `else` branch to the other variant — member access on the scrutinee in the else arm resolves against the complement variant. A `case` over a union scrutinee is checked for exhaustiveness: missing variants are warned (`non-exhaustive-case`), a `redundant-case-arm` arm fires when a later arm matches nothing the prior arms didn't already cover, and `dead-case-else` fires when the `else` arm is unreachable because the preceding arms cover the domain. The warnings also fire on `bool` and `bool?` scrutinees, on `T?` of a union, on closed class hierarchies (the in-assembly subclasses are the closed set — plus the root type itself when the root is concrete, since it is then constructible) and on enums. A `case` over an open-domain scrutinee (`int`, `string`, open class hierarchy, tuple) with no `else` arm fires `case-needs-else`: a warning on the statement form and on an expression form whose expected type has a default (value type or `T?`), an error otherwise.
 
 Unions compare by structural equality through the `=~` operator — two union values are `=~` when they hold the same variant with memberwise-equal fields.
 
@@ -633,7 +633,7 @@ else
 esac
 ```
 
-`case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` needs either an `else` arm or arms that cover the scrutinee's closed domain (a union's full variant set, both bool branches, etc.) so every match path produces a value:
+`case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` needs either an `else` arm, arms that cover the scrutinee's closed domain (a union's full variant set, both bool branches, etc.), or — over an open-domain scrutinee with an expected type that has a default value (value type or `T?`) — none of the above, in which case the `case` produces `default(T)` on the no-match path and `case-needs-else` warns:
 
 ```ghul
 let label = case status
