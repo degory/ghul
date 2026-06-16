@@ -16,6 +16,8 @@ ghūl keywords are lowercase. Identifiers follow a convention that the compiler 
 
 A leading underscore (`_name`) marks a name as non-public. For methods and properties this is enforced. There are no `public`/`private` keywords; the naming convention carries that information.
 
+A `non-snake-case-member` warning fires on ghūl-source variable, function, property, method or function-argument declarations whose names contain any character other than lowercase letters, digits and underscores. Suppress per declaration, per file, or project-wide with `@suppress("non-snake-case-member")`.
+
 ## namespaces and `use`
 
 See <https://ghul.dev/definitions.html#namespaces>.
