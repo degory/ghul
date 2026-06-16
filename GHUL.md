@@ -22,7 +22,7 @@ The compiler warns when a ghūl-source declaration doesn't match the convention 
 - `non-pascal-case-name` — abstract classes, traits, unions, enums.
 - `non-upper-snake-case-name` — concrete classes, structs, variants, enum members.
 
-A class with only `static` members (and no primary-constructor parameters) is treated as effectively abstract for naming purposes and follows the PascalCase rule.
+A class with only `static` members (and no primary-constructor parameters) is a static-utility container — never constructed — and accepts either PascalCase or UPPER_SNAKE_CASE.
 
 ## namespaces and `use`
 
