@@ -6,18 +6,18 @@ namespace Syntax.Process is
     use Semantic.Symbols.Classy;
     use Semantic.Symbols.ENUM_STRUCT_MEMBER;
 
-    // Closed-domain exhaustiveness / redundancy check over a `case`
-    // statement or expression. The check runs once after every arm's
-    // pattern and statements have been compiled, so the scrutinee's
-    // type and each arm's classification are settled. The three
-    // emitted warnings — `non-exhaustive-case`, `redundant-case-arm`,
-    // `dead-case-else` — are all derived from the same per-arm
-    // coverage walk over a small closed domain (union, closed-class
-    // root, enum, bool, and the optional-wrapped variant of each).
-    // Scrutinee types whose value space is open (int, string, open
-    // class hierarchies, tuples) produce no warnings — `else` is the
-    // only way to be exhaustive there, and a missing one is the
-    // user's deliberate choice.
+    // Exhaustiveness / redundancy check over a `case` statement or
+    // expression. The check runs once after every arm's pattern and
+    // statements have been compiled, so the scrutinee's type and each
+    // arm's classification are settled. Four warnings are emitted:
+    // `non-exhaustive-case`, `redundant-case-arm`, and
+    // `dead-case-else` are derived from a per-arm coverage walk over
+    // a small closed domain (union, closed-class root, enum, bool,
+    // and the optional-wrapped variant of each). `case-needs-else`
+    // is emitted for an open-domain scrutinee (int, string, open
+    // class hierarchies, tuples) with no fallback arm — a warning on
+    // the statement form and on an expression form with a
+    // defaultable expected type, an error otherwise.
     class CASE_EXHAUSTIVENESS_CHECKER is
         _logger: Logger;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
@@ -43,9 +43,35 @@ namespace Syntax.Process is
                 return;
             fi
 
+            // For the open-domain branch we treat any arm carrying a
+            // destructure pattern (not just an actual `else`) as a
+            // catch-all — the existing `compile_conditionals.visit_case`
+            // and `pattern_arm_coverage` paths already treat a bare
+            // destructure as universe-covering, and `case` source
+            // commonly uses a trailing `when (x, y) then` arm as the
+            // exhaustive fallback. Anything stricter would fire on
+            // working code.
+            let has_fallback mut = false;
+            for arm in `case.matches do
+                if !arm.expressions? then
+                    has_fallback = true;
+                fi
+            od
+
             let domain = _classify_domain(scrutinee_type);
 
             if !domain? then
+                // Open-domain scrutinee (int, string, open class
+                // hierarchy, tuple). Without a fallback arm, emit
+                // `case-needs-else`. Severity depends on form: a
+                // statement just falls through; an expression must
+                // produce a value, but for a defaultable expected
+                // type we can warn and emit default(T) at the IL
+                // fall-through.
+                if !has_fallback then
+                    _emit_needs_else(`case, scrutinee_type);
+                fi
+
                 return;
             fi
 
@@ -90,13 +116,56 @@ namespace Syntax.Process is
                     );
                 fi
             elif !covered.is_complete then
-                _logger.warn(
-                    `case.location,
-                    "non-exhaustive-case",
-                    "case is not exhaustive: missing {covered.describe_missing()}"
-                );
+                // For an expression-form case, missing arms over a
+                // closed domain mean no value can be produced — that
+                // is an error. For a statement-form case it is a
+                // warning. Either way the list of missing cases is
+                // the actionable detail.
+                let message = "case is not exhaustive: missing {covered.describe_missing()}";
+
+                if `case.want_value then
+                    _logger.error(
+                        `case.location,
+                        message
+                    );
+                else
+                    _logger.warn(
+                        `case.location,
+                        "non-exhaustive-case",
+                        message
+                    );
+                fi
             fi
         si
+
+        _emit_needs_else(`case: Trees.Statements.CASE, scrutinee_type: Type) is
+            if !`case.want_value then
+                _logger.warn(
+                    `case.location,
+                    "case-needs-else",
+                    "case without else may fall through: {scrutinee_type} cannot be exhaustively matched"
+                );
+                return;
+            fi
+
+            if `case.expected_type? /\ _is_defaultable(`case.expected_type) then
+                _logger.warn(
+                    `case.location,
+                    "case-needs-else",
+                    "case without else may return default: {scrutinee_type} cannot be exhaustively matched"
+                );
+                `case.requires_default_fallthrough = true;
+                return;
+            fi
+
+            _logger.error(
+                `case.location,
+                "else required: {scrutinee_type} cannot be exhaustively matched"
+            );
+        si
+
+        _is_defaultable(t: Type) -> bool =>
+            t.is_value_type \/ t.is_optional;
 
         _is_else_arm(arm: Trees.Statements.CASE_MATCH) -> bool =>
             !arm.expressions? /\ !arm.pattern?;
@@ -319,7 +388,7 @@ namespace Syntax.Process is
     // are the closed set), closed class (in-assembly subclasses are
     // the closed set), and enum (literal members are the closed set).
     // Open scrutinees (int, string, open class hierarchies, tuples)
-    // return null and the case is skipped silently.
+    // return null and take the `case-needs-else` branch instead.
     class CASE_DOMAIN is
         root_symbol: Classy? public;
         alternatives: Collections.LIST[Classy]? public;
