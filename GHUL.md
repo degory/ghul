@@ -536,7 +536,9 @@ For a two-variant union the `else` branch is narrowed to the other variant. The 
 
 Narrowing is flow-sensitive: if a guard rejects a type and then leaves the block — by `return`, `throw`, `break`, or `continue` — the code after the guard is narrowed too.
 
-Narrowing applies to local variables, including a function's own parameters — never to a field or property. To narrow a field, copy it into a local variable first, or use `if let`, which introduces one.
+Type narrowing — `isa`, variant, and complement — applies to local variables, including a function's own parameters, never to a field or property. To narrow a field by type, copy it into a local variable first, or use `if let`, which introduces one.
+
+Optional *presence* narrowing — the `?` (and `!= null`) test — additionally applies to member-access paths rooted at a local. Inside `if x.y? then …`, the field or property read `x.y` is narrowed optional → non-optional, so `x.y.z` reads through it and a value-type `T?` is usable as `T`. The narrow is scoped to the guarded region and dropped if a prefix is assigned; it is kept across method calls, so a path that turns out absent at run time gives an undefined result at the use rather than a compile-time guarantee.
 
 ### if let
 
@@ -837,7 +839,7 @@ See <https://ghul.dev/type-inference.html>.
 
 ghūl infers types pervasively, but inference is **function-local**: a function's signature — its parameter and return types — is always written out, and inference works only within the body. Within a body, types are inferred for local variables, loop variables, destructured variables, anonymous function parameters and return types, and generic type arguments on calls.
 
-Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler narrows local variables but never fields or properties, and a `let` variable's inferred type does not escape the function it is declared in.
+Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler type-narrows local variables but never fields or properties (optional *presence* narrowing additionally covers member-access paths — see type narrowing), and a `let` variable's inferred type does not escape the function it is declared in.
 
 ## .NET interop
 
