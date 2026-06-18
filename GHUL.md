@@ -503,6 +503,16 @@ fi
 
 Optionals cover reference and value types alike — an optional value type is backed by the .NET `Nullable[T]`. A non-optional `T` is assignable to a `T?` without ceremony; the other direction needs the value to be known present. Assigning a possibly-absent value where a non-optional type is expected produces a warning, which clears once the value is known to be present.
 
+The `?.` operator is *coalescing* member access: `a?.b` reads `b` from `a` when `a` is present, otherwise yields the optional null. The result is always optional — a non-optional member type `U` is widened to `U?`, an already-optional `U?` stays `U?`. Receivers may be reference- or value-type optional (`T?` backed by `Nullable[T]`); a flow-narrowed non-optional receiver is allowed too, and just always takes the present branch.
+
+```ghul
+let p: PERSON? = find(id);
+let name = p?.name;              // string?
+let length = p?.name?.length;     // int? — chained coalesce
+```
+
+Only field and property access compose with `?.` for now; method calls (`a?.foo()`) need an explicit `if a?` guard.
+
 ## control flow
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.

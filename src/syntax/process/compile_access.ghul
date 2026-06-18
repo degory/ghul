@@ -75,7 +75,9 @@ namespace Syntax.Process is
                     return;
                 fi
 
-                _check_possible_null_dereference(member.left);
+                if !member.is_coalesce then
+                    _check_possible_null_dereference(member.left);
+                fi
 
                 // TODO we could loop here to handle multiple levels of dereferencing
                 if type.is_ref then
@@ -119,7 +121,24 @@ namespace Syntax.Process is
                     return;
                 fi
 
-                let named_type = type;
+                let named_type mut = type;
+
+                // For coalescing access against any optional, look
+                // up the member on the unwrapped (inner) type so
+                // `a?.b` consistently means "if a is present, access
+                // b on the unwrapped a". A value-type optional like
+                // NULLABLE[T] / MAYBE[T] otherwise resolves `value`
+                // / `has_value` against the wrapper rather than the
+                // payload, surprising the user and producing IL that
+                // mixes wrapper-thissed calls with payload-typed
+                // stack values.
+                if member.is_coalesce /\ named_type.is_optional then
+                    let inner = named_type.optional_inner_type;
+
+                    if inner? /\ isa Semantic.Types.NAMED(inner) then
+                        named_type = inner;
+                    fi
+                fi
 
                 if named_type.scope == null then
                     _logger.poison(member.left.location, "member left type has no type: {type}");
@@ -179,6 +198,10 @@ namespace Syntax.Process is
                 let value: Value mut = default;
 
                 if need_store then
+                    if member.is_coalesce then
+                        _logger.error(member.location, "cannot assign through coalescing member access");
+                    fi
+
                     let store_value = cast Need.STORE(member.value).value;
 
                     if check_store_access(member.location, member.left.value, symbol, named_type) then
@@ -196,6 +219,10 @@ namespace Syntax.Process is
                     let variant = cast Semantic.Symbols.VARIANT(symbol);
 
                     if variant? /\ variant.is_unit_variant then
+                        if member.is_coalesce then
+                            _logger.error(member.location, "coalescing member access does not apply to a unit-variant constructor");
+                        fi
+
                         let lowered = _unit_variant_constructor.try_load(member.location, variant, member.expected_type, member);
 
                         if lowered? then
@@ -206,7 +233,22 @@ namespace Syntax.Process is
                     fi
 
                     if check_load_access(member.location, member.left.value, symbol, named_type) then
-                        value = symbol.load(member.location, member.left.value, _symbol_loader);
+                        if member.is_coalesce then
+                            value = _build_coalesce_load(member, symbol);
+
+                            if value? then
+                                member.value = value;
+                                return;
+                            fi
+
+                            // Fallthrough on a build failure (e.g.
+                            // unsupported receiver shape): proceed with
+                            // a plain access so the user gets at most
+                            // one diagnostic instead of a cascade.
+                            value = symbol.load(member.location, member.left.value, _symbol_loader);
+                        else
+                            value = symbol.load(member.location, member.left.value, _symbol_loader);
+                        fi
                     fi
                 fi
 
@@ -863,6 +905,170 @@ namespace Syntax.Process is
             od
 
             return "member {member_name} is ambiguous in {names}";
+        si
+
+        // Build the IR value for an `a?.b` access. Returns the
+        // COALESCE_LOAD wrap when the receiver is a reference-typed
+        // optional and the member is a readable field or property;
+        // returns null (so the caller falls back to a plain access)
+        // on shapes that aren't supported in this lowering. Emits a
+        // diagnostic for each unsupported shape so the user learns
+        // why the `?.` had no effect.
+        _build_coalesce_load(
+            member: Trees.Expressions.MEMBER,
+            symbol: Semantic.Symbols.Symbol
+        ) -> Value? is
+            let receiver = member.left.value;
+
+            if !receiver? \/ !receiver.has_type then
+                return null;
+            fi
+
+            let receiver_type = receiver.type;
+
+            // v1 scope: fields and properties only. A method
+            // selection through `?.` would need to compose with the
+            // surrounding CALL (the call itself must short-circuit),
+            // which is a separate lowering.
+            if
+                !isa Semantic.Symbols.Field(symbol) /\
+                !isa Semantic.Symbols.Property(symbol)
+            then
+                _logger.error(
+                    member.location,
+                    "coalescing member access supports fields and properties only"
+                );
+                return null;
+            fi
+
+            let receiver_is_value_optional = receiver_type.is_optional /\ receiver_type.is_value_type;
+
+            // The member symbol lives on the receiver's underlying
+            // type regardless of the `?` flag, so `symbol.load`
+            // against a STACK_TOP of the non-optional type emits the
+            // expected access op with no preceding receiver gen.
+            let inner_type =
+                if receiver_is_value_optional then
+                    receiver_type.optional_inner_type;
+                else
+                    receiver_type.as_non_optional();
+                fi;
+
+            if !inner_type? then
+                return null;
+            fi
+
+            // STACK_TOP (has_address=false): the inner-receiver
+            // value is on the stack, not its address. A struct
+            // member access reads the value off the top, and the
+            // existing call_struct_method path's `ADDRESS(from)`
+            // spill takes its address as needed. A STACK_TOP_ADDRESS
+            // here would tell that spill the address is already
+            // present and skip it — producing a `call instance` on a
+            // bare value, which segfaults at the JIT.
+            let stack_top: IR.Values.Value = IR.Values.STACK_TOP(inner_type!);
+
+            let raw_load = symbol.load(member.location, stack_top, _symbol_loader);
+
+            if !raw_load? \/ !raw_load.has_type then
+                return null;
+            fi
+
+            let raw_type = raw_load.type;
+            let result_type = _build_optional_type(raw_type);
+
+            // Make the present arm push a value of the result type:
+            //   - reference T → T flagged optional, IL identity.
+            //   - value T   → NULLABLE[T] via WRAP_OPTIONAL (newobj
+            //                 Nullable<T>::.ctor(T)).
+            //   - already-optional U → identity.
+            let member_value: Value mut = raw_load;
+            if
+                !raw_type.is_optional /\
+                result_type.is_value_type
+            then
+                member_value = IR.Values.WRAP_OPTIONAL(result_type, raw_load);
+            fi
+
+            let null_value = _build_null_sentinel(result_type);
+
+            if !null_value? then
+                return null;
+            fi
+
+            if receiver_is_value_optional then
+                // Build presence test (get_has_value) and value
+                // extract (get_value) against a STACK_TOP_ADDRESS so
+                // both consume the address dup'd by COALESCE_LOAD.
+                let address_stand_in = IR.Values.STACK_TOP_ADDRESS(receiver_type);
+                let has_value_member = receiver_type.find_member("has_value");
+                let value_member = receiver_type.find_member("value");
+
+                if !has_value_member? \/ !value_member? then
+                    _logger.poison(
+                        member.location,
+                        "coalescing member access receiver {receiver_type} missing has_value or value member"
+                    );
+                    return null;
+                fi
+
+                let presence_test = has_value_member.load(member.location, address_stand_in, _symbol_loader);
+                let value_extract = value_member.load(member.location, address_stand_in, _symbol_loader);
+
+                if !presence_test? \/ !value_extract? then
+                    return null;
+                fi
+
+                return IR.Values.COALESCE_LOAD(
+                    receiver,
+                    presence_test,
+                    value_extract,
+                    member_value,
+                    null_value,
+                    result_type
+                );
+            fi
+
+            return IR.Values.COALESCE_LOAD(receiver, member_value, null_value, result_type);
+        si
+
+        // The null-arm sentinel for a coalescing access of result
+        // type `result_type`: `ldnull` for a reference type, a fresh
+        // DEFAULT (which hoists a `.locals init` and pushes the zero
+        // value) for a value-type optional like NULLABLE[T] or
+        // MAYBE[T].
+        _build_null_sentinel(result_type: Type) -> Value? is
+            if !result_type? then
+                return null;
+            fi
+
+            if result_type.is_value_type then
+                return IR.Values.DEFAULT(result_type);
+            fi
+
+            return IR.RAW(result_type, "ldnull");
+        si
+
+        // The `T?` form of `t`: NULLABLE[T] for a value type, the
+        // flagged reference for a reference type, MAYBE[T] for an
+        // unconstrained type parameter. `as_optional()` alone returns
+        // the receiver for a value type — leaving the result mistyped
+        // as `T` — so this dispatches the way
+        // `resolve_type_expressions` does for a written `T?`.
+        _build_optional_type(t: Type) -> Type is
+            if !t? then
+                return t;
+            fi
+
+            if t.is_optional then
+                return t;
+            fi
+
+            if t.is_value_type then
+                return _innate_symbol_lookup.get_optional_type(t);
+            fi
+
+            return t.as_optional();
         si
     si
 si
