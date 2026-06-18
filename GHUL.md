@@ -523,7 +523,7 @@ let sign = if x >= 0 then "non-negative" else "negative" fi;
 
 ### type narrowing
 
-When an `if` condition proves a stronger fact about a local variable's type, the branch sees it at the narrower type. The common cases are `isa` class or variant tests and a `?` presence test on an optional:
+When an `if` or `while` condition proves a stronger fact about a local variable's type, the branch (or loop body) sees it at the narrower type. The common cases are `isa` class or variant tests and a `?` presence test on an optional:
 
 ```ghul
 if isa Cat(a) then
@@ -625,6 +625,10 @@ od
 ```
 
 Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5).
+
+A `while` condition narrows the loop body the same way an `if` condition narrows its then-arm. `while xs? /\ i < xs.count do xs[i] …` reads `xs` at its non-optional type inside the body, and `while isa Cat(a) do a.purr() od` calls a `Cat`-only member without an inner cast.
+
+`while let` is the loop counterpart of `if let`: the loop runs while the refutable binding matches, with the bound names freshly in scope on each iteration. The same shapes work — bare presence (`while let line = reader.read_line() do …`), type ascription (`while let c: Cat = a do …`), destructure, `/\` guards (`while let c: Cat = a /\ c.has_whiskers do …`), and comma-separated multi-clause bindings (`while let x = a, y = b do …`) where every clause must succeed each iteration. Loop exit is whenever any clause's test or guard fails.
 
 ### case
 
