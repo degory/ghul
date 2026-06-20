@@ -1,0 +1,371 @@
+namespace Semantic.DotNet is
+    use Collections;
+
+    use ATTRIBUTE_DATA = System.Reflection.CustomAttributeData;
+    use TYPED_ARGUMENT = System.Reflection.CustomAttributeTypedArgument;
+
+    // Emit and read `System.Runtime.CompilerServices.NullableAttribute`,
+    // the CLR-standard carrier for reference-type `?` annotations. ghūl's
+    // `?` postfix on reference types is purely a source-side annotation —
+    // the underlying IL type for `Foo?` and `Foo` is identical — so to
+    // survive cross-assembly reflection the annotation rides on a custom
+    // attribute applied to the slot (parameter, return, field, property).
+    //
+    // Format: a pre-order walk of the type tree, one byte per Type slot,
+    // with 2 = `?`, 1 = non-`?`, 0 = no opinion (value types,
+    // System.Nullable[T], Ghul.MAYBE[T] — each carries its optionality
+    // through its CLR type, so no per-slot marker is needed). Generic
+    // arguments contribute bytes after their parent's byte. A `List[T?]`
+    // field with reference-`T?` produces `[1, 2]`: List non-`?`, T `?`.
+    //
+    // The slot's NullableAttribute is dropped entirely when no position
+    // would be 2 — every position then defaults to non-`?` on the read
+    // side. Single-position slots use the compact `.ctor(uint8)` form;
+    // multi-position slots use `.ctor(uint8[])`.
+    class NULLABILITY is
+        // True iff `type` has at least one reference-`?` position
+        // anywhere in its tree — the gate for emitting the attribute
+        // on a slot. Value-type optionals (`int?` -> System.Nullable),
+        // `Ghul.MAYBE[T]`, and bare type variables already round-trip
+        // via their distinct CLR types; their nested arguments are
+        // still walked.
+        needs_attribute(type: Types.Type) -> bool static is
+            let bytes = compute_bytes(type);
+
+            return needs_attribute_for_bytes(bytes);
+        si
+
+        // The per-position bytes for `type`. One per Type slot, pre-
+        // order: head byte for the type itself, then recurse into each
+        // entry of `arguments`. Empty `[0]` for null / sentinel /
+        // error — those carry no nullability info either way.
+        compute_bytes(type: Types.Type) -> LIST[int] static is
+            let result = LIST[int]();
+
+            _append_bytes(type, result);
+
+            return result;
+        si
+
+        _append_bytes(type: Types.Type, buffer: LIST[int]) static is
+            if !type? \/ type.is_sentinel \/ type.is_error then
+                buffer.add(0);
+                return;
+            fi
+
+            buffer.add(_head_byte(type));
+
+            let arguments = type.arguments;
+
+            if !arguments? then
+                return;
+            fi
+
+            for i in 0..arguments.count do
+                _append_bytes(arguments[i], buffer);
+            od
+        si
+
+        // The single byte for `type` at its own position. Value types
+        // (including System.Nullable[T] and Ghul.MAYBE[T]) return 0:
+        // their optionality rides on the CLR type itself, not on this
+        // attribute. Reference types and bare type variables return
+        // 1 / 2 from `is_optional`.
+        _head_byte(type: Types.Type) -> int static is
+            if !type? then
+                return 0;
+            fi
+
+            if type.is_value_type \/ type.is_maybe then
+                return 0;
+            fi
+
+            if type.is_optional then
+                return 2;
+            fi
+
+            return 1;
+        si
+
+        // The full `.custom instance void ...NullableAttribute::.ctor(...) = (...)`
+        // directive line for `type`, or null when the slot needs no
+        // attribute. Picks `.ctor(uint8)` for the single-position case
+        // and `.ctor(uint8[])` for the rest.
+        gen_attribute_line_for_type(type: Types.Type) -> string? static is
+            let bytes = compute_bytes(type);
+
+            if !needs_attribute_for_bytes(bytes) then
+                return null;
+            fi
+
+            return gen_attribute_line_for_bytes(bytes);
+        si
+
+        needs_attribute_for_bytes(bytes: List[int]) -> bool static is
+            if !bytes? \/ bytes.count == 0 then
+                return false;
+            fi
+
+            for b in bytes do
+                if b == 2 then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        gen_attribute_blob_for_bytes(bytes: List[int]) -> string static is
+            if bytes.count == 1 then
+                return _gen_single_byte_blob(bytes[0]);
+            fi
+
+            return _gen_byte_array_blob(bytes);
+        si
+
+        gen_attribute_line_for_bytes(bytes: List[int]) -> string static is
+            if bytes.count == 1 then
+                return ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8) = {_gen_single_byte_blob(bytes[0])}";
+            fi
+
+            return ".custom instance void [System.Runtime]System.Runtime.CompilerServices.NullableAttribute::.ctor(uint8[]) = {_gen_byte_array_blob(bytes)}";
+        si
+
+        // The single-byte blob for `NullableAttribute::.ctor(uint8)`:
+        //   01 00   — attribute-blob prolog
+        //   VV      — the byte
+        //   00 00   — zero named arguments
+        _gen_single_byte_blob(value: int) -> string static =>
+            "( 01 00 {_format_byte(value)} 00 00 )";
+
+        // The blob for `NullableAttribute::.ctor(uint8[])`:
+        //   01 00                  — attribute-blob prolog
+        //   LL LL LL LL            — element count, little-endian uint32
+        //   B0 B1 ...              — the bytes
+        //   00 00                  — zero named arguments
+        _gen_byte_array_blob(bytes: List[int]) -> string static is
+            let buffer = System.Text.StringBuilder();
+
+            buffer.append("( 01 00 ");
+
+            let count = bytes.count;
+
+            _append_byte_hex(buffer, count);
+            _append_byte_hex(buffer, count >> 8);
+            _append_byte_hex(buffer, count >> 16);
+            _append_byte_hex(buffer, count >> 24);
+
+            for b in bytes do
+                _append_byte_hex(buffer, b);
+            od
+
+            buffer.append("00 00 )");
+
+            return buffer.to_string();
+        si
+
+        _format_byte(value: int) -> string static =>
+            (0xFFu & cast uint(value)).to_string("X02");
+
+        _append_byte_hex(buffer: System.Text.StringBuilder, value: int) static is
+            buffer
+                .append(_format_byte(value))
+                .append(' ');
+        si
+
+        // The position bytes carried by a `NullableAttribute` in
+        // `attributes`, expanded out for the read side to walk against
+        // the reflected type. Returns null when no attribute is
+        // present, or empty when the attribute is the byte[] form
+        // with a zero-length array. The single-byte form is returned
+        // as a one-element list — the caller broadcasts it across
+        // every position via `apply_bytes`.
+        read_bytes(attributes: Iterable[ATTRIBUTE_DATA]) -> LIST[int]? static is
+            if !attributes? then
+                return null;
+            fi
+
+            try
+                for attribute in attributes do
+                    let attribute_type = attribute.attribute_type;
+
+                    if
+                        attribute_type? /\
+                        attribute_type.full_name =~ "System.Runtime.CompilerServices.NullableAttribute"
+                    then
+                        for constructor_argument in attribute.constructor_arguments do
+                            return _read_bytes_from_argument(constructor_argument);
+                        od
+                    fi
+                od
+            catch ex: System.Exception
+            yrt
+
+            return null;
+        si
+
+        _read_bytes_from_argument(argument: TYPED_ARGUMENT) -> LIST[int]? static is
+            let arg_type = argument.argument_type;
+
+            if !arg_type? then
+                return null;
+            fi
+
+            if arg_type.full_name =~ "System.Byte" then
+                let result = LIST[int]();
+                result.add(System.Convert.to_int32(argument.value));
+                return result;
+            fi
+
+            // The byte[] form surfaces as an Iterable of one
+            // CustomAttributeTypedArgument per element; each element's
+            // .value is a boxed byte.
+            let elements = cast Iterable[TYPED_ARGUMENT](argument.value);
+
+            if !elements? then
+                return null;
+            fi
+
+            let result = LIST[int]();
+
+            for element in elements do
+                let element_type = element.argument_type;
+
+                if !element_type? \/ !(element_type.full_name =~ "System.Byte") then
+                    return null;
+                fi
+
+                result.add(System.Convert.to_int32(element.value));
+            od
+
+            return result;
+        si
+
+        // Return `type` with each `?` position from `bytes` applied to
+        // the matching position in its tree. The walk mirrors the
+        // emitter: head byte at the current position, then recurse
+        // into `arguments` left-to-right. A single-byte attribute
+        // broadcasts to every position. Generics with at least one
+        // changed argument are rebuilt via `GENERIC.create`, which
+        // each subclass overrides to preserve its identity (ARRAY,
+        // NULLABLE, MAYBE, REFERENCE, POINTER, TUPLE). Symbol
+        // materialization is deferred until we actually have to
+        // rebuild — slots whose tree has no `?` position never force
+        // a TYPE_WRAPPER's symbol, preserving the bootstrap-safe path
+        // the existing reflection import depends on.
+        apply_bytes(type: Types.Type, bytes: List[int]) -> Types.Type static is
+            if !type? \/ !bytes? \/ bytes.count == 0 then
+                return type;
+            fi
+
+            let (result, _, _) = _apply_walk(type, bytes, 0);
+
+            return result;
+        si
+
+        // Returns (new_type, next_index, any_changed). `any_changed`
+        // propagates up so a parent generic only rebuilds when one of
+        // its arguments actually had a `?` applied; that keeps the
+        // bootstrap-safe path intact for slots whose tree carries
+        // only 1s or 0s.
+        _apply_walk(
+            type: Types.Type,
+            bytes: List[int],
+            start_index: int
+        ) -> (Types.Type, int, bool) static is
+            let position = start_index;
+            let index mut = start_index + 1;
+
+            if !type? then
+                return (type, index, false);
+            fi
+
+            let head = _byte_at(bytes, position);
+
+            let arguments = type.arguments;
+
+            if arguments? /\ arguments.count > 0 then
+                let new_arguments = LIST[Types.Type]();
+                let any_arg_changed mut = false;
+
+                for i in 0..arguments.count do
+                    let (new_arg, next_index, arg_changed)
+                        = _apply_walk(arguments[i], bytes, index);
+
+                    index = next_index;
+
+                    if arg_changed then
+                        any_arg_changed = true;
+                    fi
+
+                    new_arguments.add(new_arg);
+                od
+
+                let rebuilt mut = type;
+
+                if any_arg_changed then
+                    if let generic: Types.GENERIC = type then
+                        let rebuilt_generic = _rebuild_generic(generic, new_arguments);
+
+                        if rebuilt_generic? then
+                            rebuilt = rebuilt_generic;
+                        fi
+                    fi
+                fi
+
+                if head == 2 then
+                    return (rebuilt.as_optional_unchecked(), index, true);
+                fi
+
+                return (rebuilt, index, any_arg_changed);
+            fi
+
+            if head == 2 then
+                return (type.as_optional_unchecked(), index, true);
+            fi
+
+            return (type, index, false);
+        si
+
+        _byte_at(bytes: List[int], position: int) -> int static is
+            if bytes.count == 1 then
+                return bytes[0];
+            fi
+
+            if position < 0 \/ position >= bytes.count then
+                return 0;
+            fi
+
+            return bytes[position];
+        si
+
+        // Construct a fresh GENERIC with `new_arguments` by dispatching
+        // through `GENERIC.create` — the same hook each subclass uses
+        // for specialization, so an ARRAY stays an ARRAY, a NULLABLE
+        // stays a NULLABLE, etc. Returns null when the underlying
+        // Classy can't be reached (e.g. the wrapper's symbol failed to
+        // materialize during early bootstrap); the caller falls back
+        // to the non-rebuilt path so reads stay best-effort instead
+        // of crashing.
+        _rebuild_generic(
+            generic: Types.GENERIC,
+            new_arguments: List[Types.Type]
+        ) -> Types.GENERIC? static is
+            try
+                let generic_symbol = cast Symbols.GENERIC(generic.symbol);
+
+                if !generic_symbol? \/ !generic_symbol.symbol? then
+                    return null;
+                fi
+
+                return generic.create(
+                    Source.LOCATION.reflected,
+                    generic_symbol.symbol,
+                    new_arguments
+                );
+            catch ex: System.Exception
+                return null;
+            yrt
+        si
+    si
+si
