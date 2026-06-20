@@ -513,6 +513,17 @@ let length = p?.name?.length;     // int? — chained coalesce
 
 Only field and property access compose with `?.` for now; method calls (`a?.foo()`) need an explicit `if a?` guard.
 
+The `??` operator is *null-coalescing*: `a ?? b` returns `a` when it is present, otherwise evaluates and returns `b`. The right operand is evaluated only when needed. `??` is right-associative, so `a ?? b ?? c ?? d` parses as `a ?? (b ?? (c ?? d))`; each intermediate result stays optional until the chain is closed by a non-optional fallback. The result type is the LUB of the left's underlying type and the right's type, kept optional iff the right is itself optional — so a chain that ends in a plain `T` returns `T`, and a chain that stays all-optional returns `T?`. `??` applies to reference-typed optionals; value-type optionals are not yet supported.
+
+```ghul
+let name: string? = lookup();
+let greeting = "hello, {name ?? "stranger"}";   // string
+
+let primary: string?   = first();
+let secondary: string? = second();
+let chosen = primary ?? secondary ?? "fallback"; // string
+```
+
 ## control flow
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.
