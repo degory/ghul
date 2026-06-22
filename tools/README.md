@@ -29,9 +29,10 @@ cd -
 ./build/filter-jb-annotations.sh tools/jetbrains-annotations
 ```
 
-The compiler reads `GHUL_JB_ANNOTATIONS_PATH` first if set,
-otherwise probes `<compiler-dir>/jetbrains-annotations`, then
-`../tools/jetbrains-annotations`, then `../../../tools/jetbrains-annotations`
-for the bin layout. Missing means no JB-coverage upgrade — every
-imported BCL method stays at the default IMPURE on the import
-side.
+The compiler reads from `<compiler-dir>/jetbrains-annotations` —
+the layout the build / publish / pack outputs put together via
+the `<Content Link="jetbrains-annotations\…" CopyToOutputDirectory="Always">`
+glob in `ghul.ghulproj`. `GHUL_JB_ANNOTATIONS_PATH` overrides for
+the rare out-of-tree case. Missing means no JB-coverage upgrade
+— every imported BCL method stays at the default IMPURE on the
+import side.
