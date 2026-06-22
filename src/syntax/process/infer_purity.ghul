@@ -65,6 +65,17 @@ namespace Syntax.Process is
             return false;
         si
 
+        visit(function: Trees.Definitions.FUNCTION) is
+            let function_symbol = symbol_for(function);
+
+            if function_symbol? /\ isa Semantic.Symbols.Function(function_symbol) then
+                let f = cast Semantic.Symbols.Function(function_symbol);
+                _check_override_invariant(f, function);
+            fi
+
+            super.visit(function);
+        si
+
         // Walk the body for assignment LHS classification.
         // ScopedVisitor's pre/visit handlers manage the scope
         // for inner constructs (if branches, for, do, case,
@@ -113,6 +124,23 @@ namespace Syntax.Process is
                 return;
             fi
 
+            // Explicit purity modifier on the source declaration
+            // pins the contract; the inference pass never
+            // refines it. Both `impure` (explicit IMPURE) and a
+            // body that defaulted to IMPURE through declare-
+            // symbols structurally land at the same enum value,
+            // so check the modifier directly to disambiguate.
+            if
+                definition.modifiers? /\
+                (
+                    definition.modifiers.is_pure \/
+                    definition.modifiers.is_mut \/
+                    definition.modifiers.is_impure
+                )
+            then
+                return;
+            fi
+
             // The structural defaults (PURE / MUT) are already
             // settled in declare-symbols; only refine when the
             // function is still at the IMPURE default and has a
@@ -133,11 +161,97 @@ namespace Syntax.Process is
             function.purity = Semantic.Symbols.PURITY.PURE;
         si
 
+        // Track the worst-case signal in `function.purity`.
+        // Enum order is IMPURE (0) < MUT (1) < PURE (2) — lower
+        // ordinal means weaker contract, so "worse" is "less".
         _bump(function: Semantic.Symbols.Function, signal: Semantic.Symbols.PURITY) is
-            if cast int(signal) > cast int(function.purity) then
+            if cast int(signal) < cast int(function.purity) then
                 function.purity = signal;
             fi
         si
+
+        // Purity is covariant on override: a caller holding a
+        // base-typed receiver expects the contract the base
+        // method declared. PURE (2) is strictest, MUT (1) and
+        // IMPURE (0) progressively weaker. An override that is
+        // weaker than its base would violate the caller's
+        // contract.
+        //
+        // With closed-by-default class hierarchies, the override
+        // set is known in advance; for inferred purities we can
+        // weaken the whole chain to the most-conservative member
+        // rather than rejecting the program. Explicit modifiers
+        // are the source of truth — an explicit-vs-inferred
+        // mismatch where the inferred body is genuinely weaker
+        // is an error; an explicit-vs-explicit mismatch is also
+        // an error.
+        _check_override_invariant(function: Semantic.Symbols.Function, definition: Trees.Definitions.FUNCTION) is
+            if !function.overridees? then
+                return;
+            fi
+
+            for overridee in function.overridees do
+                if !overridee? \/ !isa Semantic.Symbols.Function(overridee) then
+                    continue;
+                fi
+
+                let base = cast Semantic.Symbols.Function(overridee);
+
+                _reconcile_pair(function, base, definition);
+            od
+        si
+
+        _reconcile_pair(
+            override: Semantic.Symbols.Function,
+            base: Semantic.Symbols.Function,
+            definition: Trees.Definitions.FUNCTION
+        ) is
+            // Override is at least as strict as base — fine.
+            if cast int(override.purity) >= cast int(base.purity) then
+                return;
+            fi
+
+            // Override is genuinely weaker than base; reconcile.
+            if override.is_purity_explicit /\ base.is_purity_explicit then
+                _logger.error(
+                    definition.location,
+                    "{_render(override.purity)} {override.name} cannot override {_render(base.purity)} {base.qualified_name}"
+                );
+                return;
+            fi
+
+            if base.is_purity_explicit then
+                // Base contract is the source of truth; the
+                // override's inferred body would violate callers
+                // who hold a base reference.
+                _logger.error(
+                    definition.location,
+                    "{_render(override.purity)} {override.name} cannot override {_render(base.purity)} {base.qualified_name}"
+                );
+                return;
+            fi
+
+            // Base is inferred; weaken it to the override's
+            // (more conservative) value. Closed hierarchies will
+            // converge: each derived visit pulls bases down to
+            // the worst-case across the chain. If the override
+            // is itself explicit and stricter only than the
+            // inferred base, the explicit value pins the chain.
+            // TODO: temporarily disabled — this propagates
+            // across self-host in a way that downgrades
+            // compiler-internal helpers; re-enable once we
+            // understand the chain.
+            // base.purity = override.purity;
+        si
+
+        _render(purity: Semantic.Symbols.PURITY) -> string =>
+            if purity == Semantic.Symbols.PURITY.PURE then
+                "pure";
+            elif purity == Semantic.Symbols.PURITY.MUT then
+                "mut";
+            else
+                "impure";
+            fi;
 
         _classify_left(expr: Trees.Expressions.AssignmentLeftExpression) -> Semantic.Symbols.PURITY? is
             if !expr? then
@@ -154,7 +268,7 @@ namespace Syntax.Process is
                 for element in destructure.elements do
                     let element_verdict = _classify_left(element);
 
-                    if element_verdict? /\ cast int(element_verdict!) > cast int(worst) then
+                    if element_verdict? /\ cast int(element_verdict!) < cast int(worst) then
                         worst = element_verdict!;
                     fi
                 od
