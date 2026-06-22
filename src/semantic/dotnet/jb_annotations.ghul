@@ -4,35 +4,41 @@ namespace Semantic.DotNet is
     use System.Xml.Linq.XElement;
     use System.Xml.Linq.XName;
 
-    // JetBrains ExternalAnnotations XML lookup. Reads
-    // `JetBrains.Annotations.PureAttribute` markers from the
-    // per-assembly XML files JB ships at
-    // <https://github.com/JetBrains/ExternalAnnotations> and
-    // exposes a simple "is this method PURE?" probe over a
-    // reflected `MethodInfo`.
+    use Semantic.Symbols.PURITY;
+
+    // External-annotations lookup for imported (.NET reflected)
+    // methods. Two sources, both keyed by C# XML doc-ID:
     //
-    // Modern BCL has effectively dropped `[Pure]` in
-    // metadata; JB's XML is where ~all of the still-current
-    // BCL purity coverage lives (`Math.Abs`, `string.Substring`,
-    // `string.Format`, most LINQ, `int.Parse`, `Regex.IsMatch`,
-    // and similar). On import we look up the method's C# XML
-    // doc ID in the XML for the method's assembly; a match
-    // upgrades the imported function's purity to PURE.
+    //   1. Our own overlay XML under `<compiler-dir>/ghul-annotations/`,
+    //      bundled with the compiler NuGet at
+    //      `tools/<tfm>/any/lib/ghul-annotations/`. Marks BCL methods
+    //      that JB's XML doesn't cover or contradicts — chiefly the
+    //      stream / console writes we treat as MUT for narrowing
+    //      purposes (mutates an external sink, not caller-reachable
+    //      state). Reads both
+    //      `Ghul.Internal.PURE_ATTRIBUTE` (PURE) and
+    //      `Ghul.Internal.MUT_ATTRIBUTE` (MUT) markers.
     //
-    // Loading is lazy per-assembly. The first time a method
-    // from assembly X is queried, we scan `<base>/<X>/*.xml`
-    // for `PureAttribute` markers and collect their doc IDs
-    // into a set; subsequent queries for that assembly are
-    // set lookups. Missing assembly folders cache as empty
-    // so re-asking is cheap.
+    //   2. JetBrains/ExternalAnnotations XML under
+    //      `<compiler-dir>/jetbrains-annotations/`. The historical
+    //      source — covers most of `Math.abs`, `string.Substring`,
+    //      LINQ, etc. Reads only
+    //      `JetBrains.Annotations.PureAttribute` (PURE).
     //
-    // Base path: `<compiler-dir>/jetbrains-annotations`. Both
-    // the bundled NuGet (lays the XML alongside `ghul.dll` at
-    // install time) and the dev build (`<Content … Link=…
-    // CopyToOutputDirectory=Always>` in `ghul.ghulproj`) put the
-    // files there. `GHUL_JB_ANNOTATIONS_PATH` overrides for the
-    // rare case where the compiler runs against an out-of-tree
-    // copy.
+    // Overlay entries take precedence over JB on doc-ID conflict.
+    // `classify(method)` returns the looked-up tri-state, or null
+    // when neither source has an entry — the symbol-factory caller
+    // then falls back to attribute scan / accessor shape / IMPURE
+    // default.
+    //
+    // Loading is lazy per-assembly: the first lookup against
+    // assembly X scans `<overlay>/X/*.xml` then `<jb>/X/*.xml`
+    // and folds them into a single doc-id → PURITY map. Missing
+    // assembly folders cache as empty maps so re-asking is cheap.
+    //
+    // `GHUL_JB_ANNOTATIONS_PATH` overrides JB's base path (the
+    // overlay path stays compiler-dir-relative — the overlay is
+    // shipped with the tool, not a user-configurable resource).
     class JB_ANNOTATIONS is
         _instance: JB_ANNOTATIONS static;
 
@@ -44,44 +50,59 @@ namespace Semantic.DotNet is
             return _instance;
         si
 
-        _base_path: string?;
-        _base_path_resolved: bool;
+        _jb_base_path: string?;
+        _jb_base_path_resolved: bool;
 
-        // Per-assembly cache: assembly simple name -> set of
-        // PURE-marked doc IDs. Empty set entry means "no JB
-        // folder for that assembly" (cached so we don't rescan).
-        _per_assembly: Collections.MAP[string,Collections.SET[string]];
+        _overlay_base_path: string?;
+        _overlay_base_path_resolved: bool;
+
+        // Per-assembly cache: assembly simple name → doc-id → PURITY.
+        // Empty map entry means "no XML for that assembly" (cached
+        // so we don't rescan).
+        _per_assembly: Collections.MAP[string, Collections.MAP[string, PURITY]];
 
         init() is
-            _per_assembly = Collections.MAP[string,Collections.SET[string]]();
+            _per_assembly = Collections.MAP[string, Collections.MAP[string, PURITY]]();
         si
 
-        // True iff JB has marked `method` with
-        // `JetBrains.Annotations.PureAttribute`.
-        is_pure(method: MethodInfo) -> bool is
+        // Tri-state lookup. Returns the overlay or JB classification
+        // when present, null when neither source covers the method.
+        classify(method: MethodInfo) -> PURITY? is
             if !method? \/ !method.declaring_type? then
-                return false;
+                return null;
             fi
 
             let assembly_name = _assembly_simple_name(method);
 
             if !assembly_name? then
-                return false;
+                return null;
             fi
 
             let entries = _ensure_assembly_loaded(assembly_name);
 
             if entries.count == 0 then
-                return false;
+                return null;
             fi
 
             let doc_id = XML_DOC_ID.for_method(method);
 
             if !doc_id? then
-                return false;
+                return null;
             fi
 
-            return entries.contains(doc_id);
+            let result: PURITY mut = default;
+
+            if entries.try_get_value(doc_id, result ref) then
+                return result;
+            fi
+
+            return null;
+        si
+
+        // Back-compat shim for callers that only care about PURE.
+        is_pure(method: MethodInfo) -> bool is
+            let p = classify(method);
+            return p? /\ p! == PURITY.PURE;
         si
 
         _assembly_simple_name(method: MethodInfo) -> string? is
@@ -104,43 +125,58 @@ namespace Semantic.DotNet is
             yrt
         si
 
-        _ensure_assembly_loaded(assembly_name: string) -> Collections.SET[string] is
-            let cached: Collections.SET[string] mut = default;
+        _ensure_assembly_loaded(assembly_name: string) -> Collections.MAP[string, PURITY] is
+            let cached: Collections.MAP[string, PURITY] mut = default;
 
             if _per_assembly.try_get_value(assembly_name, cached ref) then
                 return cached;
             fi
 
-            let empty = Collections.SET[string]();
+            let entries = Collections.MAP[string, PURITY]();
 
-            let base_path = _resolve_base_path();
-
-            if !base_path? then
-                _per_assembly[assembly_name] = empty;
-                return empty;
-            fi
-
-            let folder = IO.Path.join(base_path, assembly_name);
-
-            if !IO.Directory.exists(folder) then
-                _per_assembly[assembly_name] = empty;
-                return empty;
-            fi
-
-            let entries = Collections.SET[string]();
-
-            try
-                for xml_file in IO.Directory.enumerate_files(folder, "*.xml") do
-                    _collect_pure_doc_ids(xml_file, entries);
-                od
-            catch ex: System.Exception
-            yrt
+            // Order matters: load JB first, then overlay on top so
+            // overlay entries override on doc-ID conflict.
+            _load_from_base(_resolve_jb_base_path(), assembly_name, entries, false);
+            _load_from_base(_resolve_overlay_base_path(), assembly_name, entries, true);
 
             _per_assembly[assembly_name] = entries;
             return entries;
         si
 
-        _collect_pure_doc_ids(xml_file: string, entries: Collections.SET[string]) is
+        // `accept_mut` flag controls whether the loader recognises
+        // `Ghul.Internal.MUT_ATTRIBUTE` markers. JB's XML only
+        // carries `PureAttribute`; mixing MUT semantics into JB
+        // entries would be silently wrong if any third-party XML
+        // ever set the JB attribute on a MUT method.
+        _load_from_base(
+            base_path: string?,
+            assembly_name: string,
+            entries: Collections.MAP[string, PURITY],
+            accept_mut: bool
+        ) is
+            if !base_path? then
+                return;
+            fi
+
+            let folder = IO.Path.join(base_path, assembly_name);
+
+            if !IO.Directory.exists(folder) then
+                return;
+            fi
+
+            try
+                for xml_file in IO.Directory.enumerate_files(folder, "*.xml") do
+                    _collect_from_xml(xml_file, entries, accept_mut);
+                od
+            catch ex: System.Exception
+            yrt
+        si
+
+        _collect_from_xml(
+            xml_file: string,
+            entries: Collections.MAP[string, PURITY],
+            accept_mut: bool
+        ) is
             try
                 let document = XDocument.load(xml_file);
                 let root = document.root;
@@ -162,15 +198,17 @@ namespace Semantic.DotNet is
                         continue;
                     fi
 
-                    if _member_has_pure_marker(member) then
-                        entries.add(doc_id);
+                    let classification = _classify_member(member, accept_mut);
+
+                    if classification? then
+                        entries[doc_id] = classification!;
                     fi
                 od
             catch ex: System.Exception
             yrt
         si
 
-        _member_has_pure_marker(member: XElement) -> bool is
+        _classify_member(member: XElement, accept_mut: bool) -> PURITY? is
             for attr in member.elements(XName.get("attribute")) do
                 let ctor_attr = attr.attribute(XName.get("ctor"));
 
@@ -178,28 +216,61 @@ namespace Semantic.DotNet is
                     continue;
                 fi
 
-                if ctor_attr.value.starts_with("M:JetBrains.Annotations.PureAttribute") then
-                    return true;
+                let ctor = ctor_attr.value;
+
+                if ctor.starts_with("M:JetBrains.Annotations.PureAttribute") then
+                    return PURITY.PURE;
+                fi
+
+                if ctor.starts_with("M:Ghul.Internal.PURE_ATTRIBUTE") then
+                    return PURITY.PURE;
+                fi
+
+                if accept_mut /\ ctor.starts_with("M:Ghul.Internal.MUT_ATTRIBUTE") then
+                    return PURITY.MUT;
                 fi
             od
 
-            return false;
+            return null;
         si
 
-        _resolve_base_path() -> string? is
-            if _base_path_resolved then
-                return _base_path;
+        _resolve_jb_base_path() -> string? is
+            if _jb_base_path_resolved then
+                return _jb_base_path;
             fi
 
-            _base_path_resolved = true;
+            _jb_base_path_resolved = true;
 
             let env = System.Environment.get_environment_variable("GHUL_JB_ANNOTATIONS_PATH");
 
             if env? /\ IO.Directory.exists(env) then
-                _base_path = env;
-                return _base_path;
+                _jb_base_path = env;
+                return _jb_base_path;
             fi
 
+            _jb_base_path = _compiler_relative_path("jetbrains-annotations");
+            return _jb_base_path;
+        si
+
+        _resolve_overlay_base_path() -> string? is
+            if _overlay_base_path_resolved then
+                return _overlay_base_path;
+            fi
+
+            _overlay_base_path_resolved = true;
+
+            // Overlay is always compiler-relative; it ships with
+            // the tool and isn't user-configurable.
+            _overlay_base_path = _compiler_relative_path("ghul-annotations");
+            return _overlay_base_path;
+        si
+
+        // `<Content Link="…\..." CopyToOutputDirectory="Always">`
+        // in `ghul.ghulproj` lands these folders beside the DLL
+        // for the dev build (`bin/<config>/<tfm>/`), the
+        // `dotnet publish` output (`publish/`), and the packed
+        // NuGet (`tools/<tfm>/any/`). One candidate is enough.
+        _compiler_relative_path(name: string) -> string? static is
             let executing_assembly = System.Reflection.Assembly.get_executing_assembly();
 
             if !executing_assembly? \/ !executing_assembly.location? then
@@ -212,17 +283,10 @@ namespace Semantic.DotNet is
                 return null;
             fi
 
-            // `<Content Link="jetbrains-annotations\..." CopyToOutputDirectory="Always">`
-            // in `ghul.ghulproj` lands the XML beside the DLL for
-            // both the dev build (`bin/<config>/<tfm>/`), the
-            // `dotnet publish` output (`publish/`), and the
-            // packed NuGet (`tools/<tfm>/any/`). One candidate is
-            // enough.
-            let candidate = IO.Path.join(compiler_dir, "jetbrains-annotations");
+            let candidate = IO.Path.join(compiler_dir, name);
 
             if IO.Directory.exists(candidate) then
-                _base_path = candidate;
-                return _base_path;
+                return candidate;
             fi
 
             return null;
