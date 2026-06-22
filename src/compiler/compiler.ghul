@@ -21,6 +21,10 @@ namespace Compiler is
         build_passes: MutableList[Pass];
 
         _compile_expressions_pass: Pass;
+        _resolve_type_expressions_pass: Pass;
+        _record_type_argument_uses_pass: Pass;
+        _verify_purity_pass: Pass;
+        _generate_il_pass: Pass;
 
         is_full_compile_needed: bool public;
 
@@ -42,7 +46,7 @@ namespace Compiler is
             build_passes = LIST[Pass]();
             add_pass(build_passes, "declare-symbols", (source_file) -> bool => declare_symbols_pass(source_file));
             add_pass(build_passes, "resolve-uses", (source_file) -> bool => resolve_uses_pass(source_file));
-            add_pass(build_passes, "resolve-type-expressions", (source_file: SOURCE_FILE) -> bool => resolve_type_expressions_pass(source_file));
+            _resolve_type_expressions_pass = add_pass(build_passes, "resolve-type-expressions", (source_file: SOURCE_FILE) -> bool => resolve_type_expressions_pass(source_file));
             add_pass(build_passes, "resolve-ancestors", (source_file) -> bool => resolve_ancestors_pass(source_file));
             add_pass(build_passes, "resolve-explicit-types", (source_file) -> bool => resolve_explicit_types_pass(source_file));
             add_pass(
@@ -55,15 +59,15 @@ namespace Compiler is
                 si
             );
             add_pass(build_passes, "infer-purity", (source_file) -> bool => infer_purity_pass(source_file));
-            add_pass(build_passes, "record-type-argument-uses", (source_file) -> bool => record_type_argument_uses_pass(source_file));
+            _record_type_argument_uses_pass = add_pass(build_passes, "record-type-argument-uses", (source_file) -> bool => record_type_argument_uses_pass(source_file));
 
             add_pass(build_passes, "mark-boxed-locals", (source_file) -> bool => mark_boxed_locals_pass(source_file));
 
             _compile_expressions_pass = add_pass(build_passes, "compile-expressions", (source_file) -> bool => compile_expressions_pass(source_file));
 
-            add_pass(build_passes, "verify-purity", (source_file) -> bool => verify_purity_pass(source_file));
+            _verify_purity_pass = add_pass(build_passes, "verify-purity", (source_file) -> bool => verify_purity_pass(source_file));
 
-            add_pass(
+            _generate_il_pass = add_pass(
                 build_passes,
                 "generate-il",
                 () -> void is
@@ -239,9 +243,100 @@ namespace Compiler is
 
         build() is
             container.ghul_namespace_creator.create_namespaces();
-            build(build_passes, source_files);
+
+            // Phase 1: linear pipeline through verify-purity. The
+            // first run uses INFER_PURITY's optimistic structural
+            // defaults and may classify functions whose body
+            // (observed through the call graph by verify-purity)
+            // turns out weaker than declared.
+            build(_passes_through(_verify_purity_pass), source_files);
+
+            // Phase 2: iterate compile-expressions + verify-purity
+            // to convergence. verify-purity downgrades inferred
+            // functions when their observed purity is weaker than
+            // declared and reports `had_downgrades`. The narrowing
+            // decisions compile-expressions made trusted the
+            // (now-stale) higher contract, so clear compile-
+            // expressions state and re-run from
+            // resolve-type-expressions through verify-purity. The
+            // earlier passes (declare-symbols, resolve-uses,
+            // resolve-ancestors-via-symbol-graph) are not affected
+            // by CLEAR_STATE_VISITOR and don't need to re-run.
+            //
+            // Termination: purities only move down the lattice
+            // (IMPURE < MUT < PURE), so iterations are bounded by
+            // (3 × function count). In practice converges in 2-3.
+            // `max_iterations` is a safety net.
+            let max_iterations = 16;
+            let iteration mut = 0;
+            while
+                iteration < max_iterations /\
+                container.verify_purity.had_downgrades
+            do
+                iteration = iteration + 1;
+
+                // Narrow clear: only compile-expressions output
+                // (Expression.value, Statement state). Preserve
+                // resolve-type-expressions / resolve-explicit-types
+                // output — re-running those on already-typed nodes
+                // triggers "set type twice".
+                let clear_state = Syntax.Process.CLEAR_COMPILE_STATE_VISITOR();
+                for i in source_files do
+                    clear_state.apply(i.definition);
+                od
+
+                container.verify_purity.reset_iteration_state();
+
+                // Re-run from record-type-argument-uses (which
+                // depends on compile-expressions inputs) through
+                // verify-purity. Skip declare-symbols /
+                // resolve-uses / resolve-type-expressions /
+                // resolve-ancestors / resolve-explicit-types /
+                // resolve-overrides — their output lives on
+                // symbols and TypeExpressions which CLEAR_COMPILE_STATE
+                // preserves. Skip infer-purity — its seed has
+                // already been applied and verify-purity has
+                // refined from there; re-running would undo
+                // those refinements.
+                build(_passes_in_range(_record_type_argument_uses_pass, _verify_purity_pass), source_files);
+            od
+
+            // Phase 3: IL emission with the converged purities.
+            build(_passes_in_range(_generate_il_pass, _generate_il_pass), source_files);
 
             container.stable_symbols.next_generation();
+        si
+
+        // Slice the build_passes list up to and including the
+        // given pass.
+        _passes_through(last: Pass) -> Collections.Iterable[Pass] is
+            let result = LIST[Pass]();
+            for pass in build_passes do
+                result.add(pass);
+                if pass == last then
+                    return result;
+                fi
+            od
+            return result;
+        si
+
+        // Slice the build_passes list from `first` to `last`
+        // inclusive.
+        _passes_in_range(first: Pass, last: Pass) -> Collections.Iterable[Pass] is
+            let result = LIST[Pass]();
+            let started mut = false;
+            for pass in build_passes do
+                if pass == first then
+                    started = true;
+                fi
+                if started then
+                    result.add(pass);
+                fi
+                if pass == last then
+                    return result;
+                fi
+            od
+            return result;
         si
 
         build(passes: Collections.Iterable[Pass], source_files: Collections.Iterable[SOURCE_FILE]) is
