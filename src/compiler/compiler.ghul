@@ -23,6 +23,7 @@ namespace Compiler is
         _compile_expressions_pass: Pass;
         _resolve_type_expressions_pass: Pass;
         _record_type_argument_uses_pass: Pass;
+        _mark_boxed_locals_pass: Pass;
         _verify_purity_pass: Pass;
         _generate_il_pass: Pass;
 
@@ -61,7 +62,7 @@ namespace Compiler is
             add_pass(build_passes, "infer-purity", (source_file) -> bool => infer_purity_pass(source_file));
             _record_type_argument_uses_pass = add_pass(build_passes, "record-type-argument-uses", (source_file) -> bool => record_type_argument_uses_pass(source_file));
 
-            add_pass(build_passes, "mark-boxed-locals", (source_file) -> bool => mark_boxed_locals_pass(source_file));
+            _mark_boxed_locals_pass = add_pass(build_passes, "mark-boxed-locals", (source_file) -> bool => mark_boxed_locals_pass(source_file));
 
             _compile_expressions_pass = add_pass(build_passes, "compile-expressions", (source_file) -> bool => compile_expressions_pass(source_file));
 
@@ -244,74 +245,80 @@ namespace Compiler is
         build() is
             container.ghul_namespace_creator.create_namespaces();
 
-            // Phase 1: linear pipeline through verify-purity. The
-            // first run uses INFER_PURITY's optimistic structural
-            // defaults and may classify functions whose body
-            // (observed through the call graph by verify-purity)
-            // turns out weaker than declared.
-            build(_passes_through(_verify_purity_pass), source_files);
+            // Phase 1: passes up to and including mark-boxed-locals.
+            // Diagnostics from these passes are stable across the
+            // verify-purity iteration loop, so they're emitted
+            // unconditionally.
+            build(_passes_through(_mark_boxed_locals_pass), source_files);
 
             // Phase 2: iterate compile-expressions + verify-purity
             // to convergence. verify-purity downgrades inferred
             // functions when their observed purity is weaker than
-            // declared and reports `had_downgrades`. The narrowing
-            // decisions compile-expressions made trusted the
-            // (now-stale) higher contract, so clear compile-
-            // expressions state and re-run from
-            // resolve-type-expressions through verify-purity. The
-            // earlier passes (declare-symbols, resolve-uses,
-            // resolve-ancestors-via-symbol-graph) are not affected
-            // by CLEAR_STATE_VISITOR and don't need to re-run.
+            // declared; narrowing decisions compile-expressions made
+            // trusted the (now-stale) higher contract, so on
+            // downgrade we clear compile-expressions output and
+            // re-run.
+            //
+            // Each iteration emits compile-expressions+verify-purity
+            // diagnostics into a speculative logger frame. Non-final
+            // iterations roll back; the converged final iteration
+            // commits. Without this, "may be used before assigned"
+            // and "purity-mismatch" warnings would appear once per
+            // iteration in the final output.
             //
             // Termination: purities only move down the lattice
             // (IMPURE < MUT < PURE), so iterations are bounded by
             // (3 × function count). In practice converges in 2-3.
             // `max_iterations` is a safety net.
-            // 0 = no iteration (downgrade still fires in Phase 1,
-            // so cross-asm purity attributes are correct, but
-            // narrowing decisions in this compilation use the
-            // pre-downgrade purities — same unsoundness as before
-            // verify-purity existed).
             //
-            // > 0 = iterate to convergence. **Currently broken**:
-            // generic-constructor type inference depends on
-            // `Variable.type` starting unset so constraints from
-            // later uses (`xs.add(...)`, `consume(xs)`) reach the
-            // constructor's placeholder. Iter 2 sees `xs.type`
-            // already settled (from iter 1) so the constructor's
-            // fresh placeholder gets no constraint flow, defaults
-            // to `object` via `fill_in_defaults`, and emits
-            // `LIST<object>::.ctor()` instead of the correct
-            // closed instantiation. Downstream uses then dispatch
-            // against open-generic methodrefs at runtime.
-            // Repro: `integration-tests/execution/bootstrap-tuple-field-lub`.
-            // See `docs/claude/purity-iteration-debug.md` (workspace).
-            let max_iterations = 0;
-            let iteration mut = 0;
-            while
-                iteration < max_iterations /\
-                container.verify_purity.had_downgrades
-            do
-                iteration = iteration + 1;
+            // 0 = no iteration: skip the speculate dance entirely
+            // and emit Phase 1's compile-expressions+verify-purity
+            // diagnostics directly. Cross-asm purity attributes
+            // still get downgraded; same-compilation narrowing
+            // decisions use pre-downgrade purities.
+            let max_iterations = 16;
 
-                if System.Environment.get_environment_variable("GHUL_DEBUG_PURITY_ITER")? then
-                    IO.Std.error.write_line("verify-purity: iteration {iteration} (had_downgrades)");
-                fi
+            if max_iterations <= 0 then
+                build(_passes_in_range(_compile_expressions_pass, _verify_purity_pass), source_files);
+            else
+                let clear_state = Syntax.Process.CLEAR_COMPILE_STATE_VISITOR(
+                    container.logger,
+                    container.stable_symbols,
+                    container.symbol_table,
+                    container.namespaces
+                );
 
-                // Narrow clear: only compile-expressions output
-                // (Expression.value, Statement state). Preserve
-                // resolve-type-expressions / resolve-explicit-types
-                // output — re-running those on already-typed nodes
-                // triggers "set type twice".
-                let clear_state = Syntax.Process.CLEAR_COMPILE_STATE_VISITOR();
-                for i in source_files do
-                    clear_state.apply(i.definition);
+                let iteration mut = 0;
+                let converged mut = false;
+
+                while !converged /\ iteration < max_iterations do
+                    iteration = iteration + 1;
+
+                    if System.Environment.get_environment_variable("GHUL_DEBUG_PURITY_ITER")? then
+                        IO.Std.error.write_line("verify-purity: iteration {iteration}");
+                    fi
+
+                    if iteration > 1 then
+                        for i in source_files do
+                            clear_state.apply(i.definition);
+                        od
+
+                        container.verify_purity.reset_iteration_state();
+                    fi
+
+                    container.logger.speculate();
+
+                    build(_passes_in_range(_compile_expressions_pass, _verify_purity_pass), source_files);
+
+                    converged = !container.verify_purity.had_downgrades;
+
+                    if converged \/ iteration >= max_iterations then
+                        container.logger.commit();
+                    else
+                        container.logger.roll_back();
+                    fi
                 od
-
-                container.verify_purity.reset_iteration_state();
-
-                build(_passes_in_range(_record_type_argument_uses_pass, _verify_purity_pass), source_files);
-            od
+            fi
 
             // Phase 3: IL emission with the converged purities.
             build(_passes_in_range(_generate_il_pass, _generate_il_pass), source_files);
