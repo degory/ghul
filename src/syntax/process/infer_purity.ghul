@@ -1,0 +1,354 @@
+namespace Syntax.Process is
+
+    use Logging;
+    use Trees;
+
+    // Body-shape purity inference for ghūl-declared block-bodied
+    // functions whose `pure` / `mut` / `impure` modifier wasn't
+    // settled in `declare-symbols` (i.e. the function's purity
+    // is still its default IMPURE because the structural cases
+    // — init, setter, getter, arrow body, INNATE, abstract —
+    // didn't fire).
+    //
+    // Runs after `resolve-overrides` so:
+    //   - The symbol table reflects inheritance: `find_member`
+    //     on the enclosing class walks the chain, so a write to
+    //     an inherited field classifies as MUT (writes to
+    //     `this`) rather than falling through to IMPURE.
+    //   - Override invariants can be enforced — overriding a
+    //     pure base with mut / impure violates the LSP contract
+    //     callers expect when they hold a base-typed receiver.
+    //
+    // Block scopes need proper enter / leave so that locals
+    // declared in nested blocks are visible to `find_enclosing`
+    // at the assignment site. Inheriting from `ScopedVisitor`
+    // makes the scope tracking automatic.
+    class INFER_PURITY: ScopedVisitor is
+        _logger: Logger;
+        _symbol_table: Semantic.SYMBOL_TABLE;
+
+        init(
+            logger: Logger,
+            stable_symbols: Semantic.STABLE_SYMBOLS,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES
+        )
+        is
+            super.init(logger, stable_symbols, symbol_table, namespaces);
+
+            _logger = logger;
+            _symbol_table = symbol_table;
+        si
+
+        apply(root: Trees.Node) is
+            root.walk(self);
+        si
+
+        // Function-definition visit: ScopedVisitor's pre handler
+        // already entered the function's scope (so parameters
+        // and the body's top-level lets are visible to lookups
+        // inside the body walk). The base visit handler will
+        // leave the scope after this returns.
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            super.pre(function);
+
+            let function_symbol = symbol_for(function);
+
+            if !function_symbol? \/ !isa Semantic.Symbols.Function(function_symbol) then
+                return false;
+            fi
+
+            let f = cast Semantic.Symbols.Function(function_symbol);
+
+            _infer(f, function);
+
+            return false;
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            let function_symbol = symbol_for(function);
+
+            if function_symbol? /\ isa Semantic.Symbols.Function(function_symbol) then
+                let f = cast Semantic.Symbols.Function(function_symbol);
+                _check_override_invariant(f, function);
+            fi
+
+            super.visit(function);
+        si
+
+        // Walk the body for assignment LHS classification.
+        // ScopedVisitor's pre/visit handlers manage the scope
+        // for inner constructs (if branches, for, do, case,
+        // catch, labelled blocks, let-in expressions), so by
+        // the time we hit a particular ASSIGNMENT the symbol
+        // table's current scope contains every local visible
+        // at that point.
+        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
+            let signal = _classify_left(assignment.left);
+
+            if signal? then
+                let function = _symbol_table.current_function;
+
+                if function? then
+                    _bump(function, signal!);
+                fi
+            fi
+
+            return false;
+        si
+
+        pre(`yield: Trees.Statements.YIELD) -> bool is
+            let function = _symbol_table.current_function;
+
+            if function? then
+                _bump(function, Semantic.Symbols.PURITY.IMPURE);
+            fi
+
+            return false;
+        si
+
+        // Lambdas / anonymous functions inside a body get their
+        // own scope entered (so their parameters and lets are
+        // visible) but we don't infer their purity here — for
+        // v1 lambdas keep the default IMPURE and the on_call
+        // dispatch treats them conservatively. The enclosing
+        // function's purity is decoupled from the lambda body
+        // by ScopedVisitor's scope handling.
+        pre(function: Trees.Expressions.FUNCTION) -> bool is
+            super.pre(function);
+            return false;
+        si
+
+        _infer(function: Semantic.Symbols.Function, definition: Trees.Definitions.FUNCTION) is
+            if !definition? \/ !definition.body? then
+                return;
+            fi
+
+            // Explicit purity modifier on the source declaration
+            // pins the contract; the inference pass never
+            // refines it. Both `impure` (explicit IMPURE) and a
+            // body that defaulted to IMPURE through declare-
+            // symbols structurally land at the same enum value,
+            // so check the modifier directly to disambiguate.
+            if
+                definition.modifiers? /\
+                (
+                    definition.modifiers.is_pure \/
+                    definition.modifiers.is_mut \/
+                    definition.modifiers.is_impure
+                )
+            then
+                return;
+            fi
+
+            // The structural defaults (PURE / MUT) are already
+            // settled in declare-symbols; only refine when the
+            // function is still at the IMPURE default and has a
+            // block body we can walk.
+            if function.purity != Semantic.Symbols.PURITY.IMPURE then
+                return;
+            fi
+
+            if !isa Trees.Bodies.BLOCK(definition.body) then
+                return;
+            fi
+
+            // Start the body inference at PURE; the walk's
+            // ASSIGNMENT / yield handlers will bump it toward
+            // MUT / IMPURE if they find a negative signal.
+            // _bump mutates `function.purity` directly so the
+            // current value tracks the worst-case found so far.
+            //
+            // Calls to non-pure helpers are not a downgrade
+            // signal here — INFER_PURITY runs after
+            // resolve-overrides but before compile-expressions
+            // resolves call targets, so the callee's Function
+            // symbol isn't available. A block-bodied function
+            // whose only side effect is delegated through a
+            // helper call therefore stays PURE; override with
+            // explicit `mut` / `impure` when that matters.
+            // Call-graph closure is a follow-up.
+            function.purity = Semantic.Symbols.PURITY.PURE;
+        si
+
+        // Track the worst-case signal in `function.purity`.
+        // Enum order is IMPURE (0) < MUT (1) < PURE (2) — lower
+        // ordinal means weaker contract, so "worse" is "less".
+        _bump(function: Semantic.Symbols.Function, signal: Semantic.Symbols.PURITY) is
+            if cast int(signal) < cast int(function.purity) then
+                function.purity = signal;
+            fi
+        si
+
+        // Purity is covariant on override: a caller holding a
+        // base-typed receiver expects the contract the base
+        // method declared. PURE (2) is strictest, MUT (1) and
+        // IMPURE (0) progressively weaker. An override that is
+        // weaker than its base would violate the caller's
+        // contract.
+        //
+        // With closed-by-default class hierarchies, the override
+        // set is known in advance; for inferred purities we can
+        // weaken the whole chain to the most-conservative member
+        // rather than rejecting the program. Explicit modifiers
+        // are the source of truth — an explicit-vs-inferred
+        // mismatch where the inferred body is genuinely weaker
+        // is an error; an explicit-vs-explicit mismatch is also
+        // an error.
+        _check_override_invariant(function: Semantic.Symbols.Function, definition: Trees.Definitions.FUNCTION) is
+            if !function.overridees? then
+                return;
+            fi
+
+            for overridee in function.overridees do
+                if !overridee? \/ !isa Semantic.Symbols.Function(overridee) then
+                    continue;
+                fi
+
+                let base = cast Semantic.Symbols.Function(overridee);
+
+                _reconcile_pair(function, base, definition);
+            od
+        si
+
+        _reconcile_pair(
+            override: Semantic.Symbols.Function,
+            base: Semantic.Symbols.Function,
+            definition: Trees.Definitions.FUNCTION
+        ) is
+            // Override is at least as strict as base — fine.
+            if cast int(override.purity) >= cast int(base.purity) then
+                return;
+            fi
+
+            // Override is genuinely weaker than base; reconcile.
+            if override.is_purity_explicit /\ base.is_purity_explicit then
+                _logger.error(
+                    definition.location,
+                    "{_render(override.purity)} {override.name} cannot override {_render(base.purity)} {base.qualified_name}"
+                );
+                return;
+            fi
+
+            if base.is_purity_explicit then
+                // Base contract is the source of truth; the
+                // override's inferred body would violate callers
+                // who hold a base reference.
+                _logger.error(
+                    definition.location,
+                    "{_render(override.purity)} {override.name} cannot override {_render(base.purity)} {base.qualified_name}"
+                );
+                return;
+            fi
+
+            // Base is inferred and the override is weaker. In a
+            // closed hierarchy the right move is to weaken the
+            // base to match — every dispatch through the base-
+            // typed receiver could land on this override, so the
+            // base contract has to honour the weakest member of
+            // the set. Inferred-side propagation is left for a
+            // follow-up — the cascade interacts with current
+            // src/ helpers that haven't been annotated yet, and
+            // shipping that is its own piece of work.
+        si
+
+        _render(purity: Semantic.Symbols.PURITY) -> string =>
+            if purity == Semantic.Symbols.PURITY.PURE then
+                "pure";
+            elif purity == Semantic.Symbols.PURITY.MUT then
+                "mut";
+            else
+                "impure";
+            fi;
+
+        _classify_left(expr: Trees.Expressions.AssignmentLeftExpression) -> Semantic.Symbols.PURITY? is
+            if !expr? then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            if let simple: Trees.Expressions.SIMPLE_LEFT_EXPRESSION = expr then
+                return _classify_simple(simple.expression);
+            fi
+
+            if let destructure: Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION = expr then
+                let worst: Semantic.Symbols.PURITY mut = Semantic.Symbols.PURITY.PURE;
+
+                for element in destructure.elements do
+                    let element_verdict = _classify_left(element);
+
+                    if element_verdict? /\ cast int(element_verdict!) < cast int(worst) then
+                        worst = element_verdict!;
+                    fi
+                od
+
+                return worst;
+            fi
+
+            return Semantic.Symbols.PURITY.IMPURE;
+        si
+
+        _classify_simple(expr: Trees.Expressions.Expression) -> Semantic.Symbols.PURITY is
+            if !expr? then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            if let identifier: Trees.Expressions.IDENTIFIER = expr then
+                return _classify_bare_identifier(identifier);
+            fi
+
+            if let member: Trees.Expressions.MEMBER = expr then
+                return _classify_member(member);
+            fi
+
+            return Semantic.Symbols.PURITY.IMPURE;
+        si
+
+        _classify_bare_identifier(identifier: Trees.Expressions.IDENTIFIER) -> Semantic.Symbols.PURITY is
+            if !identifier.identifier? \/ identifier.identifier.is_qualified then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            let name = identifier.identifier.name;
+
+            if !name? then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            let symbol = _symbol_table.current_scope.find_enclosing(name);
+
+            if !symbol? then
+                return Semantic.Symbols.PURITY.PURE;
+            fi
+
+            if
+                isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/
+                isa Semantic.Symbols.LOCAL_ARGUMENT(symbol)
+            then
+                return Semantic.Symbols.PURITY.PURE;
+            fi
+
+            let instance = _symbol_table.current_instance_context;
+
+            if instance? /\ instance.find_member(name) == symbol then
+                return Semantic.Symbols.PURITY.MUT;
+            fi
+
+            return Semantic.Symbols.PURITY.IMPURE;
+        si
+
+        _classify_member(member: Trees.Expressions.MEMBER) -> Semantic.Symbols.PURITY is
+            if !member.left? then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            if
+                isa Trees.Expressions.SELF(member.left) \/
+                isa Trees.Expressions.SUPER(member.left)
+            then
+                return Semantic.Symbols.PURITY.MUT;
+            fi
+
+            return Semantic.Symbols.PURITY.IMPURE;
+        si
+    si
+si

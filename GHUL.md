@@ -192,6 +192,24 @@ Functions are declared at namespace scope — there are no nested function defin
 
 Functions are first-class values. A function literal has the same shape without a name, but its argument and return types are generally *inferred* — from the body and from the context the literal is used in — so they are usually written without annotations (though either can be given explicitly). With a single argument the parentheses are optional. `A -> B` is the type of a function from `A` to `B`. Function literals capture references from the enclosing scope, forming closures: an immutable `let` is captured by value (a snapshot at the point the literal is constructed); a `let mut` is captured by reference, so the closure and the outer scope share one live variable that either side can read or reassign. An anonymous function refers to itself through the `rec` keyword:
 
+A named function or property accessor can carry a postfix **purity modifier** declaring how the callee can mutate state visible to the caller:
+
+- **`pure`** — no caller-observable mutation. Path-presence narrowings (`if x.foo? then … x.foo …`) survive across the call untouched.
+- **`mut`** — mutates the receiver only. The same `mut` keyword `let mut` uses. Path narrowings rooted at the call's receiver variable drop; narrowings of unrelated paths survive.
+- **`impure`** — may mutate anything reachable. All path narrowings clear at the call site. This is the default when no modifier is given.
+
+Property setters and `init` constructors auto-classify as `mut`; property getters as `pure`. Arrow-bodied functions are optimistically pure. The modifier sits between the return type (or parameter list, for void) and the body:
+
+```ghul
+square(x: int) -> int pure => x * x;
+note(s: string) mut is self.last = s; si
+log(msg: string) impure => Std.write_line(msg);
+```
+
+The contract is covariant on override: an override may strengthen its base (`pure` overriding `mut` is fine) but may not weaken it; an explicit `impure` overriding an explicit `pure` is rejected at compile time.
+
+`pure`, `impure`, `mut`, and `abstract` are reserved keywords — they can no longer be used as ordinary identifiers.
+
 ```ghul
 let twice = x => x * 2;
 let apply_twice = (f: int -> int, i) => f(f(i));
