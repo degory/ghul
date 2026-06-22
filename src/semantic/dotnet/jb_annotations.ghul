@@ -1,0 +1,232 @@
+namespace Semantic.DotNet is
+    use System.Reflection.MethodInfo;
+    use System.Xml.Linq.XDocument;
+    use System.Xml.Linq.XElement;
+    use System.Xml.Linq.XName;
+
+    // JetBrains ExternalAnnotations XML lookup. Reads
+    // `JetBrains.Annotations.PureAttribute` markers from the
+    // per-assembly XML files JB ships at
+    // <https://github.com/JetBrains/ExternalAnnotations> and
+    // exposes a simple "is this method PURE?" probe over a
+    // reflected `MethodInfo`.
+    //
+    // Modern BCL has effectively dropped `[Pure]` in
+    // metadata; JB's XML is where ~all of the still-current
+    // BCL purity coverage lives (`Math.Abs`, `string.Substring`,
+    // `string.Format`, most LINQ, `int.Parse`, `Regex.IsMatch`,
+    // and similar). On import we look up the method's C# XML
+    // doc ID in the XML for the method's assembly; a match
+    // upgrades the imported function's purity to PURE.
+    //
+    // Loading is lazy per-assembly. The first time a method
+    // from assembly X is queried, we scan `<base>/<X>/*.xml`
+    // for `PureAttribute` markers and collect their doc IDs
+    // into a set; subsequent queries for that assembly are
+    // set lookups. Missing assembly folders cache as empty
+    // so re-asking is cheap.
+    //
+    // Base path: `GHUL_JB_ANNOTATIONS_PATH` env var if set,
+    // otherwise discovered relative to the compiler DLL.
+    class JB_ANNOTATIONS is
+        _instance: JB_ANNOTATIONS static;
+
+        instance: JB_ANNOTATIONS static is
+            if !_instance? then
+                _instance = JB_ANNOTATIONS();
+            fi
+
+            return _instance;
+        si
+
+        _base_path: string?;
+        _base_path_resolved: bool;
+
+        // Per-assembly cache: assembly simple name -> set of
+        // PURE-marked doc IDs. Empty set entry means "no JB
+        // folder for that assembly" (cached so we don't rescan).
+        _per_assembly: Collections.MAP[string,Collections.SET[string]];
+
+        init() is
+            _per_assembly = Collections.MAP[string,Collections.SET[string]]();
+        si
+
+        // True iff JB has marked `method` with
+        // `JetBrains.Annotations.PureAttribute`.
+        is_pure(method: MethodInfo) -> bool is
+            if !method? \/ !method.declaring_type? then
+                return false;
+            fi
+
+            let assembly_name = _assembly_simple_name(method);
+
+            if !assembly_name? then
+                return false;
+            fi
+
+            let entries = _ensure_assembly_loaded(assembly_name);
+
+            if entries.count == 0 then
+                return false;
+            fi
+
+            let doc_id = XML_DOC_ID.for_method(method);
+
+            if !doc_id? then
+                return false;
+            fi
+
+            return entries.contains(doc_id);
+        si
+
+        _assembly_simple_name(method: MethodInfo) -> string? is
+            try
+                let module = method.module;
+
+                if !module? then
+                    return null;
+                fi
+
+                let assembly = module.assembly;
+
+                if !assembly? then
+                    return null;
+                fi
+
+                return assembly.get_name().name;
+            catch ex: System.Exception
+                return null;
+            yrt
+        si
+
+        _ensure_assembly_loaded(assembly_name: string) -> Collections.SET[string] is
+            let cached: Collections.SET[string] mut = default;
+
+            if _per_assembly.try_get_value(assembly_name, cached ref) then
+                return cached;
+            fi
+
+            let empty = Collections.SET[string]();
+
+            let base_path = _resolve_base_path();
+
+            if !base_path? then
+                _per_assembly[assembly_name] = empty;
+                return empty;
+            fi
+
+            let folder = IO.Path.join(base_path, assembly_name);
+
+            if !IO.Directory.exists(folder) then
+                _per_assembly[assembly_name] = empty;
+                return empty;
+            fi
+
+            let entries = Collections.SET[string]();
+
+            try
+                for xml_file in IO.Directory.enumerate_files(folder, "*.xml") do
+                    _collect_pure_doc_ids(xml_file, entries);
+                od
+            catch ex: System.Exception
+            yrt
+
+            _per_assembly[assembly_name] = entries;
+            return entries;
+        si
+
+        _collect_pure_doc_ids(xml_file: string, entries: Collections.SET[string]) is
+            try
+                let document = XDocument.load(xml_file);
+                let root = document.root;
+
+                if !root? then
+                    return;
+                fi
+
+                for member in root.elements(XName.get("member")) do
+                    let name_attr = member.attribute(XName.get("name"));
+
+                    if !name_attr? \/ !name_attr.value? then
+                        continue;
+                    fi
+
+                    let doc_id = name_attr.value;
+
+                    if !doc_id.starts_with("M:") then
+                        continue;
+                    fi
+
+                    if _member_has_pure_marker(member) then
+                        entries.add(doc_id);
+                    fi
+                od
+            catch ex: System.Exception
+            yrt
+        si
+
+        _member_has_pure_marker(member: XElement) -> bool is
+            for attr in member.elements(XName.get("attribute")) do
+                let ctor_attr = attr.attribute(XName.get("ctor"));
+
+                if !ctor_attr? \/ !ctor_attr.value? then
+                    continue;
+                fi
+
+                if ctor_attr.value.starts_with("M:JetBrains.Annotations.PureAttribute") then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        _resolve_base_path() -> string? is
+            if _base_path_resolved then
+                return _base_path;
+            fi
+
+            _base_path_resolved = true;
+
+            let env = System.Environment.get_environment_variable("GHUL_JB_ANNOTATIONS_PATH");
+
+            if env? /\ IO.Directory.exists(env) then
+                _base_path = env;
+                return _base_path;
+            fi
+
+            let executing_assembly = System.Reflection.Assembly.get_executing_assembly();
+
+            if !executing_assembly? \/ !executing_assembly.location? then
+                return null;
+            fi
+
+            let compiler_dir = IO.Path.get_directory_name(executing_assembly.location);
+
+            if !compiler_dir? then
+                return null;
+            fi
+
+            // Layout candidates, in priority order:
+            //   1. alongside the DLL (published / installed tool):
+            //      <compiler-dir>/jetbrains-annotations
+            //   2. one level up (publish/ inside the worktree):
+            //      <compiler-dir>/../tools/jetbrains-annotations
+            //   3. three levels up (bin/{Debug,Release}/net10.0/):
+            //      <compiler-dir>/../../../tools/jetbrains-annotations
+            let candidates = Collections.LIST[string]();
+            candidates.add(IO.Path.join(compiler_dir, "jetbrains-annotations"));
+            candidates.add(IO.Path.get_full_path(IO.Path.join(compiler_dir, "../tools/jetbrains-annotations")));
+            candidates.add(IO.Path.get_full_path(IO.Path.join(compiler_dir, "../../../tools/jetbrains-annotations")));
+
+            for candidate in candidates do
+                if IO.Directory.exists(candidate) then
+                    _base_path = candidate;
+                    return _base_path;
+                fi
+            od
+
+            return null;
+        si
+    si
+si
