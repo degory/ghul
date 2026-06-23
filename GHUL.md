@@ -198,7 +198,7 @@ A named function or property accessor can carry a postfix **purity modifier** de
 - **`mut`** — mutates the receiver only. The same `mut` keyword `let mut` uses. Path narrowings rooted at the call's receiver variable drop; narrowings of unrelated paths survive.
 - **`impure`** — may mutate anything reachable. All path narrowings clear at the call site. This is the default when no modifier is given.
 
-Property setters and `init` constructors auto-classify as `mut`; property getters as `pure`. Arrow-bodied functions are optimistically pure. The modifier sits between the return type (or parameter list, for void) and the body:
+Property setters and `init` constructors auto-classify as `mut`; property getters as `pure`. Arrow-bodied functions classify by shape: value-returning arrows are optimistically `pure`; a void arrow defaults to `mut` on an instance / struct method and `impure` on a static method or global function. The modifier sits between the return type (or parameter list, for void) and the body:
 
 ```ghul
 square(x: int) -> int pure => x * x;

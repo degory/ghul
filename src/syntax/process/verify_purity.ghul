@@ -1,0 +1,326 @@
+namespace Syntax.Process is
+
+    use Logging;
+    use Trees;
+
+    // Late check for the per-function purity contract. Runs after
+    // compile-expressions, so call sites carry their resolved
+    // Function symbol on `Expression.value`. Walks each body
+    // and records the worst-case purity signal observed from
+    // calls, assignment-LHS shapes, and yield. Emits
+    // `[purity-mismatch]` warnings when the observed verdict
+    // is weaker than the function's declared / inferred contract.
+    //
+    // Advisory: never downgrades `function.purity`. Call-site
+    // narrowing in compile-expressions trusts the declared /
+    // inferred contract; the verifier surfaces the holes
+    // INFER_PURITY's optimistic policy leaves open without
+    // flipping behaviour silently. Promotion to error is a
+    // planned follow-up once the warnings have been triaged.
+    //
+    // Coverage relative to INFER_PURITY:
+    //
+    //   - Inferred-PURE block bodies that call a non-pure helper
+    //     (the soundness hole INFER_PURITY couldn't see because
+    //     call targets aren't resolved at its slot in the
+    //     pipeline).
+    //   - Explicit `pure` / `mut` annotations whose body
+    //     contradicts the contract (assignment shape, call to a
+    //     weaker callee, or yield).
+    //   - Arrow-bodied functions whose expression contains a
+    //     weaker call.
+    class VERIFY_PURITY: ScopedVisitor is
+        _logger: Logger;
+        _symbol_table: Semantic.SYMBOL_TABLE;
+        _observed: Collections.MAP[Semantic.Symbols.Function, Semantic.Symbols.PURITY];
+        _lhs_classifier: LHS_PURITY_CLASSIFIER;
+
+        init(
+            logger: Logger,
+            stable_symbols: Semantic.STABLE_SYMBOLS,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES
+        )
+        is
+            super.init(logger, stable_symbols, symbol_table, namespaces);
+
+            _logger = logger;
+            _symbol_table = symbol_table;
+            _observed = Collections.MAP[Semantic.Symbols.Function, Semantic.Symbols.PURITY]();
+            _lhs_classifier = LHS_PURITY_CLASSIFIER(symbol_table);
+        si
+
+        apply(root: Trees.Node) is
+            root.walk(self);
+        si
+
+        // Seed observed at PURE when we enter a function whose
+        // declared contract is stronger than IMPURE. IMPURE
+        // bodies don't need checking — nothing the body could do
+        // would weaken the contract further.
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            super.pre(function);
+
+            let function_symbol = symbol_for(function);
+
+            if !function_symbol? \/ !isa Semantic.Symbols.Function(function_symbol) then
+                return false;
+            fi
+
+            let f = cast Semantic.Symbols.Function(function_symbol);
+
+            if f.purity == Semantic.Symbols.PURITY.IMPURE then
+                return false;
+            fi
+
+            _observed[f] = Semantic.Symbols.PURITY.PURE;
+
+            return false;
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            let function_symbol = symbol_for(function);
+
+            if function_symbol? /\ isa Semantic.Symbols.Function(function_symbol) then
+                let f = cast Semantic.Symbols.Function(function_symbol);
+                _check_mismatch(f, function);
+            fi
+
+            super.visit(function);
+        si
+
+        // Lambdas keep their own purity slot but for v1 the
+        // verifier treats them the same as named functions —
+        // ScopedVisitor's scope handling means we don't conflate
+        // a nested lambda's observed verdict with the enclosing
+        // function's.
+        pre(function: Trees.Expressions.FUNCTION) -> bool is
+            super.pre(function);
+            return false;
+        si
+
+        // Each call is a potential downgrade signal. The signal
+        // is what the call propagates to *this* function's
+        // caller-narrowing contract, not the callee's contract
+        // itself — receiver-aware, matching the semantics that
+        // `NARROWING_FLOW.on_call` already uses at call sites
+        // for narrowing decisions:
+        //
+        //   - PURE callee                       → PURE signal
+        //   - MUT callee, no caller receiver    → PURE signal
+        //     (static / global / NEW — nothing caller-reachable
+        //     to alias)
+        //   - MUT callee, receiver is `self`    → MUT signal
+        //     (mutating this propagates to the caller, who may
+        //     hold the same instance)
+        //   - MUT callee, receiver is a local
+        //     LET-bound variable of this body   → PURE signal
+        //     (the local was created here, no caller alias)
+        //   - MUT callee, anything else
+        //     (argument, member access, expr)   → IMPURE
+        //     (conservative — could alias caller state)
+        //   - IMPURE / unknown callee           → IMPURE
+        pre(call: Trees.Expressions.CALL) -> bool is
+            let signal = _signal_for_call(call.value);
+
+            let function = _symbol_table.current_function;
+
+            if function? then
+                _bump(function, signal);
+            fi
+
+            return false;
+        si
+
+        _signal_for_call(value: IR.Values.Value?) -> Semantic.Symbols.PURITY is
+            let callee = CALL_RESOLVER.resolved_function(value);
+
+            if !callee? then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            if callee.purity == Semantic.Symbols.PURITY.PURE then
+                return Semantic.Symbols.PURITY.PURE;
+            fi
+
+            if callee.purity == Semantic.Symbols.PURITY.IMPURE then
+                return Semantic.Symbols.PURITY.IMPURE;
+            fi
+
+            // callee is MUT — receiver shape decides the signal.
+            let receiver_value = _call_receiver_value(value);
+
+            if !receiver_value? then
+                return Semantic.Symbols.PURITY.PURE;
+            fi
+
+            if receiver_value.is_self then
+                return Semantic.Symbols.PURITY.MUT;
+            fi
+
+            if let load: IR.Values.Load.SYMBOL = receiver_value then
+                if isa Semantic.Symbols.LOCAL_VARIABLE(load.symbol) then
+                    return Semantic.Symbols.PURITY.PURE;
+                fi
+            fi
+
+            // Receiver is an instance field of `self`
+            // (`self.x.mutator()`): the call mutates state
+            // reachable through `this`. From the caller's POV
+            // this is the same as the enclosing function being
+            // MUT on self — bubble it up as a MUT signal, not
+            // IMPURE. Multi-level `self.x.y.mutator()` recurses.
+            if let inst_field: IR.Values.Load.INSTANCE_FIELD = receiver_value then
+                if _value_is_rooted_at_self(inst_field.from) then
+                    return Semantic.Symbols.PURITY.MUT;
+                fi
+            fi
+
+            // Freshly-constructed receiver — `Foo(args).bar()`.
+            // The instance was created inline; nothing in the
+            // caller's narrowing env aliases it, so mutating it
+            // doesn't propagate. Same shape as MUT-with-no-
+            // receiver semantically.
+            if isa IR.Values.NEW(receiver_value) then
+                return Semantic.Symbols.PURITY.PURE;
+            fi
+
+            return Semantic.Symbols.PURITY.IMPURE;
+        si
+
+        // True when `v` ultimately roots at `self` — direct
+        // SELF, or a chain of instance-field loads ending at
+        // SELF. Used to recognise `self.x.y.mutator()` as a
+        // self-rooted mutation.
+        _value_is_rooted_at_self(v: IR.Values.Value?) -> bool static is
+            if !v? then
+                return false;
+            fi
+
+            if v.is_self then
+                return true;
+            fi
+
+            if let inst_field: IR.Values.Load.INSTANCE_FIELD = v then
+                return _value_is_rooted_at_self(inst_field.from);
+            fi
+
+            return false;
+        si
+
+        // Extract the receiver IR value of a call (the `from`
+        // expression on INSTANCE / STRUCT). Returns null for
+        // calls with no receiver expression — STATIC / GLOBAL /
+        // NEW.
+        _call_receiver_value(value: IR.Values.Value?) -> IR.Values.Value? static is
+            if !value? then
+                return null;
+            fi
+
+            if let instance: IR.Values.Call.INSTANCE = value then
+                return instance.from;
+            fi
+
+            if let `struct: IR.Values.Call.STRUCT = value then
+                return `struct.from;
+            fi
+
+            return null;
+        si
+
+        // Assignment LHS classification — shared with INFER_PURITY
+        // via `LHS_PURITY_CLASSIFIER` so the two passes can't drift
+        // on what each shape signals.
+        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool is
+            let signal = _lhs_classifier.classify(assignment.left);
+
+            if signal? then
+                let function = _symbol_table.current_function;
+
+                if function? then
+                    _bump(function, signal!);
+                fi
+            fi
+
+            return false;
+        si
+
+        pre(`yield: Trees.Statements.YIELD) -> bool is
+            let function = _symbol_table.current_function;
+
+            if function? then
+                _bump(function, Semantic.Symbols.PURITY.IMPURE);
+            fi
+
+            return false;
+        si
+
+        // Track the worst-case signal in `_observed[function]`.
+        // Enum order: IMPURE (0) < MUT (1) < PURE (2), lower
+        // ordinal = weaker.
+        _bump(function: Semantic.Symbols.Function, signal: Semantic.Symbols.PURITY) is
+            let current mut = Semantic.Symbols.PURITY.PURE;
+
+            if _observed.contains_key(function) then
+                current = _observed[function];
+            else
+                // Function entered before `_observed` was seeded
+                // (declared IMPURE, so we don't bother tracking
+                // it). Nothing to bump.
+                return;
+            fi
+
+            if cast int(signal) < cast int(current) then
+                _observed[function] = signal;
+            fi
+        si
+
+        _check_mismatch(f: Semantic.Symbols.Function, definition: Trees.Definitions.FUNCTION) is
+            // Only flag explicit-modifier contracts the body
+            // contradicts. INFER_PURITY's block-body seed is
+            // optimistic (PURE, downgraded only by assignment /
+            // yield — never by impure callees, since callees
+            // aren't resolved at infer-time), so an "inferred
+            // PURE observed as impure" warning would fire on
+            // most non-trivial bodies and drown out the explicit-
+            // contract mismatches the user actually wants to see.
+            //
+            // The downside is silent: an inferred-PURE body with
+            // impure callees still drives optimistic path-narrowing
+            // at call sites. Promotion to a call-graph-aware
+            // inference is the next step.
+            if !f.is_purity_explicit then
+                return;
+            fi
+
+            if !_observed.contains_key(f) then
+                return;
+            fi
+
+            let observed = _observed[f];
+
+            if cast int(observed) >= cast int(f.purity) then
+                return;
+            fi
+
+            _logger.warn(
+                definition.location,
+                "purity-mismatch",
+                "{_purity_name(f.purity)} {f.name} body observed as {_purity_name(observed)}"
+            );
+        si
+
+        _purity_name(p: Semantic.Symbols.PURITY) -> string static is
+            if p == Semantic.Symbols.PURITY.PURE then
+                return "pure";
+            fi
+
+            if p == Semantic.Symbols.PURITY.MUT then
+                return "mut";
+            fi
+
+            return "impure";
+        si
+
+    si
+si
