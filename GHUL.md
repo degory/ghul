@@ -192,24 +192,6 @@ Functions are declared at namespace scope — there are no nested function defin
 
 Functions are first-class values. A function literal has the same shape without a name, but its argument and return types are generally *inferred* — from the body and from the context the literal is used in — so they are usually written without annotations (though either can be given explicitly). With a single argument the parentheses are optional. `A -> B` is the type of a function from `A` to `B`. Function literals capture references from the enclosing scope, forming closures: an immutable `let` is captured by value (a snapshot at the point the literal is constructed); a `let mut` is captured by reference, so the closure and the outer scope share one live variable that either side can read or reassign. An anonymous function refers to itself through the `rec` keyword:
 
-A named function or property accessor can carry a postfix **purity modifier** declaring how the callee can mutate state visible to the caller:
-
-- **`pure`** — no caller-observable mutation. Path-presence narrowings (`if x.foo? then … x.foo …`) survive across the call untouched.
-- **`mut`** — mutates the receiver only. The same `mut` keyword `let mut` uses. Path narrowings rooted at the call's receiver variable drop; narrowings of unrelated paths survive.
-- **`impure`** — may mutate anything reachable. All path narrowings clear at the call site. This is the default when no modifier is given.
-
-Property setters and `init` constructors auto-classify as `mut`; property getters as `pure`. Arrow-bodied functions are optimistically pure. The modifier sits between the return type (or parameter list, for void) and the body:
-
-```ghul
-square(x: int) -> int pure => x * x;
-note(s: string) mut is self.last = s; si
-log(msg: string) impure => Std.write_line(msg);
-```
-
-The contract is covariant on override: an override may strengthen its base (`pure` overriding `mut` is fine) but may not weaken it; an explicit `impure` overriding an explicit `pure` is rejected at compile time.
-
-`pure`, `impure`, `mut`, and `abstract` are reserved keywords — they can no longer be used as ordinary identifiers.
-
 ```ghul
 let twice = x => x * 2;
 let apply_twice = (f: int -> int, i) => f(f(i));
@@ -519,7 +501,7 @@ if name? then
 fi
 ```
 
-Optionals cover reference and value types alike — an optional value type is backed by the .NET `Nullable[T]`. A non-optional `T` is assignable to a `T?` without ceremony; the other direction is a hard rejection. To use a `T?` where a non-optional `T` is expected, the caller must narrow first — `if x?` / `if let` flow-narrow inside the guarded region, `x!` asserts present (throws if absent), and `x ?? default` falls back to a non-optional value.
+Optionals cover reference and value types alike — an optional value type is backed by the .NET `Nullable[T]`. A non-optional `T` is assignable to a `T?` without ceremony; the other direction is a hard rejection. To use a `T?` where a non-optional `T` is expected, the caller must narrow first — `if x?` / `if let` flow-narrow inside the guarded region, `x!` asserts present (throws if absent), and `x ?? default` falls back to a non-optional value. Reading a member through an optional receiver the flow analysis has not proven present — an un-narrowed local, a member path, a call result — draws a `null-deref` warning; `x?.y`, `x.has_value`, `x!`, and `if let` are the warning-free ways through (`--no-warn-null-deref` opts out project-wide).
 
 The `?.` operator is *coalescing* member access: `a?.b` reads `b` from `a` when `a` is present, otherwise yields the optional null. The result is always optional — a non-optional member type `U` is widened to `U?`, an already-optional `U?` stays `U?`. Receivers may be reference- or value-type optional (`T?` backed by `Nullable[T]`); a flow-narrowed non-optional receiver is allowed too, and just always takes the present branch.
 
@@ -575,9 +557,7 @@ For a two-variant union the `else` branch is narrowed to the other variant. The 
 
 Narrowing is flow-sensitive: if a guard rejects a type and then leaves the block — by `return`, `throw`, `break`, or `continue` — the code after the guard is narrowed too.
 
-Type narrowing — `isa`, variant, and complement — applies to local variables, including a function's own parameters, never to a field or property. To narrow a field by type, copy it into a local variable first, or use `if let`, which introduces one.
-
-Optional *presence* narrowing — the `?` (and `!= null`) test — additionally applies to member-access paths rooted at a local. Inside `if x.y? then …`, the field or property read `x.y` is narrowed optional → non-optional, so `x.y.z` reads through it and a value-type `T?` is usable as `T`. The narrow is scoped to the guarded region and dropped if a prefix is assigned; it is kept across method calls, so a path that turns out absent at run time gives an undefined result at the use rather than a compile-time guarantee.
+Narrowing applies to local variables, including a function's own parameters — never to a field or property. To narrow a field, copy it into a local variable first, or use `if let`, which introduces one.
 
 ### if let
 
@@ -617,9 +597,9 @@ if let (Color.RED, label) = entry then
 fi
 ```
 
-Literal leaves are only allowed inside refutable bindings (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
+Literal leaves are only allowed in refutable contexts (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
 
-Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the binding, with the bound name in scope:
+Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the test, with the new variable in scope:
 
 ```ghul
 if let c: Cat = animal /\ c.is_friendly then
@@ -627,9 +607,9 @@ if let c: Cat = animal /\ c.is_friendly then
 fi
 ```
 
-The binding's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The binding's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
+The clause's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The clause's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
 
-A single `if let` can chain several comma-separated bindings; every clause's presence test and optional `/\` guard must succeed for the then-arm to fire. Later clauses' scrutinees see earlier clauses' bindings, so the value flows left to right:
+A single `if let` can chain several comma-separated clauses; every clause's presence test and optional `/\` guard must succeed for the then-arm to fire. Later clauses' scrutinees see earlier clauses' variables, so the value flows left to right:
 
 ```ghul
 if let outer = holder, inner = outer.value then
@@ -641,7 +621,25 @@ if let c: Cat = a, d: Dog = b then
 fi
 ```
 
-A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' bindings then aren't in scope.
+A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' variables then aren't in scope.
+
+When the tested value is a member path and the variable should simply take the path's last name, the `name =` can be omitted: `if let x.y.z?` declares `z`, holding the tested value, and `if let path: T` does the same with a type test. The shorthand composes with guards, comma-chained clauses, and `while let` exactly like the full form:
+
+```ghul
+if let order.customer? then
+    write_line("customer: {customer.name}");     // customer = order.customer
+fi
+
+if let zoo.pet: Cat /\ pet.is_friendly then
+    write_line("{pet.name} says meow");
+fi
+
+while let queue.head? do
+    process(head);
+od
+```
+
+The shorthand needs a path — for a bare optional local, `if x?` already narrows the variable itself, with no new name to introduce.
 
 ghūl has no dedicated `match` construct; variant tags, narrowing, and `if let` cover that ground.
 
@@ -882,7 +880,7 @@ See <https://ghul.dev/type-inference.html>.
 
 ghūl infers types pervasively, but inference is **function-local**: a function's signature — its parameter and return types — is always written out, and inference works only within the body. Within a body, types are inferred for local variables, loop variables, destructured variables, anonymous function parameters and return types, and generic type arguments on calls.
 
-Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler type-narrows local variables but never fields or properties (optional *presence* narrowing additionally covers member-access paths — see type narrowing), and a `let` variable's inferred type does not escape the function it is declared in.
+Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler narrows local variables but never fields or properties, and a `let` variable's inferred type does not escape the function it is declared in.
 
 ## .NET interop
 
