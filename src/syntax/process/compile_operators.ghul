@@ -23,6 +23,7 @@ namespace Syntax.Process is
         _flow: NARROWING_FLOW;
         _condition_analyzer: CONDITION_ANALYZER;
         _visitor: ScopedVisitor;
+        _value_boxer: IR.VALUE_BOXER;
 
         init(
             logger: Logger,
@@ -48,6 +49,7 @@ namespace Syntax.Process is
             _flow = flow;
             _condition_analyzer = condition_analyzer;
             _visitor = visitor;
+            _value_boxer = IR.VALUE_BOXER(logger);
         si
 
         visit_unary(unary: Trees.Expressions.UNARY) is
@@ -426,6 +428,7 @@ namespace Syntax.Process is
             let left_value = binary.left.value!;
             let right_value = binary.right.value!;
 
+
             left_value.check_is_consumable(_logger, binary.left.location);
             right_value.check_is_consumable(_logger, binary.right.location);
 
@@ -450,12 +453,6 @@ namespace Syntax.Process is
             let left_inner = left_type.optional_inner_type;
 
             if !left_inner? then
-                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
-                return;
-            fi
-
-            if left_inner.is_value_type then
-                _logger.error(binary.location, "?? does not yet support value-type optionals");
                 binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
                 return;
             fi
@@ -485,14 +482,79 @@ namespace Syntax.Process is
                 return;
             fi
 
+            // The result's optional kind derives from the LUB of the
+            // inner types, not from either operand: reference inner →
+            // flagged reference optional, value inner → NULLABLE, and
+            // a type-variable inner keeps the left's MAYBE carrier —
+            // the only lowering an unconstrained T? has. The operands
+            // may each be a different kind of optional; each arm
+            // coerces to the canonical result.
             let result_type =
-                if right_is_optional then
-                    result_inner.as_optional();
-                else
+                if !right_is_optional then
                     result_inner;
+                elif result_inner.is_type_variable then
+                    left_type;
+                else
+                    COMPILE_ACCESS.build_optional_type(result_inner, _innate_symbol_lookup);
                 fi;
 
-            binary.value = NULL_COALESCE(left_value, right_value, result_type);
+            let absent_arm = _coerce_coalesce_arm(right_value, result_type);
+
+            if !left_type.is_value_type then
+                binary.value = NULL_COALESCE(left_value, absent_arm, result_type);
+                return;
+            fi
+
+            // Value-shape left — NULLABLE[T] or MAYBE[T]: spill the
+            // receiver to a local and drive the presence test and
+            // payload extract through its address, mirroring the
+            // `?.` lowering.
+            let has_value_member = left_type.find_member("has_value");
+            let value_member = left_type.find_member("value");
+
+            if !has_value_member? \/ !value_member? then
+                _logger.poison(binary.location, "?? left operand {left_type} missing has_value or value member");
+                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
+                return;
+            fi
+
+            let address_stand_in = IR.Values.STACK_TOP_ADDRESS(left_type);
+            let symbol_loader = IoC.CONTAINER.instance.symbol_loader;
+
+            let presence_test = has_value_member.load(binary.left.location, address_stand_in, symbol_loader);
+            let value_extract = value_member.load(binary.left.location, address_stand_in, symbol_loader);
+
+            if !presence_test? \/ !value_extract? then
+                binary.value = DUMMY(Semantic.Types.ERROR(), binary.location);
+                return;
+            fi
+
+            let present_arm = _coerce_coalesce_arm(IR.Values.STACK_TOP(left_inner!), result_type);
+
+            binary.value =
+                IR.Values.NULL_COALESCE_VALUE(
+                    left_value,
+                    presence_test!,
+                    value_extract!,
+                    present_arm,
+                    absent_arm,
+                    result_type
+                );
+        si
+
+        // Bring one arm of `??` to the result type: T → T? wrapping
+        // (Nullable / MAYBE construction), MAYBE → reference-optional
+        // payload load, NULLABLE ↔ MAYBE pass through unchanged (the
+        // layouts are identical), and a value-typed arm boxes when
+        // the LUB widened the result to a reference type.
+        _coerce_coalesce_arm(value: IR.Values.Value, result_type: Semantic.Types.Type) -> IR.Values.Value is
+            let coerced = _value_boxer.wrap_if_needed(value, result_type);
+
+            if !result_type.is_value_type /\ coerced.type? /\ coerced.type.is_value_type then
+                return IR.Values.BOX(coerced);
+            fi
+
+            return coerced;
         si
 
         visit_index(index: Trees.Expressions.INDEX) is
