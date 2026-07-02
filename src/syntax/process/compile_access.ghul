@@ -26,10 +26,6 @@ namespace Syntax.Process is
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
         _visitor: COMPILE_EXPRESSIONS;
 
-        // Monotonic id for hidden `?!` pin locals — uniquifies their
-        // names within any one function.
-        _next_pin_id: int;
-
         init(
             logger: Logger,
             symbol_table: Semantic.SYMBOL_TABLE,
@@ -218,14 +214,6 @@ namespace Syntax.Process is
                     if check_store_access(member.location, left_value, symbol, named_type) then
                         value = symbol.store(member.location, left_value, store_value, _symbol_loader, false);
                     fi
-
-                    // A visible write through the path invalidates any
-                    // pin on it or beneath it.
-                    let stored_path = _visitor.try_build_access_path(member);
-
-                    if stored_path? then
-                        _flow.on_path_assignment(stored_path);
-                    fi
                 else
                     let variant = cast Semantic.Symbols.VARIANT(symbol);
 
@@ -249,7 +237,6 @@ namespace Syntax.Process is
 
                             if value? then
                                 member.value = value;
-                                _substitute_pin_load(member);
                                 return;
                             fi
 
@@ -265,56 +252,6 @@ namespace Syntax.Process is
                 fi
 
                 member.value = value;
-
-                if !need_store then
-                    _substitute_pin_load(member);
-                fi
-            fi
-        si
-
-        // Replace a load of a pinned path with a load of its pin —
-        // the value that passed the path's `?!` presence test — so no
-        // re-read of the path occurs in the narrowed region. A
-        // reference pin holds the checked reference at its
-        // non-optional type; a value-optional pin holds the wrapper,
-        // so the use projects `value` off it (NARROW_PROJECT keeps
-        // the wrapper reachable for the `?` / `!` peel-back). Pins
-        // bound in an enclosing function are not substituted inside a
-        // closure body — the pin local is not wired for capture, so
-        // the closure re-reads the path and the dereference check
-        // applies as usual.
-        _substitute_pin_load(member: Trees.Expressions.MEMBER) is
-            if !member.value? then
-                return;
-            fi
-
-            let path = _visitor.try_build_access_path(member);
-
-            if !path? then
-                return;
-            fi
-
-            let pin = _flow.pinned_for(path);
-
-            if !pin? \/ !pin.type? \/ pin.owner != _symbol_table.current_function then
-                return;
-            fi
-
-            if pin.type.is_value_type then
-                let value_member = pin.type.find_member("value");
-
-                if !value_member? then
-                    return;
-                fi
-
-                let underlying = IR.Values.Load.LOCAL_VARIABLE(pin);
-                let projected = value_member.load(member.location, IR.Values.Load.LOCAL_VARIABLE(pin), _symbol_loader);
-
-                if projected? then
-                    member.value = IR.Values.NARROW_PROJECT(underlying, projected);
-                fi
-            else
-                member.value = IR.Values.Load.LOCAL_VARIABLE(pin);
             fi
         si
 
@@ -504,12 +441,6 @@ namespace Syntax.Process is
             let left_value = has_value.left.value!;
             let bool_type = _innate_symbol_lookup.get_bool_type();
 
-            if has_value.is_pin then
-                if _compile_pinned_has_value(has_value, left_value, bool_type) then
-                    return;
-                fi
-            fi
-
             // Union `u?` → `isa Default(u)`. Both source-defined
             // and cross-asm unions carry the default variant on the
             // symbol; cross-asm unions get it via the
@@ -583,126 +514,6 @@ namespace Syntax.Process is
                 _logger.error(has_value.left.location, "must be a reference type or provide a has_value property");
                 has_value.value = DUMMY(bool_type, has_value.location);
             fi
-        si
-
-        // Compile the pinning presence test `path?!`: evaluate the
-        // path once into a hidden local, test presence of the local,
-        // and record the path -> pin fact on the node for the
-        // condition analysis to seed the then-edge environment.
-        // Returns false when the operand is a bare local — plain
-        // local presence narrowing already covers that soundly, so
-        // the test compiles as ordinary `?`.
-        _compile_pinned_has_value(has_value: Trees.Expressions.HAS_VALUE, left_value: Value, bool_type: Type) -> bool is
-            if _visitor.try_get_narrowing_target(has_value.left)? then
-                return false;
-            fi
-
-            let type = left_value.type;
-
-            if !type? \/ !type.is_optional then
-                _logger.error(has_value.location, "cannot pin: operand is not optional");
-                has_value.value = DUMMY(bool_type, has_value.location);
-                return true;
-            fi
-
-            let path = _visitor.try_build_access_path(has_value.left);
-
-            if !path? then
-                _logger.error(has_value.location, "cannot pin: operand is not a member access path rooted at a local variable");
-                has_value.value = DUMMY(bool_type, has_value.location);
-                return true;
-            fi
-
-            let pin = _create_pin(has_value.left.location, type);
-
-            if !pin? then
-                _logger.error(has_value.location, "cannot pin here");
-                has_value.value = DUMMY(bool_type, has_value.location);
-                return true;
-            fi
-
-            let block = IR.Values.BLOCK(bool_type);
-
-            block.add(IR.Values.Store.PIN(pin, left_value));
-
-            if type.is_value_type then
-                let has_value_member = type.find_member("has_value");
-
-                if
-                    has_value_member? /\
-                    isa Semantic.Symbols.Property(has_value_member) /\
-                    has_value_member.type =~ bool_type
-                then
-                    block.add(
-                        has_value_member.load(
-                            has_value.location,
-                            IR.Values.Load.LOCAL_VARIABLE(pin),
-                            _symbol_loader
-                        )
-                    );
-                else
-                    _logger.error(has_value.left.location, "must be a reference type or provide a has_value property");
-                    has_value.value = DUMMY(bool_type, has_value.location);
-                    return true;
-                fi
-            else
-                block.add(HAS_VALUE(IR.Values.Load.LOCAL_VARIABLE(pin), bool_type));
-            fi
-
-            has_value.value = block;
-
-            has_value.pin_symbol = pin;
-            has_value.pin_path = path;
-
-            return true;
-        si
-
-        // Synthesize the hidden local a `?!` test binds. A reference
-        // pin holds the checked reference at its non-optional type; a
-        // value-optional pin holds the wrapper (uses project `value`
-        // off it). Inside a generator / async body the pin is
-        // registered on the state-machine frame, like any local that
-        // must survive a suspend.
-        _create_pin(location: LOCATION, tested_type: Type) -> Semantic.Symbols.LOCAL_VARIABLE? is
-            let function = _symbol_table.current_function;
-
-            if !function? then
-                return null;
-            fi
-
-            let id_generator = IoC.CONTAINER.instance.local_id_generator;
-
-            id_generator.enter_function();
-            let pin = Semantic.Symbols.LOCAL_VARIABLE(location, function, "pin${_next_pin_id}");
-            id_generator.leave_function();
-
-            _next_pin_id = _next_pin_id + 1;
-
-            if tested_type.is_value_type then
-                pin.set_type(tested_type);
-            else
-                let non_optional = tested_type.as_non_optional();
-
-                if non_optional? /\ !non_optional.is_optional then
-                    pin.set_type(non_optional!);
-                else
-                    pin.set_type(tested_type);
-                fi
-            fi
-
-            pin.define();
-            pin.is_assigned = true;
-
-            let state_machine = Semantic.Symbols.state_machine_for(function);
-            let async_state_machine = Semantic.Symbols.async_state_machine_for(function);
-
-            if state_machine? /\ state_machine.frame? then
-                state_machine.frame.declare_local_field(pin);
-            elif async_state_machine? /\ async_state_machine.frame? then
-                async_state_machine.frame.declare_local_field(pin);
-            fi
-
-            return pin;
         si
 
         visit_unwrap(unwrap: Trees.Expressions.UNWRAP) is
@@ -819,21 +630,11 @@ namespace Syntax.Process is
             reference.value = ADDRESS(reference.left.value!, _innate_symbol_lookup.get_reference_type(reference.left.value.type));
 
             // The callee reached through `x ref` may write the
-            // target, so treat the `ref` as a definite assignment —
-            // and as a visible write for pin invalidation: drop pins
-            // on or under a ref'd path, and pins rooted at a ref'd
-            // local.
+            // target, so treat the `ref` as a definite assignment.
             let ref_target = _visitor.try_get_narrowing_target(reference.left);
 
             if ref_target? then
                 _flow.mark_assigned(ref_target);
-                _flow.current_env.drop_pins_rooted_at(ref_target);
-            fi
-
-            let ref_path = _visitor.try_build_access_path(reference.left);
-
-            if ref_path? then
-                _flow.on_path_assignment(ref_path);
             fi
         si
 
