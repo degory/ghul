@@ -597,9 +597,9 @@ if let (Color.RED, label) = entry then
 fi
 ```
 
-Literal leaves are only allowed inside refutable bindings (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
+Literal leaves are only allowed in refutable contexts (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
 
-Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the binding, with the bound name in scope:
+Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the test, with the new variable in scope:
 
 ```ghul
 if let c: Cat = animal /\ c.is_friendly then
@@ -607,9 +607,9 @@ if let c: Cat = animal /\ c.is_friendly then
 fi
 ```
 
-The binding's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The binding's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
+The clause's presence test runs first; if it succeeds, each guard runs in source order under the narrowed environment. Failure at any clause falls through to the next `elif`/`else` arm. The clause's initializer is whatever precedes the first `/\`; anything after is a guard, so a top-level `/\` in `if let` position always reads as a chain — its result would otherwise be `bool`, which is never refutable.
 
-A single `if let` can chain several comma-separated bindings; every clause's presence test and optional `/\` guard must succeed for the then-arm to fire. Later clauses' scrutinees see earlier clauses' bindings, so the value flows left to right:
+A single `if let` can chain several comma-separated clauses; every clause's presence test and optional `/\` guard must succeed for the then-arm to fire. Later clauses' scrutinees see earlier clauses' variables, so the value flows left to right:
 
 ```ghul
 if let outer = holder, inner = outer.value then
@@ -621,7 +621,25 @@ if let c: Cat = a, d: Dog = b then
 fi
 ```
 
-A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' bindings then aren't in scope.
+A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' variables then aren't in scope.
+
+When the tested value is a member path and the variable should simply take the path's last name, the `name =` can be omitted: `if let x.y.z?` declares `z`, holding the tested value, and `if let path: T` does the same with a type test. The shorthand composes with guards, comma-chained clauses, and `while let` exactly like the full form:
+
+```ghul
+if let order.customer? then
+    write_line("customer: {customer.name}");     // customer = order.customer
+fi
+
+if let zoo.pet: Cat /\ pet.is_friendly then
+    write_line("{pet.name} says meow");
+fi
+
+while let queue.head? do
+    process(head);
+od
+```
+
+The shorthand needs a path — for a bare optional local, `if x?` already narrows the variable itself, with no new name to introduce.
 
 ghūl has no dedicated `match` construct; variant tags, narrowing, and `if let` cover that ground.
 

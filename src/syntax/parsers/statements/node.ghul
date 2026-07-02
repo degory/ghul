@@ -291,7 +291,7 @@ namespace Syntax.Parsers.Statements is
                     if context.current.token == Lexical.TOKEN.WHILE then
                         context.next_token();
 
-                        if context.current_token == Lexical.TOKEN.LET /\ is_let_binding(context, Lexical.TOKEN.DO) then
+                        if context.current_token == Lexical.TOKEN.LET /\ is_let_binding(context, Lexical.TOKEN.DO, "while") then
                             context.next_token();
                             binding = parse_let_binding(context, "while");
                         else
@@ -412,7 +412,7 @@ namespace Syntax.Parsers.Statements is
                 then
                     context.next_token();
 
-                    if context.current_token == Lexical.TOKEN.LET /\ is_let_binding(context, Lexical.TOKEN.THEN) then
+                    if context.current_token == Lexical.TOKEN.LET /\ is_let_binding(context, Lexical.TOKEN.THEN, "if") then
                         context.next_token();
                         binding = parse_let_binding(context, "if");
 
@@ -486,18 +486,30 @@ namespace Syntax.Parsers.Statements is
         si
 
         // Disambiguate `if let x = e then` / `if let x = e, y = f then`
-        // (a conditional binding) from `if let x = e in body then` (a
+        // (a conditional definition) from `if let x = e in body then` (a
         // let-in expression used as the condition): speculatively parse
-        // the comma-separated binding list and report whether the
-        // expected terminator — `THEN` for `if let`, `DO` for
-        // `while let` — follows it.
-        is_let_binding(context: CONTEXT, terminator: Lexical.TOKEN) -> bool is
+        // the comma-separated clause list — the same grammar the real
+        // parse uses, so both accept exactly the same clause forms — and
+        // report whether the expected terminator (`THEN` for `if let`,
+        // `DO` for `while let`) follows it.
+        is_let_binding(context: CONTEXT, terminator: Lexical.TOKEN, kind: string) -> bool is
+            let last_error = context.capture_last_error();
+
+            let result = _probe_let_clauses(context, terminator, kind);
+
+            context.restore_last_error(last_error);
+
+            return result;
+        si
+
+        _probe_let_clauses(context: CONTEXT, terminator: Lexical.TOKEN, kind: string) -> bool is
+            let use logger_snapshot = context.logger_speculate_then_backtrack();
             let use snapshot = context.tokenizer_speculate_then_backtrack();
 
             context.next_token();
 
             do
-                let probe = variable_parser.parse(context);
+                let probe = _parse_clause(context, kind);
 
                 if !probe? then
                     return false;
@@ -547,13 +559,7 @@ namespace Syntax.Parsers.Statements is
             let should_poison mut = false;
 
             do
-                let variable = variable_parser.parse(context);
-
-                if !variable? then
-                    return null;
-                fi
-
-                let clause = _build_clause(context, variable, kind);
+                let clause = _parse_clause(context, kind);
 
                 if !clause? then
                     return null;
@@ -585,6 +591,238 @@ namespace Syntax.Parsers.Statements is
             result.poison(should_poison);
 
             return result;
+        si
+
+        // Parse one clause of an `if let` / `while let` clause list.
+        // Two forms share the clause position:
+        //
+        //   pattern [: T] = e [/\ guard]     — the full form
+        //   path? [/\ guard]                 — leaf-name shorthand
+        //   path: T [/\ guard]               — leaf-name shorthand, narrowed
+        //
+        // A destructure or wildcard pattern can't open a path, so a
+        // clause not starting with an identifier or self parses as the
+        // full form directly. For the ambiguous openings, parse the
+        // left-hand side as an expression first — it covers both a
+        // simple pattern name and any path shape (`a.b`, `a[i].b`,
+        // `f().b`) — then discriminate on what follows: an `=` (after
+        // an optional `: T`) means it was a full-form pattern, which
+        // must then be a simple name; anything else is the shorthand.
+        _parse_clause(context: CONTEXT, kind: string) -> Trees.Statements.REFUTABLE_BINDING_CLAUSE? is
+            if
+                context.current_token != Lexical.TOKEN.IDENTIFIER /\
+                context.current_token != Lexical.TOKEN.SELF
+            then
+                let variable = variable_parser.parse(context);
+
+                if variable? then
+                    return _build_clause(context, variable, kind);
+                fi
+
+                return null;
+            fi
+
+            let start = context.location;
+
+            let expression = expression_parser.parse(context);
+
+            if !expression? then
+                return null;
+            fi
+
+            let narrow_type_expression: Trees.TypeExpressions.TypeExpression? mut = null;
+
+            if context.current_token == Lexical.TOKEN.COLON then
+                context.next_token();
+
+                narrow_type_expression = IoC.CONTAINER.instance.type_parser.parse(context);
+            fi
+
+            if context.current_token == Lexical.TOKEN.ASSIGN then
+                return _build_full_clause(context, start, expression, narrow_type_expression, kind);
+            fi
+
+            return _build_shorthand_clause(context, start, expression, narrow_type_expression, kind);
+        si
+
+        // Full-form clause whose left-hand side arrived as an already
+        // parsed expression: `name [: T] = e [/\ guard]`. The `=` is
+        // current; the pattern must be a simple name.
+        _build_full_clause(
+            context: CONTEXT,
+            start: Source.LOCATION,
+            expression: Trees.Expressions.Expression,
+            narrow_type_expression: Trees.TypeExpressions.TypeExpression?,
+            kind: string
+        ) -> Trees.Statements.REFUTABLE_BINDING_CLAUSE? is
+            context.next_token();
+
+            let name =
+                if expression.is_unqualified_identifier then
+                    expression.try_copy_as_identifer();
+                else
+                    null;
+                fi;
+
+            let initializer = expression_parser.parse(context);
+
+            if !name? then
+                context.error(expression.location, "expected a simple variable name before = in {kind} let");
+                return null;
+            fi
+
+            if !initializer? then
+                return null;
+            fi
+
+            let pattern_left = Trees.Variables.SIMPLE_VARIABLE_LEFT(expression.location, name!);
+            pattern_left.mark_refutable_recursive();
+
+            let split = _split_chain_initializer(initializer);
+
+            let clause =
+                Trees.Statements.REFUTABLE_BINDING_CLAUSE(
+                    start::initializer.location,
+                    split.initializer,
+                    narrow_type_expression,
+                    pattern_left,
+                    split.guard
+                );
+
+            return clause;
+        si
+
+        // Leaf-name shorthand clause: `path?` or `path: T` with no
+        // pattern and no `=`. Declares an immutable local named after
+        // the path's last member, holding the tested (`?`) or
+        // narrowed (`: T`) value — `if let x.y.z? then f(z)` is
+        // `if let z = x.y.z` with the name inferred. A trailing
+        // `/\ …` chain becomes the clause guard, as in the full form.
+        _build_shorthand_clause(
+            context: CONTEXT,
+            start: Source.LOCATION,
+            expression: Trees.Expressions.Expression,
+            narrow_type_expression: Trees.TypeExpressions.TypeExpression?,
+            kind: string
+        ) -> Trees.Statements.REFUTABLE_BINDING_CLAUSE? is
+            let guard: Trees.Expressions.Expression? mut = null;
+            let scrutinee: Trees.Expressions.Expression mut = expression;
+            let end mut = expression.location;
+
+            if narrow_type_expression? then
+                // `path: T` — the type parser stopped before any
+                // `/\ guard` chain.
+                end = narrow_type_expression.location;
+
+                if context.current_token == Lexical.TOKEN.OPERATOR /\ context.current_string =~ "/\\" then
+                    context.next_token();
+                    guard = expression_parser.parse(context);
+
+                    if guard? then
+                        end = guard.location;
+                    fi
+                fi
+            else
+                // `path? [/\ guard…]` — parsed as one expression; the
+                // leftmost `/\` leaf is the presence test, the rest is
+                // the guard.
+                let split = _split_chain_initializer(expression);
+
+                if !isa Trees.Expressions.HAS_VALUE(split.initializer) then
+                    return _build_missing_test_clause(context, start, expression, kind);
+                fi
+
+                let has_value = cast Trees.Expressions.HAS_VALUE(split.initializer);
+
+                scrutinee = has_value.left;
+                guard = split.guard;
+            fi
+
+            let leaf = _infer_leaf_name(scrutinee);
+
+            if !leaf? then
+                context.error(start::end, "cannot infer a variable name for this expression: use {kind} let name = ...");
+                return null;
+            fi
+
+            let pattern_left = Trees.Variables.SIMPLE_VARIABLE_LEFT(leaf.location, leaf!);
+            pattern_left.mark_refutable_recursive();
+
+            let clause =
+                Trees.Statements.REFUTABLE_BINDING_CLAUSE(
+                    start::end,
+                    scrutinee,
+                    narrow_type_expression,
+                    pattern_left,
+                    guard
+                );
+
+            clause.is_inferred_name = true;
+
+            return clause;
+        si
+
+        // A clause that fits neither form: no `=`, no trailing `?`, no
+        // `: T`. Report the most likely omission — a bare name is a
+        // full-form clause missing its initializer; anything else is a
+        // path missing its test — and yield a poisoned clause so the
+        // rest of the chain still parses and diagnoses usefully.
+        _build_missing_test_clause(
+            context: CONTEXT,
+            start: Source.LOCATION,
+            expression: Trees.Expressions.Expression,
+            kind: string
+        ) -> Trees.Statements.REFUTABLE_BINDING_CLAUSE? is
+            let leaf =
+                if expression.is_unqualified_identifier then
+                    expression.try_copy_as_identifer();
+                else
+                    _infer_leaf_name(expression);
+                fi;
+
+            if !leaf? then
+                context.error(start::expression.location, "cannot infer a variable name for this expression: use {kind} let name = ...");
+                return null;
+            fi
+
+            if expression.is_unqualified_identifier then
+                context.error(expression.location, "{kind} let requires an initializer");
+            else
+                context.error(start::expression.location, "expected =, ? or : and a type after this expression");
+            fi
+
+            let pattern_left = Trees.Variables.SIMPLE_VARIABLE_LEFT(leaf.location, leaf!);
+            pattern_left.mark_refutable_recursive();
+
+            let clause =
+                Trees.Statements.REFUTABLE_BINDING_CLAUSE(
+                    start::expression.location,
+                    Trees.Expressions.NULL(expression.location),
+                    null,
+                    pattern_left,
+                    null
+                );
+
+            clause.poison(true);
+
+            return clause;
+        si
+
+        // The shorthand's variable name: the last member of a path. A
+        // fresh identifier node — the scrutinee keeps its own. A bare
+        // name has no path to take a leaf from, and the new variable
+        // would shadow the scrutinee's own name inside the clause's
+        // scope; narrowing already covers `if x?` on a local.
+        _infer_leaf_name(scrutinee: Trees.Expressions.Expression) -> Trees.Identifiers.Identifier? is
+            if isa Trees.Expressions.MEMBER(scrutinee) then
+                let member = cast Trees.Expressions.MEMBER(scrutinee);
+
+                if member.identifier? /\ member.identifier.name? then
+                    return Trees.Identifiers.Identifier(member.identifier.location, member.identifier.name);
+                fi
+            fi
+
+            return null;
         si
 
         // Build one REFUTABLE_BINDING_CLAUSE from a parsed VARIABLE.
