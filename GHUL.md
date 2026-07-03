@@ -425,7 +425,7 @@ union Result[T, E] is
 si
 ```
 
-`r?` is then true when `r` holds `OK`, and `r!` unwraps the `OK` payload, throwing if `r` holds `ERROR`. A default variant with one field unwraps to that field positionally — the field name does not have to be `value` — and with several fields, it unwraps to the variant.
+`r?` is then true when `r` holds `OK`, and `r!` unwraps the `OK` payload, throwing if `r` holds `ERROR`. A default variant with one field unwraps to that field positionally — the field name does not have to be `value` — and with several fields, it unwraps to the variant. Inside an `if r?` the variable narrows to the default variant — so its fields read directly, no `!` needed — and the `else` branch narrows to the remaining variant(s), the same narrowing `isa OK(r)` performs.
 
 A union may declare a **primary-constructor header** for state shared across every variant. Each variant then splices the shared parameters into its field list with `..`:
 
