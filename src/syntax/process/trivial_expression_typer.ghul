@@ -1,0 +1,308 @@
+namespace Syntax.Process is
+    use Trees;
+
+    use Semantic.Types.Type;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Answers "what is this value expression's static type?" using
+    // only information available before compile-expressions, i.e.
+    // without inference or overload resolution: declared types of
+    // fields, properties and parameters, literal types, member chains
+    // over those, and locals whose initializer type was itself
+    // trivially derivable (recorded via set_local_type as the
+    // enclosing walk passes their declarations). Null whenever the
+    // type is not certain — callers must treat null as unknown, never
+    // as a default.
+    //
+    // Lookups go through the symbol table's current scope, so answers
+    // are only meaningful while the caller is walking inside the
+    // scopes that declare the names it asks about.
+    class TRIVIAL_EXPRESSION_TYPER is
+        _symbol_table: Semantic.SYMBOL_TABLE;
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+
+        // Types of locals whose initializer type was trivially
+        // derivable, keyed by the local's symbol.
+        _local_types: Collections.MutableMap[Symbol, Type];
+
+        init(
+            symbol_table: Semantic.SYMBOL_TABLE,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
+        )
+        is
+            _symbol_table = symbol_table;
+            _innate_symbol_lookup = innate_symbol_lookup;
+
+            reset();
+        si
+
+        reset() is
+            _local_types = Collections.MAP[Symbol, Type]();
+        si
+
+        set_local_type(symbol: Symbol, type: Type) is
+            _local_types[symbol] = type;
+        si
+
+        has_local_type(symbol: Symbol) -> bool => _local_types.contains_key(symbol);
+
+        // A type is only usable as a receiver for member lookup when
+        // it is fully resolved and not a type variable.
+        usable(type: Type?) -> Type? is
+            if type? /\ type.is_settled /\ !type.is_type_variable then
+                return type;
+            fi
+
+            return null;
+        si
+
+        declared_symbol_type(symbol: Symbol) -> Type? is
+            if isa Semantic.Symbols.Variable(symbol) then
+                return usable((cast Semantic.Symbols.Variable(symbol)).type);
+            fi
+
+            if isa Semantic.Symbols.Property(symbol) then
+                return usable((cast Semantic.Symbols.Property(symbol)).type);
+            fi
+
+            return null;
+        si
+
+        try_type(expression: Trees.Expressions.Expression?) -> Type? is
+            if !expression? then
+                return null;
+            fi
+
+            if isa Trees.Expressions.IDENTIFIER(expression) then
+                let identifier = (cast Trees.Expressions.IDENTIFIER(expression)).identifier;
+
+                if !identifier? then
+                    return null;
+                fi
+
+                let symbol = try_find(identifier);
+
+                if !symbol? then
+                    return null;
+                fi
+
+                if _local_types.contains_key(symbol) then
+                    return _local_types[symbol];
+                fi
+
+                return declared_symbol_type(symbol);
+            fi
+
+            if isa Trees.Expressions.SELF(expression) then
+                let context = _symbol_table.current_instance_context;
+
+                if context? then
+                    return usable(context.type);
+                fi
+
+                return null;
+            fi
+
+            if isa Trees.Expressions.SUPER(expression) then
+                // the class-chain base type, matching what a super
+                // receiver resolves members against; the trait-default
+                // super-call refinement is not mirrored here — those
+                // members miss the base lookup and stay unknown
+                let context = _symbol_table.current_instance_context;
+
+                if context? /\ !context.is_trait then
+                    let ancestors = context.ancestors;
+
+                    if ancestors? /\ ancestors.count > 0 then
+                        return usable(ancestors[0]);
+                    fi
+                fi
+
+                return null;
+            fi
+
+            if isa Trees.Expressions.MEMBER(expression) then
+                let member = cast Trees.Expressions.MEMBER(expression);
+
+                let as_identifier = member.try_copy_as_identifer();
+
+                if as_identifier? then
+                    let symbol = try_find(as_identifier);
+
+                    if symbol? then
+                        return declared_symbol_type(symbol);
+                    fi
+                fi
+
+                let left_type = try_type(member.left);
+
+                if !left_type? \/ !member.identifier? then
+                    return null;
+                fi
+
+                let member_symbol = left_type.find_member(member.identifier.name);
+
+                if !member_symbol? then
+                    return null;
+                fi
+
+                return declared_symbol_type(member_symbol);
+            fi
+
+            if isa Trees.Expressions.Literals.INTEGER(expression) then
+                return usable(_innate_symbol_lookup.get_int_type());
+            fi
+
+            if isa Trees.Expressions.Literals.STRING(expression) then
+                return usable(_innate_symbol_lookup.get_string_type());
+            fi
+
+            if isa Trees.Expressions.Literals.BOOLEAN(expression) then
+                return usable(_innate_symbol_lookup.get_bool_type());
+            fi
+
+            if isa Trees.Expressions.Literals.CHARACTER(expression) then
+                return usable(_innate_symbol_lookup.get_char_type());
+            fi
+
+            if isa Trees.Expressions.Literals.FLOAT(expression) then
+                return usable(_innate_symbol_lookup.get_double_type());
+            fi
+
+            if
+                isa Trees.Expressions.HAS_VALUE(expression) \/
+                isa Trees.Expressions.ISA(expression)
+            then
+                return usable(_innate_symbol_lookup.get_bool_type());
+            fi
+
+            if isa Trees.Expressions.BINARY(expression) then
+                let binary = cast Trees.Expressions.BINARY(expression);
+
+                return try_operator_result_type(binary.operation, binary.left, binary.right);
+            fi
+
+            if isa Trees.Expressions.UNARY(expression) then
+                let unary = cast Trees.Expressions.UNARY(expression);
+
+                return try_operator_result_type(unary.operation, unary.right, null);
+            fi
+
+            return null;
+        si
+
+        // Result type of an operator expression, when it is decidable
+        // before overload resolution: the candidate set is the scope-
+        // visible operator group plus any member operators on the
+        // (known) operand types — the same set compile-expressions
+        // resolves over — so when every candidate returns the same
+        // settled type, the result has that type whichever candidate
+        // wins. Null as soon as an operand type is unknown or the
+        // candidates' return types disagree.
+        try_operator_result_type(
+            operation: Identifiers.Identifier?,
+            left: Trees.Expressions.Expression?,
+            right: Trees.Expressions.Expression?
+        ) -> Type? is
+            if !operation? \/ !operation.name? then
+                return null;
+            fi
+
+            let candidates = Collections.LIST[Function]();
+
+            if !try_collect_operator_candidates(find(operation.name), candidates) then
+                return null;
+            fi
+
+            let left_type = try_type(left);
+
+            if !left_type? then
+                return null;
+            fi
+
+            if !try_collect_operator_candidates(left_type.find_member(operation.name), candidates) then
+                return null;
+            fi
+
+            if right? then
+                let right_type = try_type(right);
+
+                if !right_type? then
+                    return null;
+                fi
+
+                if !try_collect_operator_candidates(right_type.find_member(operation.name), candidates) then
+                    return null;
+                fi
+            fi
+
+            let result: Type? mut = null;
+
+            for candidate in candidates do
+                let candidate_type = usable(candidate.return_type);
+
+                if !candidate_type? then
+                    return null;
+                fi
+
+                if !result? then
+                    result = candidate_type;
+                elif result != candidate_type then
+                    return null;
+                fi
+            od
+
+            return result;
+        si
+
+        // Accumulates the functions a symbol could resolve to.
+        // False when the symbol is not function-shaped, which makes
+        // the candidate set undecidable here. A null symbol is fine —
+        // no functions under that name.
+        try_collect_operator_candidates(
+            symbol: Symbol?,
+            candidates: Collections.MutableList[Function]
+        ) -> bool is
+            if !symbol? then
+                return true;
+            fi
+
+            if isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
+                for function in (cast Semantic.Symbols.FUNCTION_GROUP(symbol)).functions do
+                    candidates.add(function);
+                od
+
+                return true;
+            fi
+
+            if isa Function(symbol) then
+                candidates.add(cast Function(symbol));
+                return true;
+            fi
+
+            return false;
+        si
+
+        find(name: string) -> Symbol? => _symbol_table.current_scope.find_enclosing(name);
+
+        try_find(identifier: Identifiers.Identifier) -> Symbol? is
+            if identifier.name == null then
+                return null;
+            fi
+
+            if identifier.qualifier? then
+                let qualifier = try_find(identifier.qualifier!);
+
+                if qualifier == null then
+                    return null;
+                fi
+
+                return qualifier.find_member(identifier.name);
+            fi
+
+            return _symbol_table.current_scope.find_enclosing(identifier.name);
+        si
+    si
+si
