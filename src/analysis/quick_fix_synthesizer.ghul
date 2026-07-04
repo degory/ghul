@@ -1,0 +1,366 @@
+namespace Analysis is
+    use Collections.Iterable;
+    use Collections.LIST;
+    use Collections.MAP;
+    use Collections.SET;
+
+    use Trees = Syntax.Trees;
+
+    use Source.LOCATION;
+
+    // Attaches quick fixes to collected diagnostics before they go out on
+    // the wire. The compiler is the sole author of fixes: clients render
+    // whatever arrives here without any per-code knowledge, so adding or
+    // changing a fix is a compiler-only change.
+    //
+    // Two kinds of fix are synthesized:
+    //
+    // - Removal of a redundant operator, for the redundant-presence-test /
+    //   redundant-unwrap / redundant-coalesce warnings. These diagnostics
+    //   are reported on the operator expression with the range ending at
+    //   the operator, so the '?' and '!' edits fall out of the diagnostic
+    //   range; the '?.' edit needs the member-access node to find where
+    //   the receiver ends.
+    //
+    // - A `@suppress("<code>")` insertion for every coded diagnostic, one
+    //   per enclosing scope the pragma can attach to (the pragma wraps the
+    //   next definition or statement, so anchors are the AST nodes of that
+    //   shape whose location contains the diagnostic).
+    //
+    // Edit coordinates use the wire convention of DIAGNOSTIC ranges:
+    // 1-based, end column exclusive (AST LOCATION end columns are
+    // inclusive, hence the +1s below). Every removal edit carries the text
+    // it expects to delete so the client can drop a fix whose buffer has
+    // drifted since the compile that produced it.
+    class QUICK_FIX_SYNTHESIZER is
+        attach_fixes(
+            diagnostics: Collections.List[Protocol.DIAGNOSTIC],
+            source_files: Iterable[Compiler.SOURCE_FILE]
+        ) static is
+            let targets_by_path = MAP[string, LIST[FIX_TARGET]]();
+
+            for d in diagnostics do
+                let code = d.code;
+
+                if !code? \/ code.length == 0 then
+                    continue;
+                fi
+
+                let targets: LIST[FIX_TARGET] mut = default;
+
+                if !targets_by_path.try_get_value(d.path, targets ref) then
+                    targets = LIST[FIX_TARGET]();
+                    targets_by_path.add(d.path, targets);
+                fi
+
+                targets.add(FIX_TARGET(d, code));
+            od
+
+            if targets_by_path.count == 0 then
+                return;
+            fi
+
+            for source_file in source_files do
+                let targets: LIST[FIX_TARGET] mut = default;
+
+                if
+                    targets_by_path.try_get_value(source_file.file_name, targets ref) /\
+                    source_file.definition?
+                then
+                    source_file.definition.walk(FIX_SITE_VISITOR(targets));
+
+                    for target in targets do
+                        target.attach_fixes();
+                    od
+                fi
+            od
+        si
+    si
+
+    enum AnchorKind is
+        BLOCK,  // a statement
+        MEMBER, // a variable definition (field)
+        METHOD, // a function, property or indexer definition
+        TYPE    // a class, trait, struct, union or enum definition
+    si
+
+    class ANCHOR is
+        location: LOCATION;
+        kind: AnchorKind;
+
+        init(location: LOCATION, kind: AnchorKind) is
+            self.location = location;
+            self.kind = kind;
+        si
+    si
+
+    // Per-diagnostic accumulator: the fix-site walk records the enclosing
+    // suppress anchors and (for redundant-coalesce) the receiver location
+    // of the matching member access, then attach_fixes assembles the wire
+    // DTOs.
+    class FIX_TARGET is
+        _diagnostic: Protocol.DIAGNOSTIC;
+        _code: string;
+        _anchors: LIST[ANCHOR];
+        _coalesce_receiver: LOCATION?;
+
+        init(diagnostic: Protocol.DIAGNOSTIC, code: string) is
+            _diagnostic = diagnostic;
+            _code = code;
+            _anchors = LIST[ANCHOR]();
+        si
+
+        // Node location contains the diagnostic's wire range. Wire end
+        // columns are exclusive, LOCATION end columns inclusive.
+        contains_diagnostic(location: LOCATION) -> bool =>
+            (
+                location.start_line < _diagnostic.start_line \/
+                (location.start_line == _diagnostic.start_line /\ location.start_column <= _diagnostic.start_column)
+            ) /\
+            (
+                location.end_line > _diagnostic.end_line \/
+                (location.end_line == _diagnostic.end_line /\ location.end_column >= _diagnostic.end_column - 1)
+            );
+
+        // Node location is exactly the diagnostic's wire range.
+        matches_diagnostic(location: LOCATION) -> bool =>
+            location.start_line == _diagnostic.start_line /\
+            location.start_column == _diagnostic.start_column /\
+            location.end_line == _diagnostic.end_line /\
+            location.end_column == _diagnostic.end_column - 1;
+
+        record_anchor(location: LOCATION, kind: AnchorKind) is
+            if contains_diagnostic(location) then
+                _anchors.add(ANCHOR(location, kind));
+            fi
+        si
+
+        record_coalesce_receiver(member_location: LOCATION, receiver_location: LOCATION) is
+            if _code =~ "redundant-coalesce" /\ matches_diagnostic(member_location) then
+                _coalesce_receiver = receiver_location;
+            fi
+        si
+
+        attach_fixes() is
+            let fixes = LIST[Protocol.QUICK_FIX]();
+
+            let removal = _build_removal_fix();
+
+            if removal? then
+                fixes.add(removal);
+            fi
+
+            _add_suppress_fixes(fixes);
+
+            if fixes.count > 0 then
+                _diagnostic.fixes = fixes;
+            fi
+        si
+
+        _build_removal_fix() -> Protocol.QUICK_FIX? is
+            if _code =~ "redundant-presence-test" then
+                return _remove_trailing_operator("?");
+            elif _code =~ "redundant-unwrap" then
+                return _remove_trailing_operator("!");
+            elif _code =~ "redundant-coalesce" /\ _coalesce_receiver? then
+                // Deleting the '?' of '?.' turns the conditional access
+                // into a plain one. The '?' is the character after the
+                // receiver expression ends.
+                let receiver = _coalesce_receiver;
+
+                return _single_edit_fix(
+                    "Replace '?.' with '.'",
+                    true,
+                    Protocol.FIX_EDIT(
+                        receiver.end_line, receiver.end_column + 1,
+                        receiver.end_line, receiver.end_column + 2,
+                        "?", ""
+                    )
+                );
+            fi
+
+            return null;
+        si
+
+        // The diagnostic range ends at the operator, so the operator is
+        // its last character.
+        _remove_trailing_operator(operator: string) -> Protocol.QUICK_FIX =>
+            _single_edit_fix(
+                "Remove redundant '{operator}'",
+                true,
+                Protocol.FIX_EDIT(
+                    _diagnostic.end_line, _diagnostic.end_column - 1,
+                    _diagnostic.end_line, _diagnostic.end_column,
+                    operator, ""
+                )
+            );
+
+        _add_suppress_fixes(fixes: LIST[Protocol.QUICK_FIX]) is
+            // Locals sit inside a let statement, which is already the
+            // innermost useful anchor; a variable anchor only stands on
+            // its own for a field, where no statement contains it.
+            let anchors =
+                _anchors |
+                    .filter(a => a.kind != AnchorKind.MEMBER \/ !_is_inside_block_anchor(a))
+                    .sort((a, b) => _compare_innermost_first(a.location, b.location))
+                    .collect();
+
+            let emitted_lines = SET[int]();
+            let emitted mut = 0;
+
+            for anchor in anchors do
+                if emitted >= 3 then
+                    break;
+                fi
+
+                if emitted_lines.contains(anchor.location.start_line) then
+                    continue;
+                fi
+
+                emitted_lines.add(anchor.location.start_line);
+
+                let label =
+                    if emitted == 0 then
+                        "Suppress here";
+                    elif anchor.kind == AnchorKind.METHOD then
+                        "Suppress for enclosing method";
+                    elif anchor.kind == AnchorKind.TYPE then
+                        "Suppress for enclosing type";
+                    else
+                        "Suppress for enclosing block";
+                    fi;
+
+                fixes.add(_build_suppress_fix(label, anchor.location));
+
+                emitted = emitted + 1;
+
+                // Wider scopes than the enclosing method or type add
+                // noise, not reach.
+                if anchor.kind == AnchorKind.METHOD \/ anchor.kind == AnchorKind.TYPE then
+                    break;
+                fi
+            od
+        si
+
+        _is_inside_block_anchor(anchor: ANCHOR) -> bool =>
+            _anchors |
+                .any(
+                    other =>
+                        other.kind == AnchorKind.BLOCK /\
+                        other.location.contains(anchor.location)
+                );
+
+        _build_suppress_fix(label: string, anchor: LOCATION) -> Protocol.QUICK_FIX is
+            let indent = "".pad_left(anchor.start_column - 1);
+
+            return _single_edit_fix(
+                "{label}: @suppress(\"{_code}\")",
+                false,
+                Protocol.FIX_EDIT(
+                    anchor.start_line, 1,
+                    anchor.start_line, 1,
+                    null, "{indent}@suppress(\"{_code}\")\n"
+                )
+            );
+        si
+
+        _single_edit_fix(title: string, is_preferred: bool, edit: Protocol.FIX_EDIT) -> Protocol.QUICK_FIX static is
+            let edits = LIST[Protocol.FIX_EDIT]();
+
+            edits.add(edit);
+
+            return Protocol.QUICK_FIX(title, is_preferred, edits);
+        si
+
+        _compare_innermost_first(a: LOCATION, b: LOCATION) -> int static is
+            // Nested anchors all contain the diagnostic, so the later a
+            // span starts (and the earlier it ends) the more deeply
+            // nested it is.
+            if a.start_line != b.start_line then
+                return b.start_line - a.start_line;
+            fi
+
+            if a.start_column != b.start_column then
+                return b.start_column - a.start_column;
+            fi
+
+            if a.end_line != b.end_line then
+                return a.end_line - b.end_line;
+            fi
+
+            return a.end_column - b.end_column;
+        si
+    si
+
+    // Collects, for every target diagnostic in a file, the suppress
+    // anchors that contain it and the coalescing member access it was
+    // reported on. Statements arrive through the enter_node hook the
+    // statement-list walk already provides; definition anchors need their
+    // specific visit overloads because the definitions-list walk has no
+    // per-child hook.
+    class FIX_SITE_VISITOR: Syntax.Visitor is
+        _targets: LIST[FIX_TARGET];
+
+        init(targets: LIST[FIX_TARGET]) is
+            super.init();
+
+            _targets = targets;
+        si
+
+        _record_anchor(location: LOCATION, kind: AnchorKind) is
+            for target in _targets do
+                target.record_anchor(location, kind);
+            od
+        si
+
+        enter_node(node: Trees.Node) is
+            if isa Trees.Statements.Statement(node) then
+                _record_anchor(node.location, AnchorKind.BLOCK);
+            fi
+        si
+
+        visit(variable: Trees.Variables.VARIABLE) is
+            _record_anchor(variable.location, AnchorKind.MEMBER);
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            _record_anchor(function.location, AnchorKind.METHOD);
+        si
+
+        visit(property: Trees.Definitions.PROPERTY) is
+            _record_anchor(property.location, AnchorKind.METHOD);
+        si
+
+        visit(indexer: Trees.Definitions.INDEXER) is
+            _record_anchor(indexer.location, AnchorKind.METHOD);
+        si
+
+        visit(`class: Trees.Definitions.CLASS) is
+            _record_anchor(`class.location, AnchorKind.TYPE);
+        si
+
+        visit(`trait: Trees.Definitions.TRAIT) is
+            _record_anchor(`trait.location, AnchorKind.TYPE);
+        si
+
+        visit(`struct: Trees.Definitions.STRUCT) is
+            _record_anchor(`struct.location, AnchorKind.TYPE);
+        si
+
+        visit(`union: Trees.Definitions.UNION) is
+            _record_anchor(`union.location, AnchorKind.TYPE);
+        si
+
+        visit(`enum: Trees.Definitions.ENUM) is
+            _record_anchor(`enum.location, AnchorKind.TYPE);
+        si
+
+        visit(member: Trees.Expressions.MEMBER) is
+            if member.is_coalesce then
+                for target in _targets do
+                    target.record_coalesce_receiver(member.location, member.left.location);
+                od
+            fi
+        si
+    si
+si
