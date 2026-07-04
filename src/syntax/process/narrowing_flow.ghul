@@ -1,7 +1,7 @@
 namespace Syntax.Process is
     use Semantic.Types.Type;
     use Semantic.Types.INTERSECTION;
-    use Semantic.Symbols.Variable;
+    use Symbol = Semantic.Symbols.Symbol;
 
     // Per-IF bookkeeping for the flow pass. pre(IF) pushes a frame;
     // each branch's controlled walk records its body-exit
@@ -48,7 +48,7 @@ namespace Syntax.Process is
 
     // The flow-sensitive narrowing orchestrator. Holds the narrowing
     // environment in force at the current walk point and keeps each
-    // narrowed variable's `Variable.type` reconciled to it, so the
+    // narrowed variable's `Symbol.type` reconciled to it, so the
     // rest of COMPILE_EXPRESSIONS — and the per-use-site IR value
     // snapshots the IDE reads — observe the narrowed type.
     //
@@ -59,13 +59,13 @@ namespace Syntax.Process is
         // Declared (pre-narrowing) type of every variable that has
         // been narrowed — the restore target. Captured lazily the
         // first time a variable is narrowed.
-        _declared: Collections.MAP[Variable, Type];
+        _declared: Collections.MAP[Symbol, Type];
 
         // Deferred-initialization locals (`let x: T;` with no
         // initializer) subject to the definite-assignment read
         // check. Method-global within one body walk — a variable,
         // once declared, stays tracked until the next reset.
-        _tracked: Collections.SET[Variable];
+        _tracked: Collections.SET[Symbol];
 
         // Assignment-target receivers held exempt from the call transfer
         // while their assignment is in flight. See RECEIVER_SHIELD.
@@ -73,13 +73,22 @@ namespace Syntax.Process is
 
         init() is
             _current_env = NARROW_ENV();
-            _declared = Collections.MAP[Variable, Type]();
-            _tracked = Collections.SET[Variable]();
+            _declared = Collections.MAP[Symbol, Type]();
+            _tracked = Collections.SET[Symbol]();
             _shield = RECEIVER_SHIELD();
         si
 
         current_env: NARROW_ENV => _current_env;
         is_unreachable: bool => _current_env.is_bottom;
+
+        // Narrowing subjects are local variables, fields and
+        // properties — all carry a settable type; anything else never
+        // enters the environment, but stay defensive.
+        _set_symbol_type(v: Symbol, t: Type) is
+            if isa Semantic.Types.SettableTyped(v) then
+                (cast Semantic.Types.SettableTyped(v)).set_type(t);
+            fi
+        si
 
         // Restore every currently-narrowed variable to its declared
         // type, empty the environment, and forget declared types.
@@ -98,14 +107,14 @@ namespace Syntax.Process is
                 let declared: Type mut = default;
 
                 if _declared.try_get_value(v, declared ref) /\ declared? then
-                    v.set_type(declared);
+                    _set_symbol_type(v, declared);
                 fi
             od
         si
 
         // The declared (pre-narrowing) type of `v` — used for the
         // assignment-LHS typecheck, which must see past any narrow.
-        declared_type_of(v: Variable) -> Type? is
+        declared_type_of(v: Symbol) -> Type? is
             if !v? then
                 return null;
             fi
@@ -121,7 +130,7 @@ namespace Syntax.Process is
 
         // Make `target` the environment in force: restore all
         // current narrows, then apply `target`'s sound narrows,
-        // reconciling `Variable.type` to match. `_current_env`
+        // reconciling `Symbol.type` to match. `_current_env`
         // becomes the actually-applied subset of `target`.
         set_env(target: NARROW_ENV) is
             if !target? then
@@ -164,7 +173,7 @@ namespace Syntax.Process is
         // Assignment transfer: a write to `v` invalidates any narrow
         // on it — subsequent reads must observe the declared type —
         // and any presence fact, since the new value may be null.
-        on_assignment(v: Variable) is
+        on_assignment(v: Symbol) is
             if !v? then
                 return;
             fi
@@ -180,27 +189,29 @@ namespace Syntax.Process is
             let declared = declared_type_of(v);
 
             if declared? then
-                v.set_type(declared);
+                _set_symbol_type(v, declared);
             fi
         si
 
         // Call transfer: a field is plain storage a callee can reach
         // through `this` and reassign, so a narrow or presence fact
-        // proven before a call cannot be trusted after it. Locals are
-        // unreachable to the callee, so their facts survive. Fires once
-        // a call expression has been compiled — its receiver has already
-        // been read, so the call's own narrowed access is unaffected.
+        // proven before a call cannot be trusted after it, and a
+        // property's getter reads arbitrary heap the callee may have
+        // written. Locals are unreachable to the callee, so their
+        // facts survive. Fires once a call expression has been
+        // compiled — its receiver has already been read, so the
+        // call's own narrowed access is unaffected.
         on_call() is
-            let stale = Collections.SET[Variable]();
+            let stale = Collections.SET[Symbol]();
 
             for v in _current_env.variables do
-                if isa Semantic.Symbols.Field(v) then
+                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
                     stale.add(v);
                 fi
             od
 
             for v in _current_env.non_null_variables do
-                if isa Semantic.Symbols.Field(v) then
+                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
                     stale.add(v);
                 fi
             od
@@ -212,9 +223,36 @@ namespace Syntax.Process is
             od
         si
 
+        // Heap-store transfer: a direct store — to a field, a
+        // property, an index or any member path — can change what any
+        // property getter returns, so property facts cannot survive
+        // it. Field facts do: a store to one field cannot alter
+        // another field, and a store to the narrowed field itself is
+        // handled by the assignment transfer. Local facts are
+        // unaffected.
+        on_heap_store() is
+            let stale = Collections.SET[Symbol]();
+
+            for v in _current_env.variables do
+                if isa Semantic.Symbols.Property(v) then
+                    stale.add(v);
+                fi
+            od
+
+            for v in _current_env.non_null_variables do
+                if isa Semantic.Symbols.Property(v) then
+                    stale.add(v);
+                fi
+            od
+
+            for v in stale do
+                forget(v);
+            od
+        si
+
         // Drop a single field's narrow + presence facts — the call
         // transfer applied to one variable.
-        forget(v: Variable) is
+        forget(v: Symbol) is
             if !v? then
                 return;
             fi
@@ -225,7 +263,7 @@ namespace Syntax.Process is
                 let declared = declared_type_of(v);
 
                 if declared? then
-                    v.set_type(declared);
+                    _set_symbol_type(v, declared);
                 fi
             fi
 
@@ -234,7 +272,7 @@ namespace Syntax.Process is
 
         // Exempt `v` from the call transfer until its frame is released.
         // See RECEIVER_SHIELD.push.
-        push_shield(v: Variable?) -> SHIELD_FRAME? => _shield.push(v);
+        push_shield(v: Symbol?) -> SHIELD_FRAME? => _shield.push(v);
 
         // Release a frame from `push_shield`, returning whether a call
         // dropped the receiver. See RECEIVER_SHIELD.release.
@@ -242,29 +280,29 @@ namespace Syntax.Process is
 
         // Register `v` as a deferred-init local subject to the
         // definite-assignment use-before-assignment check.
-        track_deferred(v: Variable) is
+        track_deferred(v: Symbol) is
             if v? then
                 _tracked.add(v);
             fi
         si
 
         // True iff `v` is a tracked deferred-init local.
-        is_tracked(v: Variable) -> bool => v? /\ _tracked.contains(v);
+        is_tracked(v: Symbol) -> bool => v? /\ _tracked.contains(v);
 
         // True iff `v` is definitely assigned at the current point.
-        is_assigned(v: Variable) -> bool => _current_env.is_assigned(v);
+        is_assigned(v: Symbol) -> bool => _current_env.is_assigned(v);
 
         // Record `v` as definitely assigned at the current point.
-        mark_assigned(v: Variable) is
+        mark_assigned(v: Symbol) is
             _current_env.set_assigned(v);
         si
 
         // True iff `v` is known to hold a value at the current point.
-        is_non_null(v: Variable) -> bool => _current_env.is_non_null(v);
+        is_non_null(v: Symbol) -> bool => _current_env.is_non_null(v);
 
         // Record `v` as known to hold a value at the current point —
         // used by the `x!` (unwrap) transfer.
-        mark_non_null(v: Variable) is
+        mark_non_null(v: Symbol) is
             _current_env.set_non_null(v);
         si
 
@@ -288,7 +326,7 @@ namespace Syntax.Process is
         //
         // Captures the declared type on first narrow. Returns true
         // when the narrow was applied.
-        _apply_one(v: Variable, t: Type) -> bool is
+        _apply_one(v: Symbol, t: Type) -> bool is
             if !v? \/ !t? \/ !v.type? then
                 return false;
             fi
@@ -351,7 +389,7 @@ namespace Syntax.Process is
                 _declared[v] = v.type;
             fi
 
-            v.set_type(narrowed);
+            _set_symbol_type(v, narrowed);
 
             return true;
         si
