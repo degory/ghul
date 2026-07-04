@@ -1,20 +1,22 @@
 namespace Analysis is
     use Collections.LIST;
 
+    use Semantic.Symbols.DESCRIBE_CONTEXT;
+    use Semantic.Symbols.SIGNATURE_PART;
+
     use Syntax.Process.Printer.DOC_BUILDER;
     use Syntax.Process.Printer.DOC_RENDERER;
 
-    // Renders a symbol's declaration head — name, generics, arguments,
-    // return type — against a column budget. Function-like symbols with
-    // more parameters than fit on one line break onto per-argument
-    // lines; short signatures stay flat. Members without a wrappable
-    // argument list (properties, variables, class/trait headers) fall
-    // through to the pre-computed single-line signature.
+    // Renders a symbol's declaration head against a column budget by
+    // walking the SIGNATURE_PART tree that `Symbol.describe(context)`
+    // produces. WRAPPABLE parts drive the layout break points: they
+    // render flat when the whole thing fits the budget, otherwise their
+    // items break onto per-item indented lines. Everything else is
+    // emitted verbatim.
     //
-    // Walks the symbol's structured parts (`argument_names`, `arguments`,
-    // `generic_arguments`, `return_type`) rather than re-parsing the flat
-    // description string — the description templates in
-    // `Semantic.Symbols.*` are what this reproduces, in DOC form.
+    // Variable uses carry their observed (narrowed) type through the
+    // context so a hover on a narrowed variable shows the narrowed
+    // shape.
     class SIGNATURE_DOC is
         // Column budget for hover signatures. Narrow enough that a
         // long-parameter method wraps in a typical VS Code hover
@@ -26,157 +28,107 @@ namespace Analysis is
             build(hover, DEFAULT_WIDTH);
 
         build(hover: Semantic.HOVER_USE, width: int) -> string static is
+            let context = _build_context(hover);
             let s = hover.symbol.collapse_group_if_single_member();
+            let part = s.describe(context);
 
-            if isa Semantic.Symbols.Function(s) then
-                let f = cast Semantic.Symbols.Function(s);
-                return build_function(
-                    f.qualified_name,
-                    _to_string_list(f.generic_arguments),
-                    f.argument_names,
-                    _to_string_list(f.arguments),
-                    _return_type_text(f),
-                    width
-                );
-            fi
-
-            if isa Semantic.Symbols.VARIANT(s) then
-                let v = cast Semantic.Symbols.VARIANT(s);
-                if v.field_count > 0 then
-                    let names = LIST[string]();
-                    let types = LIST[string]();
-                    _extract_variant_fields(v, names, types);
-                    return build_variant(v.qualified_name, names, types, width);
-                fi
-            fi
-
-            return hover.signature;
-        si
-
-        // Structural entry used by the symbol dispatch above and by
-        // unit tests that supply the parts directly as strings.
-        build_function(
-            qualified_name: string,
-            generic_arguments: Collections.List[string],
-            argument_names: Collections.List[string],
-            argument_types: Collections.List[string],
-            return_type: string?,
-            width: int
-        ) -> string static is
             let b = DOC_BUILDER();
-            b.text(qualified_name);
-            _emit_generic_arguments(b, generic_arguments);
-            _emit_arguments(b, argument_names, argument_types);
-            _emit_return_type(b, return_type);
+            _emit(b, part);
             return DOC_RENDERER(width).render(b.build());
         si
 
-        build_variant(
-            qualified_name: string,
-            field_names: Collections.List[string],
-            field_types: Collections.List[string],
-            width: int
-        ) -> string static is
+        // Render an arbitrary part directly — used by unit tests to pin
+        // the layout without constructing a Symbol fixture.
+        render(part: SIGNATURE_PART, width: int) -> string static is
             let b = DOC_BUILDER();
-            b.text("variant ");
-            b.text(qualified_name);
-            _emit_arguments(b, field_names, field_types);
+            _emit(b, part);
             return DOC_RENDERER(width).render(b.build());
         si
 
-        _emit_generic_arguments(b: DOC_BUILDER, types: Collections.List[string]) static is
-            if !types? \/ types.count == 0 then
-                return;
+        _build_context(hover: Semantic.HOVER_USE) -> DESCRIBE_CONTEXT static is
+            // For a variable use, feed the observed (narrowed) type into
+            // the context so `Variable.describe` shows the narrowed
+            // shape. Non-variables ignore the map.
+            let observed = hover.observed_type_for_narrowing();
+            if !observed? then
+                return DESCRIBE_CONTEXT.instance;
             fi
-            b.text("[");
-            for i in 0..types.count do
-                if i > 0 then
-                    b.text(",");
-                fi
-                b.text(types[i]);
-            od
-            b.text("]");
+            let map = Collections.MAP[Semantic.Symbols.Symbol, Semantic.Types.Type]();
+            map[hover.symbol.collapse_group_if_single_member()] = observed;
+            return DESCRIBE_CONTEXT.with_observed_types(map);
         si
 
-        _emit_arguments(
-            b: DOC_BUILDER,
-            names: Collections.List[string],
-            types: Collections.List[string]
-        ) static is
-            b.text("(");
-            if !names? \/ names.count == 0 then
-                b.text(")");
+        _emit(b: DOC_BUILDER, part: SIGNATURE_PART) static is
+            if isa SIGNATURE_PART.NIL(part) then
                 return;
             fi
+
+            if let literal: SIGNATURE_PART.LITERAL = part then
+                b.text(literal.text);
+                return;
+            fi
+
+            if let name: SIGNATURE_PART.NAME = part then
+                b.text(name.symbol.qualified_name);
+                return;
+            fi
+
+            if let type_ref: SIGNATURE_PART.TYPE_REF = part then
+                b.text("{type_ref.type}");
+                return;
+            fi
+
+            if let sequence: SIGNATURE_PART.SEQUENCE = part then
+                for item in sequence.parts do
+                    _emit(b, item);
+                od
+                return;
+            fi
+
+            if let wrappable: SIGNATURE_PART.WRAPPABLE = part then
+                _emit_wrappable(b, wrappable);
+                return;
+            fi
+        si
+
+        // WRAPPABLE lays out as: `open` + GROUP( NEST 4( SOFT_LINE +
+        // items joined by `separator` + LINE-or-SOFT_LINE ) ) +
+        // SOFT_LINE + `close`. Group renders flat when the whole thing
+        // fits (SOFT_LINE drops out, LINE becomes a space after
+        // `separator` — so args get "a, b" while `tight` generics get
+        // "T,U"); otherwise breaks with each item on its own
+        // 4-space-indented line and the close returning to the outer
+        // indent.
+        _emit_wrappable(b: DOC_BUILDER, w: SIGNATURE_PART.WRAPPABLE) static is
+            b.text(w.open);
+
+            if w.items.count == 0 then
+                b.text(w.close);
+                return;
+            fi
+
             b.begin_group();
             b.begin_nest(4);
             b.soft_line();
-            for i in 0..names.count do
-                if i > 0 then
-                    b.text(",");
-                    b.line();
+
+            let first mut = true;
+            for item in w.items do
+                if !first then
+                    b.text(w.separator);
+                    if w.tight then
+                        b.soft_line();
+                    else
+                        b.line();
+                    fi
                 fi
-                b.text(names[i]);
-                b.text(": ");
-                b.text(types[i]);
+                first = false;
+                _emit(b, item);
             od
+
             b.end_nest();
             b.soft_line();
             b.end_group();
-            b.text(")");
-        si
-
-        _emit_return_type(b: DOC_BUILDER, return_type: string?) static is
-            if !return_type? then
-                return;
-            fi
-            b.text(" -> ");
-            b.text(return_type);
-        si
-
-        _return_type_text(f: Semantic.Symbols.Function) -> string? static is
-            // Constructors keep the callable shape but omit the return
-            // type, matching `INSTANCE_METHOD.description` in method.ghul.
-            if isa Semantic.Symbols.Method(f) then
-                let m = cast Semantic.Symbols.Method(f);
-                if m.is_constructor then
-                    return null;
-                fi
-            fi
-            if !f.return_type? then
-                return null;
-            fi
-            return "{f.return_type}";
-        si
-
-        _to_string_list(types: Collections.List[Semantic.Types.Type]) -> LIST[string] static is
-            let result = LIST[string]();
-            if !types? then
-                return result;
-            fi
-            for t in types do
-                result.add("{t}");
-            od
-            return result;
-        si
-
-        _extract_variant_fields(
-            v: Semantic.Symbols.VARIANT,
-            names: LIST[string],
-            types: LIST[string]
-        ) static is
-            for i in 0..v.field_count do
-                let field_name = v.get_destructure_member_name(i);
-                if !field_name? then
-                    continue;
-                fi
-                let member = v.find_member(field_name);
-                if !member? then
-                    continue;
-                fi
-                names.add(member.name);
-                types.add("{member.type}");
-            od
+            b.text(w.close);
         si
     si
 si
