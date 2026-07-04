@@ -78,6 +78,13 @@ namespace Syntax.Process is
         // visit(DO) pops to restore the after-loop environment.
         _loop_kept_stack: Collections.LIST[NARROW_ENV];
 
+        // Per-ASSERT flag from the controlled walk in pre(ASSERT):
+        // true when the condition's own walk killed heap facts, so
+        // visit(ASSERT) drops them from the fall-through narrowing.
+        // A stack because a block expression inside an assert's
+        // condition or message can contain another assert.
+        _assert_condition_killed_stack: Collections.LIST[bool];
+
         // Stack of per-`try` frames, one per `try` currently being
         // walked. pre(TRY) pushes; visit(TRY) pops. The
         // definite-assignment facts established before a try survive
@@ -156,7 +163,7 @@ namespace Syntax.Process is
             _tuples = COMPILE_TUPLES(logger, innate_symbol_lookup, value_boxer, self);
 
             _flow = NARROWING_FLOW();
-            _condition_analyzer = CONDITION_ANALYZER(expr => try_get_narrowing_target(expr));
+            _condition_analyzer = CONDITION_ANALYZER(expr => try_get_narrowing_target(expr), expr => try_build_access_path(expr));
 
             _calls = COMPILE_CALLS(
                 logger,
@@ -210,6 +217,7 @@ namespace Syntax.Process is
 
             _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
             _loop_kept_stack = Collections.LIST[NARROW_ENV]();
+            _assert_condition_killed_stack = Collections.LIST[bool]();
             _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
             _val_block_stack = Collections.LIST[Trees.Expressions.VAL_BLOCK?]();
 
@@ -302,6 +310,90 @@ namespace Syntax.Process is
             fi
 
             return null;
+        si
+
+        // Build the re-readable access path an expression names, or
+        // null when it isn't one: a local- or field-rooted chain of
+        // instance field / store-free-getter reads (`receiver.prop`,
+        // `receiver.a.b`). Calls, indexers, `?.`, qualified names,
+        // self / super roots, struct receivers and properties with
+        // unproven getters are all excluded — the result must be a
+        // location that re-reads to the same presence answer under an
+        // unchanged heap, and the flow transfers drop its facts the
+        // moment the heap may have changed. Each hop is re-resolved
+        // through `find` / `find_member` so the check site (`x.y?`)
+        // and every use site (`x.y`) agree on the same root Variable
+        // and member Symbols by identity, and so key the same
+        // presence fact.
+        try_build_access_path(expr: Trees.Expressions.Expression) -> ACCESS_PATH? is
+            if !expr? \/ !isa Trees.Expressions.MEMBER(expr) then
+                return null;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(expr);
+
+            if member.is_coalesce \/ !member.identifier? \/ member.identifier.is_qualified \/ !member.left? then
+                return null;
+            fi
+
+            let root: Semantic.Symbols.Variable? mut = null;
+            let members = Collections.LIST[Semantic.Symbols.Symbol]();
+
+            if isa Trees.Expressions.IDENTIFIER(member.left) then
+                let id = cast Trees.Expressions.IDENTIFIER(member.left);
+
+                if !id.identifier? \/ id.identifier.is_qualified then
+                    return null;
+                fi
+
+                let symbol = find(id.identifier);
+
+                if !symbol? \/ !isa Semantic.Symbols.Variable(symbol) then
+                    return null;
+                fi
+
+                root = cast Semantic.Symbols.Variable(symbol);
+            else
+                let left_path = try_build_access_path(member.left);
+
+                if !left_path? then
+                    return null;
+                fi
+
+                root = left_path.root;
+
+                for m in left_path.members do
+                    members.add(m);
+                od
+            fi
+
+            if !member.left.value? \/ !member.left.value.type? then
+                return null;
+            fi
+
+            let left_type = member.left.value.type;
+
+            if !isa Semantic.Types.NAMED(left_type) \/ left_type.is_value_type \/ left_type.scope == null then
+                return null;
+            fi
+
+            let hop = left_type.find_member(member.identifier.name);
+
+            if !hop? \/ !hop.is_instance then
+                return null;
+            fi
+
+            if !hop.is_field then
+                let property = cast Semantic.Symbols.Property(hop);
+
+                if !property? \/ !property.read_function? \/ !property.read_function.is_store_free then
+                    return null;
+                fi
+            fi
+
+            members.add(hop);
+
+            return ACCESS_PATH(root, members);
         si
 
         // Drop field narrows once an expression that lowers to a real
@@ -413,6 +505,7 @@ namespace Syntax.Process is
             _if_flow_stack.clear();
             _loop_kept_stack.clear();
             _try_flow_stack.clear();
+            _assert_condition_killed_stack.clear();
 
             root.walk(self);
 
@@ -423,6 +516,8 @@ namespace Syntax.Process is
                 else "loop-kept env stack leaked: {_loop_kept_stack.count} unreleased";
             assert _try_flow_stack.count == 0
                 else "try-flow frame stack leaked: {_try_flow_stack.count} unreleased";
+            assert _assert_condition_killed_stack.count == 0
+                else "assert-condition flag stack leaked: {_assert_condition_killed_stack.count} unreleased";
         si
 
         should_skip(node: Trees.Node) -> bool => _pragma_scope_stack.in_stub \/ is_stable(node);
@@ -689,8 +784,19 @@ namespace Syntax.Process is
                 // invalidate them); narrows on variables it never
                 // writes survive the loop.
                 let kept = _loops.loop_kept_env(`for);
+                let epoch = _flow.heap_epoch;
+
                 _flow.set_env(kept);
                 `for.body.walk(self);
+
+                // The assignment kill-set covers direct writes but
+                // not calls or member stores inside the body, so a
+                // kill during the walk drops the kept environment's
+                // heap facts before restoration.
+                if _flow.heap_killed_since(epoch) then
+                    kept.drop_heap_facts();
+                fi
+
                 _flow.set_env(kept);
             fi
             return false;
@@ -892,7 +998,16 @@ namespace Syntax.Process is
         pre(assert_in: Trees.Expressions.ASSERT_IN) -> bool is
             super.pre(assert_in);
 
+            let epoch = _flow.heap_epoch;
+
             assert_in.condition.walk(self);
+
+            // A kill during the condition's own walk means its
+            // derived heap facts cannot be kept (`assert _f? /\
+            // mutate() in …`). The message's walk is outside the
+            // span: it only runs on the failure path, so its kills
+            // don't invalidate what the passing condition proves.
+            let condition_killed = _flow.heap_killed_since(epoch);
 
             // Walk the message *before* installing the condition-holds
             // narrowing, because the message expression is only
@@ -905,6 +1020,11 @@ namespace Syntax.Process is
 
             if _check_assertion_condition(assert_in.condition) then
                 let facts = _condition_analyzer.analyze_condition(assert_in.condition, _flow.current_env);
+
+                if condition_killed then
+                    facts.then_env.drop_heap_facts();
+                fi
+
                 _flow.set_env(facts.then_env);
             fi
 
@@ -1208,8 +1328,32 @@ namespace Syntax.Process is
             fi
         si
 
+        pre(`assert: Trees.Statements.ASSERT) -> bool is
+            super.pre(`assert);
+
+            // Controlled walk so the epoch span covers the condition
+            // alone: a kill during its walk means its derived heap
+            // facts cannot survive (`assert _f? /\ mutate();`), but
+            // the message only runs on the failure path, so its kills
+            // don't invalidate what the passing condition proves.
+            let epoch = _flow.heap_epoch;
+
+            `assert.expression.walk(self);
+
+            _assert_condition_killed_stack.add(_flow.heap_killed_since(epoch));
+
+            if `assert.message? then
+                `assert.message.walk(self);
+            fi
+
+            return true;
+        si
+
         visit(`assert: Trees.Statements.ASSERT) is
             super.visit(`assert);
+
+            let condition_killed = _assert_condition_killed_stack[_assert_condition_killed_stack.count - 1];
+            _assert_condition_killed_stack.remove_at(_assert_condition_killed_stack.count - 1);
 
             // `assert false` always throws — control does not
             // continue past it.
@@ -1231,6 +1375,11 @@ namespace Syntax.Process is
             // in the rest of the enclosing scope, the same way
             // `if !cond then throw ... fi` would.
             let facts = _condition_analyzer.analyze_condition(`assert.expression, _flow.current_env);
+
+            if condition_killed then
+                facts.then_env.drop_heap_facts();
+            fi
+
             _flow.set_env(facts.then_env);
 
             _check_assertion_message(`assert.message);
