@@ -557,7 +557,7 @@ For a two-variant union the `else` branch is narrowed to the other variant. The 
 
 Narrowing is flow-sensitive: if a guard rejects a type and then leaves the block — by `return`, `throw`, `break`, or `continue` — the code after the guard is narrowed too.
 
-Narrowing applies to local variables, including a function's own parameters — never to a field or property. To narrow a field, copy it into a local variable first, or use `if let`, which introduces one.
+Narrowing applies to local variables (including a function's own parameters), to fields, and to properties whose getter the compiler can prove stores nothing — hover shows such members with `pure` in the trailing comment. The facts differ in how long they last: a local's narrow holds until the local is reassigned; a field's narrow also drops at any call that might store to the heap; a property's narrow additionally drops at any assignment to a field, property or element, because its getter may read anything the assignment changed. Calls the compiler proves store-free drop nothing. To narrow a value the compiler will not track — a property with an unproven getter, or a member-access path — copy it into a local variable first, or use `if let`, which introduces one.
 
 ### if let
 
@@ -880,7 +880,7 @@ See <https://ghul.dev/type-inference.html>.
 
 ghūl infers types pervasively, but inference is **function-local**: a function's signature — its parameter and return types — is always written out, and inference works only within the body. Within a body, types are inferred for local variables, loop variables, destructured variables, anonymous function parameters and return types, and generic type arguments on calls.
 
-Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler narrows local variables but never fields or properties, and a `let` variable's inferred type does not escape the function it is declared in.
+Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler narrows local variables, fields and store-free properties (see Type narrowing above for how long each kind of fact lasts), and a `let` variable's inferred type does not escape the function it is declared in.
 
 ## .NET interop
 
