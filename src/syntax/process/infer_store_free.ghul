@@ -64,15 +64,13 @@ namespace Syntax.Process is
     // leave them stale until the next compile, which only affects
     // transient in-editor diagnostics.
     class INFER_STORE_FREE: DefaultVisitor is
-        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
-
         _facts: Collections.MutableMap[Function, STORE_FREE_FACTS];
         _current: STORE_FREE_FACTS?;
         _current_function: Function?;
 
-        // Types of locals whose initializer type is trivially
-        // derivable, keyed by the local's symbol. Reset per function.
-        _local_types: Collections.MutableMap[Symbol, Type];
+        // Trivially-derivable static types, including the per-function
+        // record of locals whose initializer type was derivable.
+        _typer: TRIVIAL_EXPRESSION_TYPER;
 
         init(
             logger: Logger,
@@ -84,14 +82,14 @@ namespace Syntax.Process is
         is
             super.init(logger, stable_symbols, symbol_table, namespaces);
 
-            _innate_symbol_lookup = innate_symbol_lookup;
+            _typer = TRIVIAL_EXPRESSION_TYPER(symbol_table, innate_symbol_lookup);
 
             start_run();
         si
 
         start_run() is
             _facts = Collections.MAP[Function, STORE_FREE_FACTS]();
-            _local_types = Collections.MAP[Symbol, Type]();
+            _typer.reset();
             _current = null;
             _current_function = null;
         si
@@ -119,37 +117,11 @@ namespace Syntax.Process is
             _current_function = null;
         si
 
-        // Fixpoint over the collected facts: a function is unsafe if
-        // its body disqualified it, if a call bound to it could
-        // dispatch to an override outside the compilation, or if any
-        // bounded callee or any override of it is unsafe. Everything
-        // never reached by that propagation is store-free.
+        // Facts in, bits out — the graph solving lives in
+        // STORE_FREE_FIXPOINT.
         finish_run() is
             try
-                let unsafe = Collections.SET[Function]();
-
-                for function in _facts.keys do
-                    if _facts[function].is_disqualified \/ _is_openly_dispatchable(function) then
-                        unsafe.add(function);
-                    fi
-                od
-
-                let changed mut = true;
-
-                while changed do
-                    changed = false;
-
-                    for function in _facts.keys do
-                        if !unsafe.contains(function) /\ !_all_dependencies_safe(function, unsafe) then
-                            unsafe.add(function);
-                            changed = true;
-                        fi
-                    od
-                od
-
-                for function in _facts.keys do
-                    function.set_store_free(!unsafe.contains(function));
-                od
+                STORE_FREE_FIXPOINT().mark(_facts);
             catch ex: Exception
                 // a broken fixpoint must not leave optimistic bits
                 // from a partial write-back behind
@@ -159,58 +131,6 @@ namespace Syntax.Process is
             yrt
 
             start_run();
-        si
-
-        _all_dependencies_safe(function: Function, unsafe: Collections.SET[Function]) -> bool is
-            for callee in _facts[function].callees do
-                if !_facts.contains_key(callee) \/ unsafe.contains(callee) then
-                    return false;
-                fi
-            od
-
-            // a call bound to this function may dispatch to any
-            // override of it
-            if !function.has_no_overriders then
-                for overrider in function.overriders do
-                    if !isa Function(overrider) then
-                        return false;
-                    fi
-
-                    let overrider_function = cast Function(overrider);
-
-                    if !_facts.contains_key(overrider_function) \/ unsafe.contains(overrider_function) then
-                        return false;
-                    fi
-                od
-            fi
-
-            return true;
-        si
-
-        // A call bound to this function may dispatch to an override
-        // this compilation cannot see when the owner hierarchy is
-        // open to other assemblies. Struct methods are final, and
-        // constructors and static/global functions do not dispatch.
-        _is_openly_dispatchable(function: Function) -> bool is
-            if isa Semantic.Symbols.STRUCT_METHOD(function) then
-                return false;
-            fi
-
-            if !isa Semantic.Symbols.INSTANCE_METHOD(function) then
-                return false;
-            fi
-
-            if function.name? /\ function.name =~ "init" then
-                return false;
-            fi
-
-            let owner = function.owner;
-
-            if !owner? \/ !isa Semantic.Symbols.Classy(owner) then
-                return true;
-            fi
-
-            return (cast Semantic.Symbols.Classy(owner)).is_open;
         si
 
         // ==== default: any node kind without an explicit override ====
@@ -312,227 +232,6 @@ namespace Syntax.Process is
             // namespaces are harmless reads
         si
 
-        // ==== declared-type resolution ====
-
-        _usable(type: Type?) -> Type? is
-            if type? /\ type.is_settled /\ !type.is_type_variable then
-                return type;
-            fi
-
-            return null;
-        si
-
-        _declared_symbol_type(symbol: Symbol) -> Type? is
-            if isa Semantic.Symbols.Variable(symbol) then
-                return _usable((cast Semantic.Symbols.Variable(symbol)).type);
-            fi
-
-            if isa Semantic.Symbols.Property(symbol) then
-                return _usable((cast Semantic.Symbols.Property(symbol)).type);
-            fi
-
-            return null;
-        si
-
-        // Type of a value expression when it is trivially derivable
-        // from declared types alone; null when it is not.
-        _try_value_type(expression: Trees.Expressions.Expression?) -> Type? is
-            if !expression? then
-                return null;
-            fi
-
-            if isa Trees.Expressions.IDENTIFIER(expression) then
-                let identifier = (cast Trees.Expressions.IDENTIFIER(expression)).identifier;
-
-                if !identifier? then
-                    return null;
-                fi
-
-                let symbol = try_find(identifier);
-
-                if !symbol? then
-                    return null;
-                fi
-
-                if _local_types.contains_key(symbol) then
-                    return _local_types[symbol];
-                fi
-
-                return _declared_symbol_type(symbol);
-            fi
-
-            if isa Trees.Expressions.SELF(expression) then
-                let context = current_instance_context;
-
-                if context? then
-                    return _usable(context.type);
-                fi
-
-                return null;
-            fi
-
-            if isa Trees.Expressions.MEMBER(expression) then
-                let member = cast Trees.Expressions.MEMBER(expression);
-
-                let as_identifier = member.try_copy_as_identifer();
-
-                if as_identifier? then
-                    let symbol = try_find(as_identifier);
-
-                    if symbol? then
-                        return _declared_symbol_type(symbol);
-                    fi
-                fi
-
-                let left_type = _try_value_type(member.left);
-
-                if !left_type? \/ !member.identifier? then
-                    return null;
-                fi
-
-                let member_symbol = left_type.find_member(member.identifier.name);
-
-                if !member_symbol? then
-                    return null;
-                fi
-
-                return _declared_symbol_type(member_symbol);
-            fi
-
-            if isa Trees.Expressions.Literals.INTEGER(expression) then
-                return _usable(_innate_symbol_lookup.get_int_type());
-            fi
-
-            if isa Trees.Expressions.Literals.STRING(expression) then
-                return _usable(_innate_symbol_lookup.get_string_type());
-            fi
-
-            if isa Trees.Expressions.Literals.BOOLEAN(expression) then
-                return _usable(_innate_symbol_lookup.get_bool_type());
-            fi
-
-            if isa Trees.Expressions.Literals.CHARACTER(expression) then
-                return _usable(_innate_symbol_lookup.get_char_type());
-            fi
-
-            if isa Trees.Expressions.Literals.FLOAT(expression) then
-                return _usable(_innate_symbol_lookup.get_double_type());
-            fi
-
-            if
-                isa Trees.Expressions.HAS_VALUE(expression) \/
-                isa Trees.Expressions.ISA(expression)
-            then
-                return _usable(_innate_symbol_lookup.get_bool_type());
-            fi
-
-            if isa Trees.Expressions.BINARY(expression) then
-                let binary = cast Trees.Expressions.BINARY(expression);
-
-                return _try_operator_result_type(binary.operation, binary.left, binary.right);
-            fi
-
-            if isa Trees.Expressions.UNARY(expression) then
-                let unary = cast Trees.Expressions.UNARY(expression);
-
-                return _try_operator_result_type(unary.operation, unary.right, null);
-            fi
-
-            return null;
-        si
-
-        // Result type of an operator expression, when it is decidable
-        // before overload resolution: the candidate set is the scope-
-        // visible operator group plus any member operators on the
-        // (known) operand types — the same set compile-expressions
-        // resolves over — so when every candidate returns the same
-        // settled type, the result has that type whichever candidate
-        // wins. Null as soon as an operand type is unknown or the
-        // candidates' return types disagree.
-        _try_operator_result_type(
-            operation: Identifiers.Identifier?,
-            left: Trees.Expressions.Expression?,
-            right: Trees.Expressions.Expression?
-        ) -> Type? is
-            if !operation? \/ !operation.name? then
-                return null;
-            fi
-
-            let candidates = Collections.LIST[Function]();
-
-            if !_try_collect_operator_candidates(find(operation.name), candidates) then
-                return null;
-            fi
-
-            let left_type = _try_value_type(left);
-
-            if !left_type? then
-                return null;
-            fi
-
-            if !_try_collect_operator_candidates(left_type.find_member(operation.name), candidates) then
-                return null;
-            fi
-
-            if right? then
-                let right_type = _try_value_type(right);
-
-                if !right_type? then
-                    return null;
-                fi
-
-                if !_try_collect_operator_candidates(right_type.find_member(operation.name), candidates) then
-                    return null;
-                fi
-            fi
-
-            let result: Type? mut = null;
-
-            for candidate in candidates do
-                let candidate_type = _usable(candidate.return_type);
-
-                if !candidate_type? then
-                    return null;
-                fi
-
-                if !result? then
-                    result = candidate_type;
-                elif result != candidate_type then
-                    return null;
-                fi
-            od
-
-            return result;
-        si
-
-        // Accumulates the functions a symbol could resolve to.
-        // False when the symbol is not function-shaped, which makes
-        // the candidate set undecidable here. A null symbol is fine —
-        // no functions under that name.
-        _try_collect_operator_candidates(
-            symbol: Symbol?,
-            candidates: Collections.MutableList[Function]
-        ) -> bool is
-            if !symbol? then
-                return true;
-            fi
-
-            if isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
-                for function in (cast Semantic.Symbols.FUNCTION_GROUP(symbol)).functions do
-                    candidates.add(function);
-                od
-
-                return true;
-            fi
-
-            if isa Function(symbol) then
-                candidates.add(cast Function(symbol));
-                return true;
-            fi
-
-            return false;
-        si
-
         // ==== function context ====
 
         pre(function: Definitions.FUNCTION) -> bool is
@@ -545,7 +244,7 @@ namespace Syntax.Process is
                 _current.is_disqualified = true;
             fi
 
-            _local_types = Collections.MAP[Symbol, Type]();
+            _typer.reset();
 
             let symbol = function_for(function);
 
@@ -684,7 +383,7 @@ namespace Syntax.Process is
                     fi
                 fi
 
-                let left_type = _try_value_type(member.left);
+                let left_type = _typer.try_type(member.left);
 
                 if !left_type? \/ !member.identifier? then
                     _disqualify();
@@ -754,7 +453,7 @@ namespace Syntax.Process is
         si
 
         _add_member_operator_edges(name: string, operand: Trees.Expressions.Expression?) is
-            let operand_type = _try_value_type(operand);
+            let operand_type = _typer.try_type(operand);
 
             if !operand_type? then
                 _disqualify();
@@ -801,7 +500,7 @@ namespace Syntax.Process is
                 fi
             fi
 
-            let left_type = _try_value_type(member.left);
+            let left_type = _typer.try_type(member.left);
 
             if left_type? /\ member.identifier? then
                 let member_symbol = left_type.find_member(member.identifier.name);
@@ -822,7 +521,7 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let left_type = _try_value_type(index.left);
+            let left_type = _typer.try_type(index.left);
 
             if left_type? /\ isa Semantic.Types.ARRAY(left_type) then
                 // array element read; element stores only occur as
@@ -875,14 +574,14 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if _declared_symbol_type(symbol)? then
+            if _typer.declared_symbol_type(symbol)? then
                 return;
             fi
 
-            let initializer_type = _try_value_type(variable.initializer);
+            let initializer_type = _typer.try_type(variable.initializer);
 
             if initializer_type? then
-                _local_types[symbol] = initializer_type;
+                _typer.set_local_type(symbol, initializer_type);
             fi
         si
 
@@ -893,50 +592,9 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if !_is_store_free_innate(block.name) then
+            if !STORE_FREE_INNATES.is_store_free(block.name) then
                 _disqualify();
             fi
-        si
-
-        _is_store_free_innate(name: Identifiers.Identifier?) -> bool is
-            if !name? then
-                return false;
-            fi
-
-            let leaf = name.name;
-
-            if !leaf? then
-                return false;
-            fi
-
-            if let name.qualifier? then
-                let family = qualifier.name;
-
-                if !family? then
-                    return false;
-                fi
-
-                if
-                    family =~ "arithmetic" \/
-                    family =~ "arithmetic_decimal" \/
-                    family =~ "bool" \/
-                    family =~ "compare" \/
-                    family =~ "compare_decimal" \/
-                    family =~ "range"
-                then
-                    return true;
-                fi
-
-                if family =~ "string" /\ leaf =~ "equals" then
-                    return true;
-                fi
-
-                if (family =~ "reference" \/ family =~ "pointer") /\ leaf =~ "read" then
-                    return true;
-                fi
-            fi
-
-            return false;
         si
 
         // ==== audited-harmless node kinds ====
