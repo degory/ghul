@@ -1,4 +1,6 @@
 namespace Syntax.Process is
+    use Logging.Logger;
+    use Source.LOCATION;
     use Semantic.Types.Type;
 
     // The then/else narrowing environments a boolean condition
@@ -29,12 +31,46 @@ namespace Syntax.Process is
         _resolve_target: (Trees.Expressions.Expression) -> Semantic.Symbols.Symbol?;
         _resolve_path: (Trees.Expressions.Expression) -> ACCESS_PATH?;
 
+        // Editor-only sink for narrowing-site hints. When set,
+        // each narrowing introduction (`x?`, `isa T(x)`, `if let ...`,
+        // etc.) is announced through the logger carrying its per-site
+        // slug so the editor can render — and independently suppress —
+        // each kind. Null in the pure-analysis tests, which exercise
+        // the environments directly and don't need the diagnostics.
+        // Only `is_analysis`, `is_file_open` and `hint` are consulted.
+        _logger: Logger;
+
         init(
             resolve_target: (Trees.Expressions.Expression) -> Semantic.Symbols.Symbol?,
             resolve_path: (Trees.Expressions.Expression) -> ACCESS_PATH?
         ) is
             _resolve_target = resolve_target;
             _resolve_path = resolve_path;
+        si
+
+        init(
+            resolve_target: (Trees.Expressions.Expression) -> Semantic.Symbols.Symbol?,
+            resolve_path: (Trees.Expressions.Expression) -> ACCESS_PATH?,
+            logger: Logger
+        ) is
+            _resolve_target = resolve_target;
+            _resolve_path = resolve_path;
+            _logger = logger;
+        si
+
+        // Surface a narrowing-introduction hint. Editor-only: gated on
+        // analysis mode and the client's open-files set so a
+        // narrowing in a file the user is not viewing costs nothing.
+        _hint(location: LOCATION, code: string, message: string) is
+            if !_logger? \/ !_logger.is_analysis \/ !location? then
+                return;
+            fi
+
+            if !_logger.is_file_open(location.file_name) then
+                return;
+            fi
+
+            _logger.hint(location, code, message);
         si
 
         // Drill `type` to the underlying Classy (peeling Symbols.GENERIC
@@ -415,22 +451,37 @@ namespace Syntax.Process is
 
             if operand? then
                 let target = _resolve_target(operand);
+                let is_not_equal =
+                    binary.actual_operation? /\ binary.actual_operation =~ "!=";
+                let edge_label = if is_not_equal then "then" else "else" fi;
 
                 if target? then
-                    if binary.actual_operation? /\ binary.actual_operation =~ "!=" then
+                    if is_not_equal then
                         then_env.set_non_null(target);
                     else
                         else_env.set_non_null(target);
                     fi
+
+                    _hint(
+                        operand.location,
+                        "narrowing-null-compare",
+                        "{target.name} is known to hold a value on the {edge_label} edge here"
+                    );
                 else
                     let path = _resolve_path(operand);
 
                     if path? then
-                        if binary.actual_operation? /\ binary.actual_operation =~ "!=" then
+                        if is_not_equal then
                             then_env.set_non_null_path(path);
                         else
                             else_env.set_non_null_path(path);
                         fi
+
+                        _hint(
+                            operand.location,
+                            "narrowing-null-compare",
+                            "{path} is known to hold a value on the {edge_label} edge here"
+                        );
                     fi
                 fi
             fi
@@ -507,9 +558,21 @@ namespace Syntax.Process is
             if target? then
                 result.set_non_null(target);
                 result.set_narrow(target, specialized_narrow);
+
+                _hint(
+                    scrutinee.location,
+                    "narrowing-if-let",
+                    "{target.name} is narrowed to {specialized_narrow} on the then edge here"
+                );
             else
                 result.set_non_null_path(target_path!);
-                result.set_path_narrow(target_path!, specialized_narrow);
+                result.set_path_narrow(target_path, specialized_narrow);
+
+                _hint(
+                    scrutinee.location,
+                    "narrowing-if-let",
+                    "{target_path} is narrowed to {specialized_narrow} on the then edge here"
+                );
             fi
 
             return result;
@@ -639,8 +702,20 @@ namespace Syntax.Process is
 
             if target? then
                 result.set_narrow(target, complement);
+
+                _hint(
+                    scrutinee.location,
+                    "narrowing-if-let-complement",
+                    "{target.name} is narrowed to {complement} on the else edge here"
+                );
             else
                 result.set_path_narrow(target_path!, complement);
+
+                _hint(
+                    scrutinee.location,
+                    "narrowing-if-let-complement",
+                    "{target_path} is narrowed to {complement} on the else edge here"
+                );
             fi
 
             return result;
@@ -656,6 +731,11 @@ namespace Syntax.Process is
                 if !target? then _resolve_path(`isa.right) else null fi;
             let isa_type =
                 if `isa.type_expression? then `isa.type_expression.type else null fi;
+
+            let subject_label =
+                if target? then target.name
+                elif target_path? then target_path.to_string()
+                else "" fi;
 
             if target? \/ target_path? then
                 // `isa T(x)` is true only for a non-null `x` of a
@@ -712,12 +792,28 @@ namespace Syntax.Process is
                     // isa_classy and receiver_type are non-null whenever
                     // then_narrow is — both narrow branches above
                     // require them.
+                    let else_narrow: Type? mut = null;
+
                     if target? then
-                        _set_narrow_with_complement(
+                        else_narrow = _set_narrow_with_complement(
                             target, receiver_type!, then_narrow, isa_classy!, then_env, else_env);
                     else
-                        _set_path_narrow_with_complement(
+                        else_narrow = _set_path_narrow_with_complement(
                             target_path!, receiver_type!, then_narrow, isa_classy!, then_env, else_env);
+                    fi
+
+                    _hint(
+                        `isa.right.location,
+                        "narrowing-isa",
+                        "{subject_label} is narrowed to {then_narrow} on the then edge here"
+                    );
+
+                    if else_narrow? then
+                        _hint(
+                            `isa.right.location,
+                            "narrowing-isa-complement",
+                            "{subject_label} is narrowed to {else_narrow} on the else edge here"
+                        );
                     fi
                 elif isa_type? /\ !isa_type.is_error /\ !isa_type.is_inferred then
                     if target? then
@@ -725,6 +821,12 @@ namespace Syntax.Process is
                     else
                         then_env.set_path_narrow(target_path!, isa_type);
                     fi
+
+                    _hint(
+                        `isa.right.location,
+                        "narrowing-isa",
+                        "{subject_label} is narrowed to {isa_type} on the then edge here"
+                    );
                 fi
             fi
 
@@ -734,7 +836,9 @@ namespace Syntax.Process is
         // Narrow `target` to `then_narrow` on the true edge, and — when
         // representable — to the complement of `eliminated` within the
         // receiver's closed set on the false edge. Shared by `isa` and
-        // the default-variant `?` present-test.
+        // the default-variant `?` present-test. Returns the complement
+        // when one was applied, so the caller can announce the false
+        // edge to the editor.
         _set_narrow_with_complement(
             target: Semantic.Symbols.Symbol,
             receiver_type: Type,
@@ -742,14 +846,17 @@ namespace Syntax.Process is
             eliminated: Semantic.Symbols.Classy,
             then_env: NARROW_ENV,
             else_env: NARROW_ENV
-        ) is
+        ) -> Type? is
             then_env.set_narrow(target, then_narrow);
 
             if let complement =
                 _else_edge_complement(receiver_type, eliminated, else_env.is_non_null(target))
             then
                 else_env.set_narrow(target, complement);
+                return complement;
             fi
+
+            return null;
         si
 
         // Path-keyed mirror of `_set_narrow_with_complement`. Same
@@ -761,14 +868,17 @@ namespace Syntax.Process is
             eliminated: Semantic.Symbols.Classy,
             then_env: NARROW_ENV,
             else_env: NARROW_ENV
-        ) is
+        ) -> Type? is
             then_env.set_path_narrow(target_path, then_narrow);
 
             if let complement =
                 _else_edge_complement(receiver_type, eliminated, else_env.is_non_null_path(target_path))
             then
                 else_env.set_path_narrow(target_path, complement);
+                return complement;
             fi
+
+            return null;
         si
 
         // The complement narrow for the false edge of an `isa` /
@@ -801,6 +911,7 @@ namespace Syntax.Process is
         // No-op when the default variant isn't in the receiver's
         // narrowed set (a statically-false `x?`).
         _narrow_default_variant_has_value(
+            has_value_location: LOCATION,
             target: Semantic.Symbols.Symbol,
             receiver_type: Type,
             variant: Semantic.Symbols.Classy,
@@ -817,13 +928,28 @@ namespace Syntax.Process is
             fi
 
             if let variant_narrow = try_get_variant_type_for_classy(receiver_type, variant) then
-                _set_narrow_with_complement(
+                let else_narrow = _set_narrow_with_complement(
                     target, receiver_type, variant_narrow, variant, then_env, else_env);
+
+                _hint(
+                    has_value_location,
+                    "narrowing-default-variant",
+                    "{target.name} is narrowed to {variant_narrow} on the then edge here"
+                );
+
+                if else_narrow? then
+                    _hint(
+                        has_value_location,
+                        "narrowing-default-variant",
+                        "{target.name} is narrowed to {else_narrow} on the else edge here"
+                    );
+                fi
             fi
         si
 
         // Path-keyed mirror of `_narrow_default_variant_has_value`.
         _narrow_default_variant_has_value_path(
+            has_value_location: LOCATION,
             target_path: ACCESS_PATH,
             receiver_type: Type,
             variant: Semantic.Symbols.Classy,
@@ -840,8 +966,22 @@ namespace Syntax.Process is
             fi
 
             if let variant_narrow = try_get_variant_type_for_classy(receiver_type, variant) then
-                _set_path_narrow_with_complement(
+                let else_narrow = _set_path_narrow_with_complement(
                     target_path, receiver_type, variant_narrow, variant, then_env, else_env);
+
+                _hint(
+                    has_value_location,
+                    "narrowing-default-variant",
+                    "{target_path} is narrowed to {variant_narrow} on the then edge here"
+                );
+
+                if else_narrow? then
+                    _hint(
+                        has_value_location,
+                        "narrowing-default-variant",
+                        "{target_path} is narrowed to {else_narrow} on the else edge here"
+                    );
+                fi
             fi
         si
 
@@ -862,6 +1002,12 @@ namespace Syntax.Process is
                 if target? then
                     then_env.set_non_null(target);
 
+                    _hint(
+                        has_value.left.location,
+                        "narrowing-presence",
+                        "{target.name} is known to hold a value on the then edge here"
+                    );
+
                     let receiver_type = has_value.left.value?.type;
 
                     if receiver_type? then
@@ -873,12 +1019,19 @@ namespace Syntax.Process is
                         if union_classy? then
                             if let default_variant = union_classy.default_variant then
                                 _narrow_default_variant_has_value(
+                                    has_value.left.location,
                                     target, receiver_type, default_variant, then_env, else_env);
                             fi
                         fi
                     fi
                 elif target_path? then
-                    then_env.set_non_null_path(target_path!);
+                    then_env.set_non_null_path(target_path);
+
+                    _hint(
+                        has_value.left.location,
+                        "narrowing-presence",
+                        "{target_path} is known to hold a value on the then edge here"
+                    );
 
                     let receiver_type = has_value.left.value?.type;
 
@@ -891,7 +1044,8 @@ namespace Syntax.Process is
                         if union_classy? then
                             if let default_variant = union_classy.default_variant then
                                 _narrow_default_variant_has_value_path(
-                                    target_path!, receiver_type, default_variant, then_env, else_env);
+                                    has_value.left.location,
+                                    target_path, receiver_type, default_variant, then_env, else_env);
                             fi
                         fi
                     fi
