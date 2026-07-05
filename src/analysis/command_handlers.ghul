@@ -1565,4 +1565,223 @@ namespace Analysis is
             return result.to_string();
         si
     si
+
+    // Handles describe_type: resolve a type by qualified name (dotted) and
+    // return its kind, ancestors and members. The resolver walks name
+    // components through find_direct starting at the symbol table's global
+    // scope, which for imported .NET types transparently triggers dotnet
+    // symbol loading. Trailing generic brackets are stripped so
+    // `Collections.LIST[int]` resolves to `LIST`; generic argument
+    // substitution isn't applied to member signatures yet.
+    class DESCRIBE_TYPE_HANDLER(
+        _watchdog: WATCHDOG,
+        _symbol_table: Semantic.SYMBOL_TABLE,
+        _full_compiler: FULL_COMPILER
+    ): RequestHandler[Protocol.Request.DESCRIBE_TYPE] is
+        super();
+
+        handle_request(request: Protocol.Request.DESCRIBE_TYPE, writer: IO.TextWriter) is
+            let resolved_name mut = "";
+            let type_kind mut = "";
+            let ancestors = Collections.LIST[string]();
+            let members = Collections.LIST[Protocol.MEMBER_DTO]();
+
+            try
+                if !_watchdog.want_restart then
+                    let symbol mut = resolve_type_expression(request.type_expression);
+
+                    // A miss can mean either "unknown name" or "symbol table
+                    // not yet primed" - the initial analyser state has neither
+                    // project source EDIT'd nor .NET types loaded on demand.
+                    // Force a compile on the first miss and retry.
+                    if !symbol? then
+                        _full_compiler.compile_all(writer);
+                        symbol = resolve_type_expression(request.type_expression);
+                    fi
+
+                    if symbol? then
+                        resolved_name = symbol.qualified_name;
+                        type_kind = kind_name(symbol);
+
+                        if let classy = cast Semantic.Symbols.Classy(symbol) then
+                            collect_ancestors(classy, ancestors);
+                            collect_members(classy, members);
+                        else
+                            if symbol.is_namespace then
+                                collect_namespace_members(symbol, members);
+                            fi
+                        fi
+                    fi
+                fi
+            catch ex: Exception
+                debug_always("DESCRIBETYPE caught: {ex.get_type()} {ex.message}");
+                _watchdog.request_restart();
+            yrt
+
+            Std.error.flush();
+
+            JSON_PROTOCOL.write_response(
+                writer,
+                Protocol.Response.DESCRIBE_TYPE(resolved_name, type_kind, ancestors, members)
+            );
+        si
+
+        // Resolve a dotted type expression. Try the .NET symbol table
+        // directly first - `get_symbol("System.Text.StringBuilder")` loads
+        // reflected types on demand. If that misses, walk the dotted
+        // components through the symbol table's global scope, which finds
+        // ghūl-declared namespaces and types. Any trailing generic-argument
+        // brackets are dropped for the walk; the resolved symbol is the
+        // type template itself.
+        resolve_type_expression(expression: string) -> Semantic.Symbols.Symbol? is
+            if !expression? \/ expression.length == 0 then
+                return null;
+            fi
+
+            let stripped = strip_generic_arguments(expression);
+
+            if stripped.length == 0 then
+                return null;
+            fi
+
+            let dotnet_symbol_table = IoC.CONTAINER.instance.dotnet_symbol_table.value;
+            let dotnet_symbol = dotnet_symbol_table.get_symbol(stripped);
+
+            if dotnet_symbol? then
+                return cast Semantic.Symbols.Symbol(dotnet_symbol);
+            fi
+
+            let components = stripped.split(['.']);
+
+            if components.count == 0 then
+                return null;
+            fi
+
+            let symbol: Semantic.Symbols.Symbol? mut = _symbol_table.global_scope.find_direct(components[0]);
+
+            if !symbol? then
+                return null;
+            fi
+
+            let index mut = 1;
+
+            while index < components.count do
+                symbol = symbol.find_direct(components[index]);
+
+                if !symbol? then
+                    return null;
+                fi
+
+                index = index + 1;
+            od
+
+            return symbol;
+        si
+
+        // Strip a top-level `[...]` suffix. `LIST[int]` -> `LIST`,
+        // `Ghul.MAP[string, int]` -> `Ghul.MAP`. Anything before an inner
+        // `[` inside a component (rare) is preserved via the substring.
+        strip_generic_arguments(expression: string) -> string is
+            let bracket = expression.index_of('[');
+
+            if bracket >= 0 then
+                return expression.substring(0, bracket);
+            fi
+
+            return expression;
+        si
+
+        kind_name(symbol: Semantic.Symbols.Symbol) -> string static is
+            if symbol.is_namespace then return "namespace"; fi
+            if symbol.is_variant then return "variant"; fi
+            if symbol.is_union then return "union"; fi
+            if symbol.is_trait then return "trait"; fi
+            // ENUM_STRUCT extends STRUCT, so it must be tested first or an
+            // enum falls through to the "struct" branch.
+            if isa Semantic.Symbols.ENUM_STRUCT(symbol) then return "enum"; fi
+            if isa Semantic.Symbols.STRUCT(symbol) then return "struct"; fi
+            if symbol.is_class then return "class"; fi
+
+            return "";
+        si
+
+        collect_ancestors(classy: Semantic.Symbols.Classy, ancestors: Collections.LIST[string]) is
+            for ancestor_type in classy.ancestors do
+                if ancestor_type? /\ ancestor_type.symbol? then
+                    let name = ancestor_type.symbol.qualified_name;
+
+                    if !ancestors.contains(name) then
+                        ancestors.add(name);
+                    fi
+                fi
+            od
+        si
+
+        // Members come from two sources: those declared directly on the
+        // derived type, and those declared on an ancestor. The resolve-
+        // overrides pass pulls inherited members into the derived's own
+        // symbol store (wrapping methods in a FUNCTION_GROUP owned by the
+        // derived), so `owner` can't distinguish inheritance reliably.
+        // Instead: walk the derived's direct list first and mark those
+        // direct; then walk each ancestor and mark any not-yet-seen
+        // member inherited. A member reported as direct on both sides
+        // (e.g. an interface method reflection copied into the class)
+        // stays tagged direct.
+        collect_members(classy: Semantic.Symbols.Classy, members: Collections.LIST[Protocol.MEMBER_DTO]) is
+            let seen = Collections.SET[string]();
+
+            add_matches(classy, "", false, members, seen);
+
+            for ancestor_type in classy.ancestors do
+                if ancestor_type? /\ ancestor_type.symbol? then
+                    let ancestor = ancestor_type.symbol;
+
+                    if isa Semantic.Symbols.Classy(ancestor) then
+                        add_matches(ancestor, ancestor.qualified_name, true, members, seen);
+                    fi
+                fi
+            od
+        si
+
+        // For a plain namespace, no ancestor semantics apply.
+        collect_namespace_members(
+            scope: Semantic.Symbols.Symbol,
+            members: Collections.LIST[Protocol.MEMBER_DTO]
+        ) is
+            add_matches(scope, "", false, members, Collections.SET[string]());
+        si
+
+        add_matches(
+            scope: Semantic.Symbols.Symbol,
+            inherited_from: string,
+            is_inherited: bool,
+            members: Collections.LIST[Protocol.MEMBER_DTO],
+            seen: Collections.SET[string]
+        ) is
+            let matches = Collections.MAP[string, Semantic.Symbols.Symbol]();
+
+            scope.find_direct_matches("", matches);
+
+            for pair in matches do
+                let name = pair.key;
+                let symbol = pair.value;
+
+                if !symbol? \/ symbol.is_internal \/ seen.contains(name) then
+                    continue;
+                fi
+
+                seen.add(name);
+
+                members.add(
+                    Protocol.MEMBER_DTO(
+                        name,
+                        symbol.description,
+                        cast int(symbol.completion_kind),
+                        is_inherited,
+                        inherited_from
+                    )
+                );
+            od
+        si
+    si
 si
