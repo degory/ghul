@@ -19,24 +19,24 @@ Instructions for the cloud reviewer invoked from the `code_review` job in `.gith
 
 ## What to post, where
 
-- **One formal PR Review per run**, posted as JSON via the reviews endpoint:
-  `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json`
-  with a body of the shape:
-  ```json
-  {
-    "event": "COMMENT",
-    "body": "<optional cross-cutting summary>",
-    "comments": [
-      {"path": "src/foo.ghul", "line": 142, "body": "<finding>"},
-      ...
-    ]
-  }
-  ```
-  One finding per `comments[]` entry, anchored to the specific line. Use `body` only for cross-cutting commentary that doesn't belong on one line — most reviews can leave it empty.
-- **Group inline findings by severity inside their `body`** — prefix with `**Bug**`, `**Concern**`, or `**Nit**` so the reader can scan severity at a glance.
-- **If there's nothing to raise, post a one-line "LGTM" review** via `gh pr review <N> --comment --body "LGTM"` rather than skipping — the absence of a posted review can't be distinguished from a stuck bot.
+- **One formal PR Review per run.** Pick the event by whether you're raising anything at all — it's binary:
+  - **No findings** → `gh pr review <N> --approve --body "LGTM"`. Approval is the merge signal: branch protection on `main` requires an approving review of the latest changes and auto-merge is on, so a posted approval is what lets the PR land. Always post explicitly rather than skipping — the absence of a posted review can't be distinguished from a stuck bot.
+  - **Any inline finding, of any severity** → JSON review with `event: REQUEST_CHANGES`, posted via `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json` with a body of the shape:
+    ```json
+    {
+      "event": "REQUEST_CHANGES",
+      "body": "<optional cross-cutting summary>",
+      "comments": [
+        {"path": "src/foo.ghul", "line": 142, "body": "<finding>"},
+        ...
+      ]
+    }
+    ```
+    One finding per `comments[]` entry, anchored to the specific line. Use `body` only for cross-cutting commentary that doesn't belong on one line — most reviews can leave it empty. REQUEST_CHANGES holds the merge until you re-review on a later run and approve.
+- **Group inline findings by severity inside their `body`** — prefix with `**Bug**`, `**Concern**`, or `**Nit**` so the reader can scan severity at a glance. Severity is a *reading-order* aid for the author; it doesn't change the event choice.
+- **Never `event: COMMENT` and never `event: APPROVE` with inline findings.** COMMENT doesn't satisfy branch protection, so the PR sits stuck. APPROVE-with-findings tells the author their concerns are advisory while auto-merge lands the PR before they see them.
 - **Don't post a top-level `gh pr comment`** — issue comments are the wrong UI affordance for code review.
-- **Don't soft-pedal.** If a finding is worth saying, say it as a finding. If it isn't worth saying, stay silent. Closing notes like "non-blocking, but…", "minor nit (no action)", "consider…" are incoherent with the workflow: by the time the author reads them, the PR may already be merged. Don't write them.
+- **Don't soft-pedal.** If a finding is worth saying, say it as a finding. If it isn't worth saying, stay silent. Closing notes like "non-blocking, but…", "minor nit (no action)", "consider…" are incoherent with the workflow: by the time the author reads them, the PR may already be merged. If you'd want to qualify an approval with a caveat, that caveat *is* a finding — drop the approval, raise it as an inline comment, and switch to REQUEST_CHANGES.
 
 ## What you're reading vs. what CI gates
 
@@ -153,7 +153,8 @@ Flag when:
 
 ## Posting mechanics — reminder
 
-- One PR Review per run, posted via `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json` with `event: COMMENT` and a `comments[]` array of line-anchored findings. Top-level `body` for cross-cutting commentary only; most reviews leave it empty.
-- LGTM shortcut for no-findings runs: `gh pr review <N> --comment --body "LGTM"`.
+- One PR Review per run. With findings: `gh api repos/<owner>/<repo>/pulls/<N>/reviews -X POST --input review.json` with `event: REQUEST_CHANGES` and a `comments[]` array of line-anchored findings. Top-level `body` for cross-cutting commentary only; most reviews leave it empty.
+- No-findings shortcut: `gh pr review <N> --approve --body "LGTM"`.
+- Never `event: COMMENT` — it doesn't satisfy branch protection, so the PR sits stuck.
 - No separate `gh pr comment`.
 - Chat output is invisible. If you didn't post it, it didn't happen.
