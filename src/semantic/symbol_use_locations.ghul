@@ -29,7 +29,82 @@ namespace Semantic is
             _symbol_use_map = LOCATION_MAP[Symbols.Symbol]();
             _hover_info_map = LOCATION_MAP[HOVER_USE]();
             _symbol_reference_map = Collections.MAP[Symbols.Symbol,Collections.SET[LOCATION]](65521);
+            _reference_frames = Collections.LIST[Collections.LIST[Pair[Symbols.Symbol,LOCATION]]]();
         si
+
+        // Speculation frames over everything this store records: hover
+        // uses, symbol uses and reference-set entries. The iterative
+        // inference re-walks (a lambda body walked again once its
+        // parameter types settle, and the whole-body retry loop around
+        // it) roll their diagnostics back before each re-walk; without
+        // the same discipline here, every discarded walk leaves its
+        // recorded uses behind — a hover, definition target or
+        // reference resolved against not-yet-settled types sits at the
+        // same span as the settled walk's record and can win the
+        // tie-break. Callers open a frame wherever they speculate the
+        // logger AND are guaranteed to re-walk everything recorded
+        // since, so a rolled-back frame's information is always
+        // re-recorded by the walk whose compilation stands.
+        _reference_frames: Collections.LIST[Collections.LIST[Pair[Symbols.Symbol,LOCATION]]];
+
+        speculate() is
+            _symbol_use_map.speculate();
+            _hover_info_map.speculate();
+            _reference_frames.add(Collections.LIST[Pair[Symbols.Symbol,LOCATION]]());
+        si
+
+        roll_back() is
+            assert _reference_frames.count > 0 else "roll_back with no open uses speculation frame";
+
+            _symbol_use_map.roll_back();
+            _hover_info_map.roll_back();
+
+            let frame = _reference_frames[_reference_frames.count - 1];
+            _reference_frames.remove_at(_reference_frames.count - 1);
+
+            let i mut = frame.count - 1;
+
+            while i >= 0 do
+                let entry = frame[i];
+                let references: Collections.SET[LOCATION] mut;
+
+                if _symbol_reference_map.try_get_value(entry.key, references ref) then
+                    references.remove(entry.value);
+                fi
+
+                i = i - 1;
+            od
+        si
+
+        commit() is
+            assert _reference_frames.count > 0 else "commit with no open uses speculation frame";
+
+            _symbol_use_map.commit();
+            _hover_info_map.commit();
+
+            let frame = _reference_frames[_reference_frames.count - 1];
+            _reference_frames.remove_at(_reference_frames.count - 1);
+
+            if _reference_frames.count > 0 then
+                _reference_frames[_reference_frames.count - 1].add_range(frame);
+            fi
+        si
+
+        mark() -> int => _reference_frames.count;
+
+        release(mark: int) is
+            while _reference_frames.count > mark do
+                roll_back();
+            od
+        si
+
+        // Exception-recovery guard: `let use` one of these around a
+        // walk that opens speculation frames, so frames left open by a
+        // throw are rolled back instead of desynchronising the stack.
+        // On the normal path all frames are already closed and dispose
+        // is a no-op.
+        mark_then_release() -> USES_MARK_THEN_RELEASE =>
+            USES_MARK_THEN_RELEASE(self);
 
         add_symbol_use(location: LOCATION, symbol: Symbols.Symbol) is
             _add_use(location, symbol, null, null);
@@ -450,12 +525,22 @@ namespace Semantic is
             od
         si
 
-        _add_symbol_reference(location: LOCATION, symbol: Symbols.Symbol) is
+        _add_symbol_reference(location: LOCATION, symbol: Symbols.Symbol mut) is
+            symbol = symbol.root_specialized_from;
+
             let refs = _get_references_set(symbol);
-                
+
+            // Re-walks of the same body (inference retries) legitimately
+            // re-record the same symbol at the same location; the set
+            // membership check keeps the entry single and the journal
+            // records only genuine additions so roll_back removes
+            // exactly what this frame added.
             if !refs.contains(location) then
-                // FIXME: why is this getting called multiple times for the same symbol and location?
                 refs.add(location);
+
+                if _reference_frames.count > 0 then
+                    _reference_frames[_reference_frames.count - 1].add(Pair[Symbols.Symbol,LOCATION](symbol, location));
+                fi
             fi
         si
 
@@ -623,11 +708,96 @@ namespace Semantic is
         si
     si
 
+    struct USES_MARK_THEN_RELEASE: Disposable is
+        _uses: SYMBOL_USE_LOCATIONS;
+        _mark: int;
+
+        init(uses: SYMBOL_USE_LOCATIONS) is
+            _uses = uses;
+            _mark = uses.mark();
+        si
+
+        dispose() is
+            _uses.release(_mark);
+        si
+    si
+
+    // One reversible mutation of a LOCATION_MAP line-list, journalled
+    // while a speculation frame is open so the frame can be undone.
+    // APPENDED needs no payload: undo happens in strict reverse order,
+    // so the appended entry is still the list's tail when its turn
+    // comes. REMOVED re-inserts the entry at its original index, which
+    // is valid at undo time for the same reason.
+    union LOCATION_MAP_OP[T] is
+        APPENDED(list: Collections.LIST[Pair[LOCATION,T]]);
+        REMOVED(list: Collections.LIST[Pair[LOCATION,T]], entry: Pair[LOCATION,T], index: int);
+    si
+
     class LOCATION_MAP[T] is
         _file_name_to_file: Collections.MAP[string, Collections.MAP[int, Collections.LIST[Pair[LOCATION,T]]]];
 
+        // Speculation frames. While at least one frame is open, every
+        // mutation journals a LOCATION_MAP_OP into the innermost frame;
+        // roll_back undoes the frame's ops in reverse, commit folds them
+        // into the enclosing frame (so an outer roll_back also undoes
+        // inner committed work), and at the bottom of the stack commit
+        // makes the entries permanent. With no frame open, mutations
+        // are permanent immediately and cost nothing extra.
+        _frames: Collections.LIST[Collections.LIST[LOCATION_MAP_OP[T]]];
+
         init() is
             _file_name_to_file = Collections.MAP[string, Collections.MAP[int, Collections.LIST[Pair[LOCATION,T]]]]();
+            _frames = Collections.LIST[Collections.LIST[LOCATION_MAP_OP[T]]]();
+        si
+
+        speculate() is
+            _frames.add(Collections.LIST[LOCATION_MAP_OP[T]]());
+        si
+
+        roll_back() is
+            assert _frames.count > 0 else "roll_back with no open speculation frame";
+
+            let frame = _frames[_frames.count - 1];
+            _frames.remove_at(_frames.count - 1);
+
+            let i mut = frame.count - 1;
+
+            while i >= 0 do
+                let op = frame[i];
+
+                if let appended: LOCATION_MAP_OP.APPENDED[T] = op then
+                    appended.list.remove_at(appended.list.count - 1);
+                elif let removed: LOCATION_MAP_OP.REMOVED[T] = op then
+                    removed.list.insert(removed.index, removed.entry);
+                fi
+
+                i = i - 1;
+            od
+        si
+
+        commit() is
+            assert _frames.count > 0 else "commit with no open speculation frame";
+
+            let frame = _frames[_frames.count - 1];
+            _frames.remove_at(_frames.count - 1);
+
+            if _frames.count > 0 then
+                _frames[_frames.count - 1].add_range(frame);
+            fi
+        si
+
+        mark() -> int => _frames.count;
+
+        release(mark: int) is
+            while _frames.count > mark do
+                roll_back();
+            od
+        si
+
+        _journal(op: LOCATION_MAP_OP[T]) is
+            if _frames.count > 0 then
+                _frames[_frames.count - 1].add(op);
+            fi
         si
 
         dump_counts() is
@@ -659,6 +829,7 @@ namespace Semantic is
                     file[line] = list;
                 fi
                 list.add(Pair[LOCATION,T](location,value));
+                _journal(LOCATION_MAP_OP.APPENDED[T](list));
             od
         si
 
@@ -678,6 +849,7 @@ namespace Semantic is
                         let i mut = list.count - 1;
                         while i >= 0 do
                             if list[i].key =~ location then
+                                _journal(LOCATION_MAP_OP.REMOVED[T](list, list[i], i));
                                 list.remove_at(i);
                             fi
                             i = i - 1;
