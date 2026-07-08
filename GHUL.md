@@ -506,6 +506,8 @@ si
 
 The interface's type parameters are the target's own, written on the target after `for` (`impl Printer for List[T]`, not a separate binder). Inside the body `self` has the concrete target type, so a union's variants can be matched on directly. The target then satisfies the interface exactly as a header-declared one would — a `List[T]` passes wherever a `Printer` is expected, dispatching through the type's base. A self-relational interface takes the target as its own argument: `impl Eq[List[T]] for List[T]`. The interface must be a trait, and the target must be a same-assembly type — an imported type cannot be reopened.
 
+The target (and a `partial` block's target) can be a qualified name: a namespaced type (`impl Printer for Some.Namespace.TYPE`) or a specific union variant (`impl Printer for List.NIL`). Implementing an interface on a single variant attaches it to that variant alone — a value statically typed as the variant satisfies the interface, but the union as a whole does not unless it also implements it.
+
 ### properties, methods, and visibility
 
 A property is a name and a type, optionally with getter and setter bodies; a property with no bodies is backed by a hidden field. A property is public to read but only assignable within its defining type — prefixing the name with `_` makes it protected for reading as well.
