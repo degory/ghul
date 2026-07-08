@@ -16,20 +16,10 @@ namespace Syntax.Process is
         _anon_index: int;
         _pragma_scope_stack: PRAGMA_SCOPE_STACK;
 
-        // impl/partial blocks whose target name did not resolve during the
-        // main walk, kept with the lexical scope they were written in so
-        // declare_deferred_injections can retry them after resolve-uses.
-        _pending_injections: Collections.LIST[(node: Node, lexical: Semantic.Scope)];
-
-        // Set only during a final retry: an unresolvable target then
-        // reports its error instead of being parked again.
-        _report_missing_targets: bool;
-
         super(symbol_table, namespaces);
 
         init(..) is
             _pragma_scope_stack = PRAGMA_SCOPE_STACK();
-            _pending_injections = Collections.LIST[(node: Node, lexical: Semantic.Scope)]();
         si
 
         apply(node: Node) is
@@ -46,7 +36,7 @@ namespace Syntax.Process is
             return result;
         si
 
-        // `_` is a non-binding discard placeholder: every occurrence
+        // `_` is a discard placeholder: every occurrence
         // gets its own unique slot so the redefinition check doesn't
         // fire and there's no shared name for code to read from. Used
         // in `let _ = expr`, tuple destructure (`let (_, _, z) = ...`),
@@ -336,149 +326,13 @@ namespace Syntax.Process is
             leave_scope(`class);
         si
 
-        // A `partial` block declares its members into an already-declared
-        // target type: resolve the target and let the normal
-        // member-declaring walk add members as the target's own. The block
-        // gets an injection scope rather than the target's scope directly,
-        // so that names its members reference resolve at the block's write
-        // site (its namespace and use imports) instead of at the target's
-        // declaration site, while the target's members and type parameters
-        // stay visible first.
-        pre(`partial: Definitions.PARTIAL) -> bool is
-            let target = cast Semantic.Symbols.Classy?(find_enclosing(`partial.name));
+        // impl and partial block members are declared by
+        // DECLARE_INJECTED_SYMBOLS, a separate pass that runs after
+        // resolve-uses so the block's target name can be reached through
+        // a use import and the target can be declared anywhere.
+        pre(`partial: Definitions.PARTIAL) -> bool => true;
 
-            if !target? then
-                if !_report_missing_targets then
-                    return _defer_injection(`partial);
-                fi
-
-                _logger.error(`partial.name.location, "cannot find type {`partial.name.name} to add members to");
-                associate_and_enter_scope(`partial, _rejecting_scope());
-                return false;
-            fi
-
-            // The CLR fixes a compiled type's members at its definition, so
-            // only a type declared in this compilation can be reopened.
-            if target.is_reflected then
-                _logger.error(`partial.name.location, "cannot add members to imported type {target.name}");
-                associate_and_enter_scope(`partial, _rejecting_scope());
-                return false;
-            fi
-
-            associate_and_enter_scope(`partial, Semantic.INJECTION_SCOPE(target, current_scope));
-            return false;
-        si
-
-        // When a `partial`/`impl` target cannot be resolved to a same-assembly
-        // type, its members have nowhere valid to live. Route them into a block
-        // scope so each member is cleanly rejected ("cannot declare … here")
-        // rather than cascading to "no scope found" downstream or being silently
-        // declared as globals in the enclosing scope. A block scope still chains
-        // name lookups to the enclosing scope, so type references in the members
-        // (interfaces, return types) resolve normally instead of adding spurious
-        // "symbol not found" noise on top of the real diagnostic.
-        _rejecting_scope() -> Semantic.Scope =>
-            Semantic.BLOCK_SCOPE(current_scope);
-
-        // The main declare-symbols walk runs before resolve-uses, so an
-        // impl/partial target reachable only through a use import - or
-        // declared in a source file walked later - cannot resolve yet.
-        // Park the block with its lexical scope and skip its members; the
-        // placeholder association keeps enter/leave symmetric until a
-        // retry replaces it.
-        _defer_injection(node: Node) -> bool is
-            _pending_injections.add((node, current_scope));
-            associate_and_enter_scope(node, _rejecting_scope());
-            return true;
-        si
-
-        // A build that stops between declare-symbols and resolve-uses can
-        // leave parked blocks behind; the next build re-parks them during
-        // its own declare-symbols walk, so start from empty.
-        reset_deferred_injections() is
-            _pending_injections = Collections.LIST[(node: Node, lexical: Semantic.Scope)]();
-        si
-
-        // Retry the parked impl/partial blocks. Runs after resolve-uses,
-        // so use-imported and later-declared targets resolve; members are
-        // then declared exactly as in the main walk. A target that still
-        // does not resolve is parked again - it can depend on a use of a
-        // member that another parked block has yet to inject - unless
-        // final is set, in which case it reports its error and the
-        // block's members are individually rejected. Returns true when at
-        // least one block left the parked set, the signal the caller's
-        // retry loop uses to decide whether another round could resolve
-        // more.
-        declare_deferred_injections(final: bool) -> bool is
-            if _pending_injections.count == 0 then
-                return false;
-            fi
-
-            let pending = _pending_injections;
-            _pending_injections = Collections.LIST[(node: Node, lexical: Semantic.Scope)]();
-
-            _report_missing_targets = final;
-
-            try
-                for p in pending do
-                    let mark = mark_scope_stack();
-
-                    try
-                        enter_scope(p.lexical);
-                        p.node.walk(self);
-                    catch e: Exception
-                        _logger.exception(p.node.location, e, "caught exception declaring deferred impl/partial members");
-                    finally
-                        release_scope_stack(mark);
-                    yrt
-                od
-            finally
-                _report_missing_targets = false;
-            yrt
-
-            return _pending_injections.count < pending.count;
-        si
-
-        visit(`partial: Definitions.PARTIAL) is
-            leave_scope(`partial);
-        si
-
-        // An `impl` block attaches an interface to an already-declared target
-        // and declares the members that fill its slots: resolve the target
-        // and let the normal member-declaring walk add them as the target's
-        // own. As for `partial`, an injection scope resolves the interface
-        // name and anything the members reference at the block's write site,
-        // with the target's members and type parameters visible first. The
-        // interface itself is attached in resolve-ancestors.
-        pre(`impl: Definitions.IMPL) -> bool is
-            let target = cast Semantic.Symbols.Classy?(find_enclosing(`impl.name));
-
-            if !target? then
-                if !_report_missing_targets then
-                    return _defer_injection(`impl);
-                fi
-
-                _logger.error(`impl.name.location, "cannot find type {`impl.name.name} to implement an interface for");
-                associate_and_enter_scope(`impl, _rejecting_scope());
-                return false;
-            fi
-
-            // The CLR fixes a compiled type's members and interfaces at its
-            // definition, so only a type declared in this compilation can
-            // implement an interface this way.
-            if target.is_reflected then
-                _logger.error(`impl.name.location, "cannot implement an interface for imported type {target.name}");
-                associate_and_enter_scope(`impl, _rejecting_scope());
-                return false;
-            fi
-
-            associate_and_enter_scope(`impl, Semantic.INJECTION_SCOPE(target, current_scope));
-            return false;
-        si
-
-        visit(`impl: Definitions.IMPL) is
-            leave_scope(`impl);
-        si
+        pre(`impl: Definitions.IMPL) -> bool => true;
 
         pre(`trait: Definitions.TRAIT) -> bool =>
             _pre(
