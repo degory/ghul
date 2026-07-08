@@ -454,7 +454,7 @@ union COLOUR(name: string): NAMED is
 si
 ```
 
-`NAMED.name` is satisfied by the property auto-synthesised from the union's `name` primary parameter, and `NAMED.label` is inherited by every variant. A `NAMED` reference accepts any `COLOUR` value, with dispatch going through the union base class. The traits-only restriction is strict: a union may not declare a base class. Every trait member used by a union must either be defaulted or be a property the union already supplies (typically through a primary parameter), since neither the union body nor its variants can carry method bodies.
+`NAMED.name` is satisfied by the property auto-synthesised from the union's `name` primary parameter, and `NAMED.label` is inherited by every variant. A `NAMED` reference accepts any `COLOUR` value, with dispatch going through the union base class. The traits-only restriction is strict: a union may not declare a base class. Every trait member used through this header form must either be defaulted or be a property the union already supplies (typically through a primary parameter), since neither the union body nor its variants can carry method bodies; to give a union method implementations for a trait, use an [`impl` block](#partial-and-impl-blocks).
 
 ### enums
 
@@ -468,6 +468,43 @@ enum SUIT is
     SPADES
 si
 ```
+
+### partial and impl blocks
+
+Members can be added to an already-declared type from a separate block — even a separate file — as long as the type is declared in the same assembly. The added members are real members of the target: full private access and normal virtual dispatch, indistinguishable from members written in the type's own body.
+
+A `partial` block adds members to the type it names:
+
+```ghul
+class VISITOR is
+    _depth: int;
+    init() is _depth = 0; si
+si
+
+partial VISITOR is
+    visit_expression(e: EXPRESSION) is ... si
+si
+```
+
+`partial` carries no interface clause — interfaces stay in the type's header. It applies to classes, structs, and unions; for a union, whose body holds only variants, it is the only way to give the type methods.
+
+An `impl` block additionally makes the target implement an interface:
+
+```ghul
+trait Printer is print() -> string; si
+
+union List[T] is
+    NIL;
+    CONS(head: T, tail: List[T]);
+si
+
+impl Printer for List[T] is
+    print() -> string =>
+        if let (head, tail): CONS = self then "{head} {tail.print()}" else "nil" fi;
+si
+```
+
+The interface's type parameters are the target's own, written on the target after `for` (`impl Printer for List[T]`, not a separate binder). Inside the body `self` has the concrete target type, so a union's variants can be matched on directly. The target then satisfies the interface exactly as a header-declared one would — a `List[T]` passes wherever a `Printer` is expected, dispatching through the type's base. A self-relational interface takes the target as its own argument: `impl Eq[List[T]] for List[T]`. The interface must be a trait, and the target must be a same-assembly type — an imported type cannot be reopened.
 
 ### properties, methods, and visibility
 
