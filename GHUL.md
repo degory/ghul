@@ -508,6 +508,8 @@ The interface's type parameters are the target's own, written on the target afte
 
 The target (and a `partial` block's target) can be a qualified name: a namespaced type (`impl Printer for Some.Namespace.TYPE`) or a specific union variant (`impl Printer for List.NIL`). Implementing an interface on a single variant attaches it to that variant alone — a value statically typed as the variant satisfies the interface, but the union as a whole does not unless it also implements it.
 
+Inside the block, the target's own members, inherited members, and type parameters are in scope first, exactly as inside the target's declaration body. Every other name — the target name after `for`, the interface name, the types in member headers, anything the bodies reference — resolves where the block is written: its enclosing namespace and that namespace's `use` imports. Names that are only in scope at the target's declaration site (its namespace siblings, its own file's imports) are not visible unless they are also reachable from the block's site. Declaration order does not matter: the block can precede its target in the same file or live in a file compiled earlier.
+
 ### properties, methods, and visibility
 
 A property is a name and a type, optionally with getter and setter bodies; a property with no bodies is backed by a hidden field. A property is public to read but only assignable within its defining type — prefixing the name with `_` makes it protected for reading as well.

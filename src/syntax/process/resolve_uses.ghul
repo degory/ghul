@@ -1,18 +1,23 @@
-namespace Syntax.Process is    
+namespace Syntax.Process is
     use Logging;
     use Source;
     use Trees;
 
     class RESOLVE_USES: ScopeVisitorBase is
-        _total_uses: int;
-
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
 
+        // use clauses whose used name did not resolve during the tree
+        // walk, kept with their namespace block's scope for retry. A use
+        // can name a member that an impl/partial block injects into its
+        // target after this pass's walk, so failure to resolve here is
+        // not yet an error.
+        _pending_uses: Collections.LIST[(clause: Definitions.USE, scope: Semantic.NAMESPACE_SCOPE)];
+
         init(
-            logger: Logger, 
-            symbol_table: Semantic.SYMBOL_TABLE, 
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
             namespaces: Semantic.NAMESPACES,
             symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS
         ) is
@@ -20,6 +25,8 @@ namespace Syntax.Process is
             _logger = logger;
             _symbol_table = symbol_table;
             _symbol_use_locations = symbol_use_locations;
+
+            _pending_uses = Collections.LIST[(clause: Definitions.USE, scope: Semantic.NAMESPACE_SCOPE)]();
         si
 
         apply(node: Node) is
@@ -33,73 +40,10 @@ namespace Syntax.Process is
             for u in `namespace.body.uses do
                 if !u.`use? then
                     continue;
-                fi                
-                
-                let used_symbol = find_enclosing(u.`use);
-
-                if !used_symbol? then
-                    _logger.error(u.`use.location, "used identifier {u.`use} is not defined ");
-                    continue;
                 fi
 
-                let use_name mut = used_symbol.name;
-
-                if u.name? /\ u.name.name? then
-                    use_name = u.name.name;
-                fi
-                
-                if isa Semantic.Symbols.NAMESPACE(used_symbol) then
-                    _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol);
-
-                    if namespace_scope.contains_used_symbol(use_name) then
-                        if u.name? then
-                            _logger.error(u.name.location, "duplicate use");                        
-                        else
-                            _logger.error(u.`use.location, "duplicate use");                        
-                        fi
-                    elif u.name? then
-                        namespace_scope.add(u.name.name, used_symbol);
-                    else
-                        namespace_scope.add(used_symbol);
-                    fi
-                elif used_symbol.is_function_group then
-                    let fg = cast Semantic.Symbols.FUNCTION_GROUP?(used_symbol)!;
-
-                    if !fg.functions | .any(f => !f.is_instance) then
-                        if fg.functions.count == 1 then
-                            _logger.error(u.`use.location, "cannot use instance function");                            
-                        else
-                            _logger.error(u.`use.location, "cannot use function group comprising only instance functions");
-                        fi
-                    fi
-
-                    _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol.collapse_group_if_single_member());
-
-                    let existing_used_symbol = namespace_scope.get_used_symbol(use_name);
-
-                    let use_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
-                   
-                    if existing_used_symbol? then
-                        use_function_group = cast Semantic.Symbols.FUNCTION_GROUP?(existing_used_symbol)!;
-                    else
-                        use_function_group = Semantic.Symbols.FUNCTION_GROUP(LOCATION.unknown, namespace_scope, use_name);
-                        namespace_scope.add(use_name, use_function_group);
-                    fi
-
-                    use_function_group.add(fg);                    
-                elif !used_symbol.is_instance then
-                    if namespace_scope.contains_used_symbol(use_name) then
-                        if u.name? then
-                            _logger.error(u.name.location, "duplicate use");
-                        else
-                            _logger.error(u.`use.location, "duplicate use");
-                        fi
-                    else
-                        _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol);
-                        namespace_scope.add(use_name, used_symbol);
-                    fi
-                else
-                    _logger.error(u.`use.location, "cannot use instance member");
+                if !_resolve_use(u, namespace_scope, false) then
+                    _pending_uses.add((u, namespace_scope));
                 fi
             od
             return false;
@@ -107,6 +51,119 @@ namespace Syntax.Process is
 
         visit(`namespace: Definitions.NAMESPACE) is
             leave_namespace(`namespace.name);
+        si
+
+        // Retry the parked use clauses, re-parking any that still do not
+        // resolve unless final is set, in which case they report. Returns
+        // true when at least one clause left the parked set - the signal
+        // the caller's retry loop uses to decide whether another round
+        // could resolve more.
+        resolve_deferred_uses(final: bool) -> bool is
+            if _pending_uses.count == 0 then
+                return false;
+            fi
+
+            let pending = _pending_uses;
+            _pending_uses = Collections.LIST[(clause: Definitions.USE, scope: Semantic.NAMESPACE_SCOPE)]();
+
+            let progressed mut = false;
+
+            for p in pending do
+                let mark = mark_scope_stack();
+
+                try
+                    enter_scope(p.scope);
+
+                    if _resolve_use(p.clause, p.scope, final) then
+                        progressed = true;
+                    else
+                        _pending_uses.add(p);
+                    fi
+                finally
+                    release_scope_stack(mark);
+                yrt
+            od
+
+            return progressed;
+        si
+
+        // Resolves one use clause into its namespace block's scope.
+        // Returns false when the used name cannot be found and final is
+        // unset - the caller parks the clause for retry. A successful
+        // import or a definitive error returns true.
+        _resolve_use(u: Definitions.USE, namespace_scope: Semantic.NAMESPACE_SCOPE, final: bool) -> bool is
+            let used_symbol = find_enclosing(u.`use);
+
+            if !used_symbol? then
+                if !final then
+                    return false;
+                fi
+
+                _logger.error(u.`use.location, "used identifier {u.`use} is not defined ");
+                return true;
+            fi
+
+            let use_name mut = used_symbol.name;
+
+            if u.name? /\ u.name.name? then
+                use_name = u.name.name;
+            fi
+
+            if isa Semantic.Symbols.NAMESPACE(used_symbol) then
+                _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol);
+
+                if namespace_scope.contains_used_symbol(use_name) then
+                    if u.name? then
+                        _logger.error(u.name.location, "duplicate use");
+                    else
+                        _logger.error(u.`use.location, "duplicate use");
+                    fi
+                elif u.name? then
+                    namespace_scope.add(u.name.name, used_symbol);
+                else
+                    namespace_scope.add(used_symbol);
+                fi
+            elif used_symbol.is_function_group then
+                let fg = cast Semantic.Symbols.FUNCTION_GROUP?(used_symbol)!;
+
+                if !fg.functions | .any(f => !f.is_instance) then
+                    if fg.functions.count == 1 then
+                        _logger.error(u.`use.location, "cannot use instance function");
+                    else
+                        _logger.error(u.`use.location, "cannot use function group comprising only instance functions");
+                    fi
+                fi
+
+                _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol.collapse_group_if_single_member());
+
+                let existing_used_symbol = namespace_scope.get_used_symbol(use_name);
+
+                let use_function_group: Semantic.Symbols.FUNCTION_GROUP mut;
+
+                if existing_used_symbol? then
+                    use_function_group = cast Semantic.Symbols.FUNCTION_GROUP?(existing_used_symbol)!;
+                else
+                    use_function_group = Semantic.Symbols.FUNCTION_GROUP(LOCATION.unknown, namespace_scope, use_name);
+                    namespace_scope.add(use_name, use_function_group);
+                fi
+
+                use_function_group.add(fg);
+            elif !used_symbol.is_instance then
+                if namespace_scope.contains_used_symbol(use_name) then
+                    if u.name? then
+                        _logger.error(u.name.location, "duplicate use");
+                    else
+                        _logger.error(u.`use.location, "duplicate use");
+                    fi
+                else
+                    _symbol_use_locations.add_symbol_use(u.`use.right_location, used_symbol);
+                    namespace_scope.add(use_name, used_symbol);
+                fi
+            else
+                _logger.error(u.`use.location, "cannot use instance member");
+            fi
+
+            return true;
         si
     si
 si
