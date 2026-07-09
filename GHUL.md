@@ -677,10 +677,10 @@ fi
 
 A failure at any clause's test or guard short-circuits straight to the next `elif`/`else` arm — earlier clauses' variables then aren't in scope.
 
-When the tested value is a member path and the variable should simply take the path's last name, the `name =` can be omitted: `if let x.y.z?` declares `z`, holding the tested value, and `if let path: T` does the same with a type test. The shorthand composes with guards, comma-chained clauses, and `while let` exactly like the full form:
+When the tested value is a member path and the variable should simply take the path's last name, the `name =` can be omitted: `if let x.y.z` declares `z`, holding the value, refutable on the path's own optionality exactly as the full form `if let z = x.y.z` would be. `if let path: T` does the same with a type test. The shorthand composes with guards, comma-chained clauses, and `while let` exactly like the full form:
 
 ```ghul
-if let order.customer? then
+if let order.customer then
     write_line("customer: {customer.name}");     // customer = order.customer
 fi
 
@@ -688,7 +688,7 @@ if let zoo.pet: Cat /\ pet.is_friendly then
     write_line("{pet.name} says meow");
 fi
 
-while let queue.head? do
+while let queue.head do
     process(head);
 od
 ```
