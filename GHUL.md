@@ -14,7 +14,15 @@ ghūl keywords are lowercase. Identifiers follow a convention that the compiler 
 - `PascalCase` — namespaces, traits, abstract classes, unions, enums
 - `UPPER_SNAKE_CASE` — concrete classes, structs, variants, enum members
 
-A leading underscore (`_name`) marks a name as non-public. For methods and properties this is enforced. There are no `public`/`private` keywords; the naming convention carries that information.
+A leading underscore (`_name`) marks a member or type as non-public — there are no `public`/`private` keywords, the naming convention carries that information. By default an underscore-prefixed method, field, property or type is **private**: reachable only from its own declaring class, and hidden from other assemblies (emitted with `assembly` IL accessibility, so nothing outside the assembly can see it). Because those members are still reachable within the assembly at the IL level, an out-of-policy reference is reported as an error but the access is allowed through, so the diagnostic never cascades.
+
+The default is chosen with a compiler flag:
+
+- `--underscore-access private` (the default) — an underscore member is visible only to its declaring class.
+- `--underscore-access protected` — widens that to the declaring class and its subclasses within the same assembly.
+- `--underscore-access legacy` — the historic behaviour: underscore methods and types are emitted public, underscore fields `assembly`, with no compile-time access enforcement.
+
+Underscore global functions and variables have no meaningful declaring-class privacy, so they are simply assembly-internal (hidden from other assemblies) under `private`/`protected`.
 
 The compiler warns when a ghūl-source declaration doesn't match the convention for its kind. Each rule has its own slug, suppressible per declaration, per file, or project-wide:
 
