@@ -28,6 +28,8 @@ namespace Analysis.Profiler is
         _stats: STATS;
         compile_diagnostics: int public;
 
+        _cool_counter: int;
+
         init(analyser: ANALYSER_PROCESS, corpus: CORPUS, quick: bool) is
             _analyser = analyser;
             _corpus = corpus;
@@ -71,7 +73,76 @@ namespace Analysis.Profiler is
                 fi
             od
 
+            _log("no-result hover probe");
+            _no_result_probe();
+
             _log("workload complete");
+        si
+
+        // Does a hover at a position that has NO recorded hover-use (an
+        // identifier-shaped token that is a keyword, a declaration name, or
+        // otherwise unresolved) trigger the expensive compile_all fallback?
+        // Measures resolvable vs no-result hovers on a warm project, and how
+        // many identifier positions fall in each bucket.
+        _no_result_probe() is
+            let files mut = 3;
+            let per_kind mut = 10;
+
+            if _quick then
+                files = 2;
+                per_kind = 4;
+            fi
+
+            let resolvable_total mut = 0;
+            let no_result_total mut = 0;
+
+            for f in _corpus.sample(files) do
+                _analyser.send_compile();
+
+                let warm = _analyser.read_response();
+
+                let real = _harvest_hover_positions(f.path);
+
+                let real_keys = Collections.SET[int]();
+
+                for p in real do
+                    real_keys.add(p.line * 100000 + p.column);
+                od
+
+                let scanned = QUERY_POSITIONS.scan(f.source);
+
+                let misses = Collections.LIST[POSITION]();
+
+                for p in scanned.identifiers do
+                    if !real_keys.contains(p.line * 100000 + p.column) then
+                        misses.add(p);
+                    fi
+                od
+
+                resolvable_total = resolvable_total + real.count;
+                no_result_total = no_result_total + misses.count;
+
+                for p in QUERY_POSITIONS.sample(real, per_kind) do
+                    _time_labelled_hover(f.path, p, "HOVER — resolvable position");
+                od
+
+                for p in QUERY_POSITIONS.sample(misses, per_kind) do
+                    _time_labelled_hover(f.path, p, "HOVER — no-result position");
+                od
+            od
+
+            Std.error.write_line(
+                "[profiler] identifier positions: {resolvable_total} resolvable, "
+                "{no_result_total} no-result "
+                "({(resolvable_total * 100) / (resolvable_total + no_result_total)}% resolvable)"
+            );
+        si
+
+        _time_labelled_hover(path: string, p: POSITION, key: string) is
+            let started = System.DateTime.now;
+            _analyser.send_hover(path, p.line, p.column);
+            let response = _analyser.read_query_response();
+            _stats[key].record(_elapsed_ms(started));
         si
 
         _min_seconds() -> double static is
@@ -193,39 +264,127 @@ namespace Analysis.Profiler is
                 completions = 2;
             fi
 
+            let warm_rate = _warm_rate();
+            let warm_credit mut = 0.0D;
+
             for f in _corpus.sample(files) do
-                let positions = QUERY_POSITIONS.scan(f.source);
+                // Warm the file, then harvest the positions the analyser actually
+                // records a hover for — the symbols a real user would hover, not
+                // every identifier-shaped character (keywords, declaration names)
+                // the syntactic scan would pick. Hovering a non-symbol always
+                // misses and forces a useless compile_all, which is not a cost a
+                // real user hovering a real symbol pays.
+                _cool_cross_file_map();
 
-                for p in QUERY_POSITIONS.sample(positions.identifiers, per_kind) do
-                    _time_hover(f.path, p);
+                _analyser.send_compile();
+
+                let warm_compile_response = _analyser.read_response();
+
+                let hover_positions = _harvest_hover_positions(f.path);
+                let scanned = QUERY_POSITIONS.scan(f.source);
+
+                // The debounced COMPILE has completed before the user hovers
+                // some, but not all, of the time. Warm: the file is still compiled
+                // from the harvest above, so hovers are cache hits. Cold: re-cool
+                // without compiling, so the first hover pays the compile_all
+                // fallback (after which the file is warm again).
+                warm_credit = warm_credit + warm_rate;
+
+                let warm = warm_credit >= 1.0D;
+
+                if warm then
+                    warm_credit = warm_credit - 1.0D;
+                else
+                    _cool_cross_file_map();
+                fi
+
+                let suffix = if warm then " (warm)" else " (cold)" fi;
+
+                for p in QUERY_POSITIONS.sample(hover_positions, per_kind) do
+                    _time_hover(f.path, p, suffix);
                 od
 
-                for p in QUERY_POSITIONS.sample(positions.identifiers, per_kind) do
-                    _time_definition(f.path, p);
+                for p in QUERY_POSITIONS.sample(hover_positions, per_kind) do
+                    _time_definition(f.path, p, suffix);
                 od
 
-                for p in QUERY_POSITIONS.sample(positions.member_accesses, completions) do
+                for p in QUERY_POSITIONS.sample(scanned.member_accesses, completions) do
                     _time_completion(f.path, p);
                 od
 
-                for p in QUERY_POSITIONS.sample(positions.call_arguments, completions) do
+                for p in QUERY_POSITIONS.sample(scanned.call_arguments, completions) do
                     _time_signature(f.path, p);
                 od
             od
         si
 
-        _time_hover(path: string, p: POSITION) is
+        // The positions the analyser actually recorded a hover for in `path`,
+        // harvested via HOVER_MAP (which requires the file be compiled first).
+        _harvest_hover_positions(path: string) -> Collections.LIST[POSITION] is
+            let result = Collections.LIST[POSITION]();
+
+            _analyser.send_hover_map(path);
+
+            let response = _analyser.read_response();
+
+            if isa Response.HOVER_MAP(response) then
+                for entry in response.entries do
+                    result.add(POSITION(entry.start_line, entry.start_column));
+                od
+            fi
+
+            return result;
+        si
+
+        // Send an interface-affecting edit to a probe file so every other file's
+        // cross-file use map goes cold — the state a real editing session sits in
+        // until the debounced COMPILE catches up.
+        _cool_cross_file_map() is
+            _cool_counter = _cool_counter + 1;
+
+            for probe in _corpus.sample(1) do
+                let mutated =
+                    "{probe.source}\n"
+                    "namespace ProfilerProbe is\n"
+                    "    cool_{_cool_counter}() is si\n"
+                    "si\n";
+
+                _analyser.send_edit(probe.path, mutated);
+
+                let edit_response = _analyser.read_response();
+            od
+        si
+
+        // Fraction of query files for which the debounced COMPILE has completed
+        // before the user hovers. Tunable via PROFILE_WARM_RATE; default 0.7.
+        _warm_rate() -> double static is
+            let raw = System.Environment.get_environment_variable("PROFILE_WARM_RATE");
+
+            if string.is_null_or_white_space(raw) then
+                return 0.7D;
+            fi
+
+            let result mut = 0.0D;
+
+            if double.try_parse(raw, result ref) then
+                return result;
+            fi
+
+            return 0.7D;
+        si
+
+        _time_hover(path: string, p: POSITION, suffix: string) is
             let started = System.DateTime.now;
             _analyser.send_hover(path, p.line, p.column);
             let response = _analyser.read_query_response();
-            _stats["HOVER — query"].record(_elapsed_ms(started));
+            _stats["HOVER — query{suffix}"].record(_elapsed_ms(started));
         si
 
-        _time_definition(path: string, p: POSITION) is
+        _time_definition(path: string, p: POSITION, suffix: string) is
             let started = System.DateTime.now;
             _analyser.send_definition(path, p.line, p.column);
             let response = _analyser.read_query_response();
-            _stats["DEFINITION — query"].record(_elapsed_ms(started));
+            _stats["DEFINITION — query{suffix}"].record(_elapsed_ms(started));
         si
 
         _time_completion(path: string, p: POSITION) is
