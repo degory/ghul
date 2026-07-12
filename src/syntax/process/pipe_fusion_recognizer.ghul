@@ -32,9 +32,19 @@ namespace Syntax.Process is
     // built either - and applies `stages` inline per element. `stages`
     // are outermost-first (the order they wrap the source), so inline
     // application walks them in reverse.
-    class PIPE_FUSION(source: Trees.Expressions.Expression, stages_outermost_first: LIST[PIPE_FUSION_STAGE]) is
+    class PIPE_FUSION(source: Trees.Expressions.Expression, stages_outermost_first: LIST[PIPE_FUSION_STAGE], needs_guard: bool) is
         source: Trees.Expressions.Expression public;
         stages_outermost_first: LIST[PIPE_FUSION_STAGE] public;
+
+        // True when the source's dynamic type could be a user Pipe with an
+        // overridden map/filter (any non-sealed source - it is only
+        // statically not a Pipe). The fused loop is then emitted behind a
+        // per-site `if source isa Pipe[elem]` guard that mirrors what
+        // pipe() itself does (pipe.ghul: `elif isa Pipe[T](source)`): guard
+        // true falls back to the ordinary pipe-object loop, guard false
+        // fuses. False for sealed sources (value types, arrays) which
+        // cannot dynamically be a Pipe, so fuse unconditionally.
+        needs_guard: bool public;
 
         // The source's own iterator members, resolved against its type
         // exactly as a plain `for x in source` would. read_iterator is
@@ -44,6 +54,13 @@ namespace Syntax.Process is
         source_read_iterator: Semantic.Symbols.Function? public;
         source_move_next: Semantic.Symbols.Function? public;
         source_read_current: Semantic.Symbols.Function? public;
+
+        // The `Pipe[source-element]` type the runtime guard tests the
+        // source against (`source isa Pipe[T]`). T is the SOURCE's own
+        // element type - the same T `pipe()` uses when it decides whether
+        // to short-circuit - so guard and pipe() always agree. Filled by
+        // compile-expressions only when `needs_guard`.
+        guard_isa_type: Semantic.Types.Type? public;
     si
 
     // Decides whether a `for x in <chain>` loop's expression is a
@@ -53,22 +70,29 @@ namespace Syntax.Process is
     // Soundness: Pipe[T] is a trait with virtual `map`/`filter`, so a
     // user type implementing Pipe may override them. Static resolution
     // to Pipe.map is not enough — the `callvirt` dispatches on the
-    // receiver's dynamic type. The chain is only fused when its BASE is
-    // pinned to a type that provably uses the default `map`/`filter`;
-    // an induction over the closed-to-assembly built-in pipe classes
-    // then secures every downstream stage (each stage's receiver is a
-    // value freshly produced by an already-pinned default op returning
-    // a closed built-in pipe). See docs/claude/pipe-fusion.md.
+    // receiver's dynamic type. The chain is only fused when its BASE
+    // provably uses the default `map`/`filter`; an induction over the
+    // closed-to-assembly built-in pipe classes then secures every
+    // downstream stage (each stage's receiver is a value freshly produced
+    // by an already-pinned default op returning a closed built-in pipe).
+    // See docs/claude/pipe-fusion.md.
     //
     // The base must be a `pipe(SOURCE)` wrap (the postfix `|` operator,
-    // carrying `is_pipe_wrap`) whose SOURCE is pinned: a value type or
-    // an array that does not itself implement Pipe. Such a source has a
-    // sealed dynamic type that is exactly its static type, so it cannot
-    // be a user pipe with an override, and `pipe()` cannot short-circuit
-    // to it - it wraps it in the built-in (closed) ADAPTOR_PIPE (which
-    // the fused loop then skips by iterating SOURCE directly). Closed
-    // ghūl-class sources could pin similarly but need a closed-subclass
-    // Pipe check and are not admitted yet.
+    // carrying `is_pipe_wrap`) whose SOURCE is not itself statically a
+    // Pipe. Two cases:
+    //
+    // - SOURCE is sealed (a value type or an array): its dynamic type is
+    //   exactly its static type, so it cannot secretly be a user pipe with
+    //   an override. `pipe()` provably wraps it in the built-in (closed)
+    //   ADAPTOR_PIPE, and the fused loop skips even that by iterating
+    //   SOURCE directly. Fuse unconditionally (`needs_guard` false).
+    //
+    // - SOURCE is any other type (a collection interface, an open class):
+    //   it is only *statically* not a Pipe - its dynamic type could be a
+    //   user Pipe with an override. Fuse behind a per-site runtime guard
+    //   `if SOURCE isa Pipe[elem]` (`needs_guard` true), sound because it
+    //   mirrors pipe()'s own short-circuit test. Requires SOURCE to be
+    //   store-free so the guard can evaluate it more than once.
     class PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup) is
         recognize(`for: Trees.Statements.FOR) -> PIPE_FUSION? is
             let pipe_type = _innate_symbol_lookup.get_unspecialized_pipe_type();
@@ -125,34 +149,22 @@ namespace Syntax.Process is
                 return null;
             fi
 
-            let source = _pinned_source(current, pipe_type);
-
-            if !source? then
+            // The base must be a `pipe(SOURCE)` wrap.
+            if !isa Trees.Expressions.CALL(current) then
                 return null;
             fi
 
-            return PIPE_FUSION(source, stages);
-        si
+            let base_call = cast Trees.Expressions.CALL(current);
 
-        // If `expression` is a `pipe(SOURCE)` wrap whose SOURCE is
-        // pinned (a value type or an array that is not itself a Pipe),
-        // return SOURCE; otherwise null.
-        _pinned_source(expression: Trees.Expressions.Expression, pipe_type: Types.Type) -> Trees.Expressions.Expression? is
-            if !isa Trees.Expressions.CALL(expression) then
+            if !base_call.is_pipe_wrap then
                 return null;
             fi
 
-            let call = cast Trees.Expressions.CALL(expression);
-
-            if !call.is_pipe_wrap then
+            if base_call.arguments.expressions.count != 1 then
                 return null;
             fi
 
-            if call.arguments.expressions.count != 1 then
-                return null;
-            fi
-
-            let source = call.arguments.expressions[0];
+            let source = base_call.arguments.expressions[0];
             let source_value = source.value;
 
             if !source_value? \/ !source_value.type? then
@@ -161,15 +173,33 @@ namespace Syntax.Process is
 
             let source_type = source_value.type!;
 
-            if !(source_type.is_value_type \/ isa Semantic.Types.ARRAY(source_type)) then
-                return null;
-            fi
-
+            // Statically a Pipe: pipe() short-circuits to SOURCE and runs
+            // its (possibly overridden) map/filter, so a runtime guard
+            // would always take the fallback. No point fusing.
             if _is_pipe_type(source_type, pipe_type) then
                 return null;
             fi
 
-            return source;
+            // Sealed sources (value types, arrays) have a dynamic type that
+            // is exactly their static type, so they cannot secretly be a
+            // user Pipe with an override - fuse unconditionally. Any other
+            // source could be a Pipe at run time, so fuse behind a runtime
+            // guard, but only when re-evaluating SOURCE is safe (the guard
+            // reads it once for the `isa` test and once for iteration).
+            let is_sealed = source_type.is_value_type \/ isa Semantic.Types.ARRAY(source_type);
+            let needs_guard = !is_sealed;
+
+            // The guarded loop re-emits SOURCE's value (once for the `isa`
+            // test, again for iteration), so its IR must be safe to emit
+            // more than once: store-free (no repeated side effect) and not
+            // a BLOCK (the one single-shot IR value - `is_emitted` aborts a
+            // second gen). Real sources are plain field/local loads, which
+            // satisfy both.
+            if needs_guard /\ (source_value.is_state_changing_call \/ isa IR.Values.BLOCK(source_value)) then
+                return null;
+            fi
+
+            return PIPE_FUSION(source, stages, needs_guard);
         si
 
         _is_pipe_expression(expression: Trees.Expressions.Expression, pipe_type: Types.Type) -> bool is
