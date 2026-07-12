@@ -4855,6 +4855,26 @@ namespace Syntax.Process is
         si
 
         visit(`for: Statements.FOR) is
+            // A recognised, fusible Pipe[T] chain is lowered to one
+            // inline loop over the pinned base, applying the map/filter
+            // stages per element, instead of iterating the built pipe
+            // objects. Not in a state machine, whose iterator must live
+            // on the frame to survive yield/await re-entry - those fall
+            // through to the normal loop below.
+            if
+                `for.fusion? /\
+                !Semantic.Symbols.state_machine_for(current_function)? /\
+                !Semantic.Symbols.async_state_machine_for(current_function)?
+            then
+                if `for.fusion!.needs_guard then
+                    _visit_guarded_for(`for);
+                else
+                    _visit_fused_for(`for);
+                fi
+
+                return;
+            fi
+
             let brancher = get_brancher_for_block();
             let loop = _loops.enter_loop();
 
@@ -4947,6 +4967,349 @@ namespace Syntax.Process is
             brancher.branch(loop.start);
 
             brancher.label(loop.end);
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+        // Lower a recognised fusible Pipe[T] chain to a single loop:
+        // drive the pinned base's own iterator, apply each map/filter
+        // stage inline per element (map assigns a temp, filter skips to
+        // the next element), then bind the loop variable and run the
+        // body. The built MAP_PIPE / FilterPipe objects and their
+        // per-element virtual dispatch are never emitted.
+        _visit_fused_for(`for: Statements.FOR) is
+            let fusion = `for.fusion!;
+            let source = fusion.source;
+            let variable = `for.variable!;
+            let body = `for.body!;
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            // Iterate the source directly - the wrapping pipe objects are
+            // never built. read_iterator is null when the source is its
+            // own iterator (e.g. a range).
+            let iterator: Value mut;
+
+            if fusion.source_read_iterator? then
+                iterator = fusion.source_read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller);
+            else
+                iterator = source.value!;
+            fi
+
+            variable.walk(self);
+
+            let temp = TEMP(current_block, "fused_iterator", iterator);
+
+            // Per-stage setup: an inlined stage needs a slot for its
+            // parameter local; a delegate stage hoists its function value
+            // into a local so the delegate is built once, not per element.
+            let stage_delegates = Collections.LIST[TEMP?]();
+
+            for stage in fusion.stages_outermost_first do
+                if stage.is_inlined then
+                    add(".locals init ({stage.param_local!.type!.get_il_type()} {stage.param_local!.il_name})");
+                    stage_delegates.add(null);
+                else
+                    stage_delegates.add(TEMP(current_block, "fused_stage", stage.argument.value!));
+                fi
+            od
+
+            brancher.label(loop.start);
+
+            let has_next = fusion.source_move_next!.call(source.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let element = fusion.source_read_current!.call(source.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            // Stages wrap the source outermost-first, so a pull applies
+            // them innermost-first — walk the list in reverse.
+            let current_value: Value mut = element;
+
+            let index mut = fusion.stages_outermost_first.count - 1;
+
+            while index >= 0 do
+                let stage = fusion.stages_outermost_first[index];
+
+                let stage_result: Value mut;
+
+                if stage.is_inlined then
+                    // Assign the incoming element to the parameter local;
+                    // the pre-harvested body IR reads it (and any captured
+                    // outer locals) as ordinary locals - no delegate, no
+                    // frame.
+                    add(IR.Values.Store.LOCAL_VARIABLE(stage.param_local!, current_value));
+
+                    stage_result = stage.inline_body!;
+                else
+                    let delegate = stage_delegates[index]!.load();
+                    let func_type = stage.argument.value!.type!;
+
+                    let result_type =
+                        if func_type.is_action then
+                            _innate_symbol_lookup.get_void_type();
+                        else
+                            func_type.arguments[func_type.arguments.count - 1];
+                        fi;
+
+                    let call_arguments = Collections.LIST[Value]();
+                    call_arguments.add(current_value);
+
+                    stage_result = IR.Values.Call.CLOSURE(delegate, result_type, func_type.is_action, func_type, call_arguments);
+                fi
+
+                if stage.is_filter then
+                    // Rejected elements skip straight to the next pull.
+                    brancher.branch(BRANCH.Z, stage_result, loop.start);
+                else
+                    current_value = TEMP(current_block, "fused_mapped", stage_result).load();
+                fi
+
+                index = index - 1;
+            od
+
+            gen_destructuring_initialize(variable.left, current_value);
+
+            // Emit any anonymous-function bodies in the chain (the
+            // map/filter lambdas, plus anything inside the source).
+            // Walking these nodes emits the nested closure method bodies
+            // without emitting the pipe-construction IL itself.
+            source.walk(self);
+
+            for stage in fusion.stages_outermost_first do
+                stage.argument.walk(self);
+            od
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+        // Lower a fusible chain whose source could dynamically be a user
+        // Pipe with an overridden map/filter (any non-sealed source). The
+        // chain is fused behind a per-site guard that tests the source the
+        // same way pipe() does: `source isa Pipe[element]` true means
+        // pipe() would short-circuit to the source and run its own
+        // map/filter, so take the ordinary pipe-object loop; false means
+        // pipe() wraps the source in the built-in default pipe, so the
+        // fused loop is equivalent. Guard and pipe() agree by construction,
+        // so this is sound with no runtime-library change.
+        //
+        // Both paths share ONE copy of the loop body: generate_il emits
+        // precomputed IR and IR.Values.BLOCK is single-shot, so a
+        // val-block in the body could not be walked twice. Instead a
+        // loop-invariant `use_fused` flag selects the advance mechanism per
+        // element (a perfectly predictable branch). Never reached inside a
+        // state machine - visit(FOR)'s dispatch keeps generator/async loops
+        // on the normal lowering, whose iterator lives on the frame to
+        // survive yield/await.
+        _visit_guarded_for(`for: Statements.FOR) is
+            let fusion = `for.fusion!;
+            let source = fusion.source;
+            let variable = `for.variable!;
+            let body = `for.body!;
+            let expression = `for.expression!;
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            let bool_type = _innate_symbol_lookup.get_bool_type();
+            let element_type = `for.read_current!.return_type!;
+
+            variable.walk(self);
+
+            // Shared mutable locals, declared once before the guard branch.
+            // `use_fused` is set once (loop-invariant); `element_slot`
+            // carries the per-element value into the shared bind + body.
+            let use_fused = TEMP(current_block, "guard_use_fused", bool_type);
+            let element_slot = TEMP(current_block, "guard_element", element_type);
+
+            // Fallback iterator (the built pipe chain's) and fused iterator
+            // (the source's own). Each is stored in only one branch; the
+            // other stays default and is never read on that path.
+            let pipe_iterator_type =
+                if `for.read_iterator? then
+                    `for.read_iterator.return_type!
+                else
+                    expression.value!.type!
+                fi;
+
+            let source_iterator_type =
+                if fusion.source_read_iterator? then
+                    fusion.source_read_iterator.return_type!
+                else
+                    source.value!.type!
+                fi;
+
+            let pipe_iterator = TEMP(current_block, "guard_pipe_iterator", pipe_iterator_type);
+            let source_iterator = TEMP(current_block, "guard_source_iterator", source_iterator_type);
+
+            // Per-stage setup for the fused path: an inlined stage needs a
+            // slot for its parameter local; a delegate stage hoists its
+            // function value into a local so the delegate is built once.
+            let stage_delegates = Collections.LIST[TEMP?]();
+
+            for stage in fusion.stages_outermost_first do
+                if stage.is_inlined then
+                    add(".locals init ({stage.param_local!.type!.get_il_type()} {stage.param_local!.il_name})");
+                    stage_delegates.add(null);
+                else
+                    stage_delegates.add(TEMP(current_block, "guard_stage", stage.argument.value!.type!));
+                fi
+            od
+
+            let fused_setup = LABEL();
+            let after_setup = LABEL();
+
+            // if source isa Pipe[element] then fall back else fuse.
+            let is_pipe = cast Value(IR.Values.ISA(bool_type, fusion.guard_isa_type!, source.value!));
+
+            brancher.branch(BRANCH.Z, is_pipe, fused_setup, "pipe-guard");
+
+            // Fallback setup: build the pipe chain and iterate it, exactly
+            // as the normal for loop would.
+            use_fused.store(Literal.NUMBER("0", bool_type, "i4"));
+
+            let pipe_iterator_value =
+                if `for.read_iterator? then
+                    `for.read_iterator.call(expression.location, expression.value!, Collections.LIST[Value](0), null, _function_caller)
+                else
+                    expression.value!
+                fi;
+
+            pipe_iterator.store(pipe_iterator_value);
+
+            brancher.branch(after_setup);
+
+            // Fused setup: drive the source's own iterator directly - the
+            // pipe objects are never built.
+            brancher.label(fused_setup);
+
+            use_fused.store(Literal.NUMBER("1", bool_type, "i4"));
+
+            let source_iterator_value =
+                if fusion.source_read_iterator? then
+                    fusion.source_read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller)
+                else
+                    source.value!
+                fi;
+
+            source_iterator.store(source_iterator_value);
+
+            let setup_index mut = 0;
+            while setup_index < fusion.stages_outermost_first.count do
+                let stage = fusion.stages_outermost_first[setup_index];
+
+                if !stage.is_inlined then
+                    stage_delegates[setup_index]!.store(stage.argument.value!);
+                fi
+
+                setup_index = setup_index + 1;
+            od
+
+            brancher.label(after_setup);
+
+            // --- Merged loop over one shared body. ---
+            brancher.label(loop.start);
+
+            let fused_advance = LABEL();
+            let bind = LABEL();
+
+            brancher.branch(BRANCH.NZ, use_fused.load(), fused_advance, "use-fused");
+
+            // Fallback advance: pull from the pipe chain's iterator.
+            let fallback_has_next = `for.move_next!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, fallback_has_next, loop.end);
+
+            let fallback_current = `for.read_current!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            element_slot.store(fallback_current);
+
+            brancher.branch(bind);
+
+            // Fused advance: pull from the source, apply stages inline.
+            brancher.label(fused_advance);
+
+            let has_next = fusion.source_move_next!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let element = fusion.source_read_current!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            // Stages wrap the source outermost-first, so pull applies them
+            // innermost-first - walk the list in reverse.
+            let current_value: Value mut = element;
+
+            let index mut = fusion.stages_outermost_first.count - 1;
+
+            while index >= 0 do
+                let stage = fusion.stages_outermost_first[index];
+
+                let stage_result: Value mut;
+
+                if stage.is_inlined then
+                    add(IR.Values.Store.LOCAL_VARIABLE(stage.param_local!, current_value));
+
+                    stage_result = stage.inline_body!;
+                else
+                    let delegate = stage_delegates[index]!.load();
+                    let func_type = stage.argument.value!.type!;
+
+                    let result_type =
+                        if func_type.is_action then
+                            _innate_symbol_lookup.get_void_type();
+                        else
+                            func_type.arguments[func_type.arguments.count - 1];
+                        fi;
+
+                    let call_arguments = Collections.LIST[Value]();
+                    call_arguments.add(current_value);
+
+                    stage_result = IR.Values.Call.CLOSURE(delegate, result_type, func_type.is_action, func_type, call_arguments);
+                fi
+
+                if stage.is_filter then
+                    // Rejected elements skip straight to the next pull.
+                    brancher.branch(BRANCH.Z, stage_result, loop.start);
+                else
+                    current_value = TEMP(current_block, "guard_mapped", stage_result).load();
+                fi
+
+                index = index - 1;
+            od
+
+            element_slot.store(current_value);
+
+            // --- Shared bind + body (walked once). ---
+            brancher.label(bind);
+
+            gen_destructuring_initialize(variable.left, element_slot.load());
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            // Emit the nested closure method bodies (the map/filter lambdas
+            // and anything inside the source) exactly once. The fallback
+            // path's pipe chain and the fused path's delegate temps both
+            // reference these methods; a second walk would redefine them.
+            source.walk(self);
+
+            for stage in fusion.stages_outermost_first do
+                stage.argument.walk(self);
+            od
 
             super.visit(`for);
 

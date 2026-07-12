@@ -1,0 +1,234 @@
+namespace Syntax.Process is
+    use Collections;
+
+    use Semantic;
+
+    // One stage of a recognised pipe chain. `is_filter` false means a
+    // `map`. `argument` is the stage's function-typed argument (the
+    // `map`/`filter` lambda or delegate).
+    //
+    // When the argument is an inlinable literal lambda, compile-
+    // expressions fills `param_local` (a synthetic enclosing-method
+    // local the loop assigns the incoming element to) and `inline_body`
+    // (the lambda body re-walked in the enclosing scope, so its
+    // parameter loads that local and its captures load ordinary
+    // enclosing locals - no delegate, no closure frame). When both are
+    // set the loop emits the body inline; otherwise it invokes the
+    // argument's compiled delegate value.
+    class PIPE_FUSION_STAGE(is_filter: bool, argument: Trees.Expressions.Expression) is
+        is_filter: bool public;
+        argument: Trees.Expressions.Expression public;
+
+        param_local: Semantic.Symbols.Variable? public;
+        inline_body: IR.Values.Value? public;
+
+        is_inlined: bool => param_local? /\ inline_body?;
+    si
+
+    // A recognised, provably-sound fusible pipe chain rooted at a `for`
+    // loop. `source` is the pinned iterable fed to the base `pipe(...)`
+    // wrap (see the soundness gate in PIPE_FUSION_RECOGNIZER); the fused
+    // loop iterates it directly - so the wrapping ADAPTOR_PIPE is never
+    // built either - and applies `stages` inline per element. `stages`
+    // are outermost-first (the order they wrap the source), so inline
+    // application walks them in reverse.
+    class PIPE_FUSION(source: Trees.Expressions.Expression, stages_outermost_first: LIST[PIPE_FUSION_STAGE], needs_guard: bool) is
+        source: Trees.Expressions.Expression public;
+        stages_outermost_first: LIST[PIPE_FUSION_STAGE] public;
+
+        // True when the source's dynamic type could be a user Pipe with an
+        // overridden map/filter (any non-sealed source - it is only
+        // statically not a Pipe). The fused loop is then emitted behind a
+        // per-site `if source isa Pipe[elem]` guard that mirrors what
+        // pipe() itself does (pipe.ghul: `elif isa Pipe[T](source)`): guard
+        // true falls back to the ordinary pipe-object loop, guard false
+        // fuses. False for sealed sources (value types, arrays) which
+        // cannot dynamically be a Pipe, so fuse unconditionally.
+        needs_guard: bool public;
+
+        // The source's own iterator members, resolved against its type
+        // exactly as a plain `for x in source` would. read_iterator is
+        // null when the source is directly an iterator (e.g. a range);
+        // otherwise it yields the iterator that move_next / read_current
+        // drive. Filled by compile-expressions after recognition.
+        source_read_iterator: Semantic.Symbols.Function? public;
+        source_move_next: Semantic.Symbols.Function? public;
+        source_read_current: Semantic.Symbols.Function? public;
+
+        // The `Pipe[source-element]` type the runtime guard tests the
+        // source against (`source isa Pipe[T]`). T is the SOURCE's own
+        // element type - the same T `pipe()` uses when it decides whether
+        // to short-circuit - so guard and pipe() always agree. Filled by
+        // compile-expressions only when `needs_guard`.
+        guard_isa_type: Semantic.Types.Type? public;
+    si
+
+    // Decides whether a `for x in <chain>` loop's expression is a
+    // fusible pipe chain, and if so returns the plan the IL pass
+    // consumes. Pure recognition — no compilation side effects.
+    //
+    // Soundness: Pipe[T] is a trait with virtual `map`/`filter`, so a
+    // user type implementing Pipe may override them. Static resolution
+    // to Pipe.map is not enough — the `callvirt` dispatches on the
+    // receiver's dynamic type. The chain is only fused when its BASE
+    // provably uses the default `map`/`filter`; an induction over the
+    // closed-to-assembly built-in pipe classes then secures every
+    // downstream stage (each stage's receiver is a value freshly produced
+    // by an already-pinned default op returning a closed built-in pipe).
+    //
+    // The base must be a `pipe(SOURCE)` wrap (the postfix `|` operator,
+    // carrying `is_pipe_wrap`) whose SOURCE is not itself statically a
+    // Pipe. Two cases:
+    //
+    // - SOURCE is sealed (a value type or an array): its dynamic type is
+    //   exactly its static type, so it cannot secretly be a user pipe with
+    //   an override. `pipe()` provably wraps it in the built-in (closed)
+    //   ADAPTOR_PIPE, and the fused loop skips even that by iterating
+    //   SOURCE directly. Fuse unconditionally (`needs_guard` false).
+    //
+    // - SOURCE is any other type (a collection interface, an open class):
+    //   it is only *statically* not a Pipe - its dynamic type could be a
+    //   user Pipe with an override. Fuse behind a per-site runtime guard
+    //   `if SOURCE isa Pipe[elem]` (`needs_guard` true), sound because it
+    //   mirrors pipe()'s own short-circuit test. Requires SOURCE to be
+    //   store-free so the guard can evaluate it more than once.
+    class PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup) is
+        recognize(`for: Trees.Statements.FOR) -> PIPE_FUSION? is
+            let pipe_type = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            if !pipe_type? then
+                return null;
+            fi
+
+            let expression = `for.expression;
+
+            if !expression? then
+                return null;
+            fi
+
+            let stages = LIST[PIPE_FUSION_STAGE]();
+
+            let current mut = expression;
+
+            // Peel `map`/`filter` layers off the outside of the chain.
+            while isa Trees.Expressions.CALL(current) do
+                let call = cast Trees.Expressions.CALL(current);
+
+                if !isa Trees.Expressions.MEMBER(call.function) then
+                    break;
+                fi
+
+                let member = cast Trees.Expressions.MEMBER(call.function);
+                let name = member.identifier.name;
+
+                let is_filter = name =~ "filter";
+                let is_map = name =~ "map";
+
+                if !(is_filter \/ is_map) then
+                    break;
+                fi
+
+                if call.arguments.expressions.count != 1 then
+                    break;
+                fi
+
+                // The receiver must be statically a Pipe[T]. On a trait
+                // static type overload resolution binds the default
+                // `map`/`filter`, so this identifies the default op.
+                if !_is_pipe_expression(member.left, pipe_type) then
+                    break;
+                fi
+
+                stages.add(PIPE_FUSION_STAGE(is_filter, call.arguments.expressions[0]));
+
+                current = member.left;
+            od
+
+            if stages.count == 0 then
+                return null;
+            fi
+
+            // The base must be a `pipe(SOURCE)` wrap.
+            if !isa Trees.Expressions.CALL(current) then
+                return null;
+            fi
+
+            let base_call = cast Trees.Expressions.CALL(current);
+
+            if !base_call.is_pipe_wrap then
+                return null;
+            fi
+
+            if base_call.arguments.expressions.count != 1 then
+                return null;
+            fi
+
+            let source = base_call.arguments.expressions[0];
+            let source_value = source.value;
+
+            if !source_value? \/ !source_value.type? then
+                return null;
+            fi
+
+            let source_type = source_value.type!;
+
+            let classification = classify_source_type(source_type, pipe_type);
+
+            if !classification? then
+                return null;
+            fi
+
+            let needs_guard = classification;
+
+            // The guarded loop re-emits SOURCE's value (once for the `isa`
+            // test, again for iteration), so its IR must be safe to emit
+            // more than once: store-free (no repeated side effect) and not
+            // a BLOCK (the one single-shot IR value - `is_emitted` aborts a
+            // second gen). Real sources are plain field/local loads, which
+            // satisfy both.
+            if needs_guard /\ (source_value.is_state_changing_call \/ isa IR.Values.BLOCK(source_value)) then
+                return null;
+            fi
+
+            return PIPE_FUSION(source, stages, needs_guard);
+        si
+
+        // Classify a fusion base by its static source type:
+        //
+        // - null: do not fuse. The source is statically a Pipe, so `pipe()`
+        //   short-circuits to it and runs its (possibly overridden)
+        //   map/filter - a runtime guard would always take the fallback, so
+        //   there is nothing to gain.
+        // - false: fuse unconditionally. A sealed source (value type or
+        //   array) has a dynamic type equal to its static type, so it cannot
+        //   secretly be a user Pipe with an override.
+        // - true: fuse behind the runtime `isa Pipe[element]` guard. Any
+        //   other source is only *statically* not a Pipe; its dynamic type
+        //   could be a user Pipe, and the guard mirrors `pipe()`'s own
+        //   short-circuit test.
+        classify_source_type(source_type: Types.Type, pipe_type: Types.Type) -> bool? is
+            if _is_pipe_type(source_type, pipe_type) then
+                return null;
+            fi
+
+            if source_type.is_value_type \/ isa Semantic.Types.ARRAY(source_type) then
+                return false;
+            fi
+
+            return true;
+        si
+
+        _is_pipe_expression(expression: Trees.Expressions.Expression, pipe_type: Types.Type) -> bool is
+            let value = expression.value;
+
+            if !value? \/ !value.type? then
+                return false;
+            fi
+
+            return _is_pipe_type(value.type!, pipe_type);
+        si
+
+        _is_pipe_type(type: Types.Type, pipe_type: Types.Type) -> bool =>
+            Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(type, pipe_type)?;
+    si
+si

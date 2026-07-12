@@ -746,6 +746,257 @@ namespace Syntax.Process is
             return false;
         si
 
+        // Recognise a fusible Pipe[T] chain on the loop expression and,
+        // if found, resolve the source's own iterator members (exactly
+        // as a plain `for x in source` would) so the IL pass can drive
+        // them directly, skipping the pipe objects entirely. Returns
+        // null - fall back to the normal iterator loop - when the chain
+        // isn't fusible or the source doesn't expose a complete iterator
+        // surface.
+        _recognize_pipe_fusion(`for: Trees.Statements.FOR) -> PIPE_FUSION? is
+            // `@suppress("pipe-fusion")` disables fusion for a scope, so the
+            // loop runs the ordinary pipe-object lowering - used where the
+            // real Pipe implementations must be exercised (the Ghul.Pipes
+            // unit tests) rather than the fused equivalent.
+            if _logger.is_suppressed("pipe-fusion", `for.location) then
+                return null;
+            fi
+
+            let fusion = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup).recognize(`for);
+
+            if !fusion? then
+                return null;
+            fi
+
+            let source_value = fusion.source.value;
+
+            if !source_value? \/ !source_value.type? then
+                return null;
+            fi
+
+            if !_resolve_fusion_source_iterator(fusion, source_value.type!, false) then
+                return null;
+            fi
+
+            if fusion.needs_guard then
+                let guard_type = _fusion_guard_type(fusion);
+
+                if !guard_type? then
+                    // Cannot construct the Pipe[source-element] guard type,
+                    // so the fused loop cannot be guarded soundly - do not
+                    // fuse.
+                    return null;
+                fi
+
+                fusion.guard_isa_type = guard_type;
+            fi
+
+            for stage in fusion.stages_outermost_first do
+                _try_inline_stage(stage);
+            od
+
+            return fusion;
+        si
+
+        // Build the `Pipe[source-element]` type the runtime guard tests the
+        // source against. The element type is the source's own iterator
+        // element (`source_read_current.return_type`), matching the T that
+        // `pipe()` uses to decide its short-circuit - so guard and pipe()
+        // agree by construction.
+        _fusion_guard_type(fusion: PIPE_FUSION) -> Type? is
+            if !fusion.source_read_current? \/ !fusion.source_read_current.return_type? then
+                return null;
+            fi
+
+            let element_type = fusion.source_read_current.return_type!;
+
+            let pipe_type = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            if !pipe_type? then
+                return null;
+            fi
+
+            let pipe_symbol = pipe_type.symbol;
+
+            let pipe_classy: Semantic.Symbols.Classy? mut = null;
+
+            if isa Semantic.Symbols.GENERIC(pipe_symbol) then
+                pipe_classy = (cast Semantic.Symbols.GENERIC(pipe_symbol)).symbol;
+            elif isa Semantic.Symbols.Classy(pipe_symbol) then
+                pipe_classy = cast Semantic.Symbols.Classy(pipe_symbol);
+            fi
+
+            if !pipe_classy? then
+                return null;
+            fi
+
+            let arguments = Collections.LIST[Type]();
+            arguments.add(element_type);
+
+            return Semantic.Types.GENERIC(fusion.source.location, pipe_classy!, arguments);
+        si
+
+        _fused_local_id_counter: int static;
+
+        _next_fused_local_id() -> int static is
+            let result = _fused_local_id_counter;
+            _fused_local_id_counter = _fused_local_id_counter + 1;
+            return result;
+        si
+
+        // Attempt to inline a stage's `map`/`filter` lambda so the fused
+        // loop runs its body directly, with no delegate or closure
+        // frame. Only literal, single-parameter, expression-bodied
+        // lambdas qualify; anything else keeps the delegate path
+        // (`stage` left unmodified).
+        //
+        // Mechanism: declare a synthetic local, owned by the enclosing
+        // method, for the parameter, then re-walk the body with that
+        // local bound. Because the current function is the enclosing
+        // method (not the closure), the parameter and any captured outer
+        // locals resolve as ordinary local loads. The re-walk's
+        // diagnostics and symbol-use records are discarded (the first,
+        // normal walk already recorded them); the harvested IR is kept.
+        // A second, restoring walk of the whole lambda puts the
+        // closure-context IR back on the shared AST nodes so the (now
+        // unused) closure method body still emits valid IL.
+        _try_inline_stage(stage: PIPE_FUSION_STAGE) is
+            if !isa Trees.Expressions.FUNCTION(stage.argument) then
+                return;
+            fi
+
+            let function = cast Trees.Expressions.FUNCTION(stage.argument);
+
+            if
+                function.is_recursive \/
+                function.contains_let_await \/
+                function.arguments.expressions.count != 1 \/
+                !isa Trees.Bodies.EXPRESSION(function.body)
+            then
+                return;
+            fi
+
+            let param = function.arguments.expressions[0];
+
+            if !isa Trees.Expressions.VARIABLE(param) then
+                return;
+            fi
+
+            let param_name = (cast Trees.Expressions.VARIABLE(param)).name.name;
+
+            let closure = cast Semantic.Symbols.Closure?(_symbol_table.scope_for(function));
+
+            if !closure? then
+                return;
+            fi
+
+            let param_symbol = closure.find_direct(param_name);
+
+            if !param_symbol? \/ !isa Semantic.Types.Typed(param_symbol) then
+                return;
+            fi
+
+            let param_type = (cast Semantic.Types.Typed(param_symbol)).type;
+
+            if !param_type? \/ param_type.is_sentinel \/ param_type.is_error then
+                return;
+            fi
+
+            let body = cast Trees.Bodies.EXPRESSION(function.body);
+
+            // Harvest: re-walk the body with the parameter bound to a
+            // fresh enclosing-method local.
+            let scope = Semantic.BLOCK_SCOPE(_symbol_table.current_scope);
+
+            _symbol_table.enter_scope(scope);
+
+            // The local-id generator is only in a function frame during
+            // the declare pass; push one so the LOCAL_VARIABLE ctor can
+            // mint an id, then give the local a globally-unique IL slot
+            // name so it can't collide with an enclosing local.
+            let local_id_generator = IoC.CONTAINER.instance.local_id_generator;
+
+            local_id_generator.enter_function();
+
+            let local = scope.declare_variable(function.location, param_name, false, null);
+
+            local_id_generator.leave_function();
+
+            if !isa Semantic.Symbols.Variable(local) \/ !isa Semantic.Types.SettableTyped(local) then
+                _symbol_table.leave_scope(scope);
+                return;
+            fi
+
+            local.il_name_override = "'.fused_param.{_next_fused_local_id()}'";
+
+            (cast Semantic.Symbols.Variable(local)).define();
+            (cast Semantic.Types.SettableTyped(local)).set_type(param_type!);
+
+            _logger.speculate();
+            _symbol_use_locations.speculate();
+
+            body.expression.walk(self);
+
+            let harvested = body.expression.value;
+
+            _logger.roll_back();
+            _symbol_use_locations.roll_back();
+
+            _symbol_table.leave_scope(scope);
+
+            // Restore the closure-context IR on the shared AST nodes.
+            _logger.speculate();
+            _symbol_use_locations.speculate();
+
+            function.walk(self);
+
+            _logger.roll_back();
+            _symbol_use_locations.roll_back();
+
+            if !harvested? \/ !harvested.type? \/ harvested.type.is_error then
+                return;
+            fi
+
+            stage.param_local = cast Semantic.Symbols.Variable(local);
+            stage.inline_body = harvested;
+        si
+
+        // Fill the fusion plan's iterator slots for `type`, mirroring
+        // set_iterator_for: bind move_next / read_current directly when
+        // `type` is itself an iterator, else follow $get_iterator once
+        // and recurse. Returns false if no complete iterator surface is
+        // found (fall back to the normal loop).
+        _resolve_fusion_source_iterator(fusion: PIPE_FUSION, type: Type, recursing: bool) -> bool is
+            let move_next = get_zero_argument_function(type, "move_next");
+
+            if move_next? then
+                let read_current mut = get_zero_argument_function(type, "$get_current");
+
+                if !read_current? then
+                    read_current = get_zero_argument_function(type, "$get_Current");
+                fi
+
+                if !read_current? then
+                    return false;
+                fi
+
+                fusion.source_move_next = move_next;
+                fusion.source_read_current = read_current;
+
+                return true;
+            elif !recursing then
+                let read_iterator = get_zero_argument_function(type, "$get_iterator");
+
+                if read_iterator? then
+                    fusion.source_read_iterator = read_iterator;
+
+                    return _resolve_fusion_source_iterator(fusion, read_iterator.return_type!, true);
+                fi
+            fi
+
+            return false;
+        si
+
         pre(pragma: Trees.Definitions.PRAGMA) -> bool is
             _pragma_scope_stack.enter(pragma.pragma);
 
@@ -935,6 +1186,8 @@ namespace Syntax.Process is
                     fi
                 fi
             fi
+
+            `for.fusion = _recognize_pipe_fusion(`for);
 
             if variable? /\ !variable.is_poisoned then
                 set_symbol_type(variable.left, type);
