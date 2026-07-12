@@ -50,8 +50,22 @@ namespace Semantic.Symbols is
             self.is_recursive = is_recursive;
         si
 
+        is_stateless_delegate: bool;
+
+        // Set when the delegate's body loads self (its `ldarg.0` target).
+        // Such a delegate, e.g. `() => self`, returns a self-dependent
+        // result, so it must not be shared across receivers even though it
+        // captures no values.
+        _delegate_body_loads_self: bool;
+
+        note_delegate_body_loads_self() is
+            _delegate_body_loads_self = true;
+        si
+
         convert_to_delegate() is
             assert could_be_delegate;
+
+            is_stateless_delegate = !captured_values?;
 
             is_self_captured = false;
             captured_values = null;
@@ -59,33 +73,75 @@ namespace Semantic.Symbols is
             is_delegate = true;
         si
 
-        // A stateless, ground function literal: emitted as a static or
-        // global anonymous function (`ldnull` target, no captures) with
-        // no captured type arguments and a fully-settled function type.
-        // Its delegate carries no per-evaluation state, so it can be
-        // built once and cached in a static field instead of
-        // reallocated on every use. The settled-type gate excludes
-        // literals whose inference never resolved (their function type
-        // would render placeholder comments into the cache field).
+        // A stateless, ground function literal whose delegate carries no
+        // per-evaluation state, so it can be built once and cached in a
+        // static field instead of reallocated on every use. Two shapes
+        // qualify, both with no captured type arguments and a fully-settled,
+        // ground function type:
+        //
+        //   - a static or global anonymous function (`ldnull` target, no
+        //     captures), cached on the enclosing namespace's `$globals`;
+        //   - a self-bound delegate that captures no values and never loads
+        //     self in its body, cached on its enclosing non-generic class.
+        //
+        // The settled/ground-type gate excludes literals whose inference
+        // never resolved or whose type mentions a type variable (either
+        // would produce an invalid cache field). The self-load gate
+        // excludes a delegate like `() => self` whose result depends on the
+        // receiver even though it captures nothing.
         is_memoizable_delegate: bool is
-            if !is_anon_func \/ captured_type_arguments? \/ !_enclosing_namespace()? then
+            if captured_type_arguments? then
                 return false;
             fi
 
             let function_type = type;
 
-            return function_type? /\ function_type.is_settled;
+            if !function_type? \/ !function_type.is_settled \/ !_is_ground_type(function_type) then
+                return false;
+            fi
+
+            if is_anon_func then
+                return _enclosing_namespace()?;
+            fi
+
+            if is_delegate /\ is_stateless_delegate /\ !_delegate_body_loads_self then
+                if let owner_class: CLASS = get_il_owner() then
+                    return !owner_class.is_generic;
+                fi
+
+                return false;
+            fi
+
+            return false;
         si
 
-        // Static field caching this literal's delegate. Lives on the
-        // enclosing namespace's `$globals` class alongside the anonymous
-        // function itself. Built lazily and shared between the load-site
-        // reference and the definition emitted by generate-il.
+        _is_ground_type(candidate: Semantic.Types.Type) -> bool is
+            let mentions_type_variable mut = false;
+
+            candidate.walk((element: Semantic.Types.Type) is
+                if element.is_type_variable then
+                    mentions_type_variable = true;
+                fi
+            si);
+
+            return !mentions_type_variable;
+        si
+
+        // Static field caching this literal's delegate. A static/global
+        // anonymous function caches on the enclosing namespace's `$globals`
+        // class; a self-bound stateless delegate caches on its enclosing
+        // class. Built lazily and shared between the load-site reference and
+        // the definition emitted by generate-il.
         _delegate_cache_field: Field?;
 
         delegate_cache_field: Field is
             if !_delegate_cache_field? then
-                let `field = Symbols.GLOBAL_VARIABLE(LOCATION.internal, _enclosing_namespace()!, "{name!}$cache");
+                let `field: Field =
+                    if is_anon_func then
+                        Symbols.GLOBAL_VARIABLE(LOCATION.internal, _enclosing_namespace()!, "{name!}$cache")
+                    else
+                        Symbols.STATIC_FIELD(LOCATION.internal, get_il_owner(), "{name!}$cache")
+                    fi;
                 `field.set_type(type!);
                 _delegate_cache_field = `field;
             fi
@@ -797,7 +853,7 @@ namespace Semantic.Symbols is
 
             let delegate = IR.Values.Load.DELEGATE(closure_type, function_pointer, self_pointer);
 
-            return delegate;
+            return memoize_delegate(delegate);
         si
 
         load_outer_self(location: Source.LOCATION, loader: SYMBOL_LOADER) -> Value? is
@@ -850,6 +906,8 @@ namespace Semantic.Symbols is
         load_self(location: Source.LOCATION, loader: SYMBOL_LOADER) -> Value is
             if is_delegate then
                 let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+
+                note_delegate_body_loads_self();
 
                 return IR.Values.Load.REFERENCE_SELF(context!, context.type);
             fi
