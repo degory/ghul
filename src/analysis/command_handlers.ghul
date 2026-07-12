@@ -808,20 +808,31 @@ namespace Analysis is
             return signature.signature;
         si
 
-        // An append-only interface edit: the donor's interface signature
-        // strictly extends the retained one, so the file's declaration
-        // skeleton is the retained skeleton plus new declarations at the
-        // end. The prefix is handled by the ordinary interface-preserving
-        // body re-walk (the donor is temporarily trimmed to the retained
-        // shape), then the appended declarations are adopted onto the
-        // retained AST and declared / resolved / compiled against the
-        // retained symbol table - the whole-project rebuild is skipped.
-        // Nothing referenced the new declarations before this edit, so no
-        // retained state is invalidated. A new name can in principle
-        // capture a previously differently-resolved use in another file;
-        // that stale resolution lasts until the next full rebuild - the
-        // same class of transient imprecision the store-free bits accept.
-        try_incremental_interface_append(
+        // An interface-affecting edit handled incrementally. Two shapes
+        // qualify, classified by comparing per-top-level-definition
+        // interface signatures (the whole-file signature folds post-order
+        // - a parent's kind trails its children - so neither shape is a
+        // string-prefix relation on it):
+        //
+        //  - append-only: every retained definition matches the donor's
+        //    at the same index and the donor has extras. The appended
+        //    declarations are adopted onto the retained AST and built
+        //    against the retained tables; nothing referenced them before
+        //    the edit, so nothing else changes.
+        //  - replace-one: same count, exactly one definition differs, and
+        //    the outgoing subtree declares only functions that nothing
+        //    outside this file references or overrides. The old functions
+        //    are removed from their scopes, the side tables purge the old
+        //    subtree's span, and the new subtree is built in its place.
+        //    This is the interface-typing stream: each keystroke pause
+        //    re-replaces the one declaration in flux.
+        //
+        // Everything else falls back to the whole-project rebuild. A new
+        // or renamed name can in principle capture a previously
+        // differently-resolved use in another file; that stale resolution
+        // lasts until the next full rebuild - the same class of transient
+        // imprecision the store-free bits accept.
+        try_incremental_interface_edit(
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string]
         ) -> bool is
@@ -848,21 +859,38 @@ namespace Analysis is
             fi
 
             let donor_definitions = donor_list.definitions;
-            let retained_count = retained_list.definitions.count;
+            let retained_definitions = retained_list.definitions;
+            let retained_count = retained_definitions.count;
 
-            if donor_definitions.count <= retained_count then
+            if donor_definitions.count == retained_count then
+                let changed_index mut = -1;
+
+                for i in 0..retained_count do
+                    if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
+                        if changed_index >= 0 then
+                            return false;
+                        fi
+
+                        changed_index = i;
+                    fi
+                od
+
+                if changed_index < 0 then
+                    // The whole-file signatures differ but no top-level
+                    // definition's does - something file-level changed;
+                    // let the full rebuild sort it out.
+                    return false;
+                fi
+
+                return _try_replace_definition(retained, donor_signature, retained_list, donor_list, changed_index, diagnostics, checked_paths);
+            fi
+
+            if donor_definitions.count < retained_count then
                 return false;
             fi
 
-            // The whole-file signature folds post-order (a parent's kind
-            // trails its children), so an appended declaration is not a
-            // string-prefix relation. Compare per top-level definition
-            // instead: the edit is append-only iff every retained
-            // definition's own signature matches the donor's at the same
-            // index, leaving the donor's tail as the appended
-            // declarations.
             for i in 0..retained_count do
-                if _definition_signature(retained_list.definitions[i]) !~ _definition_signature(donor_definitions[i]) then
+                if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
                     return false;
                 fi
             od
@@ -903,6 +931,170 @@ namespace Analysis is
             return true;
         si
 
+        // The replace-one arm of try_incremental_interface_edit. All
+        // guards run before anything is mutated; once the prefix re-walk
+        // has succeeded the replacement is committed - the outgoing
+        // functions leave their scopes, the incoming subtree is spliced
+        // and built.
+        _try_replace_definition(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            retained_list: Syntax.Trees.Definitions.LIST,
+            donor_list: Syntax.Trees.Definitions.LIST,
+            index: int,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained_definitions = retained_list.definitions;
+            let donor_definitions = donor_list.definitions;
+
+            let old_definition = retained_definitions[index];
+            let new_definition = donor_definitions[index];
+
+            let old_functions = _collect_replaceable_functions(old_definition);
+
+            if !old_functions? then
+                return false;
+            fi
+
+            // Nothing outside this file may hold on to the outgoing
+            // functions: no override links in either direction, and no
+            // cross-file references (the reference query folds in the
+            // override family, so an overriding use elsewhere also shows).
+            for f in old_functions do
+                if !f.has_no_overriders then
+                    return false;
+                fi
+
+                if let overridees = f.overridees then
+                    if overridees | .any(o => true) then
+                        return false;
+                    fi
+                fi
+
+                for reference in IoC.CONTAINER.instance.symbol_use_locations.find_references_to_symbol(f) do
+                    if reference.file_name !~ retained.file_name then
+                        return false;
+                    fi
+                od
+            od
+
+            retained_definitions.remove_at(index);
+            donor_definitions.remove_at(index);
+
+            // The old subtree's side-table entries are purged along with
+            // the re-walked body spans; the rebuilt subtree re-records its
+            // own.
+            let extra_purge_spans = Collections.LIST[Source.LOCATION]();
+            extra_purge_spans.add(old_definition.location);
+
+            if !try_incremental_build(diagnostics, checked_paths, false, extra_purge_spans) then
+                retained_definitions.insert(index, old_definition);
+                donor_definitions.insert(index, new_definition);
+
+                return false;
+            fi
+
+            for f in old_functions do
+                _remove_function_from_owner(f);
+            od
+
+            retained_definitions.insert(index, new_definition);
+
+            let built = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+            built.add(new_definition);
+
+            _compiler.build_appended(
+                retained,
+                Syntax.Trees.Definitions.LIST(retained_list.location, built)
+            );
+
+            retained.interface_signature = donor_signature;
+
+            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+
+            return true;
+        si
+
+        // The functions a replaced definition subtree declared, when the
+        // subtree is simple enough to tear down: namespace blocks holding
+        // only function definitions. Anything else - classes, traits,
+        // fields, uses - returns null and the edit falls back to the full
+        // rebuild.
+        _collect_replaceable_functions(definition: Syntax.Trees.Definitions.Definition) -> Collections.LIST[Semantic.Symbols.Function]? is
+            let result = Collections.LIST[Semantic.Symbols.Function]();
+
+            if _collect_replaceable_functions_into(definition, result) then
+                return result;
+            fi
+
+            return null;
+        si
+
+        _collect_replaceable_functions_into(
+            definition: Syntax.Trees.Definitions.Definition,
+            into: Collections.LIST[Semantic.Symbols.Function]
+        ) -> bool is
+            if let namespace_definition: Syntax.Trees.Definitions.NAMESPACE = definition then
+                for d in namespace_definition.body.definitions do
+                    if !_collect_replaceable_functions_into(d, into) then
+                        return false;
+                    fi
+                od
+
+                return true;
+            fi
+
+            // Use directives carry no symbol of their own to tear down;
+            // the rebuilt subtree re-binds its imports.
+            if isa Syntax.Trees.Definitions.USE(definition) then
+                return true;
+            fi
+
+            if let function_definition: Syntax.Trees.Definitions.FUNCTION = definition then
+                // Look through stand-in scopes, as ScopeVisitorBase's
+                // function_for does.
+                let scope = _symbol_table.scope_for(function_definition);
+                let function = if scope? then cast Semantic.Symbols.Function?(scope.underlying_scope) else null fi;
+
+                if !function? then
+                    return false;
+                fi
+
+                into.add(function);
+
+                return true;
+            fi
+
+            return false;
+        si
+
+        _remove_function_from_owner(function: Semantic.Symbols.Function) is
+            let owner = cast Semantic.Symbols.Scoped?(function.owner);
+
+            if !owner? then
+                return;
+            fi
+
+            let name = function.name;
+
+            if !name? then
+                return;
+            fi
+
+            let existing = owner.find_direct(name);
+
+            if let group: Semantic.Symbols.FUNCTION_GROUP = existing then
+                group.remove(function);
+
+                if group.is_empty then
+                    owner.remove_direct(name);
+                fi
+            elif existing == function then
+                owner.remove_direct(name);
+            fi
+        si
+
         // The incremental body re-walk for an interface-preserving single-file
         // EDIT: keep the retained AST registered, splice the freshly-parsed
         // bodies onto it, refresh its locations from the fresh parse, and
@@ -913,12 +1105,20 @@ namespace Analysis is
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string]
         ) -> bool =>
-            try_incremental_build(diagnostics, checked_paths, true);
+            try_incremental_build(diagnostics, checked_paths, true, null);
 
         try_incremental_build(
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string],
             want_collect: bool
+        ) -> bool =>
+            try_incremental_build(diagnostics, checked_paths, want_collect, null);
+
+        try_incremental_build(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string],
+            want_collect: bool,
+            extra_purge_spans: Collections.List[Source.LOCATION]?
         ) -> bool is
             let retained = _retained;
 
@@ -953,6 +1153,15 @@ namespace Analysis is
                     body_spans.add(pair.retained.body!.location);
                 fi
             od
+
+            // A replaced definition's whole span purges the same way as a
+            // re-walked body: its old entries drop and the replacement's
+            // build re-records them.
+            if extra_purge_spans? then
+                for s in extra_purge_spans do
+                    body_spans.add(s);
+                od
+            fi
 
             Syntax.BODY_SPLICE.apply(pairs);
 
@@ -1040,12 +1249,12 @@ namespace Analysis is
                 _retained? /\
                 _retained.interface_signature?;
 
-            // An interface-affecting edit whose new signature strictly
-            // extends the retained one (declarations appended at the end
-            // of the file) takes the append path instead of the
-            // whole-project rebuild; the signature-prefix test itself
-            // lives in try_incremental_interface_append.
-            let append_eligible =
+            // An interface-affecting edit takes the incremental interface
+            // path - appended declarations, or one replaced declaration
+            // whose old symbols nothing else references - instead of the
+            // whole-project rebuild; the shape classification lives in
+            // try_incremental_interface_edit.
+            let interface_edit_eligible =
                 _build_flags.want_incremental_analysis /\
                 _is_interface_changed /\
                 paths.count == 1 /\
@@ -1058,7 +1267,7 @@ namespace Analysis is
                 if !_watchdog.want_restart then
                     if
                         !(incremental_eligible /\ try_incremental_build(diagnostics, checked_paths)) /\
-                        !(append_eligible /\ try_incremental_interface_append(diagnostics, checked_paths))
+                        !(interface_edit_eligible /\ try_incremental_interface_edit(diagnostics, checked_paths))
                     then
                         for i in _source_files_by_path.values do
                             i.want_compile_up_to_expressions = true;
