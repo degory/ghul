@@ -4846,13 +4846,21 @@ namespace Syntax.Process is
         si
 
         visit(`for: Statements.FOR) is
-            // TODO(pipe-fusion Stage A): when `for.fusion?`, lower the
-            // whole chain to one inline loop over the pinned base,
-            // applying the recognised map/filter stages per element,
-            // instead of iterating the built pipe objects below. See
-            // docs/claude/pipe-fusion.md. Until the fused emission
-            // lands, recognised chains fall through to the normal
-            // iterator loop (correct, just unoptimised).
+            // A recognised, fusible Pipe[T] chain is lowered to one
+            // inline loop over the pinned base, applying the map/filter
+            // stages per element, instead of iterating the built pipe
+            // objects. Not in a state machine, whose iterator must live
+            // on the frame to survive yield/await re-entry - those fall
+            // through to the normal loop below. See
+            // docs/claude/pipe-fusion.md.
+            if
+                `for.fusion? /\
+                !Semantic.Symbols.state_machine_for(current_function)? /\
+                !Semantic.Symbols.async_state_machine_for(current_function)?
+            then
+                _visit_fused_for(`for);
+                return;
+            fi
 
             let brancher = get_brancher_for_block();
             let loop = _loops.enter_loop();
@@ -4940,6 +4948,102 @@ namespace Syntax.Process is
             // not to generate code for the expression itself, but to capture IL for any anonymous function bodies:
             // TODO check that if expressions within the expression are emitted correctly
             expression.walk(self);
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+        // Lower a recognised fusible Pipe[T] chain to a single loop:
+        // drive the pinned base's own iterator, apply each map/filter
+        // stage inline per element (map assigns a temp, filter skips to
+        // the next element), then bind the loop variable and run the
+        // body. The built MAP_PIPE / FilterPipe objects and their
+        // per-element virtual dispatch are never emitted. See
+        // docs/claude/pipe-fusion.md.
+        _visit_fused_for(`for: Statements.FOR) is
+            let fusion = `for.fusion!;
+            let base = fusion.base;
+            let variable = `for.variable!;
+            let body = `for.body!;
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            // The base is a Pipe[T], hence its own Iterator[T]; build it
+            // once and drive it directly.
+            let iterator = base.value!;
+
+            variable.walk(self);
+
+            let temp = TEMP(current_block, "fused_iterator", iterator);
+
+            // Hoist each stage's function value into a local so the
+            // delegate is built once, not rebuilt per element.
+            let stage_delegates = Collections.LIST[TEMP]();
+
+            for stage in fusion.stages_outermost_first do
+                stage_delegates.add(TEMP(current_block, "fused_stage", stage.argument.value!));
+            od
+
+            brancher.label(loop.start);
+
+            let has_next = fusion.base_move_next!.call(base.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let element = fusion.base_read_current!.call(base.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            // Stages wrap the base outermost-first, so a pull applies
+            // them innermost-first — walk the list in reverse.
+            let current_value: Value mut = element;
+
+            let index mut = fusion.stages_outermost_first.count - 1;
+
+            while index >= 0 do
+                let stage = fusion.stages_outermost_first[index];
+                let delegate = stage_delegates[index].load();
+                let func_type = stage.argument.value!.type!;
+
+                let result_type =
+                    if func_type.is_action then
+                        _innate_symbol_lookup.get_void_type();
+                    else
+                        func_type.arguments[func_type.arguments.count - 1];
+                    fi;
+
+                let call_arguments = Collections.LIST[Value]();
+                call_arguments.add(current_value);
+
+                let invoke = IR.Values.Call.CLOSURE(delegate, result_type, func_type.is_action, func_type, call_arguments);
+
+                if stage.is_filter then
+                    // Rejected elements skip straight to the next pull.
+                    brancher.branch(BRANCH.Z, invoke, loop.start);
+                else
+                    current_value = TEMP(current_block, "fused_mapped", invoke).load();
+                fi
+
+                index = index - 1;
+            od
+
+            gen_destructuring_initialize(variable.left, current_value);
+
+            // Emit any anonymous-function bodies in the chain (the
+            // map/filter lambdas). Walking these nodes emits the nested
+            // closure method bodies without emitting the pipe-
+            // construction IL itself.
+            base.walk(self);
+
+            for stage in fusion.stages_outermost_first do
+                stage.argument.walk(self);
+            od
 
             body.walk(self);
 
