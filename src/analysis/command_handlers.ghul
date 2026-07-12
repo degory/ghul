@@ -800,6 +800,109 @@ namespace Analysis is
             fi
         si
 
+        _definition_signature(definition: Syntax.Trees.Definitions.Definition) -> string is
+            let signature = Syntax.INTERFACE_SIGNATURE();
+
+            definition.walk(signature);
+
+            return signature.signature;
+        si
+
+        // An append-only interface edit: the donor's interface signature
+        // strictly extends the retained one, so the file's declaration
+        // skeleton is the retained skeleton plus new declarations at the
+        // end. The prefix is handled by the ordinary interface-preserving
+        // body re-walk (the donor is temporarily trimmed to the retained
+        // shape), then the appended declarations are adopted onto the
+        // retained AST and declared / resolved / compiled against the
+        // retained symbol table - the whole-project rebuild is skipped.
+        // Nothing referenced the new declarations before this edit, so no
+        // retained state is invalidated. A new name can in principle
+        // capture a previously differently-resolved use in another file;
+        // that stale resolution lasts until the next full rebuild - the
+        // same class of transient imprecision the store-free bits accept.
+        try_incremental_interface_append(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained = _retained;
+
+            if !retained? then
+                return false;
+            fi
+
+            let edited_path = retained.file_name;
+            let donor = _source_files_by_path[edited_path];
+
+            let donor_signature = donor.interface_signature;
+
+            if !retained.interface_signature? \/ !donor_signature? then
+                return false;
+            fi
+
+            let donor_list = cast Syntax.Trees.Definitions.LIST?(donor.definition);
+            let retained_list = cast Syntax.Trees.Definitions.LIST?(retained.definition);
+
+            if !donor_list? \/ !retained_list? then
+                return false;
+            fi
+
+            let donor_definitions = donor_list.definitions;
+            let retained_count = retained_list.definitions.count;
+
+            if donor_definitions.count <= retained_count then
+                return false;
+            fi
+
+            // The whole-file signature folds post-order (a parent's kind
+            // trails its children), so an appended declaration is not a
+            // string-prefix relation. Compare per top-level definition
+            // instead: the edit is append-only iff every retained
+            // definition's own signature matches the donor's at the same
+            // index, leaving the donor's tail as the appended
+            // declarations.
+            for i in 0..retained_count do
+                if _definition_signature(retained_list.definitions[i]) !~ _definition_signature(donor_definitions[i]) then
+                    return false;
+                fi
+            od
+
+            // Split the donor: the leading definitions pair with the
+            // retained skeleton; the tail is the appended declarations.
+            let appended = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
+            while donor_definitions.count > retained_count do
+                appended.insert(0, donor_definitions[donor_definitions.count - 1]);
+                donor_definitions.remove_at(donor_definitions.count - 1);
+            od
+
+            if !try_incremental_build(diagnostics, checked_paths, false) then
+                // try_incremental_build re-registered the donor as the
+                // live file; give it its appended tail back so the full
+                // rebuild sees the whole edit.
+                for d in appended do
+                    donor_definitions.add(d);
+                od
+
+                return false;
+            fi
+
+            for d in appended do
+                retained_list.add(d);
+            od
+
+            _compiler.build_appended(
+                retained,
+                Syntax.Trees.Definitions.LIST(retained_list.location, appended)
+            );
+
+            retained.interface_signature = donor_signature;
+
+            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+
+            return true;
+        si
+
         // The incremental body re-walk for an interface-preserving single-file
         // EDIT: keep the retained AST registered, splice the freshly-parsed
         // bodies onto it, refresh its locations from the fresh parse, and
@@ -809,6 +912,13 @@ namespace Analysis is
         try_incremental_build(
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string]
+        ) -> bool =>
+            try_incremental_build(diagnostics, checked_paths, true);
+
+        try_incremental_build(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string],
+            want_collect: bool
         ) -> bool is
             let retained = _retained;
 
@@ -862,7 +972,9 @@ namespace Analysis is
 
             _compiler.rewalk_bodies(retained, correspondence, body_spans);
 
-            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+            if want_collect then
+                DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+            fi
 
             return true;
         si
@@ -928,11 +1040,26 @@ namespace Analysis is
                 _retained? /\
                 _retained.interface_signature?;
 
+            // An interface-affecting edit whose new signature strictly
+            // extends the retained one (declarations appended at the end
+            // of the file) takes the append path instead of the
+            // whole-project rebuild; the signature-prefix test itself
+            // lives in try_incremental_interface_append.
+            let append_eligible =
+                _build_flags.want_incremental_analysis /\
+                _is_interface_changed /\
+                paths.count == 1 /\
+                _retained? /\
+                _retained.interface_signature?;
+
             try
                 Semantic.Types.NAMED.clear_cache();
 
                 if !_watchdog.want_restart then
-                    if !(incremental_eligible /\ try_incremental_build(diagnostics, checked_paths)) then
+                    if
+                        !(incremental_eligible /\ try_incremental_build(diagnostics, checked_paths)) /\
+                        !(append_eligible /\ try_incremental_interface_append(diagnostics, checked_paths))
+                    then
                         for i in _source_files_by_path.values do
                             i.want_compile_up_to_expressions = true;
 
