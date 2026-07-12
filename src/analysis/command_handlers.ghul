@@ -882,7 +882,9 @@ namespace Analysis is
                     return false;
                 fi
 
-                return _try_replace_definition(retained, donor_signature, retained_list, donor_list, changed_index, diagnostics, checked_paths);
+                let chain = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
+                return _try_narrow_edit(retained, donor_signature, chain, retained_definitions[changed_index], donor_definitions[changed_index], diagnostics, checked_paths);
             fi
 
             if donor_definitions.count < retained_count then
@@ -931,92 +933,258 @@ namespace Analysis is
             return true;
         si
 
-        // The replace-one arm of try_incremental_interface_edit. All
-        // guards run before anything is mutated; once the prefix re-walk
-        // has succeeded the replacement is committed - the outgoing
-        // functions leave their scopes, the incoming subtree is spliced
-        // and built.
-        _try_replace_definition(
+        // Narrow a changed definition pair down to the smallest changed
+        // window. Containers of the same kind and name - namespaces, and
+        // classes whose headers match - recurse into their member lists;
+        // at each level the members split into a signature-matched common
+        // prefix, a signature-matched common suffix, and the changed
+        // window between them. A window consisting solely of function
+        // definitions is replaced in place; anything else falls back to
+        // the whole-project rebuild.
+        _try_narrow_edit(
             retained: SOURCE_FILE,
             donor_signature: string,
-            retained_list: Syntax.Trees.Definitions.LIST,
-            donor_list: Syntax.Trees.Definitions.LIST,
-            index: int,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_definition: Syntax.Trees.Definitions.Definition,
+            donor_definition: Syntax.Trees.Definitions.Definition,
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string]
         ) -> bool is
-            let retained_definitions = retained_list.definitions;
-            let donor_definitions = donor_list.definitions;
+            if let retained_namespace: Syntax.Trees.Definitions.NAMESPACE = retained_definition then
+                let donor_namespace = cast Syntax.Trees.Definitions.NAMESPACE?(donor_definition);
 
-            let old_definition = retained_definitions[index];
-            let new_definition = donor_definitions[index];
-
-            let old_functions = _collect_replaceable_functions(old_definition);
-
-            if !old_functions? then
-                return false;
-            fi
-
-            // Nothing outside the replaced subtree may hold on to the
-            // outgoing functions: no override links in either direction,
-            // and no references beyond the subtree's own span (the
-            // reference query folds in the override family, so an
-            // overriding use elsewhere also shows). A same-file reference
-            // from another definition matters as much as a cross-file
-            // one: that definition's bodies re-walk before the teardown,
-            // so its state would keep the dead symbol and its
-            // should-now-error call would stay silently clean.
-            for f in old_functions do
-                if !f.has_no_overriders then
+                if !donor_namespace? \/ retained_namespace.name.name !~ donor_namespace.name.name then
                     return false;
                 fi
 
-                if let overridees = f.overridees then
-                    if overridees | .any(o => true) then
+                chain.add(retained_namespace);
+
+                return _try_narrow_children(retained, donor_signature, chain, retained_namespace.body, donor_namespace.body, null, diagnostics, checked_paths);
+            fi
+
+            if let retained_class: Syntax.Trees.Definitions.CLASS = retained_definition then
+                let donor_class = cast Syntax.Trees.Definitions.CLASS?(donor_definition);
+
+                if
+                    !donor_class? \/
+                    _class_header_signature(retained_class) !~ _class_header_signature(donor_class)
+                then
+                    return false;
+                fi
+
+                let scope = _symbol_table.scope_for(retained_class);
+                let classy = if scope? then cast Semantic.Symbols.Classy?(scope.underlying_scope) else null fi;
+
+                if !classy? then
+                    return false;
+                fi
+
+                // The hierarchy slice reset is limited to the class itself
+                // for now: a class with ghul-declared subclasses or trait
+                // implementors would need them reset and re-pulled too.
+                if let implementors = classy.implementors then
+                    for i in implementors do
+                        if !i.is_reflected then
+                            return false;
+                        fi
+                    od
+                fi
+
+                chain.add(retained_class);
+
+                return _try_narrow_children(retained, donor_signature, chain, retained_class.body, donor_class.body, classy, diagnostics, checked_paths);
+            fi
+
+            return false;
+        si
+
+        _try_narrow_children(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_body: Syntax.Trees.Definitions.LIST,
+            donor_body: Syntax.Trees.Definitions.LIST,
+            slice_class: Semantic.Symbols.Classy?,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained_members = retained_body.definitions;
+            let donor_members = donor_body.definitions;
+
+            let retained_count = retained_members.count;
+            let donor_count = donor_members.count;
+
+            let limit = if retained_count < donor_count then retained_count else donor_count fi;
+
+            let prefix mut = 0;
+
+            while
+                prefix < limit /\
+                _definition_signature(retained_members[prefix]) =~ _definition_signature(donor_members[prefix])
+            do
+                prefix = prefix + 1;
+            od
+
+            let suffix mut = 0;
+
+            while
+                suffix < limit - prefix /\
+                _definition_signature(retained_members[retained_count - 1 - suffix]) =~ _definition_signature(donor_members[donor_count - 1 - suffix])
+            do
+                suffix = suffix + 1;
+            od
+
+            let retained_window = retained_count - prefix - suffix;
+            let donor_window = donor_count - prefix - suffix;
+
+            if retained_window == 1 /\ donor_window == 1 then
+                // A single changed member may itself be a container with a
+                // still narrower change inside it. Recursion mutates the
+                // chain, so work on a copy in case it declines and the
+                // window falls through to function replacement.
+                let inner_chain = Collections.LIST[Syntax.Trees.Definitions.Definition](chain);
+
+                if _try_narrow_edit(retained, donor_signature, inner_chain, retained_members[prefix], donor_members[prefix], diagnostics, checked_paths) then
+                    return true;
+                fi
+            fi
+
+            return _try_replace_functions(retained, donor_signature, chain, retained_body, donor_body, prefix, retained_window, donor_window, slice_class, diagnostics, checked_paths);
+        si
+
+        // Replace the changed window of a member list, when every member
+        // in it (both outgoing and incoming) is a function definition. All
+        // guards run before anything is mutated.
+        _try_replace_functions(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_body: Syntax.Trees.Definitions.LIST,
+            donor_body: Syntax.Trees.Definitions.LIST,
+            prefix: int,
+            retained_window: int,
+            donor_window: int,
+            slice_class: Semantic.Symbols.Classy?,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained_members = retained_body.definitions;
+            let donor_members = donor_body.definitions;
+
+            let removed_functions = Collections.LIST[Semantic.Symbols.Function]();
+
+            for i in 0..retained_window do
+                let member = retained_members[prefix + i];
+
+                let function = _function_symbol_for(member);
+
+                if !function? then
+                    return false;
+                fi
+
+                // Nothing outside the outgoing function's own definition
+                // may be bound to it: a referencing definition's bodies
+                // re-walk before the teardown, so its call to the removed
+                // function would otherwise stay silently bound to the dead
+                // symbol. Only direct references count - a call bound to
+                // an overridden base member stays valid when an override
+                // is removed. Override links in either direction are
+                // undone by the slice reset, but only when there is a
+                // class to reset - at namespace level they reject the
+                // edit.
+                if !slice_class? then
+                    if !function.has_no_overriders then
                         return false;
+                    fi
+
+                    if let overridees = function.overridees then
+                        if overridees | .any(o => true) then
+                            return false;
+                        fi
                     fi
                 fi
 
-                for reference in IoC.CONTAINER.instance.symbol_use_locations.find_references_to_symbol(f) do
+                for reference in IoC.CONTAINER.instance.symbol_use_locations.direct_references_to(function) do
                     if reference.file_name !~ retained.file_name then
                         return false;
                     fi
 
-                    if reference.start < old_definition.location.start \/ reference.start > old_definition.location.end then
+                    if reference.start < member.location.start \/ reference.start > member.location.end then
                         return false;
                     fi
                 od
+
+                removed_functions.add(function);
             od
 
-            retained_definitions.remove_at(index);
-            donor_definitions.remove_at(index);
+            for i in 0..donor_window do
+                if !isa Syntax.Trees.Definitions.FUNCTION(donor_members[prefix + i]) then
+                    return false;
+                fi
+            od
 
-            // The old subtree's side-table entries are purged along with
-            // the re-walked body spans; the rebuilt subtree re-records its
-            // own.
+            // Trim both windows so the remaining trees pair structurally
+            // for the ordinary body re-walk; the outgoing members' spans
+            // purge their side-table entries through the same
+            // reconciliation that drops re-walked body spans.
+            let removed_definitions = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+            let added_definitions = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
             let extra_purge_spans = Collections.LIST[Source.LOCATION]();
-            extra_purge_spans.add(old_definition.location);
+
+            for i in 0..retained_window do
+                let member = retained_members[prefix];
+
+                removed_definitions.add(member);
+                extra_purge_spans.add(member.location);
+
+                retained_members.remove_at(prefix);
+            od
+
+            for i in 0..donor_window do
+                added_definitions.add(donor_members[prefix]);
+                donor_members.remove_at(prefix);
+            od
 
             if !try_incremental_build(diagnostics, checked_paths, false, extra_purge_spans) then
-                retained_definitions.insert(index, old_definition);
-                donor_definitions.insert(index, new_definition);
+                for i in 0..retained_window do
+                    retained_members.insert(prefix + i, removed_definitions[i]);
+                od
+
+                for i in 0..donor_window do
+                    donor_members.insert(prefix + i, added_definitions[i]);
+                od
 
                 return false;
             fi
 
-            for f in old_functions do
+            // Committed. Undo the class's pull-down before touching its
+            // declared members so the journal's record still matches the
+            // state it was made against.
+            if slice_class? then
+                slice_class.reset_pulled_down_symbols();
+            fi
+
+            for f in removed_functions do
                 _remove_function_from_owner(f);
             od
 
-            retained_definitions.insert(index, new_definition);
+            for i in 0..donor_window do
+                retained_members.insert(prefix + i, added_definitions[i]);
+            od
 
-            let built = Collections.LIST[Syntax.Trees.Definitions.Definition]();
-            built.add(new_definition);
+            let added_list = Syntax.Trees.Definitions.LIST(retained_body.location, added_definitions);
 
-            _compiler.build_appended(
-                retained,
-                Syntax.Trees.Definitions.LIST(retained_list.location, built)
-            );
+            _compiler.build_members_interface(retained, chain, added_list);
+
+            // Re-resolve the class's inheritance against the changed
+            // member set: overrides, pulled-down members and implementor
+            // registration all rebuild through the ordinary pull-down.
+            if slice_class? then
+                slice_class.pull_down_super_symbols();
+            fi
+
+            _compiler.build_members_expressions(retained, chain, added_list);
 
             retained.interface_signature = donor_signature;
 
@@ -1025,57 +1193,40 @@ namespace Analysis is
             return true;
         si
 
-        // The functions a replaced definition subtree declared, when the
-        // subtree is simple enough to tear down: namespace blocks holding
-        // only function definitions. Anything else - classes, traits,
-        // fields, uses - returns null and the edit falls back to the full
-        // rebuild.
-        _collect_replaceable_functions(definition: Syntax.Trees.Definitions.Definition) -> Collections.LIST[Semantic.Symbols.Function]? is
-            let result = Collections.LIST[Semantic.Symbols.Function]();
+        // The header of a class-like definition - name, type parameters,
+        // ancestors and modifiers - folded the way the interface signature
+        // folds them, so two versions of a class can be compared ignoring
+        // their member lists.
+        _class_header_signature(`class: Syntax.Trees.Definitions.Classy) -> string is
+            let signature = Syntax.INTERFACE_SIGNATURE();
 
-            if _collect_replaceable_functions_into(definition, result) then
-                return result;
+            `class.name.walk(signature);
+
+            if let arguments = `class.arguments then
+                arguments.walk(signature);
             fi
 
-            return null;
+            if let ancestors = `class.ancestors then
+                ancestors.walk(signature);
+            fi
+
+            `class.modifiers.walk(signature);
+
+            return signature.signature;
         si
 
-        _collect_replaceable_functions_into(
-            definition: Syntax.Trees.Definitions.Definition,
-            into: Collections.LIST[Semantic.Symbols.Function]
-        ) -> bool is
-            if let namespace_definition: Syntax.Trees.Definitions.NAMESPACE = definition then
-                for d in namespace_definition.body.definitions do
-                    if !_collect_replaceable_functions_into(d, into) then
-                        return false;
-                    fi
-                od
-
-                return true;
+        _function_symbol_for(definition: Syntax.Trees.Definitions.Definition) -> Semantic.Symbols.Function? is
+            if !isa Syntax.Trees.Definitions.FUNCTION(definition) then
+                return null;
             fi
 
-            // Use directives carry no symbol of their own to tear down;
-            // the rebuilt subtree re-binds its imports.
-            if isa Syntax.Trees.Definitions.USE(definition) then
-                return true;
+            let scope = _symbol_table.scope_for(definition);
+
+            if !scope? then
+                return null;
             fi
 
-            if let function_definition: Syntax.Trees.Definitions.FUNCTION = definition then
-                // Look through stand-in scopes, as ScopeVisitorBase's
-                // function_for does.
-                let scope = _symbol_table.scope_for(function_definition);
-                let function = if scope? then cast Semantic.Symbols.Function?(scope.underlying_scope) else null fi;
-
-                if !function? then
-                    return false;
-                fi
-
-                into.add(function);
-
-                return true;
-            fi
-
-            return false;
+            return cast Semantic.Symbols.Function?(scope.underlying_scope);
         si
 
         _remove_function_from_owner(function: Semantic.Symbols.Function) is
