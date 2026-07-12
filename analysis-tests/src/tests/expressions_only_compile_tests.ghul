@@ -1,0 +1,188 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use IO.File;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Guards the expressions-only COMPILE: after an interface-affecting
+    // EDIT, the debounced COMPILE skips the clear-and-rebuild (the EDIT's
+    // rebuild left the declaration tables current) and runs
+    // compile-expressions for just the files that lack it. The retained
+    // generic-heavy file must compile clean through that path - the
+    // failure mode is generic type-argument identity/state leaks
+    // surfacing as "no overload found" or internal
+    // "type argument is null" exceptions.
+    class EXPRESSIONS_ONLY_COMPILE_TESTS is
+        @test()
+
+        init() is si
+
+        load_object_oriented_source() -> string is
+            let source_path = fixture_path("object-oriented/object-oriented.ghul");
+
+            assert File.exists(source_path)
+                else "fixture not copied to test output: {source_path}";
+
+            return File.read_all_text(source_path);
+        si
+
+        helper_source(extra_method: bool) -> string is
+            let extra =
+                if extra_method then
+                    "        extra() -> int => 42;\n"
+                else
+                    ""
+                fi;
+
+            return
+                "namespace ExpressionsOnlyCompile is\n"
+                "    class HELPER is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> int => 1;\n"
+                "{extra}"
+                "    si\n"
+                "si\n";
+        si
+
+        // A body with explicit generic applications - a backtick-arity
+        // generic method call and a constructed generic - whose
+        // compile-expressions walk consumes the type-expression
+        // resolutions recorded on the AST. Clearing that state without
+        // re-running the resolve passes crashes specialization with
+        // internal "type argument is null" asserts.
+        generic_bodies_source() -> string =>
+            "namespace ExpressionsOnlyCompile is\n"
+            "    class GENERIC_BODIES is\n"
+            "        init() is si\n"
+            "\n"
+            "        empties() -> int is\n"
+            "            let items = System.Array.empty`[string]();\n"
+            "            let numbers = Collections.LIST[int](items.count);\n"
+            "            return numbers.count;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        read_clean_diagnostics(analyser: ANALYSER_PROCESS, context: string) -> Response.DIAGNOSTICS is
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS on {context}, got '{response.get_type().name}'";
+
+            let user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(response));
+            Assert.are_equal(
+                0,
+                user_diagnostics.count,
+                "{diagnostics_summary("{context} surfaced unexpected diagnostics", user_diagnostics)}\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            return response;
+        si
+
+        compile_after_interface_affecting_edit__leaves_generic_heavy_file_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(false)),
+                EDIT_FILE("object-oriented.ghul", load_object_oriented_source())
+            ]);
+
+            read_clean_diagnostics(analyser, "priming EDIT");
+
+            // Interface-affecting: HELPER gains a method. The EDIT's
+            // rebuild recompiles expressions for helper.ghul only,
+            // leaving object-oriented.ghul at up-to-expressions.
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(true))
+            ]);
+
+            read_clean_diagnostics(analyser, "interface-affecting EDIT");
+
+            // The debounced COMPILE: takes the expressions-only path and
+            // re-walks object-oriented.ghul against the retained tables.
+            analyser.send_compile();
+
+            read_clean_diagnostics(analyser, "COMPILE after interface-affecting EDIT");
+        si
+
+        // The profiler's failing sequence: an incremental (body-only)
+        // EDIT of the generic-heavy file lands between the
+        // interface-affecting EDIT and the debounced COMPILE, so the
+        // expressions-only path re-walks a retained AST whose bodies were
+        // spliced and body-re-walked since the last full build. Needs
+        // ANALYSER_EXTRA_ARGS=--incremental-analysis to take the splice
+        // path; without the flag it still exercises a fallback rebuild
+        // between the two, which is worth guarding anyway.
+        compile_after_interface_edit_then_incremental_body_edit__stays_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            let oo_source = load_object_oriented_source();
+
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(false)),
+                EDIT_FILE("object-oriented.ghul", oo_source)
+            ]);
+
+            read_clean_diagnostics(analyser, "priming EDIT");
+
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(true))
+            ]);
+
+            read_clean_diagnostics(analyser, "interface-affecting EDIT");
+
+            // Body-only re-send of the generic-heavy file (identical
+            // text: interface-preserving, pairs positionally, splices).
+            analyser.send_edit("object-oriented.ghul", oo_source);
+
+            read_clean_diagnostics(analyser, "incremental body EDIT");
+
+            analyser.send_compile();
+
+            read_clean_diagnostics(analyser, "COMPILE after interface edit + incremental body edit");
+        si
+
+        // The distilled corpus failure: the retained file's bodies use
+        // explicit generic applications, so its on-demand
+        // compile-expressions walk must see the resolve passes' output
+        // intact.
+        compile_after_interface_affecting_edit__explicit_generic_bodies_stay_clean() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(false)),
+                EDIT_FILE("generic_bodies.ghul", generic_bodies_source())
+            ]);
+
+            read_clean_diagnostics(analyser, "priming EDIT");
+
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source(true))
+            ]);
+
+            read_clean_diagnostics(analyser, "interface-affecting EDIT");
+
+            analyser.send_compile();
+
+            read_clean_diagnostics(analyser, "COMPILE after interface-affecting EDIT");
+
+            // The query path shares the on-demand machinery; a hover on
+            // the generic-application line must also come back clean.
+            analyser.send_hover("generic_bodies.ghul", 6, 32);
+
+            let response = analyser.read_query_response();
+            assert isa Response.HOVER(response) else "expected HOVER response";
+        si
+    si
+si
