@@ -1,0 +1,293 @@
+namespace IR.Values is
+    use Semantic.Types.Type;
+
+    // One map/filter stage of a fused-consumer loop. The stage's lambda
+    // delegate is hoisted into a local (built once) and `apply` invokes it
+    // on the current element, yielding either a bool (a `filter` stage -
+    // branch to the next element when false) or the transformed element (a
+    // `map` stage - stored into `output_il_name` for the next stage). The
+    // delegate is called rather than inlined so a lambda that captures an
+    // enclosing local (or nests another closure) keeps its normal capture
+    // context.
+    class FUSED_CONSUMER_STAGE is
+        is_filter: bool public;
+        delegate_il_name: string public;
+        delegate_type: Type public;
+        delegate_init: Value public;
+        apply: Value public;
+        output_il_name: string public;
+        output_type: Type? public;
+
+        init(is_filter: bool, delegate_il_name: string, delegate_type: Type, delegate_init: Value, apply: Value, output_il_name: string, output_type: Type?) is
+            self.is_filter = is_filter;
+            self.delegate_il_name = delegate_il_name;
+            self.delegate_type = delegate_type;
+            self.delegate_init = delegate_init;
+            self.apply = apply;
+            self.output_il_name = output_il_name;
+            self.output_type = output_type;
+        si
+    si
+
+    // A terminal Pipe consumer (`count`, `any`, `all`, `for_each`, `reduce`,
+    // `find`, `first`, `collect_list`) fused with its chain: drives the
+    // chain's source iterator directly, applies the map/filter stages per
+    // element by calling each stage's hoisted delegate, runs the consumer's
+    // per-element body, and leaves the consumer's result on the stack -
+    // emitted in place of the consumer method call, so it flows through any
+    // expression context (like NULL_COALESCE_VALUE). A non-sealed source is
+    // guarded by `isa Pipe[element]`, falling back to the original call.
+    class FUSED_CONSUMER: Value is
+        _result_type: Type;
+
+        // Guard: when guard_isa_type is non-null the source could
+        // dynamically be a user Pipe, so emit `if source isa Pipe then
+        // fallback else fused`. `source` is the value the `isa` tests.
+        guard_isa_type: Type? public;
+        source: Value public;
+        fallback: Value public;
+
+        // Loop skeleton, pre-built against the '.fc_iter.N' iterator local.
+        // `iterator_init` produces the source's own iterator (or is the
+        // source itself when it is already an iterator); move_next /
+        // read_current drive it.
+        has_iterator: bool public;
+        iterator_init: Value public;
+        iterator_il_name: string public;
+        iterator_type: Type public;
+        move_next: Value public;
+        read_current: Value public;
+
+        // The element local the innermost stage reads.
+        element_il_name: string public;
+        element_type: Type public;
+
+        stages: Collections.List[FUSED_CONSUMER_STAGE] public;
+
+        // The surviving element after every stage - what the consumer body
+        // operates on (`collect` adds it, `find` returns it, ...).
+        final_element_il_name: string public;
+        final_element_type: Type public;
+
+        // Consumer specifics.
+        consumer_kind: string public;
+
+        // The result local, named in compile-expressions so pre-built
+        // values (a `reduce` accumulator) can reference it.
+        result_il_name: string public;
+
+        // A consumer with a function argument (`any`/`all`/`find`/`for_each`
+        // predicate/action, `reduce` accumulator) hoists it into a local so
+        // the delegate is built once. `consumer_apply` is that argument
+        // applied per element (to the final element, and for `reduce` the
+        // running result too), pre-built against the hoisted local.
+        consumer_arg_il_name: string? public;
+        consumer_arg_type: Type? public;
+        consumer_arg_init: Value? public;
+        consumer_apply: Value? public;
+
+        // `reduce` seeds the result with its first argument; `find`/`first`
+        // seed the result with an empty MAYBE; `collect` seeds it with a
+        // fresh list.
+        seed_init: Value? public;
+
+        // `find`/`first` wrap the surviving element in a MAYBE; `collect`
+        // adds it to the result list. Pre-built against the element / result
+        // locals.
+        wrap_element: Value? public;
+        add_element: Value? public;
+
+        type: Type => _result_type;
+        is_lightweight_pure: bool => false;
+
+        init(
+            result_type: Type,
+            source: Value,
+            fallback: Value,
+            iterator_init: Value,
+            has_iterator: bool,
+            iterator_il_name: string,
+            iterator_type: Type,
+            move_next: Value,
+            read_current: Value,
+            element_il_name: string,
+            element_type: Type,
+            stages: Collections.List[FUSED_CONSUMER_STAGE],
+            final_element_il_name: string,
+            final_element_type: Type,
+            consumer_kind: string,
+            result_il_name: string
+        ) is
+            super.init();
+
+            self._result_type = result_type;
+            self.source = source;
+            self.fallback = fallback;
+            self.iterator_init = iterator_init;
+            self.has_iterator = has_iterator;
+            self.iterator_il_name = iterator_il_name;
+            self.iterator_type = iterator_type;
+            self.move_next = move_next;
+            self.read_current = read_current;
+            self.element_il_name = element_il_name;
+            self.element_type = element_type;
+            self.stages = stages;
+            self.final_element_il_name = final_element_il_name;
+            self.final_element_type = final_element_type;
+            self.consumer_kind = consumer_kind;
+            self.result_il_name = result_il_name;
+        si
+
+        gen(context: IR.CONTEXT) is
+            if guard_isa_type? then
+                let fused_label = IR.LABEL();
+                let end_label = IR.LABEL();
+
+                // if source isa Pipe[element] then fall back else fuse
+                gen(source, context);
+                context.write_line("isinst {guard_isa_type!.get_il_type()}");
+                context.write_line("brfalse {fused_label}");
+
+                gen(fallback, context);
+                context.write_line("br {end_label}");
+
+                context.write_line("{fused_label}:");
+                _gen_fused_loop(context);
+
+                context.write_line("{end_label}:");
+            else
+                _gen_fused_loop(context);
+            fi
+        si
+
+        is_void: bool => consumer_kind =~ "for_each";
+
+        // Emit the fused loop, leaving the consumer's result on the stack
+        // (nothing for a void `for_each`).
+        _gen_fused_loop(context: IR.CONTEXT) is
+            let loop_start = IR.LABEL();
+            let loop_end = IR.LABEL();
+
+            if !is_void then
+                context.write_line(".locals init ({_result_type.get_il_type()} {result_il_name})");
+                _gen_result_init(context);
+            fi
+
+            // A consumer's function argument is built once into a local.
+            if let arg_name = consumer_arg_il_name, arg_type = consumer_arg_type, arg_init = consumer_arg_init then
+                context.write_line(".locals init ({arg_type.get_il_type()} {arg_name})");
+                gen(arg_init, context);
+                context.write_line("stloc {arg_name}");
+            fi
+
+            // Each stage's lambda delegate is built once before the loop.
+            for stage in stages do
+                context.write_line(".locals init ({stage.delegate_type.get_il_type()} {stage.delegate_il_name})");
+                gen(stage.delegate_init, context);
+                context.write_line("stloc {stage.delegate_il_name}");
+            od
+
+            // The iterator always lives in a local - whether it came from
+            // the source's iterator member or the source is itself an
+            // iterator (a value-type range), move_next / current drive it
+            // through the local (by address for a value-type iterator).
+            context.write_line(".locals init ({iterator_type.get_il_type()} {iterator_il_name})");
+            gen(iterator_init, context);
+            context.write_line("stloc {iterator_il_name}");
+
+            context.write_line("{loop_start}:");
+
+            gen(move_next, context);
+            context.write_line("brfalse {loop_end}");
+
+            context.write_line(".locals init ({element_type.get_il_type()} {element_il_name})");
+            gen(read_current, context);
+            context.write_line("stloc {element_il_name}");
+
+            for stage in stages do
+                if stage.is_filter then
+                    gen(stage.apply, context);
+                    context.write_line("brfalse {loop_start}");
+                else
+                    context.write_line(".locals init ({stage.output_type!.get_il_type()} {stage.output_il_name})");
+                    gen(stage.apply, context);
+                    context.write_line("stloc {stage.output_il_name}");
+                fi
+            od
+
+            _gen_element_body(context, loop_start, loop_end);
+
+            context.write_line("br {loop_start}");
+            context.write_line("{loop_end}:");
+
+            if !is_void then
+                context.write_line("ldloc {result_il_name}");
+            fi
+        si
+
+        // Initialise the result local before the loop.
+        _gen_result_init(context: IR.CONTEXT) is
+            if consumer_kind =~ "count" \/ consumer_kind =~ "any" then
+                // count starts at 0; any starts false (0).
+                context.write_line("ldc.i4.0");
+                context.write_line("stloc {result_il_name}");
+            elif consumer_kind =~ "all" then
+                context.write_line("ldc.i4.1");
+                context.write_line("stloc {result_il_name}");
+            elif let seed = seed_init then
+                // reduce (seed), find / first (empty MAYBE), collect (list).
+                gen(seed, context);
+                context.write_line("stloc {result_il_name}");
+            fi
+        si
+
+        // Per-element consumer body (after the stages have produced the
+        // surviving element).
+        _gen_element_body(context: IR.CONTEXT, loop_start: IR.LABEL, loop_end: IR.LABEL) is
+            if consumer_kind =~ "count" then
+                context.write_line("ldloc {result_il_name}");
+                context.write_line("ldc.i4.1");
+                context.write_line("add");
+                context.write_line("stloc {result_il_name}");
+            elif consumer_kind =~ "any" then
+                let next = IR.LABEL();
+                gen(consumer_apply!, context);
+                context.write_line("brfalse {next}");
+                context.write_line("ldc.i4.1");
+                context.write_line("stloc {result_il_name}");
+                context.write_line("br {loop_end}");
+                context.write_line("{next}:");
+            elif consumer_kind =~ "all" then
+                let next = IR.LABEL();
+                gen(consumer_apply!, context);
+                context.write_line("brtrue {next}");
+                context.write_line("ldc.i4.0");
+                context.write_line("stloc {result_il_name}");
+                context.write_line("br {loop_end}");
+                context.write_line("{next}:");
+            elif consumer_kind =~ "for_each" then
+                gen(consumer_apply!, context);
+            elif consumer_kind =~ "reduce" then
+                gen(consumer_apply!, context);
+                context.write_line("stloc {result_il_name}");
+            elif consumer_kind =~ "find" then
+                let next = IR.LABEL();
+                gen(consumer_apply!, context);
+                context.write_line("brfalse {next}");
+                gen(wrap_element!, context);
+                context.write_line("stloc {result_il_name}");
+                context.write_line("br {loop_end}");
+                context.write_line("{next}:");
+            elif consumer_kind =~ "first" then
+                gen(wrap_element!, context);
+                context.write_line("stloc {result_il_name}");
+                context.write_line("br {loop_end}");
+            elif consumer_kind =~ "collect" then
+                gen(add_element!, context);
+            fi
+        si
+
+        to_string() -> string =>
+            "fused-consumer:[{consumer_kind}]({_result_type})";
+    si
+si
