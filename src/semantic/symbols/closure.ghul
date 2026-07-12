@@ -50,8 +50,65 @@ namespace Semantic.Symbols is
             self.is_recursive = is_recursive;
         si
 
+        is_stateless_delegate: bool;
+
+        // Latched when the load site emits this delegate as a static
+        // method with a null target instead of an instance method bound
+        // to self. The load-site IL is frozen at load time while the
+        // method definition is emitted later by generate-il, so the
+        // decision is recorded here rather than recomputed - both must
+        // agree on the calling convention.
+        is_static_delegate: bool;
+
+        // Set when the delegate's body loads self (its `ldarg.0` target).
+        // Such a delegate, e.g. `() => self`, returns a self-dependent
+        // result, so it must not be shared across receivers even though it
+        // captures no values.
+        _delegate_body_loads_self: bool;
+
+        note_delegate_body_loads_self() is
+            _delegate_body_loads_self = true;
+        si
+
+        // True only while this closure's own literal body is being walked,
+        // so a self-load can be attributed to the body rather than to a
+        // separate scope constructing the delegate (binding its target).
+        _walking_literal_body: bool;
+
+        enter_literal_body() is
+            _walking_literal_body = true;
+        si
+
+        leave_literal_body() is
+            _walking_literal_body = false;
+        si
+
+        // A receiver load (`ldarg.0`) is about to be emitted; mark the
+        // closure whose body it lands in. That is the innermost closure
+        // currently walking its literal body - not necessarily the closure
+        // that answered the load: a nested literal's construction site sits
+        // in its enclosing literal's body, so binding the nested delegate's
+        // target loads the receiver in the enclosing body.
+        note_enclosing_body_loads_self() is
+            let stack = IoC.CONTAINER.instance.symbol_table.stack;
+            let index mut = stack.count - 1;
+
+            while index >= 0 do
+                if let closure: Closure = stack[index] then
+                    if closure._walking_literal_body then
+                        closure.note_delegate_body_loads_self();
+                        return;
+                    fi
+                fi
+
+                index = index - 1;
+            od
+        si
+
         convert_to_delegate() is
             assert could_be_delegate;
+
+            is_stateless_delegate = !captured_values?;
 
             is_self_captured = false;
             captured_values = null;
@@ -59,33 +116,89 @@ namespace Semantic.Symbols is
             is_delegate = true;
         si
 
-        // A stateless, ground function literal: emitted as a static or
-        // global anonymous function (`ldnull` target, no captures) with
-        // no captured type arguments and a fully-settled function type.
-        // Its delegate carries no per-evaluation state, so it can be
-        // built once and cached in a static field instead of
-        // reallocated on every use. The settled-type gate excludes
-        // literals whose inference never resolved (their function type
-        // would render placeholder comments into the cache field).
+        // A stateless, ground function literal whose delegate carries no
+        // per-evaluation state, so it can be built once and cached in a
+        // static field instead of reallocated on every use. Two shapes
+        // qualify, both with no captured type arguments and a fully-settled,
+        // ground function type:
+        //
+        //   - a static or global anonymous function (`ldnull` target, no
+        //     captures), cached on the enclosing namespace's `$globals`;
+        //   - an instance-context delegate that captures no values and never
+        //     loads self in its body: it is emitted as a static method with
+        //     a null target and cached on its enclosing non-generic class,
+        //     so the cache retains no receiver instance.
+        //
+        // The settled/ground-type gate excludes literals whose inference
+        // never resolved or whose type mentions a type variable (either
+        // would produce an invalid cache field). The self-load gate
+        // excludes a delegate like `() => self` whose result depends on the
+        // receiver even though it captures nothing.
         is_memoizable_delegate: bool is
-            if !is_anon_func \/ captured_type_arguments? \/ !_enclosing_namespace()? then
+            if captured_type_arguments? then
                 return false;
             fi
 
             let function_type = type;
 
-            return function_type? /\ function_type.is_settled;
+            if !function_type? \/ !function_type.is_settled \/ !_is_ground_type(function_type) then
+                return false;
+            fi
+
+            if is_anon_func then
+                return _enclosing_namespace()?;
+            fi
+
+            if is_delegate /\ is_stateless_delegate /\ !_delegate_body_loads_self then
+                // Async literals lower through the state-machine path;
+                // their delegate creation is not worth caching (the state
+                // machine allocation dominates) and is left untouched.
+                if async_state_machine_for(self)? then
+                    return false;
+                fi
+
+                if let owner_class: CLASS = get_il_owner() then
+                    return !owner_class.is_generic;
+                fi
+
+                return false;
+            fi
+
+            return false;
         si
 
-        // Static field caching this literal's delegate. Lives on the
-        // enclosing namespace's `$globals` class alongside the anonymous
-        // function itself. Built lazily and shared between the load-site
+        _is_ground_type(candidate: Semantic.Types.Type) -> bool is
+            let mentions_type_variable mut = false;
+
+            candidate.walk((element: Semantic.Types.Type) is
+                if element.is_type_variable then
+                    mentions_type_variable = true;
+                fi
+            si);
+
+            return !mentions_type_variable;
+        si
+
+        // Static field caching this literal's delegate. A static/global
+        // anonymous function caches on the enclosing namespace's `$globals`
+        // class; a stateless instance-context delegate caches on its
+        // enclosing class. Built lazily and shared between the load-site
         // reference and the definition emitted by generate-il.
         _delegate_cache_field: Field?;
 
+        // True once a load site has referenced the cache field; the field
+        // definition is emitted iff this holds, so the definition tracks
+        // what the frozen load-site IL actually references.
+        has_delegate_cache_field: bool => _delegate_cache_field?;
+
         delegate_cache_field: Field is
             if !_delegate_cache_field? then
-                let `field = Symbols.GLOBAL_VARIABLE(LOCATION.internal, _enclosing_namespace()!, "{name!}$cache");
+                let `field: Field =
+                    if is_anon_func then
+                        Symbols.GLOBAL_VARIABLE(LOCATION.internal, _enclosing_namespace()!, "{name!}$cache")
+                    else
+                        Symbols.STATIC_FIELD(LOCATION.internal, get_il_owner(), "{name!}$cache")
+                    fi;
                 `field.set_type(type!);
                 _delegate_cache_field = `field;
             fi
@@ -778,6 +891,18 @@ namespace Semantic.Symbols is
 
             let function_pointer = IR.Values.Load.FUNCTION_POINTER(self);
 
+            // A stateless delegate that never reads self doesn't need a
+            // receiver at all: emit it as a static method with a null
+            // target (the same shape as a static anonymous function) and
+            // cache it, so no receiver instance is retained by the cache.
+            is_static_delegate = is_memoizable_delegate;
+
+            if is_static_delegate then
+                let delegate = IR.Values.Load.DELEGATE(closure_type, function_pointer, IR.Values.NULL(Types.NULL()));
+
+                return memoize_delegate(delegate);
+            fi
+
             // Delegate target: the receiver the runtime binds to the
             // delegate. Inside a generator's MoveNext, `ldarg.0` is
             // the state machine, so a plain `loader.load_self` would
@@ -795,9 +920,12 @@ namespace Semantic.Symbols is
                 self_pointer = loader.load_self(LOCATION.internal);
             fi
 
-            let delegate = IR.Values.Load.DELEGATE(closure_type, function_pointer, self_pointer);
+            // Binding the target loads the receiver at the construction
+            // site, which sits in the enclosing literal's body when this
+            // delegate is nested inside another literal.
+            note_enclosing_body_loads_self();
 
-            return delegate;
+            return IR.Values.Load.DELEGATE(closure_type, function_pointer, self_pointer);
         si
 
         load_outer_self(location: Source.LOCATION, loader: SYMBOL_LOADER) -> Value? is
@@ -805,6 +933,8 @@ namespace Semantic.Symbols is
             let context = symbol_table.current_instance_context;
 
             if is_delegate then
+                note_enclosing_body_loads_self();
+
                 return IR.Values.Load.REFERENCE_SELF(context!, context.type);
             fi
 
@@ -850,6 +980,8 @@ namespace Semantic.Symbols is
         load_self(location: Source.LOCATION, loader: SYMBOL_LOADER) -> Value is
             if is_delegate then
                 let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+
+                note_enclosing_body_loads_self();
 
                 return IR.Values.Load.REFERENCE_SELF(context!, context.type);
             fi
@@ -1091,13 +1223,13 @@ namespace Semantic.Symbols is
         si
 
         gen_calling_convention(buffer: StringBuilder) is
-            if !is_anon_func then
+            if !is_anon_func /\ !is_static_delegate then
                 buffer.append("instance ");
             fi
         si
 
         gen_flags(buffer: StringBuilder) is
-            if !is_anon_func then
+            if !is_anon_func /\ !is_static_delegate then
                 buffer.append("hidebysig specialname ");
             else
                 buffer.append("hidebysig specialname static ");
