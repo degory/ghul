@@ -800,6 +800,461 @@ namespace Analysis is
             fi
         si
 
+        _definition_signature(definition: Syntax.Trees.Definitions.Definition) -> string is
+            let signature = Syntax.INTERFACE_SIGNATURE();
+
+            definition.walk(signature);
+
+            return signature.signature;
+        si
+
+        // An interface-affecting edit handled incrementally. Two shapes
+        // qualify, classified by comparing per-top-level-definition
+        // interface signatures (the whole-file signature folds post-order
+        // - a parent's kind trails its children - so neither shape is a
+        // string-prefix relation on it):
+        //
+        //  - append-only: every retained definition matches the donor's
+        //    at the same index and the donor has extras. The appended
+        //    declarations are adopted onto the retained AST and built
+        //    against the retained tables; nothing referenced them before
+        //    the edit, so nothing else changes.
+        //  - replace-one: same count, exactly one definition differs, and
+        //    the outgoing subtree declares only functions that nothing
+        //    outside this file references or overrides. The old functions
+        //    are removed from their scopes, the side tables purge the old
+        //    subtree's span, and the new subtree is built in its place.
+        //    This is the interface-typing stream: each keystroke pause
+        //    re-replaces the one declaration in flux.
+        //
+        // Everything else falls back to the whole-project rebuild. A new
+        // or renamed name can in principle capture a previously
+        // differently-resolved use in another file; that stale resolution
+        // lasts until the next full rebuild - the same class of transient
+        // imprecision the store-free bits accept.
+        try_incremental_interface_edit(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained = _retained;
+
+            if !retained? then
+                return false;
+            fi
+
+            let edited_path = retained.file_name;
+            let donor = _source_files_by_path[edited_path];
+
+            let donor_signature = donor.interface_signature;
+
+            if !retained.interface_signature? \/ !donor_signature? then
+                return false;
+            fi
+
+            let donor_list = cast Syntax.Trees.Definitions.LIST?(donor.definition);
+            let retained_list = cast Syntax.Trees.Definitions.LIST?(retained.definition);
+
+            if !donor_list? \/ !retained_list? then
+                return false;
+            fi
+
+            let donor_definitions = donor_list.definitions;
+            let retained_definitions = retained_list.definitions;
+            let retained_count = retained_definitions.count;
+
+            if donor_definitions.count == retained_count then
+                let changed_index mut = -1;
+
+                for i in 0..retained_count do
+                    if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
+                        if changed_index >= 0 then
+                            return false;
+                        fi
+
+                        changed_index = i;
+                    fi
+                od
+
+                if changed_index < 0 then
+                    // The whole-file signatures differ but no top-level
+                    // definition's does - something file-level changed;
+                    // let the full rebuild sort it out.
+                    return false;
+                fi
+
+                let chain = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
+                return _try_narrow_edit(retained, donor_signature, chain, retained_definitions[changed_index], donor_definitions[changed_index], diagnostics, checked_paths);
+            fi
+
+            if donor_definitions.count < retained_count then
+                return false;
+            fi
+
+            for i in 0..retained_count do
+                if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
+                    return false;
+                fi
+            od
+
+            // Split the donor: the leading definitions pair with the
+            // retained skeleton; the tail is the appended declarations.
+            let appended = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
+            while donor_definitions.count > retained_count do
+                appended.insert(0, donor_definitions[donor_definitions.count - 1]);
+                donor_definitions.remove_at(donor_definitions.count - 1);
+            od
+
+            if !try_incremental_build(diagnostics, checked_paths, false) then
+                // try_incremental_build re-registered the donor as the
+                // live file; give it its appended tail back so the full
+                // rebuild sees the whole edit.
+                for d in appended do
+                    donor_definitions.add(d);
+                od
+
+                return false;
+            fi
+
+            for d in appended do
+                retained_list.add(d);
+            od
+
+            _compiler.build_appended(
+                retained,
+                Syntax.Trees.Definitions.LIST(retained_list.location, appended)
+            );
+
+            retained.interface_signature = donor_signature;
+
+            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+
+            return true;
+        si
+
+        // Narrow a changed definition pair down to the smallest changed
+        // window. Containers of the same kind and name - namespaces, and
+        // classes whose headers match - recurse into their member lists;
+        // at each level the members split into a signature-matched common
+        // prefix, a signature-matched common suffix, and the changed
+        // window between them. A window consisting solely of function
+        // definitions is replaced in place; anything else falls back to
+        // the whole-project rebuild.
+        _try_narrow_edit(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_definition: Syntax.Trees.Definitions.Definition,
+            donor_definition: Syntax.Trees.Definitions.Definition,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            if let retained_namespace: Syntax.Trees.Definitions.NAMESPACE = retained_definition then
+                let donor_namespace = cast Syntax.Trees.Definitions.NAMESPACE?(donor_definition);
+
+                if !donor_namespace? \/ retained_namespace.name.name !~ donor_namespace.name.name then
+                    return false;
+                fi
+
+                chain.add(retained_namespace);
+
+                return _try_narrow_children(retained, donor_signature, chain, retained_namespace.body, donor_namespace.body, null, diagnostics, checked_paths);
+            fi
+
+            if let retained_class: Syntax.Trees.Definitions.CLASS = retained_definition then
+                let donor_class = cast Syntax.Trees.Definitions.CLASS?(donor_definition);
+
+                if
+                    !donor_class? \/
+                    _class_header_signature(retained_class) !~ _class_header_signature(donor_class)
+                then
+                    return false;
+                fi
+
+                let scope = _symbol_table.scope_for(retained_class);
+                let classy = if scope? then cast Semantic.Symbols.Classy?(scope.underlying_scope) else null fi;
+
+                if !classy? then
+                    return false;
+                fi
+
+                // The hierarchy slice reset is limited to the class itself
+                // for now: a class with ghul-declared subclasses or trait
+                // implementors would need them reset and re-pulled too.
+                if let implementors = classy.implementors then
+                    for i in implementors do
+                        if !i.is_reflected then
+                            return false;
+                        fi
+                    od
+                fi
+
+                chain.add(retained_class);
+
+                return _try_narrow_children(retained, donor_signature, chain, retained_class.body, donor_class.body, classy, diagnostics, checked_paths);
+            fi
+
+            return false;
+        si
+
+        _try_narrow_children(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_body: Syntax.Trees.Definitions.LIST,
+            donor_body: Syntax.Trees.Definitions.LIST,
+            slice_class: Semantic.Symbols.Classy?,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained_members = retained_body.definitions;
+            let donor_members = donor_body.definitions;
+
+            let retained_count = retained_members.count;
+            let donor_count = donor_members.count;
+
+            let limit = if retained_count < donor_count then retained_count else donor_count fi;
+
+            let prefix mut = 0;
+
+            while
+                prefix < limit /\
+                _definition_signature(retained_members[prefix]) =~ _definition_signature(donor_members[prefix])
+            do
+                prefix = prefix + 1;
+            od
+
+            let suffix mut = 0;
+
+            while
+                suffix < limit - prefix /\
+                _definition_signature(retained_members[retained_count - 1 - suffix]) =~ _definition_signature(donor_members[donor_count - 1 - suffix])
+            do
+                suffix = suffix + 1;
+            od
+
+            let retained_window = retained_count - prefix - suffix;
+            let donor_window = donor_count - prefix - suffix;
+
+            if retained_window == 1 /\ donor_window == 1 then
+                // A single changed member may itself be a container with a
+                // still narrower change inside it. Recursion mutates the
+                // chain, so work on a copy in case it declines and the
+                // window falls through to function replacement.
+                let inner_chain = Collections.LIST[Syntax.Trees.Definitions.Definition](chain);
+
+                if _try_narrow_edit(retained, donor_signature, inner_chain, retained_members[prefix], donor_members[prefix], diagnostics, checked_paths) then
+                    return true;
+                fi
+            fi
+
+            return _try_replace_functions(retained, donor_signature, chain, retained_body, donor_body, prefix, retained_window, donor_window, slice_class, diagnostics, checked_paths);
+        si
+
+        // Replace the changed window of a member list, when every member
+        // in it (both outgoing and incoming) is a function definition. All
+        // guards run before anything is mutated.
+        _try_replace_functions(
+            retained: SOURCE_FILE,
+            donor_signature: string,
+            chain: Collections.LIST[Syntax.Trees.Definitions.Definition],
+            retained_body: Syntax.Trees.Definitions.LIST,
+            donor_body: Syntax.Trees.Definitions.LIST,
+            prefix: int,
+            retained_window: int,
+            donor_window: int,
+            slice_class: Semantic.Symbols.Classy?,
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string]
+        ) -> bool is
+            let retained_members = retained_body.definitions;
+            let donor_members = donor_body.definitions;
+
+            let removed_functions = Collections.LIST[Semantic.Symbols.Function]();
+
+            for i in 0..retained_window do
+                let member = retained_members[prefix + i];
+
+                let function = _function_symbol_for(member);
+
+                if !function? then
+                    return false;
+                fi
+
+                // Nothing outside the outgoing function's own definition
+                // may be bound to it: a referencing definition's bodies
+                // re-walk before the teardown, so its call to the removed
+                // function would otherwise stay silently bound to the dead
+                // symbol. Only direct references count - a call bound to
+                // an overridden base member stays valid when an override
+                // is removed. Override links in either direction are
+                // undone by the slice reset, but only when there is a
+                // class to reset - at namespace level they reject the
+                // edit.
+                if !slice_class? then
+                    if !function.has_no_overriders then
+                        return false;
+                    fi
+
+                    if let overridees = function.overridees then
+                        if overridees | .any(o => true) then
+                            return false;
+                        fi
+                    fi
+                fi
+
+                for reference in IoC.CONTAINER.instance.symbol_use_locations.direct_references_to(function) do
+                    if reference.file_name !~ retained.file_name then
+                        return false;
+                    fi
+
+                    if reference.start < member.location.start \/ reference.start > member.location.end then
+                        return false;
+                    fi
+                od
+
+                removed_functions.add(function);
+            od
+
+            for i in 0..donor_window do
+                if !isa Syntax.Trees.Definitions.FUNCTION(donor_members[prefix + i]) then
+                    return false;
+                fi
+            od
+
+            // Trim both windows so the remaining trees pair structurally
+            // for the ordinary body re-walk; the outgoing members' spans
+            // purge their side-table entries through the same
+            // reconciliation that drops re-walked body spans.
+            let removed_definitions = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+            let added_definitions = Collections.LIST[Syntax.Trees.Definitions.Definition]();
+
+            let extra_purge_spans = Collections.LIST[Source.LOCATION]();
+
+            for i in 0..retained_window do
+                let member = retained_members[prefix];
+
+                removed_definitions.add(member);
+                extra_purge_spans.add(member.location);
+
+                retained_members.remove_at(prefix);
+            od
+
+            for i in 0..donor_window do
+                added_definitions.add(donor_members[prefix]);
+                donor_members.remove_at(prefix);
+            od
+
+            if !try_incremental_build(diagnostics, checked_paths, false, extra_purge_spans) then
+                for i in 0..retained_window do
+                    retained_members.insert(prefix + i, removed_definitions[i]);
+                od
+
+                for i in 0..donor_window do
+                    donor_members.insert(prefix + i, added_definitions[i]);
+                od
+
+                return false;
+            fi
+
+            // Committed. Undo the class's pull-down before touching its
+            // declared members so the journal's record still matches the
+            // state it was made against.
+            if slice_class? then
+                slice_class.reset_pulled_down_symbols();
+            fi
+
+            for f in removed_functions do
+                _remove_function_from_owner(f);
+            od
+
+            for i in 0..donor_window do
+                retained_members.insert(prefix + i, added_definitions[i]);
+            od
+
+            let added_list = Syntax.Trees.Definitions.LIST(retained_body.location, added_definitions);
+
+            _compiler.build_members_interface(retained, chain, added_list);
+
+            // Re-resolve the class's inheritance against the changed
+            // member set: overrides, pulled-down members and implementor
+            // registration all rebuild through the ordinary pull-down.
+            if slice_class? then
+                slice_class.pull_down_super_symbols();
+            fi
+
+            _compiler.build_members_expressions(retained, chain, added_list);
+
+            retained.interface_signature = donor_signature;
+
+            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+
+            return true;
+        si
+
+        // The header of a class-like definition - name, type parameters,
+        // ancestors and modifiers - folded the way the interface signature
+        // folds them, so two versions of a class can be compared ignoring
+        // their member lists.
+        _class_header_signature(`class: Syntax.Trees.Definitions.Classy) -> string is
+            let signature = Syntax.INTERFACE_SIGNATURE();
+
+            `class.name.walk(signature);
+
+            if let arguments = `class.arguments then
+                arguments.walk(signature);
+            fi
+
+            if let ancestors = `class.ancestors then
+                ancestors.walk(signature);
+            fi
+
+            `class.modifiers.walk(signature);
+
+            return signature.signature;
+        si
+
+        _function_symbol_for(definition: Syntax.Trees.Definitions.Definition) -> Semantic.Symbols.Function? is
+            if !isa Syntax.Trees.Definitions.FUNCTION(definition) then
+                return null;
+            fi
+
+            let scope = _symbol_table.scope_for(definition);
+
+            if !scope? then
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Function?(scope.underlying_scope);
+        si
+
+        _remove_function_from_owner(function: Semantic.Symbols.Function) is
+            let owner = cast Semantic.Symbols.Scoped?(function.owner);
+
+            if !owner? then
+                return;
+            fi
+
+            let name = function.name;
+
+            if !name? then
+                return;
+            fi
+
+            let existing = owner.find_direct(name);
+
+            if let group: Semantic.Symbols.FUNCTION_GROUP = existing then
+                group.remove(function);
+
+                if group.is_empty then
+                    owner.remove_direct(name);
+                fi
+            elif existing == function then
+                owner.remove_direct(name);
+            fi
+        si
+
         // The incremental body re-walk for an interface-preserving single-file
         // EDIT: keep the retained AST registered, splice the freshly-parsed
         // bodies onto it, refresh its locations from the fresh parse, and
@@ -809,6 +1264,21 @@ namespace Analysis is
         try_incremental_build(
             diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
             checked_paths: Collections.LIST[string]
+        ) -> bool =>
+            try_incremental_build(diagnostics, checked_paths, true, null);
+
+        try_incremental_build(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string],
+            want_collect: bool
+        ) -> bool =>
+            try_incremental_build(diagnostics, checked_paths, want_collect, null);
+
+        try_incremental_build(
+            diagnostics: Collections.LIST[Protocol.DIAGNOSTIC],
+            checked_paths: Collections.LIST[string],
+            want_collect: bool,
+            extra_purge_spans: Collections.List[Source.LOCATION]?
         ) -> bool is
             let retained = _retained;
 
@@ -844,6 +1314,15 @@ namespace Analysis is
                 fi
             od
 
+            // A replaced definition's whole span purges the same way as a
+            // re-walked body: its old entries drop and the replacement's
+            // build re-records them.
+            if extra_purge_spans? then
+                for s in extra_purge_spans do
+                    body_spans.add(s);
+                od
+            fi
+
             Syntax.BODY_SPLICE.apply(pairs);
 
             // The lockstep reconciliation walk: copies the donor's correct
@@ -862,7 +1341,9 @@ namespace Analysis is
 
             _compiler.rewalk_bodies(retained, correspondence, body_spans);
 
-            DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+            if want_collect then
+                DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+            fi
 
             return true;
         si
@@ -928,11 +1409,26 @@ namespace Analysis is
                 _retained? /\
                 _retained.interface_signature?;
 
+            // An interface-affecting edit takes the incremental interface
+            // path - appended declarations, or one replaced declaration
+            // whose old symbols nothing else references - instead of the
+            // whole-project rebuild; the shape classification lives in
+            // try_incremental_interface_edit.
+            let interface_edit_eligible =
+                _build_flags.want_incremental_analysis /\
+                _is_interface_changed /\
+                paths.count == 1 /\
+                _retained? /\
+                _retained.interface_signature?;
+
             try
                 Semantic.Types.NAMED.clear_cache();
 
                 if !_watchdog.want_restart then
-                    if !(incremental_eligible /\ try_incremental_build(diagnostics, checked_paths)) then
+                    if
+                        !(incremental_eligible /\ try_incremental_build(diagnostics, checked_paths)) /\
+                        !(interface_edit_eligible /\ try_incremental_interface_edit(diagnostics, checked_paths))
+                    then
                         for i in _source_files_by_path.values do
                             i.want_compile_up_to_expressions = true;
 

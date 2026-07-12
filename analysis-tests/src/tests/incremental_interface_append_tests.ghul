@@ -1,0 +1,515 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // Guards the append-only incremental interface edit: when a
+    // single-file EDIT's new interface signature strictly extends the
+    // retained one, the appended declarations are declared, resolved and
+    // compiled against the retained symbol table instead of triggering
+    // the whole-project rebuild. Runs meaningfully in both suite modes -
+    // without --incremental-analysis the same edits take the full
+    // rebuild, so the mode-sensitive assertions branch on the flag.
+    class INCREMENTAL_INTERFACE_APPEND_TESTS is
+        @test()
+
+        init() is si
+
+        is_incremental_mode() -> bool is
+            let extra = System.Environment.get_environment_variable("ANALYSER_EXTRA_ARGS");
+
+            return extra? /\ extra.contains("--incremental-analysis");
+        si
+
+        helper_source() -> string =>
+            "namespace AppendTarget is\n"
+            "    class HELPER is\n"
+            "        init() is si\n"
+            "\n"
+            "        value() -> int => 1;\n"
+            "    si\n"
+            "si\n";
+
+        // The appended block mirrors the analysis profiler's
+        // interface-edit shape: a new namespace with a global function
+        // appended at the end of the file. Its body references the
+        // retained HELPER class, so a clean compile proves the appended
+        // subtree resolved against the retained tables.
+        helper_source_with_appended_probe() -> string =>
+            "{helper_source()}"
+            "namespace AppendProbe is\n"
+            "    probe() -> int => AppendTarget.HELPER().value();\n"
+            "si\n";
+
+        // The interface-typing-stream shape: successive edits rename the
+        // probe function, so each edit replaces the tail declaration
+        // rather than appending.
+        helper_source_with_probe(n: int) -> string =>
+            "{helper_source()}"
+            "namespace AppendProbe is\n"
+            "    probe_{n}() -> int => AppendTarget.HELPER().value();\n"
+            "si\n";
+
+        helper_source_with_stale_probe_call() -> string =>
+            "{helper_source()}"
+            "namespace AppendProbe is\n"
+            "    probe_9() -> int => probe_1();\n"
+            "si\n";
+
+        helper_source_with_appended_error() -> string =>
+            "{helper_source()}"
+            "namespace AppendProbe is\n"
+            "    probe() -> int => AppendTarget.HELPER().no_such_member();\n"
+            "si\n";
+
+        watcher_source() -> string =>
+            "namespace AppendTarget is\n"
+            "    class WATCHER is\n"
+            "        init() is si\n"
+            "\n"
+            "        watch() -> int is\n"
+            "            let h = HELPER();\n"
+            "            return h.value();\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        prime(analyser: ANALYSER_PROCESS) is
+            analyser.send_edit_files([
+                EDIT_FILE("helper.ghul", helper_source()),
+                EDIT_FILE("watcher.ghul", watcher_source())
+            ]);
+
+            assert_clean(analyser, "priming EDIT");
+        si
+
+        assert_clean(analyser: ANALYSER_PROCESS, context: string) is
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS on {context}, got '{response.get_type().name}'";
+
+            let user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(response));
+            Assert.are_equal(
+                0,
+                user_diagnostics.count,
+                "{diagnostics_summary("{context} surfaced unexpected diagnostics", user_diagnostics)}\n--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        appended_declarations_compile_against_retained_tables() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            analyser.send_edit("helper.ghul", helper_source_with_appended_probe());
+
+            assert_clean(analyser, "append EDIT");
+
+            // `value` in the appended probe's body - present in the hover
+            // map only if the appended subtree went through
+            // compile-expressions.
+            analyser.send_hover("helper.ghul", 9, 46);
+
+            let response = analyser.read_query_response();
+            assert isa Response.HOVER(response) else "expected HOVER, got '{response.get_type().name}'";
+
+            Assert.is_true(
+                response.signature? /\ response.signature.contains("value"),
+                "HOVER on the appended probe's call should describe `value`, got: {response.signature}"
+            );
+        si
+
+        errors_in_appended_declarations_are_reported() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            analyser.send_edit("helper.ghul", helper_source_with_appended_error());
+
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS, got '{response.get_type().name}'";
+
+            let user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(response));
+
+            Assert.is_true(
+                user_diagnostics | .any(d => d.message.contains("no_such_member")),
+                "{diagnostics_summary("expected a diagnostic about no_such_member in the appended code, got", user_diagnostics)}"
+            );
+        si
+
+        // The typing-stream shape end to end: append, then two successive
+        // replaces of the tail declaration. Each replace must tear the
+        // old probe out (the final edit calls the long-removed probe_1
+        // and must get an error), compile the new one against the
+        // retained tables, and leave the other file's compiled state
+        // untouched.
+        replaced_tail_declaration_compiles_incrementally() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            analyser.send_edit("helper.ghul", helper_source_with_probe(1));
+            assert_clean(analyser, "append EDIT probe_1");
+
+            analyser.send_edit("helper.ghul", helper_source_with_probe(2));
+            assert_clean(analyser, "replace EDIT probe_2");
+
+            // The replacement compiled: `value` in probe_2's body is in
+            // the hover map.
+            analyser.send_hover("helper.ghul", 9, 30);
+
+            let response = analyser.read_query_response();
+            assert isa Response.HOVER(response) else "expected HOVER, got '{response.get_type().name}'";
+
+            if is_incremental_mode() then
+                // Neither edit rebuilt the world: the other file's
+                // expression-level state survived both.
+                analyser.send_hover("watcher.ghul", 7, 23);
+
+                let cross = analyser.read_response();
+                assert isa Response.HOVER(cross)
+                    else "expected HOVER directly after append+replace edits, got '{cross.get_type().name}'"
+                        "\n--- analyser stderr ---\n{analyser.stderr_capture}";
+            fi
+
+            // probe_1 was torn out by the first replace: a body that
+            // calls it must error.
+            analyser.send_edit("helper.ghul", helper_source_with_stale_probe_call());
+
+            let stale = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(stale) else "expected DIAGNOSTICS, got '{stale.get_type().name}'";
+
+            let stale_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(stale));
+
+            Assert.is_true(
+                stale_diagnostics | .any(d => d.message.contains("probe_1")),
+                "{diagnostics_summary("expected an error about the removed probe_1, got", stale_diagnostics)}"
+            );
+        si
+
+        // A same-file reference from another definition forces the
+        // fallback: the caller definition's bodies re-walk before any
+        // teardown could run, so an incremental replace would leave its
+        // call bound to the dead symbol and silently clean. The full
+        // rebuild surfaces the error instead.
+        cross_definition_reference_gets_its_error() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit(
+                "crossdef.ghul",
+                "namespace CrossCaller is\n"
+                "    ping() -> int => AppendProbe.probe_1();\n"
+                "si\n"
+                "namespace AppendProbe is\n"
+                "    probe_1() -> int => 1;\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "priming EDIT");
+
+            // Rename the probe out from under its same-file caller.
+            analyser.send_edit(
+                "crossdef.ghul",
+                "namespace CrossCaller is\n"
+                "    ping() -> int => AppendProbe.probe_1();\n"
+                "si\n"
+                "namespace AppendProbe is\n"
+                "    probe_2() -> int => 1;\n"
+                "si\n"
+            );
+
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS, got '{response.get_type().name}'";
+
+            let user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(response));
+
+            Assert.is_true(
+                user_diagnostics | .any(d => d.message.contains("probe_1")),
+                "{diagnostics_summary("expected an error about the renamed-away probe_1, got", user_diagnostics)}"
+            );
+        si
+
+        // Appending a class that extends a constructed generic exercises
+        // the pull-down through a specialized view inside build_appended:
+        // its override and implementor links must land on the retained
+        // root symbols for the follow-up append's member call to resolve.
+        appended_class_extending_constructed_generic_compiles() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit(
+                "genericbase.ghul",
+                "namespace GenericAppend is\n"
+                "    class BOX[T] is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> T? => null;\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "priming EDIT");
+
+            analyser.send_edit(
+                "genericbase.ghul",
+                "namespace GenericAppend is\n"
+                "    class BOX[T] is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> T? => null;\n"
+                "    si\n"
+                "si\n"
+                "namespace GenericAppendUse is\n"
+                "    class INT_BOX: GenericAppend.BOX[int] is\n"
+                "        init() is si\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "append class extending constructed generic");
+
+            analyser.send_edit(
+                "genericbase.ghul",
+                "namespace GenericAppend is\n"
+                "    class BOX[T] is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> T? => null;\n"
+                "    si\n"
+                "si\n"
+                "namespace GenericAppendUse is\n"
+                "    class INT_BOX: GenericAppend.BOX[int] is\n"
+                "        init() is si\n"
+                "    si\n"
+                "\n"
+                "    probe() -> int? => INT_BOX().value();\n"
+                "si\n"
+            );
+
+            // The appended probe resolves `value` through INT_BOX's
+            // pulled-down members - an identity break in the pull-down
+            // would surface here as a resolution error.
+            assert_clean(analyser, "append probe calling through the constructed-generic base");
+        si
+
+        // The real-world typing stream: a method added inside an existing
+        // class, then changed - each pause replaces the class's changed
+        // member window in place. The cross-file hover pins that neither
+        // edit rebuilt the world.
+        method_added_then_changed_in_class__compiles_incrementally() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            // Add a method to HELPER.
+            analyser.send_edit(
+                "helper.ghul",
+                "namespace AppendTarget is\n"
+                "    class HELPER is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> int => 1;\n"
+                "\n"
+                "        doubled() -> int => value() + value();\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "method-added EDIT");
+
+            // Change the new method's signature and body.
+            analyser.send_edit(
+                "helper.ghul",
+                "namespace AppendTarget is\n"
+                "    class HELPER is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> int => 1;\n"
+                "\n"
+                "        tripled() -> int => value() + value() + value();\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "method-changed EDIT");
+
+            if is_incremental_mode() then
+                analyser.send_hover("watcher.ghul", 7, 23);
+
+                let cross = analyser.read_response();
+                assert isa Response.HOVER(cross)
+                    else "expected HOVER directly after in-class method edits, got '{cross.get_type().name}'"
+                        "\n--- analyser stderr ---\n{analyser.stderr_capture}";
+            fi
+
+            // The torn-out method really is gone: a body calling it must
+            // error.
+            analyser.send_edit(
+                "helper.ghul",
+                "namespace AppendTarget is\n"
+                "    class HELPER is\n"
+                "        init() is si\n"
+                "\n"
+                "        value() -> int => 1;\n"
+                "\n"
+                "        quadrupled() -> int => doubled() + doubled();\n"
+                "    si\n"
+                "si\n"
+            );
+
+            let stale = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(stale) else "expected DIAGNOSTICS, got '{stale.get_type().name}'";
+
+            let stale_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(stale));
+
+            Assert.is_true(
+                stale_diagnostics | .any(d => d.message.contains("doubled")),
+                "{diagnostics_summary("expected an error about the removed doubled method, got", stale_diagnostics)}"
+            );
+        si
+
+        // Removing and re-adding an override re-resolves the class's
+        // inheritance through its pull-down reset: after the override is
+        // renamed away, calls through the class must reach the inherited
+        // base member; renaming it back must re-link cleanly.
+        override_method_replaced__relinks_through_pull_down() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE(
+                    "base.ghul",
+                    "namespace OverrideEdit is\n"
+                    "    class BASE is\n"
+                    "        init() is si\n"
+                    "\n"
+                    "        greet() -> string => \"b\";\n"
+                    "\n"
+                    "        twice() -> string => greet();\n"
+                    "    si\n"
+                    "si\n"
+                ),
+                EDIT_FILE(
+                    "derived.ghul",
+                    "namespace OverrideEdit is\n"
+                    "    class DERIVED: BASE is\n"
+                    "        init() is si\n"
+                    "\n"
+                    "        greet() -> string => \"d\";\n"
+                    "    si\n"
+                    "si\n"
+                )
+            ]);
+
+            assert_clean(analyser, "priming EDIT");
+
+            // Rename the override away. Nothing binds DERIVED.greet, so
+            // the teardown is in scope; its override edges on BASE.greet
+            // undo through the class's pull-down reset. (A member that
+            // other code binds falls back instead - the caller would need
+            // its expressions re-compiled to pick up the dispatch change.)
+            analyser.send_edit(
+                "derived.ghul",
+                "namespace OverrideEdit is\n"
+                "    class DERIVED: BASE is\n"
+                "        init() is si\n"
+                "\n"
+                "        shout() -> string => \"D\";\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "override renamed away");
+
+            // And back again.
+            analyser.send_edit(
+                "derived.ghul",
+                "namespace OverrideEdit is\n"
+                "    class DERIVED: BASE is\n"
+                "        init() is si\n"
+                "\n"
+                "        greet() -> string => \"d2\";\n"
+                "    si\n"
+                "si\n"
+            );
+
+            assert_clean(analyser, "override re-added");
+
+            if is_incremental_mode() then
+                // `greet` in BASE.twice's body - base.ghul was never
+                // rebuilt, so its expression state answers directly.
+                analyser.send_hover("base.ghul", 7, 31);
+
+                let cross = analyser.read_response();
+                assert isa Response.HOVER(cross)
+                    else "expected HOVER directly after override edits in the sibling file, got '{cross.get_type().name}'"
+                        "\n--- analyser stderr ---\n{analyser.stderr_capture}";
+            fi
+        si
+
+        // The discriminator: after an append edit, the other file's
+        // expression-level state should be untouched - a hover into its
+        // body answers directly. Without the flag the same edit takes the
+        // whole-project rebuild, which leaves the other file not compiled
+        // through expressions, so the hover pays a recompile and its
+        // diagnostics frame arrives first.
+        append_edit_keeps_other_files_compiled_through() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            // Baseline: the position resolves directly before the edit,
+            // pinning that a later miss is the edit's doing rather than a
+            // wrong fixture position.
+            analyser.send_hover("watcher.ghul", 7, 23);
+
+            let baseline = analyser.read_response();
+            assert isa Response.HOVER(baseline)
+                else "expected HOVER directly on the primed file before any edit, got '{baseline.get_type().name}'";
+            Assert.is_true(
+                baseline.signature? /\ baseline.signature.contains("value"),
+                "baseline HOVER should describe `value`, got: {baseline.signature}"
+            );
+
+            analyser.send_edit("helper.ghul", helper_source_with_appended_probe());
+
+            assert_clean(analyser, "append EDIT");
+
+            // `value` in WATCHER.watch's body.
+            analyser.send_hover("watcher.ghul", 7, 23);
+
+            if is_incremental_mode() then
+                let response = analyser.read_response();
+                assert isa Response.HOVER(response)
+                    else "expected HOVER directly (append path retains other files' compiled state), got '{response.get_type().name}'"
+                        "\n--- analyser stderr ---\n{analyser.stderr_capture}";
+
+                Assert.is_true(
+                    response.signature? /\ response.signature.contains("value"),
+                    "HOVER on watcher's call should describe `value`, got: {response.signature}"
+                );
+            else
+                let response = analyser.read_query_response();
+                assert isa Response.HOVER(response) else "expected HOVER, got '{response.get_type().name}'";
+            fi
+        si
+    si
+si
