@@ -764,28 +764,45 @@ namespace Syntax.Process is
 
             let fusion = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup).recognize(`for);
 
-            if !fusion? then
+            if !_resolve_chain_fusion(fusion) then
                 return null;
+            fi
+
+            return fusion;
+        si
+
+        // Finish a recognised chain plan: resolve the source's own iterator
+        // members, build the `isa Pipe` guard type for a non-sealed source,
+        // and resolve each stage (index constructor, or inline a literal
+        // lambda). Returns false when any of that fails, in which case the
+        // chain must not be fused. Shared by the `for` and consumer paths.
+        _resolve_chain_fusion(fusion: PIPE_FUSION?) -> bool =>
+            _resolve_chain_fusion(fusion, true);
+
+        // `inline_stages` false skips the inline re-walk of map/filter lambda
+        // bodies - consumer fusion calls the stage delegates rather than
+        // inlining them, and the re-walk can disturb a stage lambda whose
+        // body nests a capturing closure.
+        _resolve_chain_fusion(fusion: PIPE_FUSION?, inline_stages: bool) -> bool is
+            if !fusion? then
+                return false;
             fi
 
             let source_value = fusion.source.value;
 
             if !source_value? \/ !source_value.type? then
-                return null;
+                return false;
             fi
 
             if !_resolve_fusion_source_iterator(fusion, source_value.type!, false) then
-                return null;
+                return false;
             fi
 
             if fusion.needs_guard then
                 let guard_type = _fusion_guard_type(fusion);
 
                 if !guard_type? then
-                    // Cannot construct the Pipe[source-element] guard type,
-                    // so the fused loop cannot be guarded soundly - do not
-                    // fuse.
-                    return null;
+                    return false;
                 fi
 
                 fusion.guard_isa_type = guard_type;
@@ -796,16 +813,287 @@ namespace Syntax.Process is
                     stage.indexed_value_constructor = _resolve_index_constructor(stage.indexed_value_type!);
 
                     if !stage.is_index_ready then
-                        // Cannot resolve the INDEXED_VALUE constructor, so
-                        // the fused loop cannot build it - do not fuse.
-                        return null;
+                        return false;
                     fi
-                else
+                elif inline_stages then
                     _try_inline_stage(stage);
                 fi
             od
 
-            return fusion;
+            return true;
+        si
+
+        // Recognise a terminal Pipe consumer (`chain.count()`, ...) whose
+        // receiver is a fusible chain, and build the FUSED_CONSUMER value
+        // the call lowers to. v1 fuses only chains whose every stage is an
+        // inlinable map/filter (expression-bodied literal lambda); delegate,
+        // block-bodied, and index stages fall back to the pipe objects.
+        _recognize_consumer_fusion(call: Trees.Expressions.CALL) -> IR.Values.FUSED_CONSUMER? is
+            if _logger.is_suppressed("pipe-fusion", call.location) then
+                return null;
+            fi
+
+            if !isa Trees.Expressions.MEMBER(call.function) then
+                return null;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(call.function);
+            let name = member.identifier.name;
+            let arg_count = call.arguments.expressions.count;
+
+            let consumer_kind: string mut;
+
+            if name =~ "count" /\ arg_count == 0 then
+                consumer_kind = "count";
+            elif name =~ "any" /\ arg_count == 1 then
+                consumer_kind = "any";
+            elif name =~ "all" /\ arg_count == 1 then
+                consumer_kind = "all";
+            elif name =~ "for_each" /\ arg_count == 1 then
+                consumer_kind = "for_each";
+            elif name =~ "reduce" /\ arg_count == 2 then
+                consumer_kind = "reduce";
+            elif name =~ "find" /\ arg_count == 1 then
+                consumer_kind = "find";
+            elif name =~ "first" /\ arg_count == 0 then
+                consumer_kind = "first";
+            elif name =~ "collect_list" /\ arg_count == 0 then
+                consumer_kind = "collect";
+            else
+                return null;
+            fi
+
+            if !call.value? \/ !call.value.type? then
+                return null;
+            fi
+
+            let fusion = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup).recognize_chain(member.left);
+
+            if !_resolve_chain_fusion(fusion, false) then
+                return null;
+            fi
+
+            let plan = fusion!;
+
+            // v1 fuses map/filter stages (calling their delegates); an index
+            // stage in the chain falls back.
+            for stage in plan.stages_outermost_first do
+                if stage.is_index then
+                    return null;
+                fi
+            od
+
+            let id = _next_fused_local_id();
+
+            let iterator_il_name = "'.fc_iter.{id}'";
+            let element_il_name = "'.fc_element.{id}'";
+
+            let has_iterator = plan.source_read_iterator?;
+
+            let iterator_type =
+                if has_iterator then
+                    plan.source_read_iterator.return_type!
+                else
+                    plan.source.value!.type!
+                fi;
+
+            let iterator_init =
+                if has_iterator then
+                    plan.source_read_iterator.call(plan.source.location, plan.source.value!, Collections.LIST[IR.Values.Value](0), null, _function_caller)
+                else
+                    plan.source.value!
+                fi;
+
+            let iterator_load = cast IR.Values.Value(IR.Values.Load.TEMP(iterator_il_name, iterator_type));
+
+            let move_next = plan.source_move_next!.call(plan.source.location, iterator_load, Collections.LIST[IR.Values.Value](0), null, _function_caller);
+            let read_current = plan.source_read_current!.call(plan.source.location, iterator_load, Collections.LIST[IR.Values.Value](0), null, _function_caller);
+
+            let element_type = plan.source_read_current!.return_type!;
+
+            let built = _build_consumer_stages(plan, element_il_name, element_type);
+
+            let result_il_name = "'.fc_result.{id}'";
+
+            let fused = IR.Values.FUSED_CONSUMER(
+                call.value!.type!,
+                plan.source.value!,
+                call.value!,
+                iterator_init,
+                has_iterator,
+                iterator_il_name,
+                iterator_type,
+                move_next,
+                read_current,
+                element_il_name,
+                element_type,
+                built.ops,
+                built.final_il_name,
+                built.final_type,
+                consumer_kind,
+                result_il_name
+            );
+
+            let final_element_load = cast IR.Values.Value(IR.Values.Load.TEMP(built.final_il_name, built.final_type));
+
+            if consumer_kind =~ "any" \/ consumer_kind =~ "all" \/ consumer_kind =~ "for_each" \/ consumer_kind =~ "find" then
+                // Hoist the predicate / action delegate and apply it to the
+                // surviving element per iteration.
+                let function = call.arguments.expressions[0].value!;
+                let func_type = function.type!;
+
+                let arg_il_name = "'.fc_arg.{id}'";
+
+                let result_type =
+                    if func_type.is_action then
+                        _innate_symbol_lookup.get_void_type();
+                    else
+                        func_type.arguments[func_type.arguments.count - 1];
+                    fi;
+
+                let call_arguments = Collections.LIST[IR.Values.Value]();
+                call_arguments.add(final_element_load);
+
+                fused.consumer_arg_il_name = arg_il_name;
+                fused.consumer_arg_type = func_type;
+                fused.consumer_arg_init = function;
+                fused.consumer_apply = IR.Values.Call.CLOSURE(
+                    IR.Values.Load.TEMP(arg_il_name, func_type), result_type, func_type.is_action, func_type, call_arguments);
+            elif consumer_kind =~ "reduce" then
+                // running = accumulator(running, element).
+                let seed = call.arguments.expressions[0].value!;
+                let accumulator = call.arguments.expressions[1].value!;
+                let func_type = accumulator.type!;
+
+                let arg_il_name = "'.fc_arg.{id}'";
+                let running_type = call.value!.type!;
+
+                let call_arguments = Collections.LIST[IR.Values.Value]();
+                call_arguments.add(cast IR.Values.Value(IR.Values.Load.TEMP(result_il_name, running_type)));
+                call_arguments.add(final_element_load);
+
+                fused.seed_init = seed;
+                fused.consumer_arg_il_name = arg_il_name;
+                fused.consumer_arg_type = func_type;
+                fused.consumer_arg_init = accumulator;
+                fused.consumer_apply = IR.Values.Call.CLOSURE(
+                    IR.Values.Load.TEMP(arg_il_name, func_type), running_type, false, func_type, call_arguments);
+            fi
+
+            // find / first return a MAYBE: seed with the empty MAYBE, and
+            // wrap the surviving element with MAYBE(element).
+            if consumer_kind =~ "find" \/ consumer_kind =~ "first" then
+                let maybe_type = call.value!.type!;
+
+                let empty_ctor = _resolve_ctor_by_arity(maybe_type, 0);
+                let wrap_ctor = _resolve_ctor_by_arity(maybe_type, 1);
+
+                if !empty_ctor? \/ !wrap_ctor? then
+                    return null;
+                fi
+
+                fused.seed_init = IR.Values.NEW(maybe_type, empty_ctor!, Collections.LIST[IR.Values.Value](0));
+
+                let wrap_args = Collections.LIST[IR.Values.Value]();
+                wrap_args.add(final_element_load);
+
+                fused.wrap_element = IR.Values.NEW(maybe_type, wrap_ctor!, wrap_args);
+            fi
+
+            // collect_list returns a fresh LIST[element]; seed it empty and
+            // add the surviving element each iteration.
+            if consumer_kind =~ "collect" then
+                let list_type = call.value!.type!;
+
+                let ctor = _resolve_ctor_by_arity(list_type, 0);
+                let add_fn = _resolve_member_by_arity(list_type, "add", 1);
+
+                if !ctor? \/ !add_fn? then
+                    return null;
+                fi
+
+                fused.seed_init = IR.Values.NEW(list_type, ctor!, Collections.LIST[IR.Values.Value](0));
+
+                let add_args = Collections.LIST[IR.Values.Value]();
+                add_args.add(final_element_load);
+
+                fused.add_element = add_fn!.call(
+                    call.location, IR.Values.Load.TEMP(result_il_name, list_type), add_args, null, _function_caller);
+            fi
+
+            return fused;
+        si
+
+        // A member of `type` named `name` taking `arity` arguments (or null).
+        _resolve_member_by_arity(type: Type, name: string, arity: int) -> Semantic.Symbols.Function? is
+            let member = type.find_member(name);
+
+            if !member? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member) then
+                return null;
+            fi
+
+            let group = cast Semantic.Symbols.FUNCTION_GROUP(member);
+
+            for f in group.functions do
+                if f.argument_names.count == arity then
+                    return f;
+                fi
+            od
+
+            return null;
+        si
+
+        // The constructor of `type` taking `arity` arguments (or null).
+        _resolve_ctor_by_arity(type: Type, arity: int) -> Semantic.Symbols.Function? =>
+            _resolve_member_by_arity(type, "init", arity);
+
+        // Pre-build the per-stage application for a consumer loop, threading
+        // the element through freshly-named locals (a map produces a new
+        // typed local the next stage reads). Every stage is an inlinable
+        // lambda: assign the current element to the lambda's parameter local,
+        // then the harvested inline body is the applied value.
+        _build_consumer_stages(fusion: PIPE_FUSION, start_il_name: string, start_type: Type) -> (ops: Collections.LIST[IR.Values.FUSED_CONSUMER_STAGE], final_il_name: string, final_type: Type) is
+            let ops = Collections.LIST[IR.Values.FUSED_CONSUMER_STAGE]();
+
+            let current_il_name mut = start_il_name;
+            let current_type mut = start_type;
+
+            let index mut = fusion.stages_outermost_first.count - 1;
+
+            while index >= 0 do
+                let stage = fusion.stages_outermost_first[index];
+
+                let delegate = stage.argument!.value!;
+                let func_type = delegate.type!;
+
+                let delegate_il_name = "'.fc_stage.{_next_fused_local_id()}'";
+
+                let result_type =
+                    if func_type.is_action then
+                        _innate_symbol_lookup.get_void_type();
+                    else
+                        func_type.arguments[func_type.arguments.count - 1];
+                    fi;
+
+                let call_arguments = Collections.LIST[IR.Values.Value]();
+                call_arguments.add(cast IR.Values.Value(IR.Values.Load.TEMP(current_il_name, current_type)));
+
+                let apply = cast IR.Values.Value(IR.Values.Call.CLOSURE(
+                    IR.Values.Load.TEMP(delegate_il_name, func_type), result_type, func_type.is_action, func_type, call_arguments));
+
+                if stage.is_filter then
+                    ops.add(IR.Values.FUSED_CONSUMER_STAGE(true, delegate_il_name, func_type, delegate, apply, "", null));
+                else
+                    ops.add(IR.Values.FUSED_CONSUMER_STAGE(false, delegate_il_name, func_type, delegate, apply, "'.fc_map.{_next_fused_local_id()}'", result_type));
+
+                    current_il_name = ops[ops.count - 1].output_il_name;
+                    current_type = result_type;
+                fi
+
+                index = index - 1;
+            od
+
+            return (ops, current_il_name, current_type);
         si
 
         // The single INDEXED_VALUE[element] constructor `init(int, element)`,
@@ -3280,6 +3568,15 @@ namespace Syntax.Process is
                     call.value = call.arguments.expressions[0].value;
                 else
                     _calls.visit_call(call);
+
+                    // A terminal Pipe consumer (`.count()`, ...) over a
+                    // fusible chain lowers to an inline driving loop instead
+                    // of building the pipe objects and iterating them.
+                    let fused = _recognize_consumer_fusion(call);
+
+                    if fused? then
+                        call.value = fused;
+                    fi
                 fi
 
                 _check_pure_slots(call.location, call.value);
