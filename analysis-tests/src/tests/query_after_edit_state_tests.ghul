@@ -5,25 +5,33 @@ namespace Analysis.Tests is
 
     use Analysis.Protocol.ANALYSER_PROCESS;
     use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
     use Analysis.Protocol.Response;
 
     use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
 
-    // Companion to COMPILE_AFTER_EDIT_TESTS: probes that semantic-query
-    // handlers which fall back to FULL_COMPILER.compile_all (HOVER,
-    // DEFINITION, DECLARATION, REFERENCES on a no-symbol position;
-    // IMPLEMENTATION, RENAMEREQUEST unconditionally; SYMBOLS with an empty
-    // path; COMPLETION when the cursor file isn't compiled through
-    // expressions — see COMPLETE_FAST_PATH_TESTS for that conditional)
-    // do not surface the same retained-AST state-leak false positives
-    // that #1219 fixed for the COMPILE handler.
+    // Companion to COMPILE_AFTER_EDIT_TESTS: probes the query-miss
+    // recompile. A semantic query that cannot be answered from the maps
+    // (HOVER, DEFINITION, DECLARATION, REFERENCES on a position in a file
+    // not yet compiled through expressions; IMPLEMENTATION, RENAMEREQUEST
+    // unconditionally; SYMBOLS with an empty path) compiles the missing
+    // file's expressions on demand against the retained symbol table and
+    // emits a diagnostics frame before the query's own response.
     //
-    // The bug shape: after an initial EDIT primes the AST, the query's
-    // compile_all clears symbols and re-runs compile-expressions on the
-    // same AST. Per-build state cached on the AST during the first
-    // compile-expressions still references the just-wiped symbols, so
-    // overload resolution (in particular lambda-arg back-feed for
-    // generic methods) misfires and produces "no overload found" errors.
+    // The bug shape guarded here: the on-demand walk re-runs
+    // compile-expressions over a retained AST. Per-build state cached on
+    // that AST by an earlier compile-expressions still references
+    // since-abandoned symbols, so overload resolution (in particular
+    // lambda-arg back-feed for generic methods) misfires and produces
+    // "no overload found" errors — the false positives #1219 fixed for
+    // the COMPILE handler.
+    //
+    // Setup shape: prime three files, then re-edit two of them with a
+    // body-only change. A multi-file EDIT always takes the full-rebuild
+    // path (never the incremental body re-walk), and the body-only change
+    // keeps it interface-preserving, so no full COMPILE becomes pending;
+    // the third file is rebuilt only up to expressions. A query against
+    // the third file must then compile its expressions on demand.
     class QUERY_AFTER_EDIT_STATE_TESTS is
         @test()
 
@@ -38,38 +46,87 @@ namespace Analysis.Tests is
             return File.read_all_text(source_path);
         si
 
-        prime(analyser: ANALYSER_PROCESS, source: string) is
-            analyser.send_edit("object-oriented.ghul", source);
+        alpha_source(body_value: int) -> string =>
+            "namespace QueryAfterEdit is\n"
+            "    class ALPHA is\n"
+            "        init() is si\n"
+            "\n"
+            "        value() -> int => {body_value};\n"
+            "    si\n"
+            "si\n";
 
+        beta_source(body_value: int) -> string =>
+            "namespace QueryAfterEdit is\n"
+            "    class BETA is\n"
+            "        init() is si\n"
+            "\n"
+            "        value() -> int => {body_value};\n"
+            "    si\n"
+            "si\n";
+
+        gamma_source() -> string =>
+            "namespace QueryAfterEdit is\n"
+            "    class GAMMA is\n"
+            "        init() is si\n"
+            "\n"
+            "        run() -> int is\n"
+            "            let a = ALPHA();\n"
+            "            return a.value();\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        assert_edit_clean(analyser: ANALYSER_PROCESS, context: string) is
             let edit_diagnostics = analyser.read_response();
-            assert isa Response.DIAGNOSTICS(edit_diagnostics) else "expected DIAGNOSTICS response";
+            assert isa Response.DIAGNOSTICS(edit_diagnostics) else "expected DIAGNOSTICS response on {context}";
             Assert.are_equal("partial", edit_diagnostics.phase);
 
             let edit_user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(edit_diagnostics));
             Assert.are_equal(
                 0,
                 edit_user_diagnostics.count,
-                diagnostics_summary("EDIT response had unexpected user diagnostics", edit_user_diagnostics)
+                diagnostics_summary("{context} response had unexpected user diagnostics", edit_user_diagnostics)
             );
         si
 
+        // Prime with the third file plus two helpers, then re-edit only the
+        // helpers with body changes: the third file is left not compiled
+        // through expressions, its retained AST carrying the first build's
+        // expression-level state, while no full COMPILE is pending.
+        prime_with_uncompiled(analyser: ANALYSER_PROCESS, third_name: string, third_source: string) is
+            analyser.send_edit_files([
+                EDIT_FILE("alpha.ghul", alpha_source(1)),
+                EDIT_FILE("beta.ghul", beta_source(1)),
+                EDIT_FILE(third_name, third_source)
+            ]);
+
+            assert_edit_clean(analyser, "priming EDIT");
+
+            analyser.send_edit_files([
+                EDIT_FILE("alpha.ghul", alpha_source(2)),
+                EDIT_FILE("beta.ghul", beta_source(2))
+            ]);
+
+            assert_edit_clean(analyser, "body-only EDIT");
+        si
+
         // Common assertion: after the query, read the leading diagnostics
-        // frame (produced by FULL_COMPILER.compile_all) and assert it has
-        // no user diagnostics. Then read the actual query response frame
-        // and check its kind matches `expected_kind`.
+        // frame (produced by the on-demand compile of the queried file) and
+        // assert it has no user diagnostics. Then read the actual query
+        // response frame and check its kind matches `expected_variant`.
         assert_query_diagnostics_clean(
             analyser: ANALYSER_PROCESS,
             expected_variant: System.Type
         ) is
             let diagnostics = analyser.read_response();
-            assert isa Response.DIAGNOSTICS(diagnostics) else "expected diagnostics frame from query's compile_all, got '{diagnostics.get_type().name}'";
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected diagnostics frame from query's on-demand compile, got '{diagnostics.get_type().name}'";
 
             let user_diagnostics = LIST[DIAGNOSTIC](user_diagnostics_of(diagnostics));
             Assert.are_equal(
                 0,
                 user_diagnostics.count,
                 "{diagnostics_summary(
-                    "{expected_variant.name} compile_all surfaced spurious diagnostics "
+                    "{expected_variant.name} on-demand compile surfaced spurious diagnostics "
                     "(state leak on retained AST — see project_analysis_mode_workflow)",
                     user_diagnostics
                 )}\n--- analyser stderr ---\n{analyser.stderr_capture}"
@@ -83,17 +140,15 @@ namespace Analysis.Tests is
             );
         si
 
-        // HOVER on a position where no symbol is registered (column 1 of the
-        // first line, which is the `use` keyword) falls through to
-        // FULL_COMPILER.compile_all. The diagnostics frame that compile_all
-        // emits should not surface false-positive overload errors.
+        // HOVER on a position in a file that is not compiled through
+        // expressions triggers the on-demand compile. The diagnostics frame
+        // it emits should not surface false-positive overload errors.
         hover_on_no_symbol_position_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             // Column 1 of line 1 is on the `use` keyword — no symbol use.
             analyser.send_hover("object-oriented.ghul", 1, 1);
@@ -101,90 +156,136 @@ namespace Analysis.Tests is
             assert_query_diagnostics_clean(analyser, typeof Response.HOVER);
         si
 
-        // DEFINITION on a no-symbol position falls through to compile_all.
         definition_on_no_symbol_position_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             analyser.send_definition("object-oriented.ghul", 1, 1);
 
             assert_query_diagnostics_clean(analyser, typeof Response.DEFINITION);
         si
 
-        // DECLARATION on a no-symbol position falls through to compile_all.
         declaration_on_no_symbol_position_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             analyser.send_declaration("object-oriented.ghul", 1, 1);
 
             assert_query_diagnostics_clean(analyser, typeof Response.DECLARATION);
         si
 
-        // REFERENCES on a no-symbol position falls through to compile_all.
         references_on_no_symbol_position_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             analyser.send_references("object-oriented.ghul", 1, 1);
 
             assert_query_diagnostics_clean(analyser, typeof Response.REFERENCES);
         si
 
-        // IMPLEMENTATION unconditionally calls compile_all.
+        // IMPLEMENTATION recompiles whatever is missing regardless of
+        // position.
         implementation_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             analyser.send_implementation("object-oriented.ghul", 1, 1);
 
             assert_query_diagnostics_clean(analyser, typeof Response.IMPLEMENTATION);
         si
 
-        // RENAMEREQUEST unconditionally calls compile_all.
+        // RENAMEREQUEST recompiles whatever is missing regardless of
+        // position.
         rename_request_should_not_leak_diagnostics() is
             @test()
 
-            let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
 
             analyser.send_rename_request("object-oriented.ghul", 1, 1, "renamed");
 
             assert_query_diagnostics_clean(analyser, typeof Response.RENAME);
         si
 
-        // SYMBOLS with an empty path triggers compile_all (workspace
-        // symbols flow). With a per-file path, compile_all is not invoked
-        // and the test would not exercise the bug.
+        // SYMBOLS with an empty path (the workspace-symbols flow) recompiles
+        // whatever is missing.
         workspace_symbols_should_not_leak_diagnostics() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime_with_uncompiled(analyser, "object-oriented.ghul", load_object_oriented_source());
+
+            analyser.send_symbols("");
+
+            assert_query_diagnostics_clean(analyser, typeof Response.SYMBOLS);
+        si
+
+        // A miss on a file that is already compiled through expressions is
+        // authoritative — recompiling could not add a map entry for the
+        // position — so the response comes back directly: no recompile, no
+        // interleaved diagnostics frame.
+        miss_on_compiled_file_answers_without_recompile() is
             @test()
 
             let source = load_object_oriented_source();
             let use analyser = ANALYSER_PROCESS();
 
-            prime(analyser, source);
+            analyser.send_edit("object-oriented.ghul", source);
 
-            analyser.send_symbols("");
+            assert_edit_clean(analyser, "priming EDIT");
 
-            assert_query_diagnostics_clean(analyser, typeof Response.SYMBOLS);
+            // Column 1 of line 1 is on the `use` keyword — no symbol use,
+            // and the file was compiled through expressions by the EDIT.
+            analyser.send_hover("object-oriented.ghul", 1, 1);
+
+            let response = analyser.read_response();
+            assert isa Response.HOVER(response)
+                else "expected HOVER directly with no recompile diagnostics frame, got '{response.get_type().name}'";
+        si
+
+        // The on-demand compile populates the query maps: a hover at an
+        // expression-level position inside the not-yet-compiled file
+        // resolves after the on-demand walk, and a second query against the
+        // same file answers directly — the file is compiled through
+        // expressions now, so there is no second recompile.
+        on_demand_compile_populates_maps_and_runs_once() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime_with_uncompiled(analyser, "gamma.ghul", gamma_source());
+
+            // `value` in `return a.value();` — an expression-level member
+            // use, only present in the hover map once gamma.ghul has been
+            // walked through compile-expressions.
+            analyser.send_hover("gamma.ghul", 7, 23);
+
+            assert_query_diagnostics_clean(analyser, typeof Response.HOVER);
+
+            analyser.send_hover("gamma.ghul", 7, 23);
+
+            let second = analyser.read_response();
+            assert isa Response.HOVER(second)
+                else "expected HOVER directly on the second query (file now compiled through expressions), got '{second.get_type().name}'";
+
+            Assert.is_true(
+                second.signature? /\ second.signature.contains("value"),
+                "HOVER on a.value() should describe `value`, got: {second.signature}"
+            );
         si
     si
 si

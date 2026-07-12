@@ -583,6 +583,22 @@ namespace Analysis is
                 return;
             fi
 
+            // No interface-affecting edit is pending, so the retained
+            // declare/resolve state - symbols, ancestries, override links,
+            // store-free bits - still reflects the sources, and the type
+            // comparison cache keyed on those symbols stays valid. The only
+            // thing a query can be missing is a file's expression-level
+            // walk: an EDIT's rebuild compiles expressions for the edited
+            // files only, leaving every other file at up-to-expressions
+            // with no use-map entries. Compile just the files that lack it
+            // instead of clearing the world; when none lack it the miss is
+            // authoritative and a recompile could not change the answer.
+            if !_compiler.is_full_compile_needed then
+                compile_missing_expressions(writer, only_for_file_name);
+
+                return;
+            fi
+
             try
                 _timers.start("compile-all");
 
@@ -640,6 +656,75 @@ namespace Analysis is
                 _compiler.clear_queue();
 
                 _timers.finish("compile-all");
+            yrt
+        si
+
+        // The query-miss recompile when no interface change is pending:
+        // run compile-expressions for the files - the queried file, or
+        // all files for a cross-file query - that have not been walked
+        // through expressions in the current symbol generation. The
+        // retained symbol table is not cleared and no earlier pass is
+        // re-run. When every relevant file is already compiled through
+        // expressions there is nothing to do and no response is written -
+        // the caller answers from the maps as it would on a hit.
+        compile_missing_expressions(writer: IO.TextWriter, only_for_file_name: string?) is
+            let missing = Collections.LIST[SOURCE_FILE]();
+
+            for i in _source_files do
+                if
+                    (!only_for_file_name? \/ i.file_name =~ only_for_file_name) /\
+                    !_compiler.is_compiled_through_expressions(i)
+                then
+                    missing.add(i);
+                fi
+            od
+
+            if missing.count == 0 then
+                // Timed as a pair so the skip shows up, with a count, in
+                // the analysis stats dump.
+                _timers.start("query-miss-authoritative");
+                _timers.finish("query-miss-authoritative");
+
+                return;
+            fi
+
+            try
+                _timers.start("compile-on-demand");
+
+                IoC.CONTAINER.instance.logger.start_analysis();
+
+                if !_watchdog.want_restart then
+                    let clear_state = Syntax.Process.CLEAR_STATE_VISITOR();
+
+                    for i in missing do
+                        // The re-walk re-reports this file's expression
+                        // diagnostics; drop the previous copies so they
+                        // do not double up. Parse and declaration-level
+                        // diagnostics are kept - no earlier pass re-runs.
+                        IoC.CONTAINER.instance.logger.clear_expression_diagnostics(i.file_name);
+
+                        clear_state.apply(i.definition);
+
+                        _compiler.compile_expressions_only(i);
+                    od
+
+                    let diagnostics = Collections.LIST[Protocol.DIAGNOSTIC]();
+                    let checked_paths = Collections.LIST[string]();
+                    DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
+                    QUICK_FIX_SYNTHESIZER.attach_fixes(diagnostics, _source_files);
+                    JSON_PROTOCOL.write_response(
+                        writer,
+                        Protocol.Response.DIAGNOSTICS(diagnostics, checked_paths, "query", 0.0D, false)
+                    );
+                fi
+            catch e: Exception
+                debug_always("COMPILE_ON_DEMAND caught: {e.get_type()}: {e.message}");
+
+                _watchdog.request_restart();
+            finally
+                IoC.CONTAINER.instance.logger.end_analysis();
+
+                _timers.finish("compile-on-demand");
             yrt
         si
     si
@@ -848,6 +933,18 @@ namespace Analysis is
                             i.want_compile_up_to_expressions = true;
 
                             IoC.CONTAINER.instance.logger.clear_global_declaration_diagnostics(i.file_name);
+                        od
+
+                        // Match the COMPILE / query-miss rebuild paths:
+                        // retained ASTs carry expression-level state from
+                        // the previous build - IR values and types that
+                        // reference the symbols clear_symbols is about to
+                        // abandon. Clear it so no later walk of a retained
+                        // tree consumes state from a dead symbol
+                        // generation.
+                        let clear_state = Syntax.Process.CLEAR_STATE_VISITOR();
+                        for i in _source_files_by_path.values do
+                            clear_state.apply(i.definition);
                         od
 
                         IoC.CONTAINER.instance.logger.start_analysis();
