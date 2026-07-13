@@ -1080,6 +1080,15 @@ namespace Analysis is
             let retained_members = retained_body.definitions;
             let donor_members = donor_body.definitions;
 
+            // Texts for the body comparison in the identity adoption after
+            // the reconcile: the outgoing members' spans index into the
+            // text the retained tree was parsed from, the incoming
+            // members' into the donor's. Captured up front because a
+            // successful try_incremental_build below moves the donor's
+            // text onto the retained file.
+            let outgoing_text = retained.source_text;
+            let incoming_text = find_source_file(retained.file_name)?.source_text;
+
             let removed_functions = Collections.LIST[Semantic.Symbols.Function]();
 
             // Set when a body elsewhere in the edited file binds an
@@ -1200,9 +1209,11 @@ namespace Analysis is
                 slice_class.reset_pulled_down_symbols();
             fi
 
+
             for f in removed_functions do
                 _remove_function_from_owner(f);
             od
+
 
             for i in 0..donor_window do
                 retained_members.insert(prefix + i, added_definitions[i]);
@@ -1212,12 +1223,53 @@ namespace Analysis is
 
             _compiler.build_members_interface(retained, chain, added_list);
 
+
+            // Before anything recompiles against the new symbols: each
+            // incoming function adopts its outgoing counterpart's
+            // identity, carrying the id-keyed store-free bit across the
+            // re-creation, so the next debounced compile's refresh
+            // compares against the bits callers were compiled with
+            // rather than a default and does not escalate to a full
+            // rebuild when nothing store-free-relevant changed.
+            _adopt_replaced_identities(
+                removed_functions,
+                removed_definitions,
+                added_definitions,
+                outgoing_text,
+                incoming_text
+            );
+
             // Re-resolve the class's inheritance against the changed
             // member set: overrides, pulled-down members and implementor
             // registration all rebuild through the ordinary pull-down.
             if slice_class? then
                 slice_class.pull_down_super_symbols();
             fi
+
+            // A body that failed to bind a name recorded no reference, so
+            // the reference scan above cannot see it as a dependent - yet
+            // this interface change may be exactly what cures, or should
+            // re-report, its error. The edited file re-checks its own
+            // errors on this edit's recompile; any other file holding an
+            // error is marked not-compiled-through, with its expression
+            // state cleared now (bodies elsewhere in it can bind the
+            // outgoing symbols), so the next debounced compile's
+            // expressions-only pass re-checks it - deferring that cost to
+            // the debounce tick keeps the per-keystroke cost flat.
+            for error_path in IoC.CONTAINER.instance.logger.paths_with_errors do
+                if error_path =~ retained.file_name then
+                    needs_dependent_recompile = true;
+                elif let error_file = find_source_file(error_path) then
+                    let ce_clear = Syntax.Process.CLEAR_STATE_VISITOR(true);
+                    ce_clear.apply(error_file.definition);
+
+                    IoC.CONTAINER.instance.state_store_registry.drop_file(error_file.file_name);
+
+                    error_file.compiled_through = null;
+
+                    _compiler.is_full_compile_needed = true;
+                fi
+            od
 
             if needs_dependent_recompile then
                 // A same-file body bound the outgoing function; recompile
@@ -1296,6 +1348,154 @@ namespace Analysis is
             fi
 
             return cast Semantic.Symbols.Function?(scope.underlying_scope);
+        si
+
+        // After a reconcile replaced the changed window's members: each
+        // incoming function that pairs with exactly one outgoing function
+        // by name and arity adopts its identity, so the store-free bit —
+        // keyed by symbol id — survives the re-creation. The carried bit
+        // stays valid only while the body it was derived from is
+        // unchanged; an incoming body that differs textually resets it
+        // to the conservative default instead, and the next compile's
+        // refresh re-derives it. (A changed parameter type can rebind a
+        // call inside an unchanged body and move the derived bit; the
+        // refresh catches the difference and escalates, the same true-up
+        // that covers body-only edits.) Ambiguous pairings — several
+        // same-name same-arity candidates on either side — are skipped:
+        // the incoming function keeps its fresh identity and default bit.
+        _adopt_replaced_identities(
+            removed_functions: Collections.List[Semantic.Symbols.Function],
+            removed_definitions: Collections.List[Syntax.Trees.Definitions.Definition],
+            added_definitions: Collections.List[Syntax.Trees.Definitions.Definition],
+            outgoing_text: string?,
+            incoming_text: string?
+        ) is
+            let adopted = Collections.SET[int]();
+
+            for i in 0..added_definitions.count do
+                let added = added_definitions[i];
+
+                let incoming = _function_symbol_for(added);
+
+                if !incoming? then
+                    continue;
+                fi
+
+                let matched_index mut = -1;
+                let is_ambiguous mut = false;
+
+                for j in 0..removed_functions.count do
+                    if adopted.contains(j) then
+                        continue;
+                    fi
+
+                    let outgoing = removed_functions[j];
+
+                    if
+                        outgoing.name? /\ incoming.name? /\
+                        outgoing.name! =~ incoming.name! /\
+                        outgoing.arguments.count == incoming.arguments.count
+                    then
+                        if matched_index >= 0 then
+                            is_ambiguous = true;
+                            break;
+                        fi
+
+                        matched_index = j;
+                    fi
+                od
+
+                if matched_index < 0 \/ is_ambiguous then
+                    continue;
+                fi
+
+                adopted.add(matched_index);
+
+                incoming.adopt_id(removed_functions[matched_index]);
+
+                if !_body_text_matches(removed_definitions[matched_index], added, outgoing_text, incoming_text) then
+                    incoming.set_store_free(false);
+                fi
+            od
+        si
+
+        // Whether two function definitions' bodies are textually
+        // identical, each sliced from the source text its tree was
+        // parsed from. Unavailable text or a non-function definition
+        // compares as not matching — the conservative direction: the
+        // carried bit resets and is re-derived.
+        _body_text_matches(
+            outgoing: Syntax.Trees.Definitions.Definition,
+            incoming: Syntax.Trees.Definitions.Definition,
+            outgoing_text: string?,
+            incoming_text: string?
+        ) -> bool is
+            if
+                !isa Syntax.Trees.Definitions.FUNCTION(outgoing) \/
+                !isa Syntax.Trees.Definitions.FUNCTION(incoming)
+            then
+                return false;
+            fi
+
+            let outgoing_body = (cast Syntax.Trees.Definitions.FUNCTION(outgoing)).body;
+            let incoming_body = (cast Syntax.Trees.Definitions.FUNCTION(incoming)).body;
+
+            if !outgoing_body? /\ !incoming_body? then
+                // both bodiless: nothing body-derived can have changed
+                return true;
+            fi
+
+            if !outgoing_body? \/ !incoming_body? then
+                return false;
+            fi
+
+            let outgoing_slice = _slice_span(outgoing_text, outgoing_body.location);
+            let incoming_slice = _slice_span(incoming_text, incoming_body.location);
+
+            return outgoing_slice? /\ incoming_slice? /\ outgoing_slice! =~ incoming_slice!;
+        si
+
+        // The span's text, or null when the text is unavailable or the
+        // span falls outside it. Lines and columns are 1-based; the end
+        // column is taken as inclusive — the convention only has to be
+        // applied identically to the two sides of an equality check.
+        _slice_span(text: string?, location: Source.LOCATION) -> string? is
+            if !text? then
+                return null;
+            fi
+
+            let lines = text.replace_line_endings("\n").split(['\n']);
+
+            if location.start_line < 1 \/ location.end_line > lines.count \/ location.end_line < location.start_line then
+                return null;
+            fi
+
+            let result = System.Text.StringBuilder();
+
+            for line_number in location.start_line..location.end_line + 1 do
+                let line = lines[line_number - 1];
+
+                let from = if line_number == location.start_line then location.start_column - 1 else 0 fi;
+                let to mut = if line_number == location.end_line then location.end_column else line.length fi;
+
+                if from < 0 \/ from > line.length then
+                    return null;
+                fi
+
+                if to > line.length then
+                    to = line.length;
+                fi
+
+                if to > from then
+                    result.append(line.substring(from, to - from));
+                fi
+
+                if line_number < location.end_line then
+                    result.append('\n');
+                fi
+            od
+
+            return result.to_string();
         si
 
         _remove_function_from_owner(function: Semantic.Symbols.Function) is
@@ -1408,6 +1608,13 @@ namespace Analysis is
             IoC.CONTAINER.instance.logger.clear(edited_path, true);
             IoC.CONTAINER.instance.logger.start_analysis();
 
+            // The retained tree now reflects the donor's content — spliced
+            // bodies, donor locations — so it must carry the donor's text
+            // too. Every successful incremental edit flows through here;
+            // a stale text would let a later reconcile's body comparison
+            // false-match a since-reverted body.
+            retained.source_text = donor.source_text;
+
             _compiler.rewalk_bodies(retained, correspondence, body_spans);
 
             if want_collect then
@@ -1444,6 +1651,11 @@ namespace Analysis is
             try
                 for f in request.files do
                     parse_and_add_file(f.path, IO.StringReader(f.source), false);
+
+                    if let source_file = find_source_file(f.path) then
+                        source_file.source_text = f.source;
+                    fi
+
                     paths.add(f.path);
                 od
             catch ex: Exception
