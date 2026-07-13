@@ -1,0 +1,263 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+    use Analysis.Protocol.user_diagnostics_of;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // A signature edit to a function that a body in ANOTHER file references
+    // must re-bind that body. The incremental interface path reconciles the
+    // changed declaration in the edited file and recompiles the expressions
+    // of every other file that referenced the outgoing function, so a
+    // cross-file call whose validity depends on the new signature is
+    // re-checked.
+    //
+    // Two files, both registered by the initial multi-file EDIT:
+    //   `probe.ghul`  — declares the namespace function `probe`, the only
+    //                   file edited after priming.
+    //   `caller.ghul` — never edited; calls `probe`. Its validity flips
+    //                   with `probe`'s parameter type.
+    //
+    // The edit-path counter proves the incremental path handled the edit:
+    // without cross-file dependent recompilation the same edit falls back
+    // to the whole-project rebuild, which would recompile `caller.ghul`
+    // anyway and produce the same diagnostic - so the diagnostic alone
+    // cannot distinguish the two. The `edit-path-interface-incremental`
+    // tally rising by one (and `edit-path-full-rebuild` not) is the signal
+    // that the cross-file body was recompiled in place.
+    class CROSS_FILE_DEPENDENT_RECOMPILE_TESTS is
+        @test()
+
+        init() is si
+
+        // P.probe takes an int; caller's P.probe(0) is valid.
+        probe_param_int() -> string =>
+            "namespace XDep is\n"
+            "    class P is\n"
+            "        probe(a: int) -> int static => a;\n"
+            "    si\n"
+            "si\n";
+
+        // P.probe takes a string; caller's P.probe(0) becomes invalid. Same
+        // declaration count (skeleton-preserving); only observable if the
+        // referencing body in the other file re-bound.
+        probe_param_string() -> string =>
+            "namespace XDep is\n"
+            "    class P is\n"
+            "        probe(a: string) -> int static => 0;\n"
+            "    si\n"
+            "si\n";
+
+        caller_source() -> string =>
+            "namespace XDep is\n"
+            "    caller() -> int => P.probe(0);\n"
+            "si\n";
+
+        // Namespace-level probe (no enclosing class). A namespace's
+        // function groups are per-file, so a cross-file reference to one
+        // is the shape the incremental path cannot rebind in place.
+        ns_probe_param_int() -> string =>
+            "namespace XDepNs is\n"
+            "    probe(a: int) -> int => a;\n"
+            "si\n";
+
+        ns_probe_param_string() -> string =>
+            "namespace XDepNs is\n"
+            "    probe(a: string) -> int => 0;\n"
+            "si\n";
+
+        ns_caller_source() -> string =>
+            "namespace XDepNs is\n"
+            "    caller() -> int => probe(0);\n"
+            "si\n";
+
+        INTERFACE_INCREMENTAL: string => "edit-path-interface-incremental";
+        FULL_REBUILD: string => "edit-path-full-rebuild";
+
+        // Register both files with an initial multi-file EDIT (a
+        // whole-project rebuild) and return its user diagnostics. Callers
+        // assert the baseline they expect - clean for the int-parameter
+        // probe, one error for the string-parameter probe.
+        prime(analyser: ANALYSER_PROCESS, probe_source: string) -> LIST[DIAGNOSTIC] is
+            analyser.send_edit_files([
+                EDIT_FILE("probe.ghul", probe_source),
+                EDIT_FILE("caller.ghul", caller_source())
+            ]);
+
+            return read_edit(analyser);
+        si
+
+        read_edit(analyser: ANALYSER_PROCESS) -> LIST[DIAGNOSTIC] is
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response after EDIT";
+
+            return LIST[DIAGNOSTIC](user_diagnostics_of(diagnostics));
+        si
+
+        summary(diagnostics: LIST[DIAGNOSTIC]) -> string is
+            let result = System.Text.StringBuilder();
+            for d in diagnostics do
+                result.append("\n  ").append(d.to_string());
+            od
+            return result.to_string();
+        si
+
+        // Valid -> invalid: narrowing probe's parameter makes the caller's
+        // call in the other file fail. The single-file EDIT must recompile
+        // caller.ghul in place (interface-incremental), and the caller's
+        // now-invalid probe(0) must surface.
+        signature_edit_introduces_a_cross_file_referencing_error() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            let baseline = prime(analyser, probe_param_int());
+            Assert.are_equal(
+                0,
+                baseline.count,
+                "baseline (int param, P.probe(0) valid) should be clean; "
+                "got:{summary(baseline)}\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let incremental_before = analyser.stat_count(INTERFACE_INCREMENTAL);
+            let full_before = analyser.stat_count(FULL_REBUILD);
+
+            analyser.send_edit("probe.ghul", probe_param_string());
+            let after = read_edit(analyser);
+
+            Assert.is_true(
+                after.count > 0,
+                "after narrowing probe to take string, caller.ghul's probe(0) "
+                "should error (proving the cross-file body re-bound)\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let incremental_after = analyser.stat_count(INTERFACE_INCREMENTAL);
+            let full_after = analyser.stat_count(FULL_REBUILD);
+
+            Assert.are_equal(
+                incremental_before + 1,
+                incremental_after,
+                "the single-file signature EDIT should be handled by the "
+                "incremental interface path, recompiling the cross-file "
+                "caller in place - not fall back to the whole-project "
+                "rebuild.\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                full_before,
+                full_after,
+                "the incremental path handled the edit, so the full-rebuild "
+                "fallback tally must not move.\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Invalid -> valid: widening probe's parameter clears the caller's
+        // error in the other file. The EDIT recompiles caller.ghul; the
+        // debounced COMPILE trues up expression diagnostics across the
+        // project, by which point nothing re-reports the old error.
+        signature_edit_clears_a_cross_file_referencing_error() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            let baseline_diagnostics = prime(analyser, probe_param_string());
+            Assert.is_true(
+                baseline_diagnostics.count > 0,
+                "baseline (string param, P.probe(0) invalid) should error\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let baseline = analyser.stat_count(INTERFACE_INCREMENTAL);
+
+            analyser.send_edit("probe.ghul", probe_param_int());
+            read_edit(analyser);
+
+            Assert.are_equal(
+                baseline + 1,
+                analyser.stat_count(INTERFACE_INCREMENTAL),
+                "widening probe's parameter is a single-file signature EDIT "
+                "and should take the incremental interface path.\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            analyser.send_compile();
+            let compiled = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(compiled) else "expected DIAGNOSTICS after COMPILE";
+
+            let after = LIST[DIAGNOSTIC](user_diagnostics_of(compiled));
+            Assert.are_equal(
+                0,
+                after.count,
+                "after widening probe to take int, caller.ghul's probe(0) "
+                "should be valid; residual:{summary(after)}\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // A namespace-level function referenced from another file is the
+        // one cross-file shape the incremental path deliberately does not
+        // handle: the reconcile updates only the edited file's function
+        // group, so other files would keep resolving the outgoing symbol.
+        // The edit must fall back to the whole-project rebuild (which the
+        // class-scoped cases avoid); the debounced COMPILE then reports the
+        // caller's now-invalid call correctly.
+        namespace_level_cross_file_reference_falls_back_to_full_rebuild() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files([
+                EDIT_FILE("nsprobe.ghul", ns_probe_param_int()),
+                EDIT_FILE("nscaller.ghul", ns_caller_source())
+            ]);
+            let baseline = read_edit(analyser);
+            Assert.are_equal(
+                0,
+                baseline.count,
+                "baseline (int param) should be clean; got:{summary(baseline)}\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let incremental_before = analyser.stat_count(INTERFACE_INCREMENTAL);
+            let full_before = analyser.stat_count(FULL_REBUILD);
+
+            analyser.send_edit("nsprobe.ghul", ns_probe_param_string());
+            read_edit(analyser);
+
+            Assert.are_equal(
+                full_before + 1,
+                analyser.stat_count(FULL_REBUILD),
+                "a namespace-level function edit with a cross-file reference "
+                "must fall back to the whole-project rebuild.\n"
+                "--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                incremental_before,
+                analyser.stat_count(INTERFACE_INCREMENTAL),
+                "the edit fell back, so the incremental interface tally must "
+                "not move.\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // The fallback defers cross-file expression checks to the
+            // debounced COMPILE, which recompiles every file and surfaces
+            // the caller's now-invalid call.
+            analyser.send_compile();
+            let compiled = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(compiled) else "expected DIAGNOSTICS after COMPILE";
+
+            let after = LIST[DIAGNOSTIC](user_diagnostics_of(compiled));
+            Assert.is_true(
+                after.count > 0,
+                "after narrowing the namespace function to take string, the "
+                "COMPILE should report nscaller.ghul's probe(0) as invalid; "
+                "residual:{summary(after)}\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+    si
+si
