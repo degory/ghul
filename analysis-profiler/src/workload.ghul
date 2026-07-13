@@ -13,13 +13,21 @@ namespace Analysis.Profiler is
     // Drives the analyser through a realistic sequence of editor requests
     // against a CORPUS, timing each one into a STATS collection.
     //
-    // The phases mirror how the VS Code extension drives the analyser:
+    // The phases mirror how the VS Code extension drives the analyser,
+    // modelling a typical human session (body edits + queries dominant,
+    // signature edits rarer, structural edits rarest — the general IDE
+    // shape; the exact per-phase counts are a model, not a measurement):
     //  1. a cold whole-project EDIT (extension startup);
     //  2. a cold whole-project COMPILE;
-    //  3. single-file EDIT bursts with a debounced COMPILE after each
-    //     (a typing session — interface-preserving edits);
-    //  4. interface-affecting single-file EDITs (each adds a declaration);
-    //  5. interactive HOVER / DEFINITION / COMPLETE / SIGNATURE queries.
+    //  3. body-edit bursts on a probe declaration with a debounced COMPILE
+    //     after each — interface-preserving (incremental body re-walk),
+    //     store-free, so the COMPILE takes the skip branch;
+    //  4. store-free flip edits — a body edit that flips the probe's
+    //     store-free bit, so the debounced COMPILE escalates;
+    //  5. signature-in-place EDITs on a referenced declaration
+    //     (interface-affecting, skeleton-preserving);
+    //  6. structural EDITs (each appends a declaration);
+    //  7. interactive HOVER / DEFINITION / COMPLETE / SIGNATURE queries.
     class PROFILE_RUN is
         _analyser: ANALYSER_PROCESS;
         _corpus: CORPUS;
@@ -28,18 +36,30 @@ namespace Analysis.Profiler is
         _stats: STATS;
         compile_diagnostics: int public;
 
+        // A synthetic file injected into the corpus so the body- and
+        // signature-edit phases mutate a declaration whose store-free
+        // structure and interface shape are under the workload's control.
+        // Real corpus files can't be body-edited faithfully without
+        // reparsing them; the probe models the edited region instead.
+        _probe_path: string;
+
         init(analyser: ANALYSER_PROCESS, corpus: CORPUS, quick: bool) is
             _analyser = analyser;
             _corpus = corpus;
             _quick = quick;
             _stats = STATS();
             compile_diagnostics = 0;
+            _probe_path = "{corpus.root}/profiler_probe.ghul";
         si
 
         stats: STATS => _stats;
 
         execute() is
             let started = System.DateTime.now;
+
+            // Register the probe so the body / signature phases edit a
+            // file the analyser already holds. Store-free to start.
+            _corpus.files.add(EDIT_FILE(_probe_path, _probe_source(_body(false), "int")));
 
             _log("cold initial EDIT — {_corpus.file_count} files, {_corpus.total_lines} lines");
             _cold_edit();
@@ -52,19 +72,35 @@ namespace Analysis.Profiler is
             // 60s periodic per-pass TIMERS dump has time to fire. Unset (the
             // default) runs each phase once.
             let min_seconds = _min_seconds();
+
+            // PROFILE_BODY_ONLY isolates the pure body-edit + debounced
+            // COMPILE loop with no interleaved interface edits, so the
+            // COMPILE takes the store-free-skip / expressions-only branch
+            // — the measurement the mixed workload cannot give because its
+            // signature/structural edits keep the tables dirty.
+            let body_only = _flag("PROFILE_BODY_ONLY");
+
             let pass mut = 0;
 
             do
                 pass = pass + 1;
 
-                _log("single-file EDIT bursts (typing simulation) — pass {pass}");
+                _log("body-edit bursts (typing simulation) — pass {pass}");
                 _typing();
 
-                _log("interface-affecting single-file EDITs — pass {pass}");
-                _interface_edits();
+                if !body_only then
+                    _log("store-free flip edits — pass {pass}");
+                    _flip_edits();
 
-                _log("interactive queries — HOVER / DEFINITION / COMPLETE / SIGNATURE — pass {pass}");
-                _queries();
+                    _log("signature-in-place EDITs (referenced declaration) — pass {pass}");
+                    _signature_edits();
+
+                    _log("structural EDITs (append declaration) — pass {pass}");
+                    _interface_edits();
+
+                    _log("interactive queries — HOVER / DEFINITION / COMPLETE / SIGNATURE — pass {pass}");
+                    _queries();
+                fi
 
                 if System.DateTime.now.subtract(started).total_seconds >= min_seconds then
                     break;
@@ -72,6 +108,11 @@ namespace Analysis.Profiler is
             od
 
             _log("workload complete");
+        si
+
+        _flag(name: string) -> bool static is
+            let raw = System.Environment.get_environment_variable(name);
+            return !string.is_null_or_white_space(raw);
         si
 
         _min_seconds() -> double static is
@@ -113,36 +154,144 @@ namespace Analysis.Profiler is
             compile_diagnostics = user_diagnostics_of(diagnostics) | .count();
         si
 
+        // A synthetic probe file. `churn`'s body varies (store-free vs
+        // storing — a store-free-bit flip); `typed`'s parameter type
+        // varies (a signature-in-place interface edit). Both are called
+        // by `caller`, so `typed` is a *referenced* declaration — a
+        // signature edit to it cannot take the unreferenced-append
+        // incremental-interface fast path. `typed(0)` stays valid whether
+        // the parameter is `int` or `object`.
+        _probe_source(body: string, param_type: string) -> string =>
+            "namespace ProfilerProbe is\n"
+            "    class CHURN is\n"
+            "        _state: int public;\n"
+            "\n"
+            "        init() is si\n"
+            "\n"
+            "        churn() -> int is\n"
+            "            {body}\n"
+            "        si\n"
+            "\n"
+            "        typed(a: {param_type}) -> int => 1;\n"
+            "\n"
+            "        caller() -> int is\n"
+            "            let x = typed(0);\n"
+            "            return churn();\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // A store-free body vs one that writes a field. The store toggles
+        // `churn`'s store-free bit, which `caller` transitively depends on.
+        _body(storing: bool) -> string =>
+            if storing then
+                "_state = 1;\n            return _state;"
+            else
+                "let w = _state;\n            return w;"
+            fi;
+
+        // Body-edit typing bursts on the probe: interface-preserving
+        // (churn's signature is fixed), so each keystroke takes the
+        // incremental body re-walk. Successive keystrokes vary the body
+        // (real re-walk work, not an identical resend) but never change
+        // the store-free structure, so the debounced COMPILE's store-free
+        // refresh sees no flip and takes the skip / expressions-only
+        // branch — the common case, and the branch the flip-gate makes
+        // cheap. The escalate branch is measured separately by
+        // `_flip_edits`.
         _typing() is
             let edits mut = 6;
-            let files mut = 3;
 
             if _quick then
                 edits = 3;
-                files = 2;
             fi
 
-            for f in _corpus.sample(files) do
-                for i in 0..edits do
-                    let started = System.DateTime.now;
+            for i in 0..edits do
+                // Vary a local so the re-walk has genuine work, without
+                // touching the field store.
+                let body = "let w = _state + {i};\n            return w;";
 
-                    _analyser.send_edit(f.path, f.source);
+                let started = System.DateTime.now;
 
-                    let diagnostics = _analyser.read_response();    // DIAGNOSTICS
+                _analyser.send_edit(_probe_path, _probe_source(body, "int"));
 
-                    _stats["EDIT — single file (keystroke)"].record(_elapsed_ms(started));
-                od
+                let diagnostics = _analyser.read_response();    // DIAGNOSTICS
 
-                // The IDE fires a debounced whole-project COMPILE once typing
-                // pauses.
-                let compile_started = System.DateTime.now;
-
-                _analyser.send_compile();
-
-                let compile_diagnostics_response = _analyser.read_response();   // DIAGNOSTICS
-
-                _stats["COMPILE — debounced (after edit burst)"].record(_elapsed_ms(compile_started));
+                _stats["EDIT — body (keystroke)"].record(_elapsed_ms(started));
             od
+
+            // The IDE fires a debounced whole-project COMPILE once typing
+            // pauses.
+            let compile_started = System.DateTime.now;
+
+            _analyser.send_compile();
+
+            let compile_diagnostics_response = _analyser.read_response();   // DIAGNOSTICS
+
+            _stats["COMPILE — debounced (no store-free flip)"].record(_elapsed_ms(compile_started));
+        si
+
+        // A body edit that flips the probe's store-free bit, then a
+        // debounced COMPILE — which the store-free refresh must catch,
+        // escalating to a full rebuild. Restore-and-COMPILE flips it back.
+        // Both COMPILEs escalate; this isolates the escalate-branch cost
+        // from the skip-branch cost measured by `_typing`. The flip rate
+        // in a real session is a user-behaviour question this does not
+        // model — the deliverable is the per-branch cost.
+        _flip_edits() is
+            // Flip to storing.
+            _analyser.send_edit(_probe_path, _probe_source(_body(true), "int"));
+            let e1 = _analyser.read_response();
+
+            let c1 = System.DateTime.now;
+            _analyser.send_compile();
+            let r1 = _analyser.read_response();
+            _stats["COMPILE — debounced (store-free flip)"].record(_elapsed_ms(c1));
+
+            // Flip back to store-free.
+            _analyser.send_edit(_probe_path, _probe_source(_body(false), "int"));
+            let e2 = _analyser.read_response();
+
+            let c2 = System.DateTime.now;
+            _analyser.send_compile();
+            let r2 = _analyser.read_response();
+            _stats["COMPILE — debounced (store-free flip)"].record(_elapsed_ms(c2));
+        si
+
+        // Signature-in-place edits: retype the parameter of the referenced
+        // `typed` between `int` and `object`. The declaration count is
+        // unchanged (skeleton-preserving) but the interface signature
+        // changes, and because `typed` is referenced by `caller` this is
+        // an interface-affecting edit to a referenced declaration rather
+        // than the unreferenced-append incremental path.
+        _signature_edits() is
+            let edits mut = 4;
+
+            if _quick then
+                edits = 2;
+            fi
+
+            for i in 0..edits do
+                let param_type =
+                    if i % 2 == 0 then
+                        "object"
+                    else
+                        "int"
+                    fi;
+
+                let started = System.DateTime.now;
+
+                _analyser.send_edit(_probe_path, _probe_source(_body(false), param_type));
+
+                let diagnostics = _analyser.read_response();    // DIAGNOSTICS
+
+                _stats["EDIT — signature in place (referenced)"].record(_elapsed_ms(started));
+            od
+
+            // Restore the probe to an `int` parameter so the body phase's
+            // interface signature is stable across passes.
+            _analyser.send_edit(_probe_path, _probe_source(_body(false), "int"));
+            let restore = _analyser.read_response();
         si
 
         // Interface-affecting single-file EDITs: each edit appends a new
