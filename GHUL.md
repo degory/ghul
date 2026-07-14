@@ -230,6 +230,25 @@ si
 
 A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`, and classes compare by reference identity unless equality is overridden.
 
+A **static constructor** — `init() static` — runs once, before the type is first used, to initialise its static state. It takes no parameters and no `self`, and is invoked by the runtime rather than called directly; a class or struct may declare one alongside its instance constructors:
+
+```ghul
+class COUNTER is
+    next_id: int static;
+
+    init() static is
+        next_id = 1000;
+    si
+
+    id: int;
+
+    init() is
+        id = next_id;
+        next_id = next_id + 1;
+    si
+si
+```
+
 Two postfix modifiers shape the hierarchy:
 
 - **`open`** lifts the default closed-to-assembly rule. Without `open`, a class can only be subclassed from within the assembly it was declared in; consumers in another assembly that try to extend it are rejected at compile time. `open` opts in to cross-assembly subclassing — the right choice when a library class is genuinely a hook for downstream code, the wrong choice (and the harder one to take back) when it isn't. The closure also feeds type narrowing: the compiler can enumerate a closed root's subclasses on the else edge of an `isa` test.
