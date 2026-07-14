@@ -558,9 +558,10 @@ The `?.` operator is *coalescing* member access: `a?.b` reads `b` from `a` when 
 let p: PERSON? = find(id);
 let name = p?.name;              // string?
 let length = p?.name?.length;     // int? — chained coalesce
+let title = p?.describe();       // string? — method call short-circuits too
 ```
 
-Only field and property access compose with `?.` for now; method calls (`a?.foo()`) need an explicit `if a?` guard.
+Method calls compose with `?.` the same way: `a?.foo(args)` calls `foo` on a present receiver — argument expressions included in the short-circuit, so they are not evaluated when `a` is absent — and yields the optional null otherwise. A void method is simply skipped on an absent receiver. Function-typed fields and properties invoked through `?.` (`a?.callback()`) short-circuit the invocation the same way.
 
 The `??` operator is *null-coalescing*: `a ?? b` returns `a` when it is present, otherwise evaluates and returns `b`. The right operand is evaluated only when needed. `??` is right-associative, so `a ?? b ?? c ?? d` parses as `a ?? (b ?? (c ?? d))`; each intermediate result stays optional until the chain is closed by a non-optional fallback. The result type is the LUB of the left's underlying type and the right's type, kept optional iff the right is itself optional — so a chain that ends in a plain `T` returns `T`, and a chain that stays all-optional returns `T?`. `??` works across all three optional lowerings — reference `T?`, value-type `T?` (`Nullable[T]`), and the unconstrained-`T?` carrier `MAYBE[T]` — including mixed-kind operands: the result's optional kind is derived from the LUB of the inner types, and each side coerces to it. A `bool?` plugged with `?? false` reads as absent-means-false in condition position.
 

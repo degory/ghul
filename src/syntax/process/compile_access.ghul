@@ -1136,15 +1136,60 @@ namespace Syntax.Process is
         si
 
         // Build the IR value for an `a?.b` access. Returns the
-        // COALESCE_LOAD wrap when the receiver is a reference-typed
-        // optional and the member is a readable field or property;
-        // returns null (so the caller falls back to a plain access)
-        // on shapes that aren't supported in this lowering. Emits a
+        // COALESCE_LOAD wrap when the member is a readable field or
+        // property; returns null (so the caller falls back to a plain
+        // access) on shapes that aren't lowered here. Emits a
         // diagnostic for each unsupported shape so the user learns
         // why the `?.` had no effect.
         _build_coalesce_load(
             member: Trees.Expressions.MEMBER,
             symbol: Semantic.Symbols.Symbol
+        ) -> Value? is
+            // A method selection is coalesced at the enclosing call -
+            // the whole call, argument evaluation included, must
+            // short-circuit on an absent receiver - so a function
+            // group falls through silently to the plain load the call
+            // path consumes. An uncalled method reference through
+            // `?.` then fails downstream exactly as it does through
+            // `.`.
+            if isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
+                return null;
+            fi
+
+            if
+                !isa Semantic.Symbols.Field(symbol) /\
+                !isa Semantic.Symbols.Property(symbol)
+            then
+                _logger.error(
+                    member.location,
+                    "coalescing member access supports fields, properties and method calls only"
+                );
+                return null;
+            fi
+
+            return build_coalesce_wrap(
+                member,
+                symbol.is_instance,
+                from => symbol.load(member.location, from, _symbol_loader)
+            );
+        si
+
+        // Shared lowering for `a?.b` accesses and `a?.m(...)` calls:
+        // receiver presence diagnostics, unwrap of the optional
+        // receiver, optional widening of the result and the
+        // COALESCE_LOAD composition. `build_member_value` produces
+        // the member load or call against the supplied receiver
+        // stand-in: the original receiver value when it is statically
+        // present, or a STACK_TOP of the unwrapped receiver type
+        // inside the short-circuit arm. `receiver_consumed` is false
+        // when the member is static - the present arm then pops the
+        // tested receiver instead of feeding it to the member value.
+        // Returns null, with any diagnostic already emitted, when the
+        // shape can't be lowered.
+        build_coalesce_wrap(
+            member: Trees.Expressions.MEMBER,
+            receiver_consumed: bool,
+            build_member_value: (Value) -> Value?
         ) -> Value? is
             let receiver = member.left.value;
 
@@ -1153,21 +1198,6 @@ namespace Syntax.Process is
             fi
 
             let receiver_type = receiver.type!;
-
-            // v1 scope: fields and properties only. A method
-            // selection through `?.` would need to compose with the
-            // surrounding CALL (the call itself must short-circuit),
-            // which is a separate lowering.
-            if
-                !isa Semantic.Symbols.Field(symbol) /\
-                !isa Semantic.Symbols.Property(symbol)
-            then
-                _logger.error(
-                    member.location,
-                    "coalescing member access supports fields and properties only"
-                );
-                return null;
-            fi
 
             // A non-optional receiver (declared so, or flow-narrowed
             // from `T?` to `T`) is statically present, so the null
@@ -1199,33 +1229,22 @@ namespace Syntax.Process is
                     return null;
                 fi
 
-                let direct_load = symbol.load(member.location, receiver, _symbol_loader);
+                let direct = build_member_value(receiver);
 
-                if !direct_load.type? then
+                if !direct? then
                     return null;
                 fi
 
-                let direct_type = direct_load.type;
-                let direct_result = build_optional_type(direct_type!, _innate_symbol_lookup);
-
-                if !direct_type.is_optional /\ direct_result.is_value_type then
-                    return IR.Values.WRAP_OPTIONAL(direct_result, direct_load);
-                fi
-
-                // Reference T and T? share IL — re-type the load.
-                if direct_type !~ direct_result then
-                    return IR.Values.TYPE_WRAPPER(direct_result, direct_load);
-                fi
-
-                return direct_load;
+                return widen_coalesce_result(direct);
             fi
 
             let receiver_is_value_optional = receiver_type.is_value_type;
 
             // The member symbol lives on the receiver's underlying
-            // type regardless of the `?` flag, so `symbol.load`
-            // against a STACK_TOP of the non-optional type emits the
-            // expected access op with no preceding receiver gen.
+            // type regardless of the `?` flag, so the member value is
+            // built against a STACK_TOP of the non-optional type and
+            // emits the expected access or call ops with no preceding
+            // receiver gen.
             let inner_type =
                 if receiver_is_value_optional then
                     receiver_type.optional_inner_type;
@@ -1247,31 +1266,15 @@ namespace Syntax.Process is
             // bare value, which segfaults at the JIT.
             let stack_top: IR.Values.Value = IR.Values.STACK_TOP(inner_type);
 
-            let raw_load = symbol.load(member.location, stack_top, _symbol_loader);
+            let raw = build_member_value(stack_top);
 
-            if !raw_load.type? then
+            if !raw? then
                 return null;
             fi
 
-            let raw_type = raw_load.type;
-            let result_type = build_optional_type(raw_type!, _innate_symbol_lookup);
+            let arm = _widen_coalesce_arm(raw);
 
-            // Make the present arm push a value of the result type:
-            //   - reference T → T flagged optional, IL identity.
-            //   - value T   → NULLABLE[T] via WRAP_OPTIONAL (newobj
-            //                 Nullable<T>::.ctor(T)).
-            //   - already-optional U → identity.
-            let member_value: Value mut = raw_load;
-            if
-                !raw_type.is_optional /\
-                result_type.is_value_type
-            then
-                member_value = IR.Values.WRAP_OPTIONAL(result_type, raw_load);
-            fi
-
-            let null_value = _build_null_sentinel(result_type);
-
-            if !null_value? then
+            if !arm? then
                 return null;
             fi
 
@@ -1292,19 +1295,127 @@ namespace Syntax.Process is
                 fi
 
                 let presence_test = has_value_member.load(member.location, address_stand_in, _symbol_loader);
-                let value_extract = value_member.load(member.location, address_stand_in, _symbol_loader);
+
+                let value_extract =
+                    if receiver_consumed then
+                        value_member.load(member.location, address_stand_in, _symbol_loader)
+                    else
+                        null
+                    fi;
 
                 return IR.Values.COALESCE_LOAD(
                     receiver,
                     presence_test,
                     value_extract,
-                    member_value,
-                    null_value,
-                    result_type
+                    arm.member_value,
+                    arm.null_value,
+                    arm.result_type,
+                    receiver_consumed
                 );
             fi
 
-            return IR.Values.COALESCE_LOAD(receiver, member_value, null_value, result_type);
+            return IR.Values.COALESCE_LOAD(receiver, arm.member_value, arm.null_value, arm.result_type, receiver_consumed);
+        si
+
+        // Re-seat a coalescing member access whose loaded member is
+        // itself then invoked - `a?.f(...)` where f is a
+        // function-typed field or property. The invocation must sit
+        // inside the short-circuit arm, so the original wrap's
+        // receiver plumbing is reused around the call value, which
+        // consumes the original member load from the same arm.
+        rewrap_coalesce_call(
+            original: IR.Values.COALESCE_LOAD,
+            call_value: Value
+        ) -> Value? is
+            let arm = _widen_coalesce_arm(call_value);
+
+            if !arm? then
+                return null;
+            fi
+
+            if original.receiver_is_value_type then
+                return IR.Values.COALESCE_LOAD(
+                    original.receiver,
+                    original.presence_test!,
+                    original.value_extract,
+                    arm.member_value,
+                    arm.null_value,
+                    arm.result_type,
+                    true
+                );
+            fi
+
+            return IR.Values.COALESCE_LOAD(
+                original.receiver,
+                arm.member_value,
+                arm.null_value,
+                arm.result_type,
+                true
+            );
+        si
+
+        // The direct result of a coalescing access or call whose
+        // receiver is statically present, widened to the optional
+        // shape the `?.` asked for. A void result stays void.
+        widen_coalesce_result(direct: Value) -> Value? is
+            let direct_type = direct.type;
+
+            if !direct_type? then
+                return null;
+            fi
+
+            if direct_type.is_void then
+                return direct;
+            fi
+
+            let direct_result = build_optional_type(direct_type!, _innate_symbol_lookup);
+
+            if !direct_type.is_optional /\ direct_result.is_value_type then
+                return IR.Values.WRAP_OPTIONAL(direct_result, direct);
+            fi
+
+            // Reference T and T? share IL — re-type the load.
+            if direct_type !~ direct_result then
+                return IR.Values.TYPE_WRAPPER(direct_result, direct);
+            fi
+
+            return direct;
+        si
+
+        // Widen a present-arm member value to the optional result
+        // shape of the enclosing `?.`:
+        //   - void        → no widening, no null sentinel.
+        //   - reference T → T flagged optional, IL identity.
+        //   - value T     → NULLABLE[T] via WRAP_OPTIONAL (newobj
+        //                   Nullable<T>::.ctor(T)).
+        //   - already-optional U → identity.
+        _widen_coalesce_arm(raw: Value) -> COALESCE_ARM? is
+            let raw_type = raw.type;
+
+            if !raw_type? then
+                return null;
+            fi
+
+            if raw_type.is_void then
+                return COALESCE_ARM(raw, null, raw_type);
+            fi
+
+            let result_type = build_optional_type(raw_type!, _innate_symbol_lookup);
+
+            let member_value: Value =
+                if !raw_type.is_optional /\ result_type.is_value_type then
+                    IR.Values.WRAP_OPTIONAL(result_type, raw)
+                else
+                    raw
+                fi;
+
+            let null_value = _build_null_sentinel(result_type);
+
+            if !null_value? then
+                return null;
+            fi
+
+            return COALESCE_ARM(member_value, null_value, result_type);
         si
 
         // The null-arm sentinel for a coalescing access of result
@@ -1348,5 +1459,15 @@ namespace Syntax.Process is
 
             return t.as_optional();
         si
+    si
+
+    // The present-arm pieces of a coalescing wrap: the member value
+    // widened to the optional result shape, the null-arm sentinel
+    // (absent when the member value is void) and the result type.
+    class COALESCE_ARM(
+        member_value: Value,
+        null_value: Value?,
+        result_type: Type
+    ) is
     si
 si
