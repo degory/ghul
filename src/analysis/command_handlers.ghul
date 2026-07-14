@@ -1297,21 +1297,8 @@ namespace Analysis is
             return true;
         si
 
-        // Recompile one file's expressions against the current symbol
-        // table, keeping its resolved interface. A CE-output-only clear
-        // (preserve_resolved_types) drops the file's compile-expressions
-        // output — including the node-keyed VariableLeft store — while
-        // leaving TypeExpression.type intact, so re-running compile-
-        // expressions rebinds every body without re-resolving (and thus
-        // without double-setting) the retained interface types.
         _recompile_file_expressions(source_file: SOURCE_FILE) is
-            let ce_clear = Syntax.Process.CLEAR_STATE_VISITOR(true);
-            ce_clear.apply(source_file.definition);
-
-            IoC.CONTAINER.instance.state_store_registry.drop_file(source_file.file_name);
-            IoC.CONTAINER.instance.logger.clear_expression_diagnostics(source_file.file_name);
-
-            _compiler.compile_expressions_only(source_file);
+            _compiler.recompile_file_expressions(source_file);
         si
 
         // The header of a class-like definition - name, type parameters,
@@ -1802,6 +1789,100 @@ namespace Analysis is
     ): RequestHandler[Protocol.Request.COMPILE] is
         super();
 
+        // True up the flipped store-free bits by recompiling only the
+        // files that reference a flipped function. True when that fully
+        // covered the flip set; false means the caller must escalate to
+        // the whole-project rebuild - the flip set was unboundable, or a
+        // flipped function's callers can't be enumerated from the
+        // recorded references.
+        _try_targeted_store_free_recompile() -> bool is
+            let flipped = _compiler.last_store_free_flips;
+
+            if !flipped? then
+                return false;
+            fi
+
+            let target_paths = Collections.SET[string]();
+
+            for function in flipped do
+                if !_has_complete_references(function) then
+                    return false;
+                fi
+
+                for reference in IoC.CONTAINER.instance.symbol_use_locations.direct_references_to(function) do
+                    target_paths.add(reference.file_name);
+                od
+            od
+
+            let targets = Collections.LIST[SOURCE_FILE]();
+
+            for source_file in _source_files do
+                if target_paths.contains(source_file.file_name) then
+                    targets.add(source_file);
+                fi
+            od
+
+            if targets.count != target_paths.count then
+                // a reference in a file the analyser doesn't hold can't
+                // be trued up here
+                return false;
+            fi
+
+            // Inside the analysis window, like every other analysis-mode
+            // expression recompile: a diagnostic recorded outside it is
+            // classified as batch output, which the next expression-level
+            // clear deliberately preserves - it would stick forever.
+            IoC.CONTAINER.instance.logger.start_analysis();
+
+            for target in targets do
+                _compiler.recompile_file_expressions(target);
+            od
+
+            return true;
+        si
+
+        // A flipped function's callers are enumerable from the recorded
+        // references only when calls bind the function itself through
+        // ordinary name lookup: a named, source-declared function that
+        // its owner's scope resolves to directly (alone or through its
+        // overload group). Everything else - reflected imports whose
+        // trust changed, and accessor functions reached through a
+        // property or indexer read, which record the use against the
+        // property symbol - has callers this scan can't see.
+        _has_complete_references(function: Semantic.Symbols.Function) -> bool is
+            if function.is_reflected then
+                return false;
+            fi
+
+            let name = function.name;
+
+            if !name? then
+                return false;
+            fi
+
+            let owner = cast Semantic.Symbols.Scoped?(function.owner);
+
+            if !owner? then
+                return false;
+            fi
+
+            let found = owner.find_direct(name);
+
+            if !found? then
+                return false;
+            fi
+
+            if found == cast Semantic.Symbols.Symbol(function) then
+                return true;
+            fi
+
+            if isa Semantic.Symbols.FUNCTION_GROUP(found) then
+                return (cast Semantic.Symbols.FUNCTION_GROUP(found)).functions | .any(f => f == function);
+            fi
+
+            return false;
+        si
+
         handle_request(request: Protocol.Request.COMPILE, writer: IO.TextWriter) is
             let diagnostics = Collections.LIST[Protocol.DIAGNOSTIC]();
             let checked_paths = Collections.LIST[string]();
@@ -1814,22 +1895,37 @@ namespace Analysis is
                     // have flipped a function's store-free bit while every
                     // caller's narrowing was compiled against the old one.
                     // Re-derive the bits from the retained ASTs; a flip
-                    // means the incremental expression state is stale, so
-                    // fall through to the full rebuild rather than skip or
-                    // serve it. When the tables are not current a full
-                    // rebuild runs regardless, so the refresh is skipped.
+                    // means some callers' expression state is stale. When
+                    // the tables are not current a full rebuild runs
+                    // regardless, so the refresh is skipped.
                     _timers.start("store-free-refresh");
 
-                    let store_free_flipped = _compiler.are_tables_current /\ _compiler.refresh_store_free(_source_files);
+                    let store_free_flipped mut = _compiler.are_tables_current /\ _compiler.refresh_store_free(_source_files);
 
                     _timers.finish("store-free-refresh");
 
                     if store_free_flipped then
-                        // How often a body edit actually moves a store-free
+                        // How often an edit actually moves a store-free
                         // bit decides whether re-deriving at every COMPILE
                         // tick is the right posture; count flips against
                         // the refresh count.
                         _timers.bump("store-free-flip");
+
+                        // A body's narrowings depend only on the bits of
+                        // the functions it references, and recompiling
+                        // expressions cannot move any bit (the store-free
+                        // walk reads nothing compile-expressions writes),
+                        // so recompiling just the files that reference a
+                        // flipped function trues everything up in one
+                        // round - no whole-project rebuild. Falls back to
+                        // the rebuild whenever the flip set or any flipped
+                        // function's reference records can't be trusted to
+                        // be complete.
+                        if _try_targeted_store_free_recompile() then
+                            _timers.bump("store-free-targeted");
+
+                            store_free_flipped = false;
+                        fi
                     fi
 
                     if !store_free_flipped /\ !_compiler.is_full_compile_needed then
