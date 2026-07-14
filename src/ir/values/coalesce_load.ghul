@@ -1,23 +1,24 @@
 namespace IR.Values is
     use Semantic.Types.Type;
 
-    // The result of a coalescing member access `a?.b`. The receiver
-    // is short-circuited to absent on null (reference-type optional)
-    // or HasValue=false (value-type optional via NULLABLE / MAYBE);
-    // otherwise the member is loaded against the unwrapped receiver.
+    // The result of a coalescing member access `a?.b` or method call
+    // `a?.m(...)`. The receiver is short-circuited to absent on null
+    // (reference-type optional) or HasValue=false (value-type optional
+    // via NULLABLE / MAYBE); otherwise the member value - a field or
+    // property load, or a whole call including argument evaluation -
+    // is produced against the unwrapped receiver.
     //
-    // Built by COMPILE_ACCESS.visit_member when MEMBER.is_coalesce
-    // is set. The construction wires three sub-Values whose gen()
-    // composes the final IL inline — no `if let` tree-rewrite, no
-    // semantic-pass spilling.
+    // Built by COMPILE_ACCESS.build_coalesce_wrap. The construction
+    // wires sub-Values whose gen() composes the final IL inline - no
+    // `if let` tree-rewrite, no semantic-pass spilling.
     //
     // Reference-type receiver (T? where T is a class), ref-type
     // member result:
     //   <recv IL>                // [..., recv]
     //   dup                      // [..., recv, recv]
-    //   brfalse.s <null>         // [..., recv]
+    //   brfalse <null>           // [..., recv]
     //   <member_load IL>         // [..., U]   (member_load reads 'this' from stack)
-    //   br.s <end>
+    //   br <end>
     //   <null>:
     //   pop
     //   <null_value IL>          // ldnull (ref) or default sentinel (value)
@@ -27,10 +28,10 @@ namespace IR.Values is
     //   <recv address IL>        // [..., &recv]
     //   dup                      // [..., &recv, &recv]
     //   <presence_test IL>       // [..., &recv, bool]  (call get_has_value on 'this' addr)
-    //   brfalse.s <null>         // [..., &recv]
+    //   brfalse <null>           // [..., &recv]
     //   <value_extract IL>       // [..., T]            (call get_value on 'this' addr)
     //   <member_load IL>         // [..., U]
-    //   br.s <end>
+    //   br <end>
     //   <null>:
     //   pop
     //   <null_value IL>
@@ -38,27 +39,38 @@ namespace IR.Values is
     //
     // The null_value is `ldnull` for a reference-type result and a
     // fresh DEFAULT for a value-type result (DEFAULT hoists a
-    // `.locals init` and pushes the zero value).
+    // `.locals init` and pushes the zero value). A void member value
+    // (a coalesced call to a void method) has no null_value - neither
+    // arm leaves a result on the stack.
+    //
+    // A static member reached through `?.` never consumes the tested
+    // receiver: `receiver_consumed` false makes the present arm pop
+    // the receiver (or its dup'd address) before the member value,
+    // and the value-type shape skips the value extract entirely.
     class COALESCE_LOAD: Value is
         receiver: Value;
         presence_test: Value?;
         value_extract: Value?;
         member_load: Value;
-        null_value: Value;
+        null_value: Value?;
         _result_type: Type;
         _receiver_is_value_type: bool;
+        _receiver_consumed: bool;
 
         type: Type => _result_type;
         is_lightweight_pure: bool => false;
 
+        receiver_is_value_type: bool => _receiver_is_value_type;
+
         // Reference-type receiver constructor. `member_load`'s
-        // receiver should be a STACK_TOP — gen() leaves the receiver
+        // receiver should be a STACK_TOP - gen() leaves the receiver
         // on the stack ready for the access op.
         init(
             receiver: Value,
             member_load: Value,
-            null_value: Value,
-            result_type: Type
+            null_value: Value?,
+            result_type: Type,
+            receiver_consumed: bool
         ) is
             super.init();
 
@@ -67,20 +79,23 @@ namespace IR.Values is
             self.null_value = null_value;
             self._result_type = result_type;
             self._receiver_is_value_type = false;
+            self._receiver_consumed = receiver_consumed;
         si
 
         // Value-type receiver constructor. `receiver`'s address is
         // pushed once, dup'd, and used by `presence_test` (HasValue)
         // and `value_extract` (Value). Both receivers should consume
-        // the address from the stack — built with a STACK_TOP_ADDRESS
-        // standing in for 'this'.
+        // the address from the stack - built with a STACK_TOP_ADDRESS
+        // standing in for 'this'. `value_extract` is null when the
+        // member value doesn't consume the receiver.
         init(
             receiver: Value,
             presence_test: Value,
-            value_extract: Value,
+            value_extract: Value?,
             member_load: Value,
-            null_value: Value,
-            result_type: Type
+            null_value: Value?,
+            result_type: Type,
+            receiver_consumed: bool
         ) is
             super.init();
 
@@ -91,6 +106,7 @@ namespace IR.Values is
             self.null_value = null_value;
             self._result_type = result_type;
             self._receiver_is_value_type = true;
+            self._receiver_consumed = receiver_consumed;
         si
 
         gen(context: IR.CONTEXT) is
@@ -101,19 +117,32 @@ namespace IR.Values is
                 receiver.gen_address(context);
                 context.write_line("dup");
                 gen(presence_test!, context);
-                context.write_line("brfalse.s {null_label}");
-                gen(value_extract!, context);
+                context.write_line("brfalse {null_label}");
+
+                if _receiver_consumed then
+                    gen(value_extract!, context);
+                else
+                    context.write_line("pop");
+                fi
             else
                 gen(receiver, context);
                 context.write_line("dup");
-                context.write_line("brfalse.s {null_label}");
+                context.write_line("brfalse {null_label}");
+
+                if !_receiver_consumed then
+                    context.write_line("pop");
+                fi
             fi
 
             gen(member_load, context);
-            context.write_line("br.s {end_label}");
+            context.write_line("br {end_label}");
             context.write_line("{null_label}:");
             context.write_line("pop");
-            gen(null_value, context);
+
+            if null_value? then
+                gen(null_value!, context);
+            fi
+
             context.write_line("{end_label}:");
         si
 
@@ -125,7 +154,7 @@ namespace IR.Values is
     // (reference or struct) already on the IL stack". Embedded as
     // the `from` of a `Load.INSTANCE_FIELD` / property-getter CALL
     // when an outer composite (COALESCE_LOAD) has already pushed
-    // the receiver — letting the inner load emit only its trailing
+    // the receiver - letting the inner load emit only its trailing
     // access op.
     class STACK_TOP: Value is
         _type: Type?;
@@ -146,7 +175,7 @@ namespace IR.Values is
             "stack-top:[{type}]";
     si
 
-    // Like STACK_TOP but reports `has_address` — the IL stack
+    // Like STACK_TOP but reports `has_address` - the IL stack
     // already holds a managed pointer (e.g. the dup'd address of a
     // value-type optional receiver). The struct-aware load paths
     // gate on `has_address`, so an `INSTANCE_FIELD` / property
