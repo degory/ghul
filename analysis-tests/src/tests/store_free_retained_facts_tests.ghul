@@ -1,0 +1,168 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+    use Analysis.Protocol.user_diagnostics_of;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // The debounced COMPILE's store-free refresh reuses each file's
+    // retained fact bucket and re-walks only files whose tree or
+    // bindings changed since the facts were derived. Observed through
+    // the per-refresh rewalked-file tally.
+    class STORE_FREE_RETAINED_FACTS_TESTS is
+        @test()
+
+        init() is si
+
+        REWALKED: string => "store-free-rewalked-file";
+        STORE_FREE_FLIP: string => "store-free-flip";
+
+        probe_source(body: string, spare_param: string) -> string =>
+            "namespace SFRetain is\n"
+            "    class PROBE is\n"
+            "        s: int static public;\n"
+            "\n"
+            "        churn() -> int static is\n"
+            "            {body}\n"
+            "        si\n"
+            "\n"
+            "        spare({spare_param}: int) -> int static => 3;\n"
+            "    si\n"
+            "si\n";
+
+        caller_source() -> string =>
+            "namespace SFRetain is\n"
+            "    class HOLDER is\n"
+            "        v: int? field;\n"
+            "\n"
+            "        init() is si\n"
+            "\n"
+            "        check() -> int is\n"
+            "            if v? then\n"
+            "                PROBE.churn();\n"
+            "                return v;\n"
+            "            fi\n"
+            "\n"
+            "            return 0;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        prime(analyser: ANALYSER_PROCESS) is
+            analyser.send_edit_files([
+                EDIT_FILE("sfr-probe.ghul", probe_source("let w = s;\n            return w;", "a")),
+                EDIT_FILE("sfr-caller.ghul", caller_source())
+            ]);
+
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response after EDIT";
+        si
+
+        edit_probe(analyser: ANALYSER_PROCESS, body: string) is
+            edit_probe(analyser, body, "a");
+        si
+
+        edit_probe(analyser: ANALYSER_PROCESS, body: string, spare_param: string) is
+            analyser.send_edit("sfr-probe.ghul", probe_source(body, spare_param));
+
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response after EDIT";
+        si
+
+        compile(analyser: ANALYSER_PROCESS) is
+            analyser.send_compile();
+
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS response after COMPILE";
+        si
+
+        refresh_rewalks_only_the_files_whose_facts_went_stale() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            prime(analyser);
+
+            // The priming rebuild derived every file's facts, so the
+            // first refresh serves them all from retention.
+            let r0 = analyser.stat_count(REWALKED);
+            compile(analyser);
+            Assert.are_equal(
+                r0,
+                analyser.stat_count(REWALKED),
+                "first refresh after the priming build should re-walk nothing\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // A body edit staled exactly one file's facts.
+            edit_probe(analyser, "let w = s + 1;\n            return w;");
+
+            let r1 = analyser.stat_count(REWALKED);
+            compile(analyser);
+            Assert.are_equal(
+                r1 + 1,
+                analyser.stat_count(REWALKED),
+                "a single body edit should re-walk exactly that file\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // A flipping edit re-walks the edited file at this refresh;
+            // the targeted true-up then recompiles (and stales) the
+            // caller, so the following refresh re-walks exactly that.
+            let flips_before = analyser.stat_count(STORE_FREE_FLIP);
+
+            edit_probe(analyser, "s = 7;\n            return s;");
+
+            let r2 = analyser.stat_count(REWALKED);
+            compile(analyser);
+            Assert.are_equal(
+                r2 + 1,
+                analyser.stat_count(REWALKED),
+                "the flipping edit itself should re-walk only the edited file\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+            Assert.are_equal(
+                flips_before + 1,
+                analyser.stat_count(STORE_FREE_FLIP),
+                "the storing body must flip at the refresh\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // The true-up recompiled the caller and the edited file
+            // itself (the flipped function's own declaration site counts
+            // as a reference - deliberately not filtered, since a
+            // self-recursive body's narrowing depends on its own bit),
+            // staling both buckets.
+            let r3 = analyser.stat_count(REWALKED);
+            compile(analyser);
+            Assert.are_equal(
+                r3 + 2,
+                analyser.stat_count(REWALKED),
+                "the files the true-up recompiled should be the only re-walks at the next refresh\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // Settle the project clean before the last scenario: revert
+            // churn to store-free (the flip's true-up recompiles the
+            // caller, clearing its narrowing error) and let the following
+            // refresh re-walk the files the true-up staled - a standing
+            // error file would otherwise be conservatively re-checked on
+            // any interface edit and muddy the tally below.
+            edit_probe(analyser, "let w = s;\n            return w;");
+            compile(analyser);
+            compile(analyser);
+
+            // An interface edit to a member nothing references takes the
+            // window-only expression rebuild - the reconcile branch with
+            // no dependent recompile - and must still stale the file's
+            // facts: the member tree changed under them.
+            let r4 = analyser.stat_count(REWALKED);
+            edit_probe(analyser, "let w = s;\n            return w;", "renamed");
+            compile(analyser);
+            Assert.are_equal(
+                r4 + 1,
+                analyser.stat_count(REWALKED),
+                "an unreferenced-member interface edit should re-walk exactly the edited file\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+    si
+si
