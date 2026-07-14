@@ -1,0 +1,245 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+    use Analysis.Protocol.user_diagnostics_of;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // When the debounced COMPILE's store-free refresh reports flips, the
+    // handler recompiles only the files referencing a flipped function
+    // instead of rebuilding the whole project: narrowings depend only on
+    // the bits of the functions a body references, and recompiling
+    // expressions cannot move any bit, so one targeted round trues
+    // everything up.
+    class STORE_FREE_TARGETED_RECOMPILE_TESTS is
+        @test()
+
+        init() is si
+
+        STORE_FREE_FLIP: string => "store-free-flip";
+        STORE_FREE_TARGETED: string => "store-free-targeted";
+        COMPILE_RUN: string => "compile-run";
+
+        // `churn` reads only - store-free.
+        probe_store_free() -> string =>
+            "namespace SFTarget is\n"
+            "    class PROBE is\n"
+            "        s: int static public;\n"
+            "\n"
+            "        churn() -> int static is\n"
+            "            let w = s;\n"
+            "            return w;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // Interface-identical, but `churn` stores to a static field.
+        probe_storing() -> string =>
+            "namespace SFTarget is\n"
+            "    class PROBE is\n"
+            "        s: int static public;\n"
+            "\n"
+            "        churn() -> int static is\n"
+            "            s = 7;\n"
+            "            return s;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // HOLDER.check narrows the field `v` and keeps that narrowing
+        // across the churn() call only while churn is store-free - a
+        // local's narrowing would survive any call, but a field's dies
+        // at a call that could store: `return v` needs the narrowed int.
+        caller_source() -> string =>
+            "namespace SFTarget is\n"
+            "    class HOLDER is\n"
+            "        v: int? field;\n"
+            "\n"
+            "        init() is si\n"
+            "\n"
+            "        check() -> int is\n"
+            "            if v? then\n"
+            "                PROBE.churn();\n"
+            "                return v;\n"
+            "            fi\n"
+            "\n"
+            "            return 0;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        prime(analyser: ANALYSER_PROCESS) -> LIST[DIAGNOSTIC] is
+            analyser.send_edit_files([
+                EDIT_FILE("sft-probe.ghul", probe_store_free()),
+                EDIT_FILE("sft-caller.ghul", caller_source())
+            ]);
+
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response after EDIT";
+
+            return LIST[DIAGNOSTIC](user_diagnostics_of(diagnostics));
+        si
+
+        edit_probe(analyser: ANALYSER_PROCESS, source: string) is
+            analyser.send_edit("sft-probe.ghul", source);
+
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response after EDIT";
+        si
+
+        compile(analyser: ANALYSER_PROCESS) -> LIST[DIAGNOSTIC] is
+            analyser.send_compile();
+
+            let response = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(response) else "expected DIAGNOSTICS response after COMPILE";
+
+            return LIST[DIAGNOSTIC](user_diagnostics_of(response));
+        si
+
+        summary(diagnostics: LIST[DIAGNOSTIC]) -> string is
+            let result = System.Text.StringBuilder();
+            for d in diagnostics do
+                result.append("\n  ").append(d.to_string());
+            od
+            return result.to_string();
+        si
+
+        // A body edit flips churn's bit; the cross-file caller whose
+        // narrowing depended on it is trued up by a targeted recompile
+        // of just that file - the error appears, and appears again in
+        // reverse, without any whole-project rebuild.
+        cross_file_narrowing_trues_up_without_a_rebuild() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            let baseline = prime(analyser);
+            Assert.are_equal(
+                0,
+                baseline.count,
+                "baseline (store-free churn, narrowing holds) should be clean; got:{summary(baseline)}\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            compile(analyser);
+
+            let flips_before = analyser.stat_count(STORE_FREE_FLIP);
+            let targeted_before = analyser.stat_count(STORE_FREE_TARGETED);
+            let runs_before = analyser.stat_count(COMPILE_RUN);
+
+            edit_probe(analyser, probe_storing());
+
+            let after_flip = compile(analyser);
+
+            Assert.is_true(
+                after_flip.count > 0,
+                "after churn turns storing, check's narrowing must die and return x must error\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                flips_before + 1,
+                analyser.stat_count(STORE_FREE_FLIP),
+                "the storing edit must flip churn's bit at the refresh\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                targeted_before + 1,
+                analyser.stat_count(STORE_FREE_TARGETED),
+                "the flip must be trued up by the targeted recompile\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                runs_before,
+                analyser.stat_count(COMPILE_RUN),
+                "no whole-project rebuild - the targeted recompile covers the flip\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            edit_probe(analyser, probe_store_free());
+
+            let after_restore = compile(analyser);
+
+            Assert.are_equal(
+                0,
+                after_restore.count,
+                "restoring store-free churn must clear the caller's error; got:{summary(after_restore)}\n"
+                "flips {analyser.stat_count(STORE_FREE_FLIP)} (before {flips_before}) "
+                "targeted {analyser.stat_count(STORE_FREE_TARGETED)} (before {targeted_before}) "
+                "runs {analyser.stat_count(COMPILE_RUN)} (before {runs_before})"
+                "\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                targeted_before + 2,
+                analyser.stat_count(STORE_FREE_TARGETED),
+                "the reverse flip must also be trued up by the targeted recompile\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                runs_before,
+                analyser.stat_count(COMPILE_RUN),
+                "the reverse flip must not rebuild either\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Appending a store-free function nobody references flips its
+        // fresh bit at the next COMPILE, but the flip's reference set is
+        // empty - the targeted recompile touches nothing and the rebuild
+        // is skipped entirely.
+        appended_member_flip_recompiles_nothing() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            let baseline = prime(analyser);
+            Assert.are_equal(0, baseline.count, "baseline should be clean; got:{summary(baseline)}");
+
+            compile(analyser);
+
+            let targeted_before = analyser.stat_count(STORE_FREE_TARGETED);
+            let runs_before = analyser.stat_count(COMPILE_RUN);
+
+            // Append a store-free method to PROBE: the class-member
+            // append shape takes the incremental interface path, which
+            // declares the new member with a default store-free bit, so
+            // the next COMPILE's refresh derives true against it.
+            edit_probe(
+                analyser,
+                "namespace SFTarget is\n"
+                "    class PROBE is\n"
+                "        s: int static public;\n"
+                "\n"
+                "        churn() -> int static is\n"
+                "            let w = s;\n"
+                "            return w;\n"
+                "        si\n"
+                "\n"
+                "        appended() -> int static => 42;\n"
+                "    si\n"
+                "si\n"
+            );
+
+            let after = compile(analyser);
+
+            Assert.are_equal(
+                0,
+                after.count,
+                "the appended function should compile clean; got:{summary(after)}\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                targeted_before + 1,
+                analyser.stat_count(STORE_FREE_TARGETED),
+                "the appended member's fresh-bit flip should be covered by the targeted path\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.are_equal(
+                runs_before,
+                analyser.stat_count(COMPILE_RUN),
+                "an unreferenced append must not trigger a whole-project rebuild\n--- stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+    si
+si
