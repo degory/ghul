@@ -28,6 +28,7 @@ namespace Syntax.Process is
         _access: COMPILE_ACCESS;
         _visitor: COMPILE_EXPRESSIONS;
         _named_argument_binder: NAMED_ARGUMENT_BINDER;
+        _flow: NARROWING_FLOW;
 
         init(
             logger: Logger,
@@ -41,7 +42,8 @@ namespace Syntax.Process is
             under_determination_detector: Semantic.UNDER_DETERMINATION_DETECTOR,
             type_arg_placeholder_registry: Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY,
             access: COMPILE_ACCESS,
-            visitor: COMPILE_EXPRESSIONS
+            visitor: COMPILE_EXPRESSIONS,
+            flow: NARROWING_FLOW
         ) is
             super.init();
 
@@ -59,6 +61,7 @@ namespace Syntax.Process is
             _access = access;
             _visitor = visitor;
             _named_argument_binder = NAMED_ARGUMENT_BINDER(logger);
+            _flow = flow;
         si
 
         // Rebuild a named call's already-collected argument lists - the
@@ -396,6 +399,26 @@ namespace Syntax.Process is
             od
         si
 
+        // `pre_arguments_env` carries the narrowing facts that were in
+        // force before the argument expressions first walked, so the
+        // retry paths can re-walk them from the same facts - see
+        // `try_overload_on_partial` for why. Null when the caller
+        // cannot supply it; the retries then skip the restore.
+        // The narrowing-flow analogue of the logger roll_back the
+        // retry paths perform before re-walking argument expressions:
+        // the first walk's transfers recorded facts (an unwrap `x!`
+        // records that x holds a value), and a re-walk of the same
+        // expressions under those facts sees its own effects - the
+        // second compile of `x!` finds x already proven non-null and
+        // misreports the unwrap as redundant. Restoring the facts
+        // captured before the first walk makes the re-walk observe
+        // exactly what the first walk did.
+        _restore_pre_arguments_env(pre_arguments_env: NARROW_ENV?) is
+            if pre_arguments_env? then
+                _flow.set_env(pre_arguments_env);
+            fi
+        si
+
         resolve_constructor(
             location: LOCATION,
             right_location: LOCATION,
@@ -403,7 +426,8 @@ namespace Syntax.Process is
             argument_expressions: Trees.Expressions.LIST,
             argument_names: Collections.List[Trees.Identifiers.Identifier]?,
             constraint: Semantic.Types.Type?,
-            cache_key: Trees.Node
+            cache_key: Trees.Node,
+            pre_arguments_env: NARROW_ENV?
         ) -> (Value, Value) is
             let result: Value mut;
 
@@ -480,6 +504,7 @@ namespace Syntax.Process is
                     if specialized_candidate? /\ specialized_candidate != candidate then
                         _logger.roll_back();
                         _logger.speculate();
+                        _restore_pre_arguments_env(pre_arguments_env);
 
                         for (index, a) in argument_expressions | .index() do
                             let f = specialized_candidate.arguments[index];
@@ -531,9 +556,10 @@ namespace Syntax.Process is
                 return (cast Value(Load.SYMBOL(null, function_group)), cast Value(DUMMY(type, location)));
             fi
 
-            if overload_result.score == Semantic.Types.MATCH.PARTIAL then
+            if overload_result.needs_retry then
                 _logger.roll_back();
                 _logger.speculate();
+                _restore_pre_arguments_env(pre_arguments_env);
 
                 for (index, a) in argument_expressions | .index() do
                     // let use debug_despose = debug_enter();
@@ -824,7 +850,8 @@ namespace Syntax.Process is
             named_restrict: Collections.List[Semantic.Symbols.Function]?,
             argument_expressions: Collections.List[Trees.Expressions.Expression],
             argument_location: LOCATION,
-            cache_key: Trees.Node
+            cache_key: Trees.Node,
+            pre_arguments_env: NARROW_ENV?
         ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
             let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
 
@@ -881,6 +908,7 @@ namespace Syntax.Process is
 
                 _logger.roll_back();
                 _logger.speculate();
+                _restore_pre_arguments_env(pre_arguments_env);
 
                 for (index, a) in argument_expressions | .index() do
                     let f = push_candidate!.arguments[index];
@@ -939,7 +967,8 @@ namespace Syntax.Process is
             named_restrict: Collections.List[Semantic.Symbols.Function]?,
             argument_expressions: Collections.List[Trees.Expressions.Expression],
             argument_location: LOCATION,
-            cache_key: Trees.Node
+            cache_key: Trees.Node,
+            pre_arguments_env: NARROW_ENV?
         ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
             let push_function mut = overload_result.function;
 
@@ -961,6 +990,7 @@ namespace Syntax.Process is
 
             _logger.roll_back();
             _logger.speculate();
+            _restore_pre_arguments_env(pre_arguments_env);
 
             for (index, a) in argument_expressions | .index() do
                 if a.value? /\ isa Trees.Expressions.FUNCTION(a) then
@@ -983,7 +1013,10 @@ namespace Syntax.Process is
             return _overload_resolver.resolve(argument_location, function_group, argument_types, false, want_instance, false, named_restrict);
         si
 
-        visit_call(call: Trees.Expressions.CALL) is
+        // `pre_arguments_env` is the narrowing facts captured by the
+        // visit(CALL) wrapper before the argument expressions first
+        // walked - see `_restore_pre_arguments_env`.
+        visit_call(call: Trees.Expressions.CALL, pre_arguments_env: NARROW_ENV?) is
             // Recursive-call match propagation for self-recursive lambdas
             // (`let f = x rec => ... rec(actual) ...`). The
             // call-site match propagation below only widens a closure's
@@ -1057,7 +1090,7 @@ namespace Syntax.Process is
             fi
 
             if function_value.is_type_expression then
-                (call.function.compile_expressions_state.value, call.compile_expressions_state.value) = resolve_constructor(call.location, call.right_location, function_value.type!, call.arguments, call.argument_names, call.expected_type, call);
+                (call.function.compile_expressions_state.value, call.compile_expressions_state.value) = resolve_constructor(call.location, call.right_location, function_value.type!, call.arguments, call.argument_names, call.expected_type, call, pre_arguments_env);
 
                 return;
             fi
@@ -1117,7 +1150,7 @@ namespace Syntax.Process is
                     let overload_result mut = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict, call.expected_type);
 
                     if !overload_result? then
-                        overload_result = try_overload_after_null(function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call);
+                        overload_result = try_overload_after_null(function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call, pre_arguments_env);
                     fi
 
                     if overload_result == null then
@@ -1125,8 +1158,8 @@ namespace Syntax.Process is
                         return;
                     fi
 
-                    if overload_result.score == Semantic.Types.MATCH.PARTIAL then
-                        overload_result = try_overload_on_partial(overload_result, function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call);
+                    if overload_result.needs_retry then
+                        overload_result = try_overload_on_partial(overload_result, function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call, pre_arguments_env);
 
                         if !overload_result? then
                             call.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), call.location);
@@ -1254,7 +1287,7 @@ namespace Syntax.Process is
                 fi
             else
                 if load_symbol? /\ load_symbol.is_type then
-                    (call.function.compile_expressions_state.value, call.compile_expressions_state.value) = resolve_constructor(call.location, call.right_location, load_symbol.type!, call.arguments, call.argument_names, call.expected_type, call);
+                    (call.function.compile_expressions_state.value, call.compile_expressions_state.value) = resolve_constructor(call.location, call.right_location, load_symbol.type!, call.arguments, call.argument_names, call.expected_type, call, pre_arguments_env);
                 else
                     _logger.error(call.function.location, "cannot call value of non-function type {function_value.type}");
                     call.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), call.location);
