@@ -747,6 +747,26 @@ od
 
 Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5).
 
+Any loop (`for`, `while`, `do`) can be labelled by prefixing it with an identifier and a colon, and `break` and `continue` can then name the loop they act on, letting an inner loop exit or advance an outer one:
+
+```ghul
+outer: for i in 0..3 do
+    for j in 0..3 do
+        if j > i then
+            continue outer;    // next i
+        fi
+
+        if i == 2 then
+            break outer;       // exits both loops
+        fi
+
+        write_line("i {i} j {j}");
+    od
+od
+```
+
+A `break` or `continue` that names no enclosing labelled loop is a compile error.
+
 A `while` condition narrows the loop body the same way an `if` condition narrows its then-arm. `while xs? /\ i < xs.count do xs[i] …` reads `xs` at its non-optional type inside the body, and `while isa Cat(a) do a.purr() od` calls a `Cat`-only member without an inner cast.
 
 `while let` is the loop counterpart of `if let`: the loop runs while the refutable binding matches, with the bound names freshly in scope on each iteration. The same shapes work — bare presence (`while let line = reader.read_line() do …`), type ascription (`while let c: Cat = a do …`), destructure, `/\` guards (`while let c: Cat = a /\ c.has_whiskers do …`), and comma-separated multi-clause bindings (`while let x = a, y = b do …`) where every clause must succeed each iteration. Loop exit is whenever any clause's test or guard fails.
