@@ -978,6 +978,8 @@ let r: RESULT[int, string] = RESULT.OK(42);  // OK's arg pins T = int;
                                              // the LHS pins S = string
 ```
 
+When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
+
 ## type inference
 
 See <https://ghul.dev/type-inference.html>.
