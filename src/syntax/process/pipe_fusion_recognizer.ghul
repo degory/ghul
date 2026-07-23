@@ -25,8 +25,15 @@ namespace Syntax.Process is
         is_filter: bool public;
         is_index: bool public;
 
-        // The stage's function-typed argument (map/filter lambda or
-        // delegate). Null for an index stage.
+        // A `take`/`skip` stage: `argument` is the int count expression,
+        // evaluated once into a running counter that the loop decrements per
+        // pulled element (take stops the loop when it runs out; skip drops
+        // the element while it remains).
+        is_take: bool public;
+        is_skip: bool public;
+
+        // The stage's argument: a map/filter lambda or delegate, or the int
+        // count of a take/skip stage. Null for an index stage.
         argument: Trees.Expressions.Expression? public;
 
         // Index stage only.
@@ -36,6 +43,10 @@ namespace Syntax.Process is
 
         param_local: Semantic.Symbols.Variable? public;
         inline_body: IR.Values.Value? public;
+
+        // A take/skip stage keeps a running counter but transforms nothing,
+        // so the element passes through unchanged.
+        is_countdown: bool => is_take \/ is_skip;
 
         is_inlined: bool => param_local? /\ inline_body?;
 
@@ -51,6 +62,12 @@ namespace Syntax.Process is
         init(index_start: int) is
             self.is_index = true;
             self.index_start = index_start;
+        si
+
+        init(is_take: bool, is_skip: bool, count: Trees.Expressions.Expression) is
+            self.is_take = is_take;
+            self.is_skip = is_skip;
+            self.argument = count;
         si
     si
 
@@ -96,14 +113,15 @@ namespace Syntax.Process is
     // fusible pipe chain, and if so returns the plan the IL pass
     // consumes. Pure recognition — no compilation side effects.
     //
-    // Soundness: Pipe[T] is a trait with virtual `map`/`filter`, so a
-    // user type implementing Pipe may override them. Static resolution
-    // to Pipe.map is not enough — the `callvirt` dispatches on the
-    // receiver's dynamic type. The chain is only fused when its BASE
-    // provably uses the default `map`/`filter`; an induction over the
+    // Soundness: Pipe[T] is a trait with virtual `map`/`filter`/`index`/
+    // `take`/`skip`, so a user type implementing Pipe may override them.
+    // Static resolution to Pipe.map is not enough — the `callvirt`
+    // dispatches on the receiver's dynamic type. The chain is only fused
+    // when its BASE provably uses the default ops; an induction over the
     // closed-to-assembly built-in pipe classes then secures every
     // downstream stage (each stage's receiver is a value freshly produced
-    // by an already-pinned default op returning a closed built-in pipe).
+    // by an already-pinned default op returning a closed built-in pipe -
+    // MAP_PIPE / FilterPipe / INDEX_PIPE / TAKE_PIPE / SKIP_PIPE).
     //
     // The base must be a `pipe(SOURCE)` wrap (the postfix `|` operator,
     // carrying `is_pipe_wrap`) whose SOURCE is not itself statically a
@@ -157,19 +175,27 @@ namespace Syntax.Process is
                 let is_filter = name =~ "filter";
                 let is_map = name =~ "map";
                 let is_index = name =~ "index";
+                let is_take = name =~ "take";
+                let is_skip = name =~ "skip";
 
-                if !(is_filter \/ is_map \/ is_index) then
+                if !(is_filter \/ is_map \/ is_index \/ is_take \/ is_skip) then
                     break;
                 fi
 
                 // The receiver must be statically a Pipe[T]. On a trait
-                // static type overload resolution binds the default
-                // `map`/`filter`/`index`, so this identifies the default op.
+                // static type overload resolution binds the default op, so
+                // this identifies the default map/filter/index/take/skip.
                 if !_is_pipe_expression(member.left, pipe_type) then
                     break;
                 fi
 
-                if is_index then
+                if is_take \/ is_skip then
+                    if call.arguments.expressions.count != 1 then
+                        break;
+                    fi
+
+                    stages.add(PIPE_FUSION_STAGE(is_take, is_skip, call.arguments.expressions[0]));
+                elif is_index then
                     // Only the no-argument `index()` (start 0) is fused;
                     // `index(start)` is left to the class-based pipe.
                     if call.arguments.expressions.count != 0 then
@@ -248,6 +274,23 @@ namespace Syntax.Process is
             // satisfy both.
             if needs_guard /\ (source_value.is_state_changing_call \/ isa IR.Values.BLOCK(source_value)) then
                 return null;
+            fi
+
+            // A guarded loop also emits each take/skip count twice - once
+            // into the fused counter, once in the fallback pipe chain - so a
+            // count fed to a guarded fusion has the same emit-more-than-once
+            // requirement as the source. Counts are almost always literals,
+            // which satisfy it.
+            if needs_guard then
+                for stage in stages do
+                    if stage.is_countdown then
+                        let count_value = stage.argument!.value;
+
+                        if !count_value? \/ count_value.is_state_changing_call \/ isa IR.Values.BLOCK(count_value) then
+                            return null;
+                        fi
+                    fi
+                od
             fi
 
             return PIPE_FUSION(source, stages, needs_guard);
