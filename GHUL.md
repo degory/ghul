@@ -954,6 +954,17 @@ let sum = numbers | .reduce(0, (acc, x) => acc + x);
 
 Lazy and infinite sequences are built with `Ghul.Pipes.stream(initial, advance)`, where `advance` is a pure step function from the current state to the next element and state. The `||` infix is the step expression — `value || next_state`. A `stream(...)` is an ordinary `Pipe[T]`, so the pipe combinators chain straight onto it. See <https://ghul.dev/functional-programming.html#lazy-sequences>.
 
+The thread-first operator `|>` calls a function with the left value threaded in as its first argument: `x |> f(a)` is `f(x, a)`, and `x |> f()` is `f(x)`. The right-hand side is resolved exactly as an ordinary call, so it can be a free function, a method on an explicit receiver (`x |> box.combine(a)` is `box.combine(x, a)`), or a generic whose type argument is inferred from the left value. Chains associate left to right, so `x |> f(a) |> g(b)` is `g(f(x, a), b)`. Unlike `|`, which wraps its operand in a `Pipe[T]` and calls pipe combinators on it, `|>` is a plain call, and its right-hand side must be a function call:
+
+```ghul
+double(x: int) -> int => x * 2;
+add(x: int, y: int) -> int => x + y;
+
+let a = 5 |> double();           // double(5) is 10
+let b = 5 |> add(3);             // add(5, 3) is 8
+let c = 5 |> double() |> add(1); // add(double(5), 1) is 11
+```
+
 ## generics
 
 See <https://ghul.dev/generics.html>.
