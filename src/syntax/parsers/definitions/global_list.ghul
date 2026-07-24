@@ -1,10 +1,13 @@
 namespace Syntax.Parsers.Definitions is
     use System.Exception;
     use IO.Std;
-    
+
     use Source;
 
-    class GLOBAL_LIST(definition_parser: Parser[Trees.Definitions.Definition]): Base[Trees.Definitions.LIST] is
+    class GLOBAL_LIST(
+        definition_parser: Parser[Trees.Definitions.Definition],
+        statement_parser: Parser[Trees.Statements.Statement]
+    ): Base[Trees.Definitions.LIST] is
         description: string => "definition list";
 
         super();
@@ -13,22 +16,55 @@ namespace Syntax.Parsers.Definitions is
             let start = context.location;
             let end mut = context.location;
             let definitions = Collections.LIST[Trees.Definitions.Definition]();
+            let statements = Collections.LIST[Trees.Statements.Statement]();
 
-            while !context.is_end_of_file /\ context.current.token != Lexical.TOKEN.SI do
-                try                        
-                    let definition = definition_parser.parse(context);
-
-                    if definition? then
-                        end = definition.location;
-
-                        definitions.add(definition);
+            // `si` closes a namespace body (depth > 0); at the file root
+            // (depth 0) it is stray input the definition parser reports, so it
+            // must not end the loop there.
+            while
+                !context.is_end_of_file /\
+                (context.namespace_depth == 0 \/ context.current.token != Lexical.TOKEN.SI)
+            do
+                try
+                    // Script mode: at the file root (no enclosing namespace) a
+                    // leading token that isn't a definition keyword may begin a
+                    // top-level statement. Inside any namespace this is skipped
+                    // and parsing is unchanged.
+                    if context.namespace_depth == 0 /\ !_is_definition_head(context.current.token) then
+                        if _is_ambiguous_head(context.current.token) then
+                            // IDENTIFIER / OPERATOR / [ can each begin a global
+                            // member or a statement; a shallow peek routes the
+                            // clear definitions. The rest are parsed as a
+                            // statement, but speculatively: an incomplete
+                            // definition that the peek couldn't recognise (e.g.
+                            // `foo(` with no close) fails to parse as a statement
+                            // and falls back to the definition parser's recovery.
+                            if _starts_definition(context) \/ !_try_collect_statement(context, statements) then
+                                _parse_definition(context, definitions);
+                                end = _end_of(definitions, end);
+                            else
+                                end = _end_of_statement(statements, end);
+                            fi
+                        elif _is_statement_head(context.current.token) then
+                            _parse_statement(context, statements);
+                            end = _end_of_statement(statements, end);
+                        else
+                            // Not a definition keyword and not a statement head:
+                            // stray input, reported by the definition parser as
+                            // before.
+                            _parse_definition(context, definitions);
+                            end = _end_of(definitions, end);
+                        fi
+                    else
+                        _parse_definition(context, definitions);
+                        end = _end_of(definitions, end);
                     fi
                 catch ue: UNWIND_TO_GLOBAL_EXCEPTION
                     // carry on from here
                 catch e: Exception
                     IoC.CONTAINER.instance.logger.exception(context.current.location, e, "parse exception: {e.message}");
 
-                    while 
+                    while
                         !context.is_end_of_file /\
                         context.current.token != Lexical.TOKEN.SI /\
                         context.current.token != Lexical.TOKEN.SEMICOLON
@@ -42,7 +78,267 @@ namespace Syntax.Parsers.Definitions is
                 yrt
             od
 
-            return Trees.Definitions.LIST(start::end, definitions);
+            let result = Trees.Definitions.LIST(start::end, definitions);
+
+            // Hand any bare top-level statements to synthesise-top-level-entry,
+            // which wraps them into a global entry point. Only reachable at the
+            // file root (namespace depth 0).
+            if statements.count > 0 then
+                result.top_level_statements = Trees.Statements.LIST(start::end, statements);
+            fi
+
+            return result;
+        si
+
+        _parse_definition(context: CONTEXT, definitions: Collections.MutableList[Trees.Definitions.Definition]) is
+            let definition = definition_parser.parse(context);
+
+            if definition? then
+                definitions.add(definition);
+            fi
+        si
+
+        _parse_statement(context: CONTEXT, statements: Collections.MutableList[Trees.Statements.Statement]) is
+            let statement = statement_parser.parse(context);
+
+            if statement? then
+                statements.add(statement);
+                _skip_semicolon(context);
+            elif !context.is_end_of_file then
+                context.next_token();
+            fi
+        si
+
+        // Speculatively parse a statement at an ambiguous head, collecting it
+        // and returning true only if it parses cleanly to a statement boundary.
+        // Otherwise the tokens are rewound — tokenizer (the exempt bounded-probe
+        // kind, so it does not feed the loop detector) and diagnostics — so the
+        // caller can hand them to the definition parser instead. A well-formed
+        // call commits with no rewind; only an incomplete definition misrouted
+        // here takes the fallback.
+        _try_collect_statement(context: CONTEXT, statements: Collections.MutableList[Trees.Statements.Statement]) -> bool is
+            let use diagnostics_snapshot = context.diagnostics_speculate_then_backtrack();
+            let use snapshot = context.tokenizer_speculate_then_backtrack_bounded();
+
+            let errors_before = context.logger.error_count;
+
+            let statement = statement_parser.parse(context);
+
+            if
+                statement? /\
+                !statement.is_poisoned /\
+                context.logger.error_count == errors_before /\
+                (
+                    context.current.token == Lexical.TOKEN.SEMICOLON \/
+                    context.current.token == Lexical.TOKEN.SI \/
+                    context.is_end_of_file
+                )
+            then
+                snapshot.commit();
+                diagnostics_snapshot.commit();
+
+                statements.add(statement);
+                _skip_semicolon(context);
+
+                return true;
+            fi
+
+            return false;
+        si
+
+        _end_of(definitions: Collections.List[Trees.Definitions.Definition], previous: Source.LOCATION) -> Source.LOCATION =>
+            if definitions.count > 0 then definitions[definitions.count - 1].location else previous fi;
+
+        _end_of_statement(statements: Collections.List[Trees.Statements.Statement], previous: Source.LOCATION) -> Source.LOCATION =>
+            if statements.count > 0 then statements[statements.count - 1].location else previous fi;
+
+        // Definition-introducing keywords: everything the definition parser
+        // dispatches on that a statement can never begin with. The three
+        // tokens a statement *can* also begin with (IDENTIFIER, OPERATOR,
+        // SQUARE_OPEN) are deliberately excluded and disambiguated instead.
+        _is_definition_head(token: Lexical.TOKEN) -> bool =>
+            token == Lexical.TOKEN.NAMESPACE \/
+            token == Lexical.TOKEN.USE \/
+            token == Lexical.TOKEN.CLASS \/
+            token == Lexical.TOKEN.TRAIT \/
+            token == Lexical.TOKEN.STRUCT \/
+            token == Lexical.TOKEN.PARTIAL \/
+            token == Lexical.TOKEN.IMPL \/
+            token == Lexical.TOKEN.UNION \/
+            token == Lexical.TOKEN.ENUM \/
+            token == Lexical.TOKEN.AT;
+
+        // The tokens shared between a global-member definition and a statement.
+        _is_ambiguous_head(token: Lexical.TOKEN) -> bool =>
+            token == Lexical.TOKEN.IDENTIFIER \/
+            token == Lexical.TOKEN.OPERATOR \/
+            token == Lexical.TOKEN.SQUARE_OPEN;
+
+        // Tokens that unambiguously begin a statement (the statement parser's
+        // dispatch set, minus the ambiguous heads handled above). A token that
+        // is neither a definition head, an ambiguous head, nor one of these is
+        // stray input handled by the definition parser.
+        _is_statement_head(token: Lexical.TOKEN) -> bool =>
+            token == Lexical.TOKEN.PAREN_OPEN \/
+            token == Lexical.TOKEN.NEW \/
+            token == Lexical.TOKEN.CAST \/
+            token == Lexical.TOKEN.ISA \/
+            token == Lexical.TOKEN.TYPEOF \/
+            token == Lexical.TOKEN.INT_LITERAL \/
+            token == Lexical.TOKEN.FLOAT_LITERAL \/
+            token == Lexical.TOKEN.STRING_LITERAL \/
+            token == Lexical.TOKEN.ENTER_STRING \/
+            token == Lexical.TOKEN.CHAR_LITERAL \/
+            token == Lexical.TOKEN.TRUE \/
+            token == Lexical.TOKEN.FALSE \/
+            token == Lexical.TOKEN.NULL \/
+            token == Lexical.TOKEN.DEFAULT \/
+            token == Lexical.TOKEN.SELF \/
+            token == Lexical.TOKEN.SUPER \/
+            token == Lexical.TOKEN.REC \/
+            token == Lexical.TOKEN.VAL \/
+            token == Lexical.TOKEN.LET \/
+            token == Lexical.TOKEN.IF \/
+            token == Lexical.TOKEN.CASE \/
+            token == Lexical.TOKEN.AWAIT \/
+            token == Lexical.TOKEN.ASSERT \/
+            token == Lexical.TOKEN.RETURN \/
+            token == Lexical.TOKEN.YIELD \/
+            token == Lexical.TOKEN.THROW \/
+            token == Lexical.TOKEN.WHILE \/
+            token == Lexical.TOKEN.FOR \/
+            token == Lexical.TOKEN.DO \/
+            token == Lexical.TOKEN.TRY \/
+            token == Lexical.TOKEN.BREAK \/
+            token == Lexical.TOKEN.CONTINUE;
+
+        // Decide whether an ambiguous head begins a global definition, by a
+        // shallow bounded token peek — never a full parse, so it does not feed
+        // the speculation-loop detector (its rewind is the exempt bounded-probe
+        // kind). Because parameters are always typed, a definition is
+        // recognisable from the first couple of tokens: a `: type` annotation,
+        // a `(name: ...` / `[name: ...` typed parameter list, or an empty `()`
+        // followed by a signature tail. The peek stops at a call argument's
+        // opening token, so a formatted string argument is never read into and
+        // never mis-lexed.
+        _starts_definition(context: CONTEXT) -> bool is
+            let use snapshot = context.tokenizer_speculate_then_backtrack_bounded();
+
+            let head = context.current.token;
+
+            context.next_token();
+
+            if head == Lexical.TOKEN.SQUARE_OPEN then
+                // [i: int] -> T (indexer) vs [a, b]... (array literal).
+                return _is_typed_parameter_head(context);
+            fi
+
+            // IDENTIFIER or OPERATOR.
+            let after = context.current.token;
+
+            // name: type — global variable or typed member.
+            if after == Lexical.TOKEN.COLON then
+                return true;
+            fi
+
+            // name[T](...) — generic function definition vs name[i]... (index).
+            if after == Lexical.TOKEN.SQUARE_OPEN then
+                _skip_balanced(context, Lexical.TOKEN.SQUARE_OPEN, Lexical.TOKEN.SQUARE_CLOSE);
+
+                return _parameter_list_starts_definition(context);
+            fi
+
+            // name(...) — function definition vs call statement.
+            if after == Lexical.TOKEN.PAREN_OPEN then
+                return _parameter_list_starts_definition(context);
+            fi
+
+            return false;
+        si
+
+        // The current token is expected to be `(`. Distinguishes a parameter
+        // list (definition) from a call argument list (statement). A parameter
+        // is always `name: type`, so a definition is `()` followed by a
+        // definition tail, or `(name: …`; every other shape after `(` — a
+        // literal or compound-expression argument, or `(name` continued by
+        // anything but `:` (`,`, `)`, `.`, `(`, `[`, an operator, …) — is a
+        // call argument list, i.e. a statement.
+        _parameter_list_starts_definition(context: CONTEXT) -> bool is
+            if context.current.token != Lexical.TOKEN.PAREN_OPEN then
+                return false;
+            fi
+
+            context.next_token();
+
+            if context.current.token == Lexical.TOKEN.PAREN_CLOSE then
+                context.next_token();
+
+                return _begins_definition_tail(context.current.token);
+            fi
+
+            if context.current.token != Lexical.TOKEN.IDENTIFIER then
+                return false;
+            fi
+
+            context.next_token();
+
+            return context.current.token == Lexical.TOKEN.COLON;
+        si
+
+        // The current token should be the first parameter name, followed by `:`.
+        _is_typed_parameter_head(context: CONTEXT) -> bool is
+            if context.current.token != Lexical.TOKEN.IDENTIFIER then
+                return false;
+            fi
+
+            context.next_token();
+
+            return context.current.token == Lexical.TOKEN.COLON;
+        si
+
+        // What can follow the `()` of an empty parameter list in a function
+        // definition: the body (`is` / `=>`), a return type (`->`), or a
+        // trailing modifier (`static`, `public`, …). A call statement's `()`
+        // is followed by a statement continuation (`.`, `;`, an operator, …)
+        // instead.
+        _begins_definition_tail(token: Lexical.TOKEN) -> bool =>
+            token == Lexical.TOKEN.IS \/
+            token == Lexical.TOKEN.ARROW_FAT \/
+            token == Lexical.TOKEN.ARROW_THIN \/
+            token == Lexical.TOKEN.STATIC \/
+            token == Lexical.TOKEN.PUBLIC \/
+            token == Lexical.TOKEN.PRIVATE \/
+            token == Lexical.TOKEN.PROTECTED \/
+            token == Lexical.TOKEN.ABSTRACT \/
+            token == Lexical.TOKEN.FIELD;
+
+        // Consume a balanced bracket group. On entry the current token is the
+        // opening bracket; on return it is the token following the matching
+        // close (or end-of-input / SI if unterminated).
+        _skip_balanced(context: CONTEXT, open: Lexical.TOKEN, close: Lexical.TOKEN) is
+            let depth mut = 0;
+
+            while !context.is_end_of_file /\ context.current.token != Lexical.TOKEN.SI do
+                let token = context.current.token;
+
+                context.next_token();
+
+                if token == open then
+                    depth = depth + 1;
+                elif token == close then
+                    depth = depth - 1;
+
+                    if depth <= 0 then
+                        return;
+                    fi
+                fi
+            od
+        si
+
+        _skip_semicolon(context: CONTEXT) is
+            if context.current.token == Lexical.TOKEN.SEMICOLON then
+                context.next_token();
+            fi
         si
     si
 si
