@@ -48,7 +48,7 @@ si
 
 Namespaces nest, and a dotted name (`namespace Outer.Inner is ... si`) is shorthand for nesting. A namespace definition is an *instance* of that namespace; instances are aggregated across every source file, so a definition made in one file's `namespace Example` is visible unqualified from every other `namespace Example` block in the project.
 
-A source file with no namespace declarations has its definitions placed in a compiler-generated namespace private to that file — convenient for small programs and tests. Once a file declares any namespace, every definition in it must sit inside a namespace.
+A source file with no namespace declarations has its definitions placed in a compiler-generated namespace private to that file — convenient for small programs and tests. Compiling with `--global-namespace` instead aggregates every such file's definitions into a single unnamed global namespace shared across the project, so a global defined in one file is visible from the others. Once a file declares any namespace, every definition in it must sit inside a namespace.
 
 The `use` statement brings names into scope so they can be referred to without qualification. Applied to a namespace it imports every public symbol; applied to a single symbol it imports just that one:
 
