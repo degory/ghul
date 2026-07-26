@@ -1026,6 +1026,30 @@ A **nested** .NET type is not addressed through its enclosing type. It lives in 
 let home = System.Environment.get_folder_path(System.Environment_SpecialFolder.USER_PROFILE);
 ```
 
+A .NET **delegate** type is a slot a function literal can be written into directly, and the literal is compiled as that delegate:
+
+```ghul
+xs.sort((a: int, b: int) -> int => b - a);          // System.Comparison[int]
+
+let is_even: System.Predicate[int] = n => n % 2 == 0;
+```
+
+Parameter types are taken from the delegate the slot expects, so they need no annotation. `Func` and `Action` are different: they are the representation of ghūl's own function types, so `(int) -> bool` and `System.Func[int,bool]` are the same type and need no conversion in either direction.
+
+Any other delegate type is a distinct .NET type rather than another spelling of `(int) -> bool`, so an existing function **value** is not accepted where one is expected:
+
+```ghul
+let compare = (a: int, b: int) -> int => b - a;     // a function value
+xs.sort(compare);                                   // error: not assignable to System.Comparison[int]
+```
+
+Declare the variable at the delegate type instead, and it is that delegate from the start:
+
+```ghul
+let compare: System.Comparison[int] = (a: int, b: int) -> int => b - a;
+xs.sort(compare);
+```
+
 An auto-property's **backing field** is named `$` followed by the property name, and reflection sees it alongside the property. A reflection-based serializer told to include fields will therefore emit every property twice — with `System.Text.Json`, leave `include_fields` alone unless the type really does have fields to serialize.
 
 Because ghūl has no default argument values, a .NET **optional parameter** has to be supplied explicitly — there is no overload with it omitted. `File.ReadAllTextAsync(path)` is written:
