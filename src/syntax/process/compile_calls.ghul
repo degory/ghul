@@ -30,6 +30,7 @@ namespace Syntax.Process is
         _named_argument_binder: NAMED_ARGUMENT_BINDER;
         _flow: NARROWING_FLOW;
         _delegate_shape: Semantic.DELEGATE_SHAPE;
+        _symbol_loader: Semantic.SYMBOL_LOADER;
 
         init(
             logger: Logger,
@@ -44,7 +45,8 @@ namespace Syntax.Process is
             type_arg_placeholder_registry: Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY,
             access: COMPILE_ACCESS,
             visitor: COMPILE_EXPRESSIONS,
-            flow: NARROWING_FLOW
+            flow: NARROWING_FLOW,
+            symbol_loader: Semantic.SYMBOL_LOADER
         ) is
             super.init();
 
@@ -64,6 +66,7 @@ namespace Syntax.Process is
             _named_argument_binder = NAMED_ARGUMENT_BINDER(logger);
             _flow = flow;
             _delegate_shape = Semantic.DELEGATE_SHAPE();
+            _symbol_loader = symbol_loader;
         si
 
         // Rebuild a named call's already-collected argument lists - the
@@ -347,6 +350,171 @@ namespace Syntax.Process is
             fi
         si
 
+        // Find the delegate type's own compiler-synthesized
+        // constructor - `.ctor(object, native int)`, the only one a
+        // real .NET delegate type ever declares.
+        _find_delegate_constructor(type: Semantic.Types.Type) -> Semantic.Symbols.Function? is
+            let named = cast Semantic.Types.NAMED?(type);
+
+            if !named? then
+                return null;
+            fi
+
+            let symbol = named.scope.find_direct("init");
+
+            if let group: Semantic.Symbols.FUNCTION_GROUP = symbol then
+                if group.count == 1 then
+                    return group.functions[0];
+                fi
+
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Function?(symbol);
+        si
+
+        // Resolve a member that is either a bare Function or a
+        // single-member FUNCTION_GROUP - the shape `find_member`
+        // returns for a non-overloaded method (mirrors
+        // DELEGATE_SHAPE._find_invoke).
+        _find_single_function_member(type: Semantic.Types.Type, name: string) -> Semantic.Symbols.Function? is
+            let symbol = type.find_member(name);
+
+            if let group: Semantic.Symbols.FUNCTION_GROUP = symbol then
+                if group.count == 1 then
+                    return group.functions[0];
+                fi
+
+                return null;
+            fi
+
+            return cast Semantic.Symbols.Function?(symbol);
+        si
+
+        // A real .NET delegate type's sole constructor is the
+        // compiler-synthesized `.ctor(object, native int)`, which no
+        // ghūl call site can satisfy (nothing produces a usable
+        // `native int`), so a single-argument constructor call
+        // against a named delegate type is free to mean explicit
+        // conversion: `TargetDelegate(functionValue)`.
+        //
+        // A literal written directly as the argument is pushed the
+        // delegate type as its expected type, the same way an
+        // assignment or argument-formal context does (see
+        // COMPILE_LAMBDAS.visit_function), and constructs the
+        // delegate directly via ldftn/newobj. An existing
+        // function/delegate-typed value has no compile-time method
+        // token to `ldftn` - its method is only known at runtime, via
+        // its own `Method` property - so it is reconstructed over
+        // (Target, MethodHandle function pointer) via the target
+        // delegate's own constructor instead.
+        _resolve_delegate_value_construction(
+            location: LOCATION,
+            type: Semantic.Types.Type,
+            argument_expression: Trees.Expressions.Expression
+        ) -> (Value, Value) is
+            if isa Trees.Expressions.FUNCTION(argument_expression) then
+                _logger.roll_back();
+                _logger.speculate();
+                _flow.restore();
+
+                argument_expression.set_expected_type(type, "{{0}} is not assignable to {{1}}");
+                argument_expression.walk(_visitor);
+
+                let value = argument_expression.value;
+
+                if !value? \/ !value.type? \/ !value.check_is_consumable(_logger, argument_expression.location) then
+                    return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+                fi
+
+                return (cast Value(DUMMY(type, location)), value);
+            fi
+
+            let value = argument_expression.value;
+
+            if !value? \/ !value.type? \/ !value.check_is_consumable(_logger, argument_expression.location) then
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            let source_type = value.type!;
+
+            if !source_type.is_function /\ !_delegate_shape.is_named_delegate(source_type) then
+                _logger.error(argument_expression.location, "no constructor found init({source_type})");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            // Compile-time shape check: the two call shapes must
+            // actually agree. `Delegate.CreateDelegate` would have
+            // caught a mismatch for us at construction time, but
+            // going straight to a raw function pointer below bypasses
+            // that check entirely, so it has to happen here instead.
+            let source_shape =
+                if source_type.is_function then
+                    source_type
+                else
+                    _delegate_shape.try_get_function_type(source_type, _innate_symbol_lookup)
+                fi;
+
+            let target_shape = _delegate_shape.try_get_function_type(type, _innate_symbol_lookup);
+
+            if !source_shape? \/ !target_shape? \/ !target_shape.is_assignable_from(source_shape) then
+                _logger.error(argument_expression.location, "{source_type} is not assignable to {type}");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            // `Target`/`Method` report only the last entry of a
+            // combined (multicast) delegate's invocation list, so a
+            // source built via `Delegate.Combine` would silently lose
+            // every earlier target. Not guarded against: ghūl has no
+            // syntax to combine delegates, so no ghūl-produced value
+            // reaching here is ever multicast.
+            let target_property = cast Semantic.Symbols.Property?(source_type.find_member("target"));
+            let method_property = cast Semantic.Symbols.Property?(source_type.find_member("method"));
+
+            if !target_property? \/ !method_property? then
+                _logger.error(argument_expression.location, "cannot convert {source_type} to {type}");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            let target_value = target_property.load(location, value, _symbol_loader);
+            let method_value = method_property.load(location, value, _symbol_loader);
+            let method_type = method_value.type!;
+
+            let handle_property = cast Semantic.Symbols.Property?(method_type.find_member("method_handle"));
+
+            if !handle_property? then
+                _logger.error(argument_expression.location, "cannot convert {source_type} to {type}");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            let handle_value = handle_property.load(location, method_value, _symbol_loader);
+            let handle_type = handle_value.type!;
+
+            let get_function_pointer_function = _find_single_function_member(handle_type, "get_function_pointer");
+
+            if !get_function_pointer_function? then
+                _logger.error(argument_expression.location, "cannot convert {source_type} to {type}");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            let pointer_value = get_function_pointer_function.call(location, handle_value, Collections.LIST[Value](), null, _function_caller);
+
+            let ctor = _find_delegate_constructor(type);
+
+            if !ctor? then
+                _logger.error(argument_expression.location, "cannot convert {source_type} to {type}");
+                return (cast Value(DUMMY(type, location)), cast Value(DUMMY(type, location)));
+            fi
+
+            let ctor_arguments = Collections.LIST[Value]();
+            ctor_arguments.add(target_value);
+            ctor_arguments.add(pointer_value);
+
+            let constructed = _function_caller.call_constructor(ctor, ctor_arguments, type);
+
+            return (cast Value(DUMMY(type, location)), constructed);
+        si
+
         resolve_constructor(
             location: LOCATION,
             right_location: LOCATION,
@@ -366,6 +534,14 @@ namespace Syntax.Process is
 
             let named_type = cast Semantic.Types.NAMED?(type)!;
             let type_symbol mut = named_type.symbol;
+
+            if
+                !argument_names? /\
+                argument_expressions.expressions.count == 1 /\
+                _delegate_shape.is_named_delegate(type)
+            then
+                return _resolve_delegate_value_construction(location, type, argument_expressions.expressions[0]);
+            fi
 
             if let abstract_class: Semantic.Symbols.CLASS = type_symbol then
                 if abstract_class.is_abstract then
