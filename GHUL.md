@@ -1036,7 +1036,7 @@ let is_even: System.Predicate[int] = n => n % 2 == 0;
 
 Parameter types are taken from the delegate the slot expects, so they need no annotation. `Func` and `Action` are different: they are the representation of ghūl's own function types, so `(int) -> bool` and `System.Func[int,bool]` are the same type and need no conversion in either direction.
 
-Any other delegate type is a distinct .NET type rather than another spelling of `(int) -> bool`, so an existing function **value** is not accepted where one is expected:
+Any other delegate type is a distinct .NET type rather than another spelling of `(int) -> bool`, so an existing function **value** held in a variable is not accepted where one is expected:
 
 ```ghul
 let compare = (a: int, b: int) -> int => b - a;     // a function value
@@ -1056,6 +1056,18 @@ Or construct the delegate explicitly from the existing value, calling the delega
 let compare = (a: int, b: int) -> int => b - a;     // a function value
 xs.sort(System.Comparison[int](compare));
 ```
+
+A global function, or a static or instance method, referred to **by name** is different from a stored function value: the name converts directly wherever a function or delegate is expected, since the compiler reaches for the method itself rather than needing an existing value to wrap.
+
+```ghul
+compare_descending(a: int, b: int) -> int => b - a;
+
+xs.sort(compare_descending);                        // ok - no lambda wrapper needed
+
+let f = compare_descending;                         // f: (int, int) -> int
+```
+
+An overloaded name is resolved against whichever function or delegate type the reference needs to match, the same way a call's argument types pick an overload; with no such type in scope, an ambiguous name is left as an error rather than guessed at.
 
 An auto-property's **backing field** is named `$` followed by the property name, and reflection sees it alongside the property. A reflection-based serializer told to include fields will therefore emit every property twice — with `System.Text.Json`, leave `include_fields` alone unless the type really does have fields to serialize.
 
