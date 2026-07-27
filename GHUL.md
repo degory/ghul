@@ -1050,6 +1050,13 @@ let compare: System.Comparison[int] = (a: int, b: int) -> int => b - a;
 xs.sort(compare);
 ```
 
+Or construct the delegate explicitly from the existing value, calling the delegate type as if it were a constructor:
+
+```ghul
+let compare = (a: int, b: int) -> int => b - a;     // a function value
+xs.sort(System.Comparison[int](compare));
+```
+
 An auto-property's **backing field** is named `$` followed by the property name, and reflection sees it alongside the property. A reflection-based serializer told to include fields will therefore emit every property twice — with `System.Text.Json`, leave `include_fields` alone unless the type really does have fields to serialize.
 
 Because ghūl has no default argument values, a .NET **optional parameter** has to be supplied explicitly — there is no overload with it omitted. `File.ReadAllTextAsync(path)` is written:
