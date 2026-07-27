@@ -32,6 +32,7 @@ namespace Syntax.Process is
         _condition_analyzer: CONDITION_ANALYZER;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
         _visitor: COMPILE_EXPRESSIONS;
+        _delegate_shape: Semantic.DELEGATE_SHAPE;
 
         init(
             logger: Logger,
@@ -61,6 +62,162 @@ namespace Syntax.Process is
             _condition_analyzer = condition_analyzer;
             _build_flags = build_flags;
             _visitor = visitor;
+            _delegate_shape = Semantic.DELEGATE_SHAPE();
+        si
+
+        // A global function, static/instance/struct method, or the
+        // single member of an overloaded group, used where a value is
+        // wanted rather than called (`is_call_target` false): converts
+        // it to a function/delegate value via `ldftn` on the method
+        // directly (plus the receiver, for an instance method), never
+        // through a closure frame — there is no capture to allocate.
+        // Returns null when `symbol` isn't a function reference in
+        // value position at all, so the caller falls back to the
+        // ordinary `symbol.load` path unchanged.
+        //
+        // An overloaded group needs a target shape to know which
+        // member is meant: `expected_type` supplies it when the
+        // reference sits in a context that already pushed one
+        // (a typed `let`/assignment, a return, or a call argument
+        // already retried under a pushed formal type — the same
+        // mechanism #1772 added for delegate-typed lambda literals).
+        // With no target shape available yet, an ambiguous group is
+        // left alone (null) rather than guessed at, so it still falls
+        // through to today's "cannot use this here".
+        try_load_function_reference(
+            location: LOCATION,
+            symbol: Semantic.Symbols.Symbol,
+            from: Value?,
+            expected_type: Type?,
+            is_call_target: bool
+        ) -> Value? is
+            if is_call_target \/ isa Semantic.Symbols.Closure(symbol) then
+                return null;
+            fi
+
+            let single: Semantic.Symbols.Function? mut = cast Semantic.Symbols.Function?(symbol);
+
+            if !single? then
+                let group = cast Semantic.Symbols.FUNCTION_GROUP?(symbol);
+
+                if !group? \/ group.count == 0 then
+                    return null;
+                fi
+
+                if group.count == 1 then
+                    single = group.functions[0];
+                else
+                    let target_shape = _get_target_call_shape(expected_type);
+
+                    if !target_shape? then
+                        return null;
+                    fi
+
+                    single = _resolve_function_group_reference(location, group, from, target_shape);
+
+                    if !single? then
+                        return DUMMY(Semantic.Types.ERROR(), location);
+                    fi
+                fi
+            fi
+
+            return _build_function_reference_value(location, single, from, expected_type);
+        si
+
+        // The function-type shape a value must present to be usable
+        // as `expected_type`: `expected_type` itself when it's already
+        // a ghūl function type, or the call shape of its `invoke`
+        // when it's a named .NET delegate. Null when `expected_type`
+        // is absent or neither.
+        _get_target_call_shape(expected_type: Type?) -> Type? is
+            if !expected_type? then
+                return null;
+            fi
+
+            if expected_type.is_function then
+                return expected_type;
+            fi
+
+            return _delegate_shape.try_get_function_type(expected_type, _innate_symbol_lookup);
+        si
+
+        // Picks the group member whose formal parameters accept
+        // `target_shape`'s parameter types, via the same
+        // OVERLOAD_RESOLVER a call site uses — `target_shape`'s
+        // parameter types stand in for the actual argument types
+        // (the direction a value of this shape would be invoked
+        // with), and its return type is the tie-break constraint.
+        // No delegate-specific reasoning happens inside the resolver
+        // itself; this is an ordinary resolve() call, and it logs its
+        // own diagnostic when nothing matches.
+        _resolve_function_group_reference(
+            location: LOCATION,
+            group: Semantic.Symbols.FUNCTION_GROUP,
+            from: Value?,
+            target_shape: Type
+        ) -> Semantic.Symbols.Function? is
+            let shape_arguments = target_shape.arguments;
+            let parameter_count = shape_arguments.count - 1;
+
+            let parameter_types = Collections.LIST[Type](parameter_count);
+
+            for i in 0..parameter_count do
+                parameter_types.add(shape_arguments[i]);
+            od
+
+            let return_constraint = shape_arguments[parameter_count];
+
+            let want_instance =
+                if from? then
+                    from.is_consumable
+                else
+                    _symbol_table.current_instance_context?
+                fi;
+
+            let result = _overload_resolver.resolve(location, group, parameter_types, false, want_instance, false, null, return_constraint);
+
+            if !result? then
+                return null;
+            fi
+
+            return result.function;
+        si
+
+        // Builds the function/delegate value directly: `ldftn` the
+        // method (no closure frame — a named function has nothing to
+        // capture) and pair it with the receiver an instance method
+        // needs, or a null target for a static/global one. Checked
+        // against `expected_type` when supplied; falls back to the
+        // function's own native call shape (the same default a bare
+        // lambda literal gets) when there is no target context yet.
+        _build_function_reference_value(
+            location: LOCATION,
+            function: Semantic.Symbols.Function,
+            from: Value?,
+            expected_type: Type?
+        ) -> Value is
+            let source_shape = function.get_full_type(_innate_symbol_lookup);
+            let target_shape = _get_target_call_shape(expected_type);
+
+            if target_shape? /\ !target_shape.is_assignable_from(source_shape) then
+                _logger.error(location, "{function} is not compatible with {expected_type!}");
+                return DUMMY(Semantic.Types.ERROR(), location);
+            fi
+
+            let result_type = expected_type ?? source_shape;
+
+            let function_pointer = Load.FUNCTION_POINTER(function);
+
+            let target: Value =
+                if !function.is_instance then
+                    NULL(Semantic.Types.NULL());
+                elif from? then
+                    from;
+                else
+                    _symbol_loader.load_self(location);
+                fi;
+
+            return Load.DELEGATE(result_type, function_pointer, target);
         si
 
         visit_member(member: Trees.Expressions.MEMBER) is
@@ -290,7 +447,9 @@ namespace Syntax.Process is
                             // one diagnostic instead of a cascade.
                             value = symbol.load(member.location, left_value, _symbol_loader);
                         else
-                            value = symbol.load(member.location, left_value, _symbol_loader);
+                            value =
+                                try_load_function_reference(member.location, symbol, left_value, member.expected_type, member.is_call_target) ??
+                                symbol.load(member.location, left_value, _symbol_loader);
                         fi
                     fi
                 fi
@@ -548,7 +707,9 @@ namespace Syntax.Process is
                             _symbol_use_locations.add_symbol_use(identifier.right_location, symbol);
                         fi
                     else
-                        identifier.compile_expressions_state.value = symbol.load(identifier.location, null, _symbol_loader);
+                        identifier.compile_expressions_state.value =
+                            try_load_function_reference(identifier.location, symbol, null, identifier.expected_type, identifier.is_call_target) ??
+                            symbol.load(identifier.location, null, _symbol_loader);
 
                         // Optional-narrowing: when flow analysis has
                         // established this variable is non-null here,
