@@ -149,7 +149,15 @@ run_out_of_process_suite() {
     # A failing test still leaves usable coverage, so record the outcome and
     # carry on rather than losing the run to `set -e`.
     local status=0
-    "$tools/coverlet" publish/ghul.dll \
+    # GitHub Actions sets CI=true for every job. ghul-test reads that and
+    # defaults to COMPILER_RUN_MODE.CI, which runs the pinned `dotnet
+    # ghul-compiler` tool instead of discovering publish/ghul.dll — the exact
+    # file just instrumented above — so the suite runs at its normal,
+    # uninstrumented speed and coverage comes back empty. --use-dotnet-build
+    # already sidesteps this for cross-assembly by forcing DOTNET mode
+    # outright; clearing CI here gets the plain integration run the same
+    # publish/ discovery by falling back to LOCAL mode.
+    CI= "$tools/coverlet" publish/ghul.dll \
         --target dotnet \
         --targetargs "$args" \
         --format cobertura \
@@ -220,6 +228,12 @@ done
 reports=("$output"/*.cobertura.xml)
 [[ -e "${reports[0]}" ]] || die "no coverage reports were produced"
 
+# analysis-tests is the test project itself, not compiler source, so its own
+# coverage number is meaningless noise — always excluded. analysis-protocol
+# is the shared DTO project; none of today's suites exercise much of it, so
+# it's excluded for now too rather than reporting a permanently-red number.
+assembly_filters="-assemblyfilters:-analysis-tests;-analysis-protocol"
+
 # One report per suite, so a category can be inspected on its own.
 for report in "${reports[@]}"; do
     suite_name="$(basename "$report" .cobertura.xml)"
@@ -228,6 +242,7 @@ for report in "${reports[@]}"; do
         "-targetdir:$output/report/$suite_name" \
         "-reporttypes:Html;lcov" \
         "-filefilters:-*/obj/*" \
+        "$assembly_filters" \
         >/dev/null || die "report generation failed for $suite_name"
 done
 
@@ -239,6 +254,7 @@ echo "coverage: merging ${#reports[@]} report(s)"
     "-targetdir:$output/report" \
     "-reporttypes:Html;Cobertura;lcov;Badges;MarkdownSummaryGithub;TextSummary" \
     "-filefilters:-*/obj/*" \
+    "$assembly_filters" \
     >/dev/null || die "combined report generation failed"
 
 echo
