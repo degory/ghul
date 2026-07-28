@@ -320,6 +320,109 @@ namespace Syntax.Process is
             return null;
         si
 
+        // `formal` is a named .NET delegate type the current `actual`
+        // isn't already assignable to, but which `actual` (a bare
+        // function value with no delegate type of its own - a named
+        // function reference, or a lambda literal that resolved
+        // without a pushed constraint) could satisfy once its own
+        // call shape is pushed against the delegate's invoke shape
+        // and re-walked. Mirrors the assignability check
+        // `FUNCTION_REFERENCE_RESOLVER._build_value` runs once the
+        // push has happened; this is the *before* side, deciding
+        // whether pushing is worth attempting at all.
+        _is_delegate_push_candidate(formal: Type, actual: Type) -> bool is
+            if !_delegate_shape.is_named_delegate(formal) \/ formal.is_assignable_from(actual) then
+                return false;
+            fi
+
+            if !actual.is_function then
+                return false;
+            fi
+
+            let shape = _delegate_shape.try_get_function_type(formal, _innate_symbol_lookup);
+
+            return shape? /\ shape.is_assignable_from(actual);
+        si
+
+        // Same shape as `_try_find_single_arity_candidate`, for the
+        // case that method finds nothing because more than one
+        // arity-matching overload exists (`List[T].sort` has both
+        // `Sort(Comparison[T])` and `Sort(IComparer[T])`). A named
+        // delegate formal narrows the field: an overload whose
+        // mismatched argument isn't even delegate-pushable is
+        // rejected outright, so genuine ambiguity between two
+        // delegate-shaped formals still falls through to null - only
+        // a name that resolves to exactly one push-worthy overload is
+        // picked here.
+        _find_single_delegate_pushable_candidate(
+            group: Semantic.Symbols.FUNCTION_GROUP,
+            argument_types: Collections.LIST[Type],
+            want_instance: bool
+        ) -> Semantic.Symbols.Function? is
+            let result: Semantic.Symbols.Function? mut = null;
+            let count mut = 0;
+
+            for f in group.functions do
+                if !want_instance /\ f.is_instance then
+                    continue;
+                fi
+
+                if !f.are_arguments_declared then
+                    continue;
+                fi
+
+                if f.arguments.count != argument_types.count then
+                    continue;
+                fi
+
+                let compatible mut = true;
+                let any_pushed mut = false;
+
+                for i in 0..argument_types.count do
+                    let formal = f.arguments[i];
+                    let actual = argument_types[i];
+
+                    if formal.is_assignable_from(actual) then
+                        continue;
+                    fi
+
+                    if _is_delegate_push_candidate(formal, actual) then
+                        any_pushed = true;
+                        continue;
+                    fi
+
+                    compatible = false;
+                od
+
+                if compatible /\ any_pushed then
+                    result = f;
+                    count = count + 1;
+                fi
+            od
+
+            if count == 1 then
+                return result;
+            fi
+
+            return null;
+        si
+
+        // True when pushing `candidate`'s own formal types onto the
+        // current actuals stands a chance of resolving a named-
+        // delegate mismatch that a plain assignability check missed
+        // on the first walk (a bare function reference or an
+        // un-pushed lambda literal, either compiled to its own native
+        // shape rather than the delegate the formal wants).
+        _has_delegate_push_mismatch(candidate: Semantic.Symbols.Function, argument_types: Collections.LIST[Type]) -> bool is
+            for i in 0..argument_types.count do
+                if _is_delegate_push_candidate(candidate.arguments[i], argument_types[i]) then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
         // should be called with logger speculating
         _compile_call_arguments(
             argument_expressions: Trees.Expressions.LIST,
@@ -978,6 +1081,15 @@ namespace Syntax.Process is
         ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
             let candidate = _try_find_single_arity_candidate(function_group, argument_types.count, want_instance);
 
+            // A named delegate formal narrows an otherwise-ambiguous
+            // arity match: `List[T].sort` has both `Sort(Comparison[T])`
+            // and `Sort(IComparer[T])` at arity 1, so
+            // `_try_find_single_arity_candidate` alone returns null,
+            // but only one of the two is delegate-pushable for a
+            // function-shaped actual - see
+            // `_find_single_delegate_pushable_candidate`.
+            let effective_candidate = candidate ?? _find_single_delegate_pushable_candidate(function_group, argument_types, want_instance);
+
             // Trigger the retry when at least one actual
             // is a FUNCTION literal even if its first-walk
             // type has been ERROR-tainted by a body that
@@ -987,12 +1099,17 @@ namespace Syntax.Process is
             // null overload result might be recoverable.
             // The pre-existing `any_arg_under_determined`
             // path still covers the constructor-arg shape
-            // (e.g. `apply(Box())`).
+            // (e.g. `apply(Box())`). A named-delegate formal
+            // mismatched against a bare function-shaped actual
+            // (a named function reference, or a lambda that
+            // resolved to its own native shape) is the same kind
+            // of recoverable gap.
 
-            if candidate? /\ (
-                _under_determination_detector.any_arg_under_determined(candidate, argument_types) \/
+            if effective_candidate? /\ (
+                _under_determination_detector.any_arg_under_determined(effective_candidate, argument_types) \/
                 COMPILE_CALLS.has_function_literal_argument(argument_expressions) \/
-                COMPILE_CALLS.has_empty_array_literal_argument(argument_expressions)
+                COMPILE_CALLS.has_empty_array_literal_argument(argument_expressions) \/
+                _has_delegate_push_mismatch(effective_candidate, argument_types)
             ) then
                 // Sibling-arg specialisation, symmetric to
                 // the path in `resolve_constructor`: when
@@ -1007,7 +1124,7 @@ namespace Syntax.Process is
                 // generic short-circuit inside
                 // OWNER_TYPE_ARG_SPECIALIZER and the
                 // pre-existing behaviour is preserved.
-                let push_candidate: Semantic.Symbols.Function? mut = candidate;
+                let push_candidate: Semantic.Symbols.Function? mut = effective_candidate;
 
                 // Two-step specialisation: try
                 // owner-class generic args first (for
@@ -1023,11 +1140,11 @@ namespace Syntax.Process is
                 // from a phantom, and the substituted
                 // formal-arg-type can then constrain the
                 // lambda's body re-walk.
-                push_candidate = _specialise_candidate_from_concrete_siblings(candidate, argument_types, cache_key, argument_location);
+                push_candidate = _specialise_candidate_from_concrete_siblings(effective_candidate, argument_types, cache_key, argument_location);
 
-                if push_candidate == candidate /\ candidate.is_generic then
-                    let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(cache_key, argument_location, candidate);
-                    push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(candidate, argument_types, phantom_origins, argument_location);
+                if push_candidate == effective_candidate /\ effective_candidate.is_generic then
+                    let phantom_origins = _type_arg_placeholder_registry.get_or_create_for_function(cache_key, argument_location, effective_candidate);
+                    push_candidate = _owner_type_arg_specializer.specialize_function_own_args_from_concrete_siblings(effective_candidate, argument_types, phantom_origins, argument_location);
                 fi
 
                 _logger.roll_back();
