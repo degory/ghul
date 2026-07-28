@@ -1154,7 +1154,7 @@ let compare = (a: int, b: int) -> int => b - a;     // a function value
 xs.sort(System.Comparison[int](compare));
 ```
 
-A global function, or a static or instance method, referred to **by name** is different from a stored function value: the name converts directly wherever a *function type* is expected, since the compiler reaches for the method itself rather than needing an existing value to wrap.
+A global function, or a static or instance method, referred to **by name** is different from a stored function value: the name converts directly wherever a function type *or* a named delegate is expected, since the compiler reaches for the method itself rather than needing an existing value to wrap.
 
 ```ghul
 compare_descending(a: int, b: int) -> int => b - a;
@@ -1163,12 +1163,12 @@ apply(f: (int, int) -> int) -> int => f(3, 5);
 
 apply(compare_descending);                          // ok - no lambda wrapper needed
 
+xs.sort(compare_descending);                        // ok - System.Comparison[int]
+
 let f = compare_descending;                         // f: (int, int) -> int
 ```
 
-This does not extend to a named delegate: `xs.sort(compare_descending)` is rejected the same way a stored value is, because the name resolves to a ghūl function type and that is what the slot then refuses. Construct the delegate explicitly, as above.
-
-An overloaded name is resolved against whichever function type the reference needs to match, the same way a call's argument types pick an overload; with no such type in scope, an ambiguous name is left as an error rather than guessed at.
+An overloaded name is resolved against whichever function or delegate type the reference needs to match, the same way a call's argument types pick an overload; with no such type in scope, an ambiguous name is left as an error rather than guessed at.
 
 An auto-property's **backing field** is named `$` followed by the property name, and reflection sees it alongside the property. A reflection-based serializer told to include fields will therefore emit every property twice — with `System.Text.Json`, leave `include_fields` alone unless the type really does have fields to serialize.
 
