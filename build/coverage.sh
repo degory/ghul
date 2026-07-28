@@ -49,7 +49,12 @@ output="coverage"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage 0 ;;
-        -s|--suite) suites+=("${2:?--suite needs a name}"); shift 2 ;;
+        -s|--suite)
+            case "${2:?--suite needs a name}" in
+                integration|cross-assembly|all) suites+=("$2") ;;
+                *) die "unknown suite: $2 (see --help)" ;;
+            esac
+            shift 2 ;;
         -f|--filter) filter="${2:?--filter needs a path}"; shift 2 ;;
         -n|--no-build) build=0; shift ;;
         -o|--output) output="${2:?--output needs a dir}"; shift 2 ;;
@@ -57,9 +62,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ ${#suites[@]} -gt 0 ]] || suites=(integration)
-if [[ ${#suites[@]} -eq 1 && "${suites[0]}" == "all" ]]; then
-    suites=(integration cross-assembly)
-fi
+
+# `all` anywhere in the list means every suite, and a suite named twice runs
+# once, so any combination of repeats does what it looks like.
+expanded=()
+for suite in "${suites[@]}"; do
+    if [[ "$suite" == "all" ]]; then
+        expanded=(integration cross-assembly)
+        break
+    fi
+    if [[ " ${expanded[*]:-} " != *" $suite "* ]]; then
+        expanded+=("$suite")
+    fi
+done
+suites=("${expanded[@]}")
 if [[ -n "$filter" && ${#suites[@]} -ne 1 ]]; then
     die "--filter applies to a single suite"
 fi
@@ -146,8 +162,10 @@ echo "coverage: merging ${#reports[@]} report(s)"
     >/dev/null || die "report generation failed"
 
 echo
-cat "$output/report/Summary.txt" 2>/dev/null | sed -n '1,12p'
-echo
+if [[ -f "$output/report/Summary.txt" ]]; then
+    sed -n '1,12p' "$output/report/Summary.txt"
+    echo
+fi
 echo "coverage: wrote"
 echo "  $output/report/index.html            browse"
 echo "  $output/report/lcov.info             VS Code (Coverage Gutters: Display Coverage)"
