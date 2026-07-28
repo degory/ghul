@@ -102,14 +102,12 @@ ensure_tool() {
 ensure_tool coverlet.console coverlet
 ensure_tool dotnet-reportgenerator-globaltool reportgenerator
 
-# coverlet's Cobertura writer includes a per-method cyclomatic-complexity
-# figure, which feeds ReportGenerator's Crap Score column and Risk Hotspots
-# page. Nothing here validates that figure against the ghūl source it's
-# attributed to — the CFG it's computed from is coverlet's own, over the
-# emitted IL — so it is presented with a confidence the compiler's own
-# structure doesn't back up. Stripped from every raw report before
-# ReportGenerator sees it, so there's no dial that brings it back.
+# The complexity figure coverlet's Cobertura writer emits, which feeds
+# ReportGenerator's Crap Score and Risk Hotspots, is computed from coverlet's
+# own CFG over the emitted IL, not from ghūl source — dropped before
+# ReportGenerator sees it. A no-op if the report was never produced.
 strip_complexity() {
+    [[ -f "$1" ]] || return 0
     sed -i -E 's/ complexity="[0-9.]+"//g' "$1"
 }
 
@@ -248,10 +246,8 @@ reports=("$output"/*.cobertura.xml)
 # it's excluded for now too rather than reporting a permanently-red number.
 assembly_filters="-assemblyfilters:-analysis-tests;-analysis-protocol"
 
-# Belt-and-braces alongside strip_complexity above: with no complexity data
-# left in any input report, Risk Hotspots would end up empty on its own, but
-# excluding every assembly from the analysis outright means ReportGenerator
-# never even looks for it.
+# Excludes every assembly from risk-hotspot analysis outright, on top of
+# strip_complexity above.
 riskhotspot_filters="-riskhotspotassemblyfilters:-*"
 
 # One report per suite, so a category can be inspected on its own.
