@@ -102,6 +102,15 @@ ensure_tool() {
 ensure_tool coverlet.console coverlet
 ensure_tool dotnet-reportgenerator-globaltool reportgenerator
 
+# The complexity figure coverlet's Cobertura writer emits, which feeds
+# ReportGenerator's Crap Score and Risk Hotspots, is computed from coverlet's
+# own CFG over the emitted IL, not from ghūl source — dropped before
+# ReportGenerator sees it. A no-op if the report was never produced.
+strip_complexity() {
+    [[ -f "$1" ]] || return 0
+    sed -i -E 's/ complexity="[0-9.]+"//g' "$1"
+}
+
 # ---- build the compiler with debug information -----------------------------
 # Only the integration and cross-assembly suites need publish/: they spawn
 # the compiler out of process, from a path each test's ghul.json names
@@ -164,6 +173,7 @@ run_out_of_process_suite() {
         --output "$output/$suite.cobertura.xml" \
         --include-test-assembly \
         || status=$?
+    strip_complexity "$output/$suite.cobertura.xml"
     echo "coverage: $suite finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: $suite reported failures; coverage below still reflects what ran"
 }
@@ -184,6 +194,7 @@ run_unit_suite() {
     [[ -n "$produced" ]] || die "unit test coverage file was not produced"
     cp "$produced" "$output/unit.cobertura.xml"
     rm -rf "$raw"
+    strip_complexity "$output/unit.cobertura.xml"
     echo "coverage: unit finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: unit reported failures; coverage below still reflects what ran"
 }
@@ -211,6 +222,7 @@ run_analysis_suite() {
         --output "$output/analysis.cobertura.xml" \
         --include-test-assembly \
         || status=$?
+    strip_complexity "$output/analysis.cobertura.xml"
     echo "coverage: analysis finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: analysis reported failures; coverage below still reflects what ran"
 }
@@ -234,6 +246,10 @@ reports=("$output"/*.cobertura.xml)
 # it's excluded for now too rather than reporting a permanently-red number.
 assembly_filters="-assemblyfilters:-analysis-tests;-analysis-protocol"
 
+# Excludes every assembly from risk-hotspot analysis outright, on top of
+# strip_complexity above.
+riskhotspot_filters="-riskhotspotassemblyfilters:-*"
+
 # One report per suite, so a category can be inspected on its own.
 for report in "${reports[@]}"; do
     suite_name="$(basename "$report" .cobertura.xml)"
@@ -243,6 +259,7 @@ for report in "${reports[@]}"; do
         "-reporttypes:Html;lcov" \
         "-filefilters:-*/obj/*" \
         "$assembly_filters" \
+        "$riskhotspot_filters" \
         >/dev/null || die "report generation failed for $suite_name"
 done
 
@@ -255,6 +272,7 @@ echo "coverage: merging ${#reports[@]} report(s)"
     "-reporttypes:Html;Cobertura;lcov;Badges;MarkdownSummaryGithub;TextSummary" \
     "-filefilters:-*/obj/*" \
     "$assembly_filters" \
+    "$riskhotspot_filters" \
     >/dev/null || die "combined report generation failed"
 
 echo
