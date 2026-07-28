@@ -753,6 +753,11 @@ namespace Analysis is
 
         _is_interface_changed: bool;
 
+        // The guard that last gave up on this EDIT, reported if it ends up
+        // taking the whole-project rebuild. Null when no incremental path
+        // was attempted at all.
+        _declined_reason: string?;
+
         // The pre-edit SOURCE_FILE of the most recent parse, stashed by
         // parse_and_add_file. For an interface-preserving single-file EDIT the
         // incremental body re-walk splices the new bodies onto it (its symbols
@@ -811,6 +816,18 @@ namespace Analysis is
             fi
         si
 
+        // Latch why an incremental path gave up, and decline. Every
+        // bail-out in the incremental paths goes through here. The first
+        // reason latched wins, and it is reported only if the edit ends up
+        // rebuilding; WORK_COUNTERS carries why.
+        _decline(reason: string) -> bool is
+            if !_declined_reason? then
+                _declined_reason = reason;
+            fi
+
+            return false;
+        si
+
         _definition_signature(definition: Syntax.Trees.Definitions.Definition) -> string is
             let signature = Syntax.INTERFACE_SIGNATURE();
 
@@ -850,7 +867,7 @@ namespace Analysis is
             let retained = _retained;
 
             if !retained? then
-                return false;
+                return _decline(WORK_COUNTERS.NO_RETAINED_PARSE);
             fi
 
             let edited_path = retained.file_name;
@@ -859,14 +876,14 @@ namespace Analysis is
             let donor_signature = donor.interface_signature;
 
             if !retained.interface_signature? \/ !donor_signature? then
-                return false;
+                return _decline(WORK_COUNTERS.MISSING_INTERFACE_SIGNATURE);
             fi
 
             let donor_list = cast Syntax.Trees.Definitions.LIST?(donor.definition);
             let retained_list = cast Syntax.Trees.Definitions.LIST?(retained.definition);
 
             if !donor_list? \/ !retained_list? then
-                return false;
+                return _decline(WORK_COUNTERS.FILE_ROOT_NOT_A_LIST);
             fi
 
             let donor_definitions = donor_list.definitions;
@@ -879,7 +896,7 @@ namespace Analysis is
                 for i in 0..retained_count do
                     if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
                         if changed_index >= 0 then
-                            return false;
+                            return _decline(WORK_COUNTERS.MULTIPLE_CHANGED_DEFINITIONS);
                         fi
 
                         changed_index = i;
@@ -890,7 +907,7 @@ namespace Analysis is
                     // The whole-file signatures differ but no top-level
                     // definition's does - something file-level changed;
                     // let the full rebuild sort it out.
-                    return false;
+                    return _decline(WORK_COUNTERS.FILE_LEVEL_CHANGE);
                 fi
 
                 let chain = Collections.LIST[Syntax.Trees.Definitions.Definition]();
@@ -899,12 +916,12 @@ namespace Analysis is
             fi
 
             if donor_definitions.count < retained_count then
-                return false;
+                return _decline(WORK_COUNTERS.FEWER_DEFINITIONS);
             fi
 
             for i in 0..retained_count do
                 if _definition_signature(retained_definitions[i]) !~ _definition_signature(donor_definitions[i]) then
-                    return false;
+                    return _decline(WORK_COUNTERS.RETAINED_PREFIX_MISMATCH);
                 fi
             od
 
@@ -920,7 +937,8 @@ namespace Analysis is
             if !try_incremental_build(diagnostics, checked_paths, false) then
                 // try_incremental_build re-registered the donor as the
                 // live file; give it its appended tail back so the full
-                // rebuild sees the whole edit.
+                // rebuild sees the whole edit. It named its own decline
+                // reason, so none is named here.
                 for d in appended do
                     donor_definitions.add(d);
                 od
@@ -965,7 +983,7 @@ namespace Analysis is
                 let donor_namespace = cast Syntax.Trees.Definitions.NAMESPACE?(donor_definition);
 
                 if !donor_namespace? \/ retained_namespace.name.name !~ donor_namespace.name.name then
-                    return false;
+                    return _decline(WORK_COUNTERS.NAMESPACE_NAME_MISMATCH);
                 fi
 
                 chain.add(retained_namespace);
@@ -973,21 +991,22 @@ namespace Analysis is
                 return _try_narrow_children(retained, donor_signature, chain, retained_namespace.body, donor_namespace.body, null, diagnostics, checked_paths);
             fi
 
-            if let retained_class: Syntax.Trees.Definitions.CLASS = retained_definition then
-                let donor_class = cast Syntax.Trees.Definitions.CLASS?(donor_definition);
+            if let retained_class: Syntax.Trees.Definitions.Classy = retained_definition /\ _is_member_container(retained_class) then
+                let donor_class = cast Syntax.Trees.Definitions.Classy?(donor_definition);
 
                 if
                     !donor_class? \/
+                    retained_definition.get_type() != donor_definition.get_type() \/
                     _class_header_signature(retained_class) !~ _class_header_signature(donor_class)
                 then
-                    return false;
+                    return _decline(WORK_COUNTERS.CLASS_HEADER_MISMATCH);
                 fi
 
                 let scope = _symbol_table.scope_for(retained_class);
                 let classy = if scope? then cast Semantic.Symbols.Classy?(scope.underlying_scope) else null fi;
 
                 if !classy? then
-                    return false;
+                    return _decline(WORK_COUNTERS.NO_CLASS_SYMBOL);
                 fi
 
                 // A class with ghul-declared subclasses or trait
@@ -999,7 +1018,7 @@ namespace Analysis is
                 // bindings on the dead clones, so those fall back to the
                 // whole-project rebuild.
                 if !_implementor_closure(classy)? then
-                    return false;
+                    return _decline(WORK_COUNTERS.UNRESETTABLE_CLOSURE);
                 fi
 
                 chain.add(retained_class);
@@ -1007,6 +1026,11 @@ namespace Analysis is
                 return _try_narrow_children(retained, donor_signature, chain, retained_class.body, donor_class.body, classy, diagnostics, checked_paths);
             fi
 
+            // Not a container the search can descend into. This is the
+            // recursion's base case rather than a guard rejecting the
+            // edit - the caller falls through to replacing the definition
+            // in its enclosing member list, and names a reason if that
+            // does not apply either. Latching one here would mask it.
             return false;
         si
 
@@ -1108,7 +1132,7 @@ namespace Analysis is
                 let function = _function_symbol_for(member);
 
                 if !function? then
-                    return false;
+                    return _decline(WORK_COUNTERS.OUTGOING_NOT_A_FUNCTION);
                 fi
 
                 // A body bound to the outgoing function must re-bind to the
@@ -1124,12 +1148,12 @@ namespace Analysis is
                 // namespace level they reject the edit.
                 if !slice_class? then
                     if !function.has_no_overriders then
-                        return false;
+                        return _decline(WORK_COUNTERS.OUTGOING_HAS_OVERRIDERS);
                     fi
 
                     if let overridees = function.overridees then
                         if overridees | .any(o => true) then
-                            return false;
+                            return _decline(WORK_COUNTERS.OUTGOING_HAS_OVERRIDEES);
                         fi
                     fi
                 else
@@ -1139,7 +1163,7 @@ namespace Analysis is
                     // subclass's declaration-level diagnostics would not
                     // be re-derived against the new signature.
                     if !function.has_no_overriders then
-                        return false;
+                        return _decline(WORK_COUNTERS.OUTGOING_HAS_OVERRIDERS);
                     fi
                 fi
 
@@ -1162,8 +1186,12 @@ namespace Analysis is
                         // whole-project rebuild for a namespace-level edit,
                         // and for a reference in a file that is not a known
                         // source file.
-                        if !slice_class? \/ !find_source_file(reference.file_name)? then
-                            return false;
+                        if !slice_class? then
+                            return _decline(WORK_COUNTERS.CROSS_FILE_NAMESPACE_REFERENCE);
+                        fi
+
+                        if !find_source_file(reference.file_name)? then
+                            return _decline(WORK_COUNTERS.CROSS_FILE_UNKNOWN_FILE);
                         fi
 
                         dependent_file_names.add(reference.file_name);
@@ -1175,7 +1203,7 @@ namespace Analysis is
 
             for i in 0..donor_window do
                 if !isa Syntax.Trees.Definitions.FUNCTION(donor_members[prefix + i]) then
-                    return false;
+                    return _decline(WORK_COUNTERS.INCOMING_NOT_A_FUNCTION);
                 fi
             od
 
@@ -1192,7 +1220,7 @@ namespace Analysis is
                 fi;
 
             if slice_class? /\ !hierarchy_slice? then
-                return false;
+                return _decline(WORK_COUNTERS.UNRESETTABLE_CLOSURE);
             fi
 
             // Trim both windows so the remaining trees pair structurally
@@ -1218,6 +1246,7 @@ namespace Analysis is
                 donor_members.remove_at(prefix);
             od
 
+            // A decline here was named by try_incremental_build itself.
             if !try_incremental_build(diagnostics, checked_paths, false, extra_purge_spans) then
                 for i in 0..retained_window do
                     retained_members.insert(prefix + i, removed_definitions[i]);
@@ -1367,6 +1396,20 @@ namespace Analysis is
 
             return signature.signature;
         si
+
+        // Whether the narrowing search can descend into this definition's
+        // body looking for a changed member.
+        //
+        // Classes, structs and traits carry methods and properties, which
+        // is what the window replacement below knows how to swap. Unions
+        // and enums share the same `Classy` base and the same body shape,
+        // but their bodies hold variants and enum members - the
+        // replacement would reject every window, so descending only buys a
+        // longer walk to the same answer.
+        _is_member_container(definition: Syntax.Trees.Definitions.Definition) -> bool =>
+            isa Syntax.Trees.Definitions.CLASS(definition) \/
+            isa Syntax.Trees.Definitions.STRUCT(definition) \/
+            isa Syntax.Trees.Definitions.TRAIT(definition);
 
         _function_symbol_for(definition: Syntax.Trees.Definitions.Definition) -> Semantic.Symbols.Function? is
             if !isa Syntax.Trees.Definitions.FUNCTION(definition) then
@@ -1630,7 +1673,7 @@ namespace Analysis is
             let retained = _retained;
 
             if !retained? then
-                return false;
+                return _decline(WORK_COUNTERS.NO_RETAINED_PARSE);
             fi
 
             let edited_path = retained.file_name;
@@ -1646,7 +1689,7 @@ namespace Analysis is
 
             if !pairs? then
                 _source_files_by_path[edited_path] = donor;
-                return false;
+                return _decline(WORK_COUNTERS.FUNCTION_PAIRING_DESYNC);
             fi
 
             // Capture the pre-edit spans of the bodies about to be
@@ -1680,7 +1723,7 @@ namespace Analysis is
 
             if !correspondence? then
                 _source_files_by_path[edited_path] = donor;
-                return false;
+                return _decline(WORK_COUNTERS.LOCATION_REFRESH_DESYNC);
             fi
 
             IoC.CONTAINER.instance.logger.clear(edited_path, true);
@@ -1707,6 +1750,7 @@ namespace Analysis is
         handle_request(request: Protocol.Request.EDIT, writer: IO.TextWriter) is
             _is_interface_changed = false;
             _retained = null;
+            _declined_reason = null;
 
             for i in _source_files_by_path.values do
                 i.want_compile_expressions = false;
@@ -1800,13 +1844,23 @@ namespace Analysis is
                         try_incremental_interface_edit(diagnostics, checked_paths);
 
                     if handled_by_body_rewalk then
-                        _timers.bump("edit-path-body-rewalk");
+                        _timers.bump(WORK_COUNTERS.EDIT_PATH_BODY_REWALK);
                     elif handled_by_interface_path then
-                        _timers.bump("edit-path-interface-incremental");
+                        _timers.bump(WORK_COUNTERS.EDIT_PATH_INTERFACE_INCREMENTAL);
                     fi
 
                     if !handled_by_body_rewalk /\ !handled_by_interface_path then
-                        _timers.bump("edit-path-full-rebuild");
+                        _timers.bump(WORK_COUNTERS.EDIT_PATH_FULL_REBUILD);
+
+                        // Exactly one reason per rebuilt edit: the guard
+                        // that gave up, or not-eligible when no
+                        // incremental path was attempted (the flag is off,
+                        // the edit spans several files, or this is the
+                        // first parse of the file).
+                        WORK_COUNTERS.declined(
+                            _timers,
+                            _declined_reason ?? WORK_COUNTERS.NOT_ELIGIBLE
+                        );
 
                         for i in _source_files_by_path.values do
                             i.want_compile_up_to_expressions = true;
