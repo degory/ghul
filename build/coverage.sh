@@ -4,13 +4,16 @@
 # suites execute.
 #
 # The compiler is built with debug information so ilasm emits a Portable PDB
-# mapping IL back to .ghul source. coverlet rewrites the built assembly to
-# record which sequence points are hit, the suites run against the rewritten
-# assembly, and ReportGenerator merges the per-suite results into one report.
+# mapping IL back to .ghul source. For the integration and cross-assembly
+# suites, coverlet rewrites the built assembly to record which sequence
+# points are hit; unit tests use coverlet's in-process VSTest collector
+# instead, since they call into the compiler directly rather than spawning
+# it. ReportGenerator turns each suite's result into its own report, and all
+# of them together into one combined report.
 #
 # Coverage is attributed to .ghul files, so any tool that reads lcov or
-# Cobertura can display it — including the Coverage Gutters VS Code extension,
-# which picks up coverage/report/lcov.info with no configuration.
+# Cobertura can display it — including the Coverage Gutters VS Code
+# extension, which picks up coverage/report/lcov.info with no configuration.
 #
 # Usage:
 #   build/coverage.sh [options]
@@ -19,19 +22,18 @@
 #   -s, --suite <name>   Suite to measure; repeatable. One of:
 #                          integration     (default) integration-tests
 #                          cross-assembly  cross-assembly-tests
-#                          all             both of the above
-#   -f, --filter <path>  Restrict a suite to one subdirectory, e.g.
-#                        integration-tests/semantic. Implies a single suite.
-#   -n, --no-build       Reuse the existing publish/ tree. Only safe when it
-#                        was produced by this script (it needs the PDB).
+#                          unit            unit-tests
+#                          analysis        analysis-tests
+#                          all             every suite above
+#   -f, --filter <path>  Restrict the integration or cross-assembly suite to
+#                        one subdirectory, e.g. integration-tests/semantic.
+#                        Implies a single suite of one of those two kinds.
+#   -n, --no-build       Reuse the existing publish/ tree for the integration
+#                        and cross-assembly suites. Only safe when it was
+#                        produced by this script (it needs the PDB). Unit and
+#                        analysis tests always build fresh; both are quick.
 #   -o, --output <dir>   Output directory (default: coverage/).
 #   -h, --help           Show this help.
-#
-# Unit and analysis tests are not included: they run through `dotnet test`
-# against bin/, not publish/, so they need coverlet.collector wired into their
-# project files rather than this out-of-process instrumentation. Until that is
-# done, treat a low number on a file as "not covered by end-to-end tests"
-# rather than "not covered at all".
 #
 set -euo pipefail
 
@@ -51,7 +53,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help) usage 0 ;;
         -s|--suite)
             case "${2:?--suite needs a name}" in
-                integration|cross-assembly|all) suites+=("$2") ;;
+                integration|cross-assembly|unit|analysis|all) suites+=("$2") ;;
                 *) die "unknown suite: $2 (see --help)" ;;
             esac
             shift 2 ;;
@@ -68,7 +70,7 @@ done
 expanded=()
 for suite in "${suites[@]}"; do
     if [[ "$suite" == "all" ]]; then
-        expanded=(integration cross-assembly)
+        expanded=(integration cross-assembly unit analysis)
         break
     fi
     if [[ " ${expanded[*]:-} " != *" $suite "* ]]; then
@@ -76,8 +78,13 @@ for suite in "${suites[@]}"; do
     fi
 done
 suites=("${expanded[@]}")
-if [[ -n "$filter" && ${#suites[@]} -ne 1 ]]; then
-    die "--filter applies to a single suite"
+
+if [[ -n "$filter" ]]; then
+    [[ ${#suites[@]} -eq 1 ]] || die "--filter applies to a single suite"
+    case "${suites[0]}" in
+        integration|cross-assembly) ;;
+        *) die "--filter only applies to the integration or cross-assembly suites" ;;
+    esac
 fi
 
 # ---- tooling ---------------------------------------------------------------
@@ -95,34 +102,42 @@ ensure_tool() {
 ensure_tool coverlet.console coverlet
 ensure_tool dotnet-reportgenerator-globaltool reportgenerator
 
-# ---- build with debug information -----------------------------------------
-# DebugType/DebugSymbols are what the ghūl MSBuild targets consult to decide
-# whether to pass --debug to the compiler. They are set here rather than in
-# ghul.ghulproj so that ordinary builds — and the released package — stay free
-# of debug information and the JIT optimization it suppresses.
-if [[ "$build" -eq 1 ]]; then
-    echo "coverage: building compiler with debug information"
-    dotnet publish --output publish/ -p:DebugType=portable -p:DebugSymbols=true \
-        || die "build failed"
+# ---- build the compiler with debug information -----------------------------
+# Only the integration and cross-assembly suites need publish/: they spawn
+# the compiler out of process, from a path each test's ghul.json names
+# explicitly. DebugType/DebugSymbols are what the ghūl MSBuild targets
+# consult to decide whether to pass --debug to the compiler; setting them
+# here rather than in ghul.ghulproj keeps ordinary builds, and the released
+# package, free of debug information and the JIT optimization it suppresses.
+needs_publish=0
+for suite in "${suites[@]}"; do
+    [[ "$suite" == "integration" || "$suite" == "cross-assembly" ]] && needs_publish=1
+done
+
+if [[ "$needs_publish" -eq 1 ]]; then
+    if [[ "$build" -eq 1 ]]; then
+        echo "coverage: building compiler with debug information"
+        dotnet publish --output publish/ -p:DebugType=portable -p:DebugSymbols=true \
+            || die "build failed"
+    fi
+    [[ -f publish/ghul.dll ]] || die "publish/ghul.dll not found; drop --no-build"
+    [[ -f publish/ghul.pdb ]] || die "publish/ghul.pdb not found; publish/ was built without debug information, drop --no-build"
 fi
-[[ -f publish/ghul.dll ]] || die "publish/ghul.dll not found; drop --no-build"
-[[ -f publish/ghul.pdb ]] || die "publish/ghul.pdb not found; publish/ was built without debug information, drop --no-build"
 
 rm -rf "$output"
 mkdir -p "$output"
 
 # ---- run each suite under instrumentation ---------------------------------
-# coverlet rewrites publish/ghul.dll in place, runs the target, then restores
-# the original. Every compiler process the harness spawns — directly, or via
-# MSBuild for the cross-assembly suite — is the instrumented one, and their
-# hit counts accumulate into a single file under a mutex, so the suites'
-# internal parallelism is not a problem.
-run_suite() {
+# The integration and cross-assembly suites spawn the compiler as a separate
+# process — directly, or via MSBuild for cross-assembly — many times over,
+# so coverlet instruments publish/ghul.dll itself; every spawned process
+# runs the instrumented copy and merges its hit counts into one file under a
+# mutex, so the suites' internal parallelism is not a problem.
+run_out_of_process_suite() {
     local suite="$1" target
     case "$suite" in
         integration)    target="${filter:-integration-tests}" ;;
         cross-assembly) target="${filter:-cross-assembly-tests}" ;;
-        *) die "unknown suite: $suite (see --help)" ;;
     esac
     [[ -e "$target" ]] || die "no such test path: $target"
 
@@ -145,21 +160,86 @@ run_suite() {
     [[ "$status" -eq 0 ]] || echo "coverage: warning: $suite reported failures; coverage below still reflects what ran"
 }
 
+# Unit tests call into the compiler in the same process, so coverlet.collector
+# (referenced from unit-tests.ghulproj) attaches through the standard VSTest
+# data-collector protocol instead — no separate instrumentation step.
+run_unit_suite() {
+    echo "coverage: running unit"
+    local start=$SECONDS
+    local raw="$output/.raw-unit"
+    rm -rf "$raw"
+    local status=0
+    dotnet test unit-tests --collect:"XPlat Code Coverage" --results-directory "$raw" \
+        || status=$?
+    local produced
+    produced="$(find "$raw" -name 'coverage.cobertura.xml' -print -quit)"
+    [[ -n "$produced" ]] || die "unit test coverage file was not produced"
+    cp "$produced" "$output/unit.cobertura.xml"
+    rm -rf "$raw"
+    echo "coverage: unit finished in $((SECONDS - start))s (exit $status)"
+    [[ "$status" -eq 0 ]] || echo "coverage: warning: unit reported failures; coverage below still reflects what ran"
+}
+
+# Analysis tests spawn the compiler as a subprocess too (analyser_process.ghul
+# launches the ghul.dll that lands in analysis-tests/bin/ via ProjectReference),
+# so this instruments that copy directly rather than going through publish/.
+# Built explicitly first, and run with --no-build after, so `dotnet test`
+# cannot silently rebuild over the instrumented copy mid-run.
+run_analysis_suite() {
+    echo "coverage: building analysis-tests"
+    local config="Debug"
+    dotnet build analysis-tests -c "$config" >/dev/null || die "analysis-tests build failed"
+    local dll="analysis-tests/bin/$config/net10.0/ghul.dll"
+    [[ -f "$dll" ]] || die "$dll not found after build"
+    [[ -f "${dll%.dll}.pdb" ]] || die "${dll%.dll}.pdb not found; analysis-tests was built without debug information"
+
+    echo "coverage: running analysis"
+    local start=$SECONDS
+    local status=0
+    "$tools/coverlet" "$dll" \
+        --target dotnet \
+        --targetargs "test analysis-tests -c $config --no-build" \
+        --format cobertura \
+        --output "$output/analysis.cobertura.xml" \
+        --include-test-assembly \
+        || status=$?
+    echo "coverage: analysis finished in $((SECONDS - start))s (exit $status)"
+    [[ "$status" -eq 0 ]] || echo "coverage: warning: analysis reported failures; coverage below still reflects what ran"
+}
+
 for suite in "${suites[@]}"; do
-    run_suite "$suite"
+    case "$suite" in
+        integration|cross-assembly) run_out_of_process_suite "$suite" ;;
+        unit)                       run_unit_suite ;;
+        analysis)                   run_analysis_suite ;;
+        *) die "unknown suite: $suite (see --help)" ;;
+    esac
 done
 
-# ---- merge and report ------------------------------------------------------
+# ---- report -----------------------------------------------------------------
 reports=("$output"/*.cobertura.xml)
 [[ -e "${reports[0]}" ]] || die "no coverage reports were produced"
 
+# One report per suite, so a category can be inspected on its own.
+for report in "${reports[@]}"; do
+    suite_name="$(basename "$report" .cobertura.xml)"
+    "$tools/reportgenerator" \
+        "-reports:$report" \
+        "-targetdir:$output/report/$suite_name" \
+        "-reporttypes:Html;lcov" \
+        "-filefilters:-*/obj/*" \
+        >/dev/null || die "report generation failed for $suite_name"
+done
+
+# The combined report and headline number, generated at the report root so
+# its badges and lcov sit at a stable path regardless of which suites ran.
 echo "coverage: merging ${#reports[@]} report(s)"
 "$tools/reportgenerator" \
     "-reports:$output/*.cobertura.xml" \
     "-targetdir:$output/report" \
     "-reporttypes:Html;Cobertura;lcov;Badges;MarkdownSummaryGithub;TextSummary" \
     "-filefilters:-*/obj/*" \
-    >/dev/null || die "report generation failed"
+    >/dev/null || die "combined report generation failed"
 
 echo
 if [[ -f "$output/report/Summary.txt" ]]; then
@@ -167,11 +247,12 @@ if [[ -f "$output/report/Summary.txt" ]]; then
     echo
 fi
 echo "coverage: wrote"
-echo "  $output/report/index.html            browse"
+echo "  $output/report/index.html            combined report"
+echo "  $output/report/<suite>/index.html    per-suite report"
 echo "  $output/report/lcov.info             VS Code (Coverage Gutters: Display Coverage)"
 echo "  $output/report/Cobertura.xml         machine-readable"
 echo "  $output/report/SummaryGithub.md      job summary for a CI run"
-echo "  $output/report/badge_*.svg           coverage badges"
+echo "  $output/report/badge_*.svg           coverage badges (combined)"
 
 # On a GitHub runner, surface the summary on the run's own page. Nothing is
 # written anywhere else, so this stays inert locally.
