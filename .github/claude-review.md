@@ -78,9 +78,9 @@ For changes here, AGENTS.md requires:
 
 Flag type-system PRs that don't follow this.
 
-### Project tests
+### Cross-assembly tests
 
-- **Don't share a `.csproj` reference across project tests.** Parallel `dotnet build` races on `bin/Debug/net8.0/<project>.deps.json` (MSBuild's `GenerateDepsFile` takes an exclusive write lock). Each project test gets its own private library. Stochastic — passes on PR, fails on main.
+- **Don't share a `.csproj` reference across cross-assembly tests.** Parallel `dotnet build` races on `bin/Debug/net8.0/<project>.deps.json` (MSBuild's `GenerateDepsFile` takes an exclusive write lock). Each test gets its own private library. Stochastic — passes on PR, fails on main.
 - **Bootstrap source-compat**: `src/` must build under the currently-pinned compiler. A PR that uses a brand-new language feature in `src/` will fail bootstrap until the feature ships and the pin bumps. Fix-and-consume must be separate PRs across a publish.
 
 ## Source comment hygiene

@@ -21,6 +21,7 @@ All tests must pass before submitting a pull request. The test suite includes:
 | Unit Tests     | `dotnet test unit-tests`                     | Seconds                                | Coverage is intentionally selective for most areas (rely on integration tests). The *type system and inference paths* are an exception — see "Type-system changes" below.           |
 | Bootstrap      | `./build/bootstrap.sh`                       | ~1 minute                              | Verifies compiler self-hosting. May appear to pause during builds; produces little output until each build completes. Can take longer on less powerful machines or in agent environments. |
 | Integration    | `dotnet publish --output publish/ && dotnet ghul-test integration-tests` | ~3 minutes | Snapshot-based; see [integration-tests/README.md](integration-tests/README.md) for details. Produces continuous output. Requires compiler to be published to `./publish/` first. May take longer in agent/dev environments. |
+| Cross-assembly | `dotnet publish --output publish/ && dotnet ghul-test --use-dotnet-build cross-assembly-tests` | ~1 minute | Real MSBuild projects compiling against a separate assembly; covers what survives metadata. Publish first: without a `publish/` directory the projects build with the published compiler from `.config/dotnet-tools.json` rather than your changes. See [cross-assembly-tests/README.md](cross-assembly-tests/README.md). |
 
 ### Integration Test Groups
 
