@@ -376,11 +376,12 @@ A trailing **modifier suffix** on the parameter overrides the default visibility
 
 - `x: int public` — public read and write.
 - `x: int protected` — readable from the declaring class and its subclasses.
+- `x: int private` — captured into the underscore-named member `_x`, non-public under the rules in [naming conventions](#naming-conventions). The parameter itself keeps the plain name `x`, so the member is read as `_x` and the constructor argument stays `x`. A private capture is left out of the synthesised `deconstruct`.
 - `x: int field` — plain field rather than auto-property.
 - `x: int static` — a static member rather than a per-instance one.
 - `x: int init` — **no field generated**. The parameter is in scope only inside the synthesised `init` and any explicit `init(..)` body; useful when the constructor consumes its argument to compute something else (`init(.., other)` style).
 
-Naming the parameter with a leading underscore (`_x: int`) is the separate, convention-driven route to a non-public member, and follows the rules in [naming conventions](#naming-conventions).
+Naming the parameter with a leading underscore (`_x: int`) is the equivalent convention-driven route, and follows the same rules; `_x: int private` is accepted and adds nothing, the name already carrying the visibility.
 
 An explicit body declaration with the same name as a primary parameter (under the same `_foo` / `foo` matching rule) wins over auto-generation — the body decl receives the auto-init copy. This is the *capture* form: writing the field shorthand `_x;` (or a property declaration named `_x` / `x` that supplies neither a read nor an assign body) tells the rewriter "match primary parameter `x` to this declaration." A property that does supply an accessor body is a normal member, not a capture. With explicit body decls you also get to choose private renames (`_x;` on a primary parameter `x`) without using the modifier suffix.
 
@@ -614,7 +615,7 @@ Inside the block, the target's own members, inherited members, and type paramete
 
 A property is a name and a type, optionally with getter and setter bodies; a property with no bodies is backed by a hidden field. A property is public to read but only assignable within its defining type — prefixing the name with `_` makes it non-public for reading too, to whatever extent the `--underscore-access` policy in [naming conventions](#naming-conventions) sets.
 
-The same trailing modifiers available on a primary-constructor parameter apply to a body declaration: `x: int public` for public read and write, `x: int field` for a plain field rather than an auto-property, and `x: int static` for a static member. The `field` distinction matters most on value types — see [structs](#structs).
+The storage and visibility modifiers available on a primary-constructor parameter apply to a body declaration too: `x: int public` for public read and write, `x: int field` for a plain field rather than an auto-property, and `x: int static` for a static member. The `field` distinction matters most on value types — see [structs](#structs). `private` is the exception: it renames the member it captures, which only makes sense on a primary-constructor parameter. A plain body declaration has no separate name to rename from, so writing `private` on one without an accessor body is rejected; name the member `_x` directly instead.
 
 ```ghul
 class COUNTER is
