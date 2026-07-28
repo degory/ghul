@@ -16,15 +16,17 @@ ghūl keywords are lowercase. Identifiers follow a convention that the compiler 
 
 A `static` field or property reads as a named constant, so it accepts either `snake_case` or `UPPER_SNAKE_CASE`.
 
-A leading underscore (`_name`) marks a member or type as non-public — there are no `public`/`private` keywords, the naming convention carries that information. What that buys differs by kind. An underscore-prefixed **type** is assembly-private: it is emitted `.class private`, so nothing outside the assembly can see it, and that is the whole of the rule — a type has no declaring class to be narrower than. An underscore-prefixed **member** — method, field or property — is emitted with `assembly` IL accessibility and is *additionally* gated at compile time, by default to its own declaring class. Because those members are still reachable within the assembly at the IL level, an out-of-policy reference is reported as an error but the access is allowed through, so the diagnostic never cascades.
+A leading underscore (`_name`) marks a declaration as non-public — there are no `public`/`private` keywords, the naming convention carries that information. Whatever it is attached to, an underscore-prefixed name is **private to the assembly it is declared in**: another assembly cannot see it at all, and a reference to one from outside is a compile error.
 
-The member gate is chosen with a compiler flag:
+Within the assembly the rule differs by kind. A **member** — method, field or property — is restricted further, by default to its own declaring class. A **type**, **global function** or **global variable** has no declaring class to be narrower than, so for those the underscore means exactly "private to this assembly" and nothing more.
+
+How far the member restriction reaches is chosen with a compiler flag:
 
 - `--underscore-access private` (the default) — an underscore member is visible only to its declaring class.
 - `--underscore-access protected` — widens that to the declaring class and its subclasses within the same assembly.
-- `--underscore-access legacy` — the historic behaviour: underscore methods and types are emitted public, underscore fields `assembly`, with no compile-time access enforcement.
+- `--underscore-access legacy` — the historic behaviour: no compile-time enforcement at all, and underscore methods and types are emitted public, so they escape the assembly.
 
-Underscore global functions and variables have no meaningful declaring-class privacy, so they are simply assembly-internal (hidden from other assemblies) under `private`/`protected`.
+An out-of-policy reference from elsewhere *inside* the assembly is reported as an error, but the access is allowed through rather than being cut, so the diagnostic never cascades.
 
 The compiler warns when a ghūl-source declaration doesn't match the convention for its kind. Each rule has its own slug, suppressible per declaration, per file, or project-wide:
 
