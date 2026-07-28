@@ -7,8 +7,6 @@ concepts include:
 - **symbols** – `symbol_table.ghul` stores declarations and scopes.
 - **types** – the `types/` subfolder defines `Type` and all concrete type nodes
   used throughout the compiler.
-- **stable_symbols.ghul** – a registry of built‑in symbols that other modules
-  depend on.
 - **dotnet/** – helpers for emitting .NET metadata such as attributes and
   assembly info.
 
