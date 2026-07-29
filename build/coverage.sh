@@ -8,12 +8,14 @@
 # suites, coverlet rewrites the built assembly to record which sequence
 # points are hit; unit tests use coverlet's in-process VSTest collector
 # instead, since they call into the compiler directly rather than spawning
-# it. ReportGenerator turns each suite's result into its own report, and all
-# of them together into one combined report.
+# it. degory/ghul-coverage-report's coverage-data-tool turns the merged
+# Cobertura output into report data (namespace/type/method rollups, per-line
+# coverage, syntax highlighting and hover info via the compiler's own
+# analyser), and its site/ (a VitePress project) renders that into the HTML
+# report — see https://github.com/degory/ghul-coverage-report.
 #
-# Coverage is attributed to .ghul files, so any tool that reads lcov or
-# Cobertura can display it — including the Coverage Gutters VS Code
-# extension, which picks up coverage/report/lcov.info with no configuration.
+# Coverage is attributed to .ghul files, so any tool that reads Cobertura
+# can display it too.
 #
 # Usage:
 #   build/coverage.sh [options]
@@ -100,16 +102,6 @@ ensure_tool() {
     fi
 }
 ensure_tool coverlet.console coverlet
-ensure_tool dotnet-reportgenerator-globaltool reportgenerator
-
-# The complexity figure coverlet's Cobertura writer emits, which feeds
-# ReportGenerator's Crap Score and Risk Hotspots, is computed from coverlet's
-# own CFG over the emitted IL, not from ghūl source — dropped before
-# ReportGenerator sees it. A no-op if the report was never produced.
-strip_complexity() {
-    [[ -f "$1" ]] || return 0
-    sed -i -E 's/ complexity="[0-9.]+"//g' "$1"
-}
 
 # ---- build the compiler with debug information -----------------------------
 # Only the integration and cross-assembly suites need publish/: they spawn
@@ -173,7 +165,6 @@ run_out_of_process_suite() {
         --output "$output/$suite.cobertura.xml" \
         --include-test-assembly \
         || status=$?
-    strip_complexity "$output/$suite.cobertura.xml"
     echo "coverage: $suite finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: $suite reported failures; coverage below still reflects what ran"
 }
@@ -194,7 +185,6 @@ run_unit_suite() {
     [[ -n "$produced" ]] || die "unit test coverage file was not produced"
     cp "$produced" "$output/unit.cobertura.xml"
     rm -rf "$raw"
-    strip_complexity "$output/unit.cobertura.xml"
     echo "coverage: unit finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: unit reported failures; coverage below still reflects what ran"
 }
@@ -222,7 +212,6 @@ run_analysis_suite() {
         --output "$output/analysis.cobertura.xml" \
         --include-test-assembly \
         || status=$?
-    strip_complexity "$output/analysis.cobertura.xml"
     echo "coverage: analysis finished in $((SECONDS - start))s (exit $status)"
     [[ "$status" -eq 0 ]] || echo "coverage: warning: analysis reported failures; coverage below still reflects what ran"
 }
@@ -240,57 +229,61 @@ done
 reports=("$output"/*.cobertura.xml)
 [[ -e "${reports[0]}" ]] || die "no coverage reports were produced"
 
-# analysis-tests is the test project itself, not compiler source, so its own
-# coverage number is meaningless noise — always excluded. analysis-protocol
-# is the shared DTO project; none of today's suites exercise much of it, so
-# it's excluded for now too rather than reporting a permanently-red number.
-assembly_filters="-assemblyfilters:-analysis-tests;-analysis-protocol"
+# degory/ghul-coverage-report checked out fresh unless the caller already
+# has a copy staged (COVERAGE_REPORT_SRC) — e.g. a workflow that wants to
+# pin a specific ref, or a developer iterating on the tool itself locally.
+report_src="${COVERAGE_REPORT_SRC:-$repo_root/.coverage-report-src}"
+if [[ ! -d "$report_src" ]]; then
+    echo "coverage: fetching degory/ghul-coverage-report"
+    git clone --depth 1 https://github.com/degory/ghul-coverage-report "$report_src" \
+        || die "could not clone degory/ghul-coverage-report"
+fi
 
-# Excludes every assembly from risk-hotspot analysis outright, on top of
-# strip_complexity above.
-riskhotspot_filters="-riskhotspotassemblyfilters:-*"
+# coverage-data-tool drives the analyser against this project directly, so
+# it needs the same reference-assembly manifest the analyser always needs
+# (see ghul-mcp / example-tool for the other consumers of this target).
+dotnet build -verbosity:quiet -t:GenerateAssembliesJson || die "GenerateAssembliesJson failed"
 
-# One report per suite, so a category can be inspected on its own.
+report_globs=""
 for report in "${reports[@]}"; do
-    suite_name="$(basename "$report" .cobertura.xml)"
-    "$tools/reportgenerator" \
-        "-reports:$report" \
-        "-targetdir:$output/report/$suite_name" \
-        "-reporttypes:Html;lcov" \
-        "-filefilters:-*/obj/*" \
-        "$assembly_filters" \
-        "$riskhotspot_filters" \
-        >/dev/null || die "report generation failed for $suite_name"
+    report_globs+="$report;"
 done
 
-# The combined report and headline number, generated at the report root so
-# its badges and lcov sit at a stable path regardless of which suites ran.
-echo "coverage: merging ${#reports[@]} report(s)"
-"$tools/reportgenerator" \
-    "-reports:$output/*.cobertura.xml" \
-    "-targetdir:$output/report" \
-    "-reporttypes:Html;Cobertura;lcov;Badges;MarkdownSummaryGithub;TextSummary" \
-    "-filefilters:-*/obj/*" \
-    "$assembly_filters" \
-    "$riskhotspot_filters" \
-    >/dev/null || die "combined report generation failed"
+echo "coverage: generating report data from ${#reports[@]} report(s)"
+dotnet run --project "$report_src/coverage-data-tool" -- \
+    "-reports:${report_globs%;}" \
+    "-project:$repo_root" \
+    "-targetdir:$report_src/site/coverage-data" \
+    || die "coverage-data-tool failed"
+
+# VitePress copies public/'s contents verbatim to the site root, which is
+# how the badge lands at a stable, predictable deployed URL
+# (.../badge.json) for a README to point a shields.io endpoint badge at.
+mkdir -p "$report_src/site/public"
+cp "$report_src/site/coverage-data/badge.json" "$report_src/site/public/badge.json"
+
+echo "coverage: building report site"
+(
+    cd "$report_src/site"
+    npm ci --silent
+    npm run build
+) || die "site build failed"
+
+rm -rf "$output/report"
+mkdir -p "$output/report"
+cp -r "$report_src/site/.vitepress/dist/." "$output/report/"
 
 echo
-if [[ -f "$output/report/Summary.txt" ]]; then
-    sed -n '1,12p' "$output/report/Summary.txt"
-    echo
-fi
 echo "coverage: wrote"
-echo "  $output/report/index.html            combined report"
-echo "  $output/report/<suite>/index.html    per-suite report"
-echo "  $output/report/lcov.info             VS Code (Coverage Gutters: Display Coverage)"
-echo "  $output/report/Cobertura.xml         machine-readable"
-echo "  $output/report/SummaryGithub.md      job summary for a CI run"
-echo "  $output/report/badge_*.svg           coverage badges (combined)"
+echo "  $output/report/index.html      combined report"
+echo "  $output/report/badge.json      shields.io endpoint badge data"
 
-# On a GitHub runner, surface the summary on the run's own page. Nothing is
-# written anywhere else, so this stays inert locally.
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    cat "$output/report/SummaryGithub.md" >> "$GITHUB_STEP_SUMMARY"
-    echo "coverage: appended summary to the job summary"
+# On a GitHub runner, surface the headline number on the run's own page.
+# Nothing is written anywhere else, so this stays inert locally.
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -f "$output/report/badge.json" ]]; then
+    message="$(sed -n 's/.*"message":"\([^"]*\)".*/\1/p' "$output/report/badge.json")"
+    if [[ -n "$message" ]]; then
+        echo "**Line coverage: $message**" >> "$GITHUB_STEP_SUMMARY"
+        echo "coverage: appended summary to the job summary"
+    fi
 fi
