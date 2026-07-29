@@ -64,6 +64,43 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 | `il.expected` | Expected IL disassembly output. |
 | `ghul.json` | Configuration file pointing at the compiler (created from the template). |
 | `disabled*` | Any file beginning with `disabled` causes the test to be skipped. |
+| `tags` | Zero or more whitespace-separated tag names, used to select a subset of tests with `--tag`. See 'Tags' below. |
+
+## Tags
+
+A test directory can carry a `tags` file naming zero or more of the tags below,
+space- or newline-separated. `ghul-test --tag <name>` (repeatable, matched as a
+union) restricts a run to tests carrying at least one of the requested tags —
+see `ghul-test`'s own README for the flag. Two uses this serves:
+
+- **Cross-cutting feature tags** — run everything that touches a language
+  feature regardless of which of `execution`/`il`/`parse`/`semantic` it lives
+  in, e.g. `dotnet ghul-test --tag unions integration-tests` for every
+  union-related test.
+- **`smoke`** — a fixed, deterministic subset (currently ~80 tests, one
+  representative per (feature tag, physical group) pair, picked
+  alphabetically) intended as a fast pre-push sanity check. It is not a
+  substitute for the full suite, which CI always runs regardless — see
+  'Local CI' in the workspace `CLAUDE.md`. Run it with
+  `dotnet ghul-test --tag smoke integration-tests`.
+
+Current feature tags: `parser`, `narrowing`, `optionals`, `unions`, `generics`,
+`traits`, `classes`, `structs`, `enums`, `tuples`, `lambdas`, `async`,
+`generators`, `pipes`, `purity`, `inference`, `il-emission`, `interop`,
+`exceptions`, `control-flow`, `diagnostics`, `primary-ctor`, `operators`,
+`arrays`, `strings`, `namespaces`, `variables`, `literals`.
+
+The initial pass (2026-07-29) assigned these mechanically, from keywords in
+each test directory's name — good enough to be useful, not perfectly accurate,
+and about 9% of tests matched no keyword and carry no tags at all. There is no
+scheduled re-sweep. Instead: **when you touch a test directory for an
+unrelated reason and its `tags` file is missing, wrong, or could be more
+specific, fix it as part of that change** — add a `tags` file where one is
+missing and the test clearly fits an existing tag, correct a stale or
+mismatched one, or add a new tag to the list above (updating this section) when
+an existing test clearly needs a feature tag that doesn't exist yet. Don't go
+looking for mistagged tests outside of what you're already touching — this is
+opportunistic upkeep, not a project.
 
 ## Expectation comparison workflow
 
@@ -76,8 +113,11 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 ## Command line usage
 
 ```
-ghul-test [--use-dotnet-build] <test-folder> [...]
+ghul-test [--use-dotnet-build] [--tag <name>]... <test-folder> [...]
 ```
+
+`--tag <name>` (repeatable) restricts discovery to tests carrying at least one
+of the requested tags — see 'Tags' above.
 
 Environment variables:
 
