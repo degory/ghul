@@ -234,16 +234,6 @@ reports=("$output"/*.cobertura.xml)
 # unpinned fetch would make this periodic job depend on whatever happens
 # to be on its default branch each run, with no diff in this repo to
 # explain a break. Bump report_ref by hand to pick up changes there.
-#
-# COVERAGE_REPORT_SRC (e.g. a developer iterating on the tool itself
-# locally) bypasses the pin entirely and is trusted as given. Otherwise
-# the pinned ref is checked out on every run, not just the first — an
-# existing .coverage-report-src (left by a prior run, or predating a
-# report_ref bump) is brought to the pin too, rather than trusted as-is —
-# and the initial clone is staged in a temp directory and only moved into
-# place after the checkout succeeds, so a failure partway through (bad
-# ref, network drop) can never leave an unpinned tree sitting at
-# .coverage-report-src for a later run to silently pick up.
 report_ref="d07150bcd469e5b8f58a351811512b060e2f5dbf"
 if [[ -n "${COVERAGE_REPORT_SRC:-}" ]]; then
     report_src="$COVERAGE_REPORT_SRC"
@@ -276,16 +266,10 @@ for report in "${reports[@]}"; do
     report_globs+="$report;"
 done
 
-# The old ReportGenerator invocation carried -assemblyfilters and
-# -filefilters excluding analysis-tests, analysis-protocol and generated
-# obj/ sources — coverage-data-tool needs no equivalent, and drops none of
-# them silently: it only ever rolls up coverage for files under -project's
-# own -sourceprefix directory (src/, by default) that the compiler's own
-# analyser actually opened while resolving *this* project, so a Cobertura
-# entry for anything else (a different project's source, a generated
-# obj/ path) never matches a key in that set and is simply never claimed
-# by any type or method - not filtered out by name, excluded by
-# construction from what gets looked up in the first place.
+# coverage-data-tool rolls up coverage only for files under -project's
+# own -sourceprefix directory that the compiler's analyser actually
+# opened, so a Cobertura entry for anything else (another project's
+# source, a generated obj/ path) is never claimed by any type or method.
 echo "coverage: generating report data from ${#reports[@]} report(s)"
 dotnet run --project "$report_src/coverage-data-tool" -- \
     "-reports:${report_globs%;}" \
