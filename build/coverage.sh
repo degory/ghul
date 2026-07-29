@@ -230,18 +230,25 @@ reports=("$output"/*.cobertura.xml)
 [[ -e "${reports[0]}" ]] || die "no coverage reports were produced"
 
 # degory/ghul-coverage-report checked out fresh unless the caller already
-# has a copy staged (COVERAGE_REPORT_SRC) — e.g. a workflow that wants to
-# pin a specific ref, or a developer iterating on the tool itself locally.
+# has a copy staged (COVERAGE_REPORT_SRC) — e.g. a developer iterating on
+# the tool itself locally. Pinned to a known-good commit rather than
+# tracking the branch tip: that repo has no release process yet, so an
+# unpinned fetch would make this periodic job depend on whatever happens
+# to be on its default branch each run, with no diff in this repo to
+# explain a break. Bump this SHA by hand to pick up changes there.
+report_ref="d07150bcd469e5b8f58a351811512b060e2f5dbf"
 report_src="${COVERAGE_REPORT_SRC:-$repo_root/.coverage-report-src}"
 if [[ ! -d "$report_src" ]]; then
-    echo "coverage: fetching degory/ghul-coverage-report"
-    git clone --depth 1 https://github.com/degory/ghul-coverage-report "$report_src" \
+    echo "coverage: fetching degory/ghul-coverage-report@$report_ref"
+    git clone https://github.com/degory/ghul-coverage-report "$report_src" \
         || die "could not clone degory/ghul-coverage-report"
+    git -C "$report_src" checkout --quiet "$report_ref" \
+        || die "could not check out degory/ghul-coverage-report@$report_ref"
 fi
 
 # coverage-data-tool drives the analyser against this project directly, so
 # it needs the same reference-assembly manifest the analyser always needs
-# (see ghul-mcp / example-tool for the other consumers of this target).
+# (see degory/ghul-mcp for another consumer of this target).
 dotnet build -verbosity:quiet -t:GenerateAssembliesJson || die "GenerateAssembliesJson failed"
 
 report_globs=""
