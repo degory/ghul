@@ -8,11 +8,10 @@
 # suites, coverlet rewrites the built assembly to record which sequence
 # points are hit; unit tests use coverlet's in-process VSTest collector
 # instead, since they call into the compiler directly rather than spawning
-# it. degory/ghul-coverage-report's coverage-data-tool turns the merged
-# Cobertura output into report data (namespace/type/method rollups, per-line
-# coverage, syntax highlighting and hover info via the compiler's own
-# analyser), and its site/ (a VitePress project) renders that into the HTML
-# report — see https://github.com/degory/ghul-coverage-report.
+# it. This script only captures — it writes each suite's Cobertura report
+# to coverage/ and stops there. Turning that into the HTML report is
+# degory/ghul-coverage-report's job: its own scheduled workflow checks out
+# this repo, runs this script, and builds+deploys the report.
 #
 # Coverage is attributed to .ghul files, so any tool that reads Cobertura
 # can display it too.
@@ -225,86 +224,16 @@ for suite in "${suites[@]}"; do
     esac
 done
 
-# ---- report -----------------------------------------------------------------
+# ---- done -------------------------------------------------------------------
 reports=("$output"/*.cobertura.xml)
 [[ -e "${reports[0]}" ]] || die "no coverage reports were produced"
 
-# degory/ghul-coverage-report, pinned to a known-good commit rather than
-# tracking the branch tip: that repo has no release process yet, so an
-# unpinned fetch would make this periodic job depend on whatever happens
-# to be on its default branch each run, with no diff in this repo to
-# explain a break. Bump report_ref by hand to pick up changes there.
-report_ref="d07150bcd469e5b8f58a351811512b060e2f5dbf"
-if [[ -n "${COVERAGE_REPORT_SRC:-}" ]]; then
-    report_src="$COVERAGE_REPORT_SRC"
-else
-    report_src="$repo_root/.coverage-report-src"
-
-    if [[ -d "$report_src" ]]; then
-        echo "coverage: updating degory/ghul-coverage-report to $report_ref"
-        git -C "$report_src" fetch --quiet origin "$report_ref" \
-            || die "could not fetch degory/ghul-coverage-report@$report_ref"
-        git -C "$report_src" checkout --quiet "$report_ref" \
-            || die "could not check out degory/ghul-coverage-report@$report_ref"
-    else
-        echo "coverage: fetching degory/ghul-coverage-report@$report_ref"
-        clone_tmp="$(mktemp -d)"
-        git clone --quiet https://github.com/degory/ghul-coverage-report "$clone_tmp" \
-            && git -C "$clone_tmp" checkout --quiet "$report_ref" \
-            || { rm -rf "$clone_tmp"; die "could not fetch degory/ghul-coverage-report@$report_ref"; }
-        mv "$clone_tmp" "$report_src"
-    fi
-fi
-
-# coverage-data-tool drives the analyser against this project directly, so
-# it needs the same reference-assembly manifest the analyser always needs
-# (see degory/ghul-mcp for another consumer of this target).
-dotnet build -verbosity:quiet -t:GenerateAssembliesJson || die "GenerateAssembliesJson failed"
-
-report_globs=""
-for report in "${reports[@]}"; do
-    report_globs+="$report;"
-done
-
-# coverage-data-tool rolls up coverage only for files under -project's
-# own -sourceprefix directory that the compiler's analyser actually
-# opened, so a Cobertura entry for anything else (another project's
-# source, a generated obj/ path) is never claimed by any type or method.
-echo "coverage: generating report data from ${#reports[@]} report(s)"
-dotnet run --project "$report_src/coverage-data-tool" -- \
-    "-reports:${report_globs%;}" \
-    "-project:$repo_root" \
-    "-targetdir:$report_src/site/coverage-data" \
-    || die "coverage-data-tool failed"
-
-# VitePress copies public/'s contents verbatim to the site root, which is
-# how the badge lands at a stable, predictable deployed URL
-# (.../badge.json) for a README to point a shields.io endpoint badge at.
-mkdir -p "$report_src/site/public"
-cp "$report_src/site/coverage-data/badge.json" "$report_src/site/public/badge.json"
-
-echo "coverage: building report site"
-(
-    cd "$report_src/site"
-    npm ci --silent
-    npm run build
-) || die "site build failed"
-
-rm -rf "$output/report"
-mkdir -p "$output/report"
-cp -r "$report_src/site/.vitepress/dist/." "$output/report/"
-
 echo
 echo "coverage: wrote"
-echo "  $output/report/index.html      combined report"
-echo "  $output/report/badge.json      shields.io endpoint badge data"
-
-# On a GitHub runner, surface the headline number on the run's own page.
-# Nothing is written anywhere else, so this stays inert locally.
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -f "$output/report/badge.json" ]]; then
-    message="$(sed -n 's/.*"message":"\([^"]*\)".*/\1/p' "$output/report/badge.json")"
-    if [[ -n "$message" ]]; then
-        echo "**Line coverage: $message**" >> "$GITHUB_STEP_SUMMARY"
-        echo "coverage: appended summary to the job summary"
-    fi
-fi
+for report in "${reports[@]}"; do
+    echo "  $report"
+done
+echo
+echo "Turning these into the HTML report is degory/ghul-coverage-report's job"
+echo "(its own scheduled workflow checks out this repo, runs this script, and"
+echo "builds+deploys the report) - see https://github.com/degory/ghul-coverage-report."
