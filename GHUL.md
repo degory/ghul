@@ -904,6 +904,21 @@ esac
 
 A bare identifier without `:` or `(...)` is still an expression — `when v then` tests equality against the value of `v` in scope, it does not bind a new local. Bindings carry shape information.
 
+A pattern arm can carry a trailing `/\`-guard, evaluated after the pattern binds — the bound names are in scope in the guard and in the arm body:
+
+```ghul
+case s
+when c: CIRCLE /\ c.radius > 3 then
+    write_line("big circle {c.radius}");
+when c: CIRCLE then
+    write_line("small circle {c.radius}");
+when q: SQUARE then
+    write_line("square {q.side}");
+esac
+```
+
+A failing guard falls through to the next arm, exactly as if the pattern itself hadn't matched. A guarded arm never counts towards exhaustiveness — it can decline to run even when its pattern matches, so `non-exhaustive-case` still fires for a variant only ever matched by a guarded arm.
+
 ### val ... lav
 
 `val ... lav` is a block expression: a sequence of statements whose value is the value of the last statement. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
