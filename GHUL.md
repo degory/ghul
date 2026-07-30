@@ -1206,3 +1206,21 @@ Because ghūl has no default argument values, a .NET **optional parameter** has 
 ```ghul
 let text = await IO.File.read_all_text_async(path, System.Threading.CancellationToken.none);
 ```
+
+A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
+
+```ghul
+@System.Obsolete("use PRODUCT instead")
+class LEGACY_PRODUCT is
+    init() is si
+si
+
+get_product(
+    @Microsoft.AspNetCore.Mvc.FromServices() store: ProductStore,
+    @Microsoft.AspNetCore.Mvc.FromRoute() index: int
+) -> Tasks.TASK[IResult] is
+    ...
+si
+```
+
+A parameter attribute is recognised only in a named function or method's parameter list — not on a `let`, a primary-constructor parameter, or a lambda literal's parameters.
