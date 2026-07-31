@@ -1207,7 +1207,7 @@ Because ghūl has no default argument values, a .NET **optional parameter** has 
 let text = await IO.File.read_all_text_async(path, System.Threading.CancellationToken.none);
 ```
 
-A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
+A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list, including a lambda literal's. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
 
 ```ghul
 @System.Obsolete("use PRODUCT instead")
@@ -1221,6 +1221,13 @@ get_product(
 ) -> Tasks.TASK[IResult] is
     ...
 si
+
+app.map_get(
+    "/products/{index}",
+    (@Microsoft.AspNetCore.Mvc.FromRoute() index: int, store: ProductStore) -> Tasks.TASK[IResult] is
+        ...
+    si
+);
 ```
 
-A parameter attribute is recognised only in a named function or method's parameter list — not on a `let`, a primary-constructor parameter, or a lambda literal's parameters.
+A parameter attribute is recognised only where a formal parameter can appear: a named function or method's parameter list, or a lambda literal's — not on a `let` or a primary-constructor parameter. Written on an element of a parenthesised expression that turns out not to be a lambda (an ordinary value tuple), it's rejected with an error rather than silently ignored.
