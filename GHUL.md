@@ -269,7 +269,7 @@ entries | .for_each(((key, value): Collections.KeyValuePair[string, int]) =>
     write_line("{key}={value}"));
 ```
 
-Patterns nest and take discards, so `(((a, b), c)) => …` and `((_, b)) => …` both work.
+Patterns nest and take discards, so `(((a, b), c)) => …` and `((_, b)) => …` both work. An asynchronous function literal cannot take one: its body compiles into a state machine whose locals are frame fields, which the pattern's names are not.
 
 ## type definitions
 
