@@ -1144,6 +1144,14 @@ trait Named is name: string; si
 greet[T: Named](x: T) => write_line("hello {x.name}");
 ```
 
+A bound's *static* members are reachable through the type parameter itself, written `T.member(...)` — the mechanism .NET's generic-math interfaces (`IParsable[T]`, `INumber[T]`, `IBinaryInteger[T]`, ...) are built on:
+
+```ghul
+use System.IParsable;
+
+parse[T: IParsable[T]](s: string) -> T => T.parse(s, null);
+```
+
 The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS) when the constructor arguments alone don't pin every owner-generic slot:
 
 ```ghul
