@@ -88,7 +88,7 @@ Current feature tags: `parser`, `narrowing`, `optionals`, `unions`, `generics`,
 `traits`, `classes`, `structs`, `enums`, `tuples`, `lambdas`, `async`,
 `generators`, `pipes`, `purity`, `inference`, `il-emission`, `interop`,
 `exceptions`, `control-flow`, `diagnostics`, `primary-ctor`, `operators`,
-`arrays`, `strings`, `namespaces`, `variables`, `literals`, `tail-calls`.
+`arrays`, `strings`, `namespaces`, `variables`, `literals`.
 
 The initial pass (2026-07-29) assigned these mechanically, from keywords in
 each test directory's name — good enough to be useful, not perfectly accurate,
