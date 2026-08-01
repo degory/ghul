@@ -1028,39 +1028,53 @@ namespace Semantic.Symbols is
 
         load_self(location: Source.LOCATION, loader: SYMBOL_LOADER) -> Value is
             if is_delegate then
-                let context = IoC.CONTAINER.instance.symbol_table.current_instance_context;
+                let context = IoC.CONTAINER.instance.symbol_table.current_instance_context!;
 
                 note_enclosing_body_loads_self();
 
-                return IR.Values.Load.REFERENCE_SELF(context!, context.type);
+                // A delegate is emitted as a method on the enclosing type,
+                // so its receiver is normally `ldarg.0`. For an async
+                // literal the body lives in the state machine's MoveNext,
+                // where `ldarg.0` is the state machine — the receiver is
+                // reached through its `$outer_self` field instead. Only the
+                // body is inside MoveNext: the load that binds the
+                // delegate's target sits in the enclosing method, where
+                // `ldarg.0` is the receiver as usual.
+                if _walking_literal_body then
+                    if let redirected = _state_machine_outer_self_load(context) then
+                        return redirected;
+                    fi
+                fi
+
+                return IR.Values.Load.REFERENCE_SELF(context, context.type);
             fi
 
             let `field = find_or_add_capture_self();
-            let frame = self.frame!;
 
-            return loader.load_instance_variable(location, IR.Values.Load.REFERENCE_SELF(frame, frame.type), `field);
+            return loader.load_instance_variable(location, _capture_frame_self_load(), `field);
         si
 
         // At a closure-construction emission site that ends up inside
-        // a generator's MoveNext, `ldarg.0` refers to the state
-        // machine — so the closure's delegate target / captured-self
-        // value can't be loaded via REFERENCE_SELF (which would emit
-        // `ldarg.0` of the state machine). Instead load through the
-        // state-machine frame's `_outer_self` field, which the outer
-        // method populates with the user's instance at .ctor time.
+        // an enclosing function's MoveNext, `ldarg.0` refers to that
+        // function's state machine — so the closure's delegate target
+        // / captured-self value can't be loaded via REFERENCE_SELF
+        // (which would emit `ldarg.0` of the state machine). Instead
+        // load through the state-machine frame's `_outer_self` field,
+        // which the outer method populates with the user's instance at
+        // .ctor time.
         //
         // Walks outward from this closure to find the closest
-        // enclosing Function. If that function is a generator with a
-        // frame carrying `_outer_self`, returns the matching
-        // `OUTER_SELF` IR Value; otherwise returns null and the
-        // caller falls back to a plain REFERENCE_SELF.
+        // enclosing Function. If that function compiles into a state
+        // machine whose frame carries `_outer_self`, returns the
+        // matching `OUTER_SELF` IR Value; otherwise returns null and
+        // the caller falls back to a plain REFERENCE_SELF.
         //
         // Called only at construction sites (`_load_delegate`,
-        // `_get_actual_arguments`) — NOT from `load_self` /
-        // `load_outer_self`, because those are also invoked while
-        // emitting the lambda's body, where `ldarg.0` is the
-        // delegate's target (the user's instance) and a `_outer_self`
-        // redirect would dereference the wrong receiver.
+        // `_get_actual_arguments`), which is what makes the *enclosing*
+        // function's state machine the right one to look for. A
+        // self-load in the closure's own body wants its own state
+        // machine instead, and `load_self` handles that separately off
+        // `_walking_literal_body`.
         _try_load_self_for_construction_via_outer_self(context: Symbol) -> Value? is
             let stack = IoC.CONTAINER.instance.symbol_table.stack;
             let index mut = stack.count - 1;
@@ -1074,13 +1088,8 @@ namespace Semantic.Symbols is
                 fi
 
                 if let function: Function = scope then
-                    let sm = state_machine_for(function);
-
-                    if sm? then
-                        if let sm.frame?, frame.outer_self_field? then
-                            frame.declare();
-                            return IR.Values.Load.OUTER_SELF(context, context.type, outer_self_field);
-                        fi
+                    if let outer_self_field = _enclosing_state_machine_outer_self_field(function) then
+                        return IR.Values.Load.OUTER_SELF(context, context.type, outer_self_field);
                     fi
 
                     return null;
@@ -1088,6 +1097,30 @@ namespace Semantic.Symbols is
 
                 index = index - 1;
             od
+
+            return null;
+        si
+
+        // The `$outer_self` field of whichever state machine `function`
+        // compiles into — generator or async. Null when it compiles into
+        // neither, or when the frame carries no outer self (statics and
+        // globals have none). declare() materialises the field; it is lazy
+        // and idempotent, and required because the frame property only
+        // constructs the bare FRAME object.
+        _enclosing_state_machine_outer_self_field(function: Function) -> Field? is
+            if let sm = state_machine_for(function) then
+                if let frame = sm.frame then
+                    frame.declare();
+
+                    return frame.outer_self_field;
+                fi
+            elif let async_sm = async_state_machine_for(function) then
+                if let frame = async_sm.frame then
+                    frame.declare();
+
+                    return frame.outer_self_field;
+                fi
+            fi
 
             return null;
         si
@@ -1204,22 +1237,28 @@ namespace Semantic.Symbols is
         _capture_frame_self_load() -> Value is
             let frame = self.frame!;
 
-            let async_sm = async_state_machine_for(self);
-            if async_sm? then
-                let sm_frame = async_sm.frame;
-                if sm_frame? then
-                    // declare() materialises outer_self_field; it's
-                    // lazy and idempotent. Required because the frame
-                    // property only constructs the bare FRAME object —
-                    // its members (including _outer_self_field) come
-                    // from declare().
-                    sm_frame.declare();
-                    if sm_frame.outer_self_field? then
-                        return IR.Values.Load.OUTER_SELF(frame, frame.type, sm_frame.outer_self_field);
-                    fi
-                fi
+            return _state_machine_outer_self_load(frame) ?? IR.Values.Load.REFERENCE_SELF(frame, frame.type);
+        si
+
+        // The `$outer_self` load that stands in for `ldarg.0` inside this
+        // literal's own MoveNext, where `ldarg.0` is the state machine
+        // rather than whatever the body means by self. `context` is the
+        // symbol the loaded value is typed against — the captures frame
+        // for a framed literal, the enclosing instance for a delegate.
+        // Null when this literal does not compile into a state machine,
+        // leaving the caller to emit an ordinary self reference.
+        //
+        // In practice that means an async literal: `yield` in a literal
+        // is not supported, so there is no generator closure kind for
+        // the shared lookup's generator half to match. Should one ever
+        // be added its body would be inside its own MoveNext for the
+        // same reason, and would want the same redirect.
+        _state_machine_outer_self_load(context: Symbol) -> Value? is
+            if let outer_self_field = _enclosing_state_machine_outer_self_field(self) then
+                return IR.Values.Load.OUTER_SELF(context, context.type, outer_self_field);
             fi
-            return IR.Values.Load.REFERENCE_SELF(frame, frame.type);
+
+            return null;
         si
 
         gen_definition_header(buffer: StringBuilder) is
