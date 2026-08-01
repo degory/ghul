@@ -140,17 +140,26 @@ namespace Syntax.Process is
     //   mirrors pipe()'s own short-circuit test. Requires SOURCE to be
     //   store-free so the guard can evaluate it more than once.
     class PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup) is
-        recognize(`for: Trees.Statements.FOR) -> PIPE_FUSION? is
-            let chain = recognize_chain(`for.expression);
+        recognize(`for: Trees.Statements.FOR) -> PIPE_FUSION? =>
+            recognize_any(`for.expression);
+
+        // Peel either chain shape off `expression`: a `Pipe[T]` method
+        // chain (`pipe(xs).map(f)`) or a chain of `Ghul.Pipes` free
+        // functions (`xs |> map(f)`, desugared at parse time into ordinary
+        // calls - see recognize_free_function_chain). Used both by the
+        // `for`-loop path and by consumer fusion, since a terminal
+        // consumer's receiver can be written in either form.
+        recognize_any(expression: Trees.Expressions.Expression?) -> PIPE_FUSION? is
+            let chain = recognize_chain(expression);
 
             if chain? then
                 return chain;
             fi
 
-            return recognize_free_function_chain(`for.expression);
+            return recognize_free_function_chain(expression);
         si
 
-        // Peel a `... |> map(f) |> map(g)` chain of `Ghul.Pipes` free
+        // Peel a `... |> map(f) |> filter(p)` chain of `Ghul.Pipes` free
         // functions off an arbitrary expression. `|>` is desugared entirely
         // at parse time into an ordinary CALL with the threaded value
         // inserted as argument 0, so by the time this pass runs `xs |>
@@ -158,9 +167,15 @@ namespace Syntax.Process is
         // global-function call resolved once via ordinary overload
         // resolution.
         //
-        // Soundness: unlike Pipe[T]'s trait `map`/`filter`, the callee here
-        // is a fixed global function - there is no receiver and so no
-        // virtual dispatch to secure against. Any source is safe to fuse
+        // Soundness: unlike Pipe[T]'s trait `map`/`filter`, every
+        // `Ghul.Pipes` free function is a fixed global function with no
+        // isa-based dispatch of its own (contrast the `pipe()` wrap, which
+        // short-circuits to the operand's own possibly-overridden `map`/
+        // `filter` when the operand is already a Pipe - see
+        // classify_source_type below). Each stage's driving calls
+        // (`source.iterator`/`move_next`/`current`) are exactly the calls
+        // the unfused function body would make, fused or not, so there is
+        // nothing a guard could catch: any source is safe to fuse
         // unconditionally (`needs_guard` always false), regardless of its
         // static type.
         recognize_free_function_chain(expression: Trees.Expressions.Expression?) -> PIPE_FUSION? is
@@ -175,15 +190,13 @@ namespace Syntax.Process is
             while isa Trees.Expressions.CALL(current) do
                 let call = cast Trees.Expressions.CALL(current);
 
-                if !_is_pipe_map_call(call) then
+                let stage = _classify_free_function_stage(call);
+
+                if !stage? then
                     break;
                 fi
 
-                if call.arguments.expressions.count != 2 then
-                    break;
-                fi
-
-                stages.add(PIPE_FUSION_STAGE(false, call.arguments.expressions[1]));
+                stages.add(stage);
 
                 current = call.arguments.expressions[0];
             od
@@ -202,19 +215,47 @@ namespace Syntax.Process is
             return PIPE_FUSION(source, stages, false);
         si
 
-        // True when `call` is a resolved call to `Ghul.Pipes.map` - checked
-        // against the compiled IR rather than the AST, since a global
-        // function call carries no receiver to inspect syntactically.
-        _is_pipe_map_call(call: Trees.Expressions.CALL) -> bool is
+        // Classify `call` as a fusible `Ghul.Pipes` free-function stage -
+        // map, filter, take or skip - matching the same stage shapes the
+        // method-chain recognizer above builds, checked against the
+        // compiled IR rather than the AST since a global-function call
+        // carries no receiver to inspect syntactically. Returns null for
+        // any other `Ghul.Pipes` function (flat_map, skip_while,
+        // take_while, distinct, peek, index, zip, cat, intersect_with,
+        // except, union_with, ...) and for any non-Pipes call: none of
+        // those map onto PIPE_FUSION_STAGE's vocabulary without new
+        // control-flow support in generate_il (a nested loop for flat_map;
+        // cross-element state that survives a `continue`/`break` for
+        // skip_while/take_while/distinct; a void-returning pass-through
+        // for peek) - the peel loop stops there and the call is left as an
+        // ordinary, unfused expression (either the whole chain's source, if
+        // nothing fusible sits above it, or the source fed to the stages
+        // already peeled off above it - either way still correct, since
+        // those stages drive the unrecognised call's *result* through its
+        // own iterator exactly as the unfused lowering would).
+        _classify_free_function_stage(call: Trees.Expressions.CALL) -> PIPE_FUSION_STAGE? is
             let value = call.value;
 
             if !isa IR.Values.Call.GLOBAL(value) then
-                return false;
+                return null;
             fi
 
             let global_call = cast IR.Values.Call.GLOBAL(value);
+            let qualified_name = global_call.function.qualified_name;
 
-            return global_call.function.qualified_name =~ "Ghul.Pipes.map";
+            if call.arguments.expressions.count != 2 then
+                return null;
+            fi
+
+            if qualified_name =~ "Ghul.Pipes.map" \/ qualified_name =~ "Ghul.Pipes.filter" then
+                return PIPE_FUSION_STAGE(qualified_name =~ "Ghul.Pipes.filter", call.arguments.expressions[1]);
+            fi
+
+            if qualified_name =~ "Ghul.Pipes.take" \/ qualified_name =~ "Ghul.Pipes.skip" then
+                return PIPE_FUSION_STAGE(qualified_name =~ "Ghul.Pipes.take", qualified_name =~ "Ghul.Pipes.skip", call.arguments.expressions[1]);
+            fi
+
+            return null;
         si
 
         // Peel a `pipe(SOURCE).map(f).filter(p).index()...` chain off an
