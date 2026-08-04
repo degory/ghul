@@ -265,7 +265,7 @@ The bare single-parameter shorthand (`x => …`) can't carry a pattern any more 
 ```ghul
 let add = ((a, b): (int, int)) => a + b;
 
-entries | .for_each(((key, value): Collections.KeyValuePair[string, int]) =>
+entries | .each(((key, value): Collections.KeyValuePair[string, int]) =>
     write_line("{key}={value}"));
 ```
 
@@ -1099,7 +1099,7 @@ scores.add("alice", 1);
 let total = scores["alice"];
 ```
 
-The pipe operator `|` chains sequence operations: an expression, then `| .method(...)`. ghūl provides the usual combinators, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array`, `count`, `find`, `find_map`, `first`, `only`, `has`, `any`, `all`, `for_each`, `join`, `append_to`.
+The pipe operator `|` chains sequence operations: an expression, then `| .method(...)`. ghūl provides the usual combinators, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array`, `count`, `find`, `find_map`, `first`, `only`, `has`, `any`, `all`, `each`, `join`, `append_to`.
 
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
