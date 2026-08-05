@@ -1253,6 +1253,15 @@ let f = compare_descending;                         // f: (int, int) -> int
 
 An overloaded name is resolved against whichever function or delegate type the reference needs to match, the same way a call's argument types pick an overload; with no such type in scope, an ambiguous name is left as an error rather than guessed at.
 
+A .NET **user-defined conversion operator** (`op_Implicit` / `op_Explicit`) declared on either the source or the target type is reachable through `cast`, alongside the subtype and scalar conversions `cast` already performs:
+
+```ghul
+let h = cast System.Half(1.5);      // System.Half declares `explicit operator Half(float)`
+let f = cast single(h);             // and `implicit operator float(Half)`
+```
+
+`cast T(v)` calls the operator and lets it throw on failure, same as calling it from C# would. `cast T?(v)` never throws: `InvalidCastException` or `OverflowException` from the operator becomes an absent value, and any other exception still propagates.
+
 An auto-property's **backing field** is named `$` followed by the property name, and reflection sees it alongside the property. A reflection-based serializer told to include fields will therefore emit every property twice — with `System.Text.Json`, leave `include_fields` alone unless the type really does have fields to serialize.
 
 Because ghūl has no default argument values, a .NET **optional parameter** has to be supplied explicitly — there is no overload with it omitted. `File.ReadAllTextAsync(path)` is written:

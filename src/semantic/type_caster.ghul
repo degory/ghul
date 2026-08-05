@@ -16,6 +16,7 @@ namespace Semantic is
         _value_boxer: IR.VALUE_BOXER,
         _value_converter: IR.VALUE_CONVERTER,
         _innate_symbol_lookup: Lookups.InnateSymbolLookup,
+        _conversion_lookup: USER_DEFINED_CONVERSION_LOOKUP,
         _logger: Logger
     ) is
         super();
@@ -35,7 +36,10 @@ namespace Semantic is
                 let decimal_type = _innate_symbol_lookup.get_decimal_type();
 
                 if source_type =~ decimal_type \/ target_type =~ decimal_type then
-                    if !_value_converter.get_decimal_conversion_instruction(source_type, target_type)? then
+                    if
+                        !_value_converter.get_decimal_conversion_instruction(source_type, target_type)? /\
+                        !_conversion_lookup.find(source_type, target_type)?
+                    then
                         _logger.error(location, "cannot convert {source_type} to {target_type}");
                         return false;
                     fi
@@ -44,17 +48,38 @@ namespace Semantic is
                 fi
 
                 let instruction = _value_converter.get_instruction(target_type);
+                let enum_type = _innate_symbol_lookup.get_enum_type();
 
-                if !instruction? then
-                    let enum_type = _innate_symbol_lookup.get_enum_type();
-
+                if instruction? then
+                    // A `conv.*` opcode only accepts a source already on
+                    // the evaluation stack in a compatible primitive
+                    // shape - one of the built-in scalars, or an enum
+                    // (which decays to its underlying integral type on
+                    // the stack per ECMA-335). A multi-field value type
+                    // like Half or Int128 is neither, so `get_instruction`
+                    // being keyed on the target alone isn't enough here.
                     if
+                        !_value_converter.get_instruction(source_type)? /\
                         !enum_type.is_assignable_from(source_type) /\
-                        !enum_type.is_assignable_from(target_type)
+                        !_conversion_lookup.find(source_type, target_type)?
                     then
                         _logger.error(location, "cannot convert {source_type} to {target_type}");
                         return false;
                     fi
+                elif
+                    // Only a target enum is accepted here, matching
+                    // cast_value below: `conv.i4` re-annotates the
+                    // stack value's type as `target_type`, which is
+                    // only sound when that target itself decays to
+                    // int32 the same way a source enum does. An enum
+                    // source with some other non-scalar target is the
+                    // same unsound-IL shape the check above rejects
+                    // for a struct source.
+                    !enum_type.is_assignable_from(target_type) /\
+                    !_conversion_lookup.find(source_type, target_type)?
+                then
+                    _logger.error(location, "cannot convert {source_type} to {target_type}");
+                    return false;
                 fi
             fi
 
@@ -102,6 +127,12 @@ namespace Semantic is
                     let decimal_instruction = _value_converter.get_decimal_conversion_instruction(value.type!, target_type);
 
                     if !decimal_instruction? then
+                        let conversion_function = _conversion_lookup.find(value.type!, target_type);
+
+                        if conversion_function? then
+                            return _build_conversion_call(value, conversion_function, target_type);
+                        fi
+
                         if !quiet then
                             _logger.error(location, "cannot convert {value.type} to {target_type}");
                         fi
@@ -122,38 +153,64 @@ namespace Semantic is
                 fi
 
                 let instruction = _value_converter.get_instruction(target_type);
+                let enum_type = _innate_symbol_lookup.get_enum_type();
 
-                if !instruction? then
-                    let enum_type = _innate_symbol_lookup.get_enum_type();
-
-                    if 
-                        !enum_type.is_assignable_from(value.type!) /\
-                        !enum_type.is_assignable_from(target_type)
+                if instruction? then
+                    // See the matching comment in check_cast_is_valid:
+                    // `get_instruction` is keyed on the target alone, so
+                    // it says nothing about whether `value` is actually
+                    // stack-compatible with the resulting `conv.*`
+                    // opcode. A multi-field value type like Half or
+                    // Int128 isn't, and reaching the JIT with one gives
+                    // an InvalidProgramException rather than a compile
+                    // error.
+                    if
+                        _value_converter.get_instruction(value.type!)? \/
+                        enum_type.is_assignable_from(value.type!)
                     then
-                        if !quiet then
-                            _logger.error(location, "cannot convert {value.type} to {target_type}");
-                        fi
-
                         return
-                            DUMMY(
+                            CONVERT(
                                 target_type,
-                                location
-                            );    
+                                value,
+                                instruction
+                            );
                     fi
-                    
+                elif enum_type.is_assignable_from(target_type) then
                     return
                         CONVERT(
                             target_type,
                             value,
                             "conv.i4"
                         );
-               else
-                    return
-                        CONVERT(
-                            target_type,
-                            value,
-                            instruction
-                        );
+                fi
+
+                let conversion_function = _conversion_lookup.find(value.type!, target_type);
+
+                if conversion_function? then
+                    return _build_conversion_call(value, conversion_function, target_type);
+                fi
+
+                if !quiet then
+                    _logger.error(location, "cannot convert {value.type} to {target_type}");
+                fi
+
+                return
+                    DUMMY(
+                        target_type,
+                        location
+                    );
+            fi
+
+            let target_non_optional = target_type.optional_inner_type ?? target_type;
+
+            if
+                !target_non_optional.is_assignable_from(value.type!) /\
+                !value.type!.is_assignable_from(target_non_optional)
+            then
+                let conversion_function = _conversion_lookup.find(value.type!, target_type);
+
+                if conversion_function? then
+                    return _build_conversion_call(value, conversion_function, target_type);
                 fi
             fi
 
@@ -167,7 +224,68 @@ namespace Semantic is
                 result = _conditionally_unbox(result, target_type);
             fi
 
-            return result;    
+            return result;
+        si
+
+        // Public so compile_expressions can exclude a cast covered by a
+        // user-defined conversion from the impossible-cast warning.
+        find_user_defined_conversion(source_type: Type, target_type: Type) -> Symbols.Function? =>
+            _conversion_lookup.find(source_type, target_type);
+
+        _build_conversion_call(value: Value, function: Symbols.Function, target_type: Type) -> Value is
+            let arguments = Collections.LIST[Value]();
+            arguments.add(value);
+
+            let call: Value =
+                Call.STATIC(
+                    function,
+                    _value_boxer.box_arguments(arguments, function.arguments),
+                    function.return_type,
+                    null
+                );
+
+            if !target_type.is_optional then
+                return call;
+            fi
+
+            return _guard_against_conversion_failure(call, target_type);
+        si
+
+        // A user-defined conversion is arbitrary code and can throw;
+        // `cast T?(...)` promises never to, for the two failure kinds
+        // the C# conversion-operator guidelines specify. Any other
+        // exception is a bug and propagates.
+        _guard_against_conversion_failure(call: Value, target_type: Type) -> Value is
+            let block = _block_context.enter_block(target_type);
+            let brancher = _brancher.get_for(block);
+
+            let result = TEMP(block, "user_convert", target_type);
+
+            let done = IR.LABEL();
+
+            block.add(".try {{");
+            result.store(_value_boxer.box_if_needed(call, target_type));
+            brancher.leave(done);
+            block.add("}}");
+
+            block.add("catch class ['System.Runtime']System.InvalidCastException {{");
+            block.add("pop");
+            result.store(IR.Values.DEFAULT(target_type));
+            brancher.leave(done);
+            block.add("}}");
+
+            block.add("catch class ['System.Runtime']System.OverflowException {{");
+            block.add("pop");
+            result.store(IR.Values.DEFAULT(target_type));
+            brancher.leave(done);
+            block.add("}}");
+
+            brancher.label(done);
+            block.add(result.load());
+
+            _block_context.leave_block();
+
+            return block;
         si
 
         _conditionally_unbox(
