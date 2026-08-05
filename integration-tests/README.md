@@ -176,12 +176,18 @@ To run all tests, from the repo root directory run `./integration-tests/test.sh`
 
 #### Running a specific test
 
-To run a specific test run `./integration-tests/test.sh test-case-name`, where `test-case-name` is the name of the directory under integration-tests/cases containing that test's files
+To run a specific test, run `dotnet ghul-test integration-tests/<test-folder>`.
 
 #### Capturing test case expectations
 
-To capture expected test result for a test case, from the repo root directory run `./integration-tests/capture.sh test-case-name`
+To capture a test's expected results, run `./tasks/capture.sh integration-tests/<test-folder>`.
 
-**Note** a test must have previously been run and have produced output before that output can be captured as the expected result)
+**Note** a test must have previously been run and left a `failed` marker before its output can be captured as the expected result.
 
-**Note** the current working directory must be the repository root when running these scripts
+**Note** the current working directory must be the repository root when running these scripts.
+
+Capture promotes each produced file to its `*.expected` counterpart, and deletes
+any that came out empty — an empty expectation asserts exactly what a missing
+one does, since the runner diffs against `/dev/null` when no expectation is
+present. `fail.expected` is the exception, being read for its presence rather
+than its contents.
