@@ -335,6 +335,118 @@ namespace Syntax.Process is
             od
         si
 
+        // True for a bare `default` argument (no explicit `default[T]`
+        // type argument) that failed to infer a type on the first
+        // walk - before the callee was resolved, nothing had pushed
+        // it an expected type yet.
+        is_unresolved_default_argument(a: Trees.Expressions.Expression) -> bool static is
+            if !isa Trees.Expressions.DEFAULT(a) \/ a.type_expression? then
+                return false;
+            fi
+
+            if let value: Value = a.value then
+                if let type: Type = value.type then
+                    return type.is_error;
+                fi
+
+                return true;
+            fi
+
+            return true;
+        si
+
+        // True when the call carries at least one unresolved `default`
+        // argument.
+        has_unresolved_default_argument(argument_expressions: Collections.List[Trees.Expressions.Expression]) -> bool static =>
+            argument_expressions |> any(a => COMPILE_CALLS.is_unresolved_default_argument(a));
+
+        // Once overload resolution has settled on a single, unambiguous
+        // `function`, retry any bare `default` argument that had no
+        // type to infer against on the first walk - the resolved
+        // callee's formal types are available now. Re-walks every
+        // argument under a fresh speculation level, since the roll-
+        // back below discards whatever the first walk logged for the
+        // whole call, not just the `default` arguments.
+        //
+        // A `default` argument is only ever pushed a type when the
+        // resolved formal at that position is itself concrete: a
+        // generic candidate whose type variable is pinned by a sibling
+        // argument or an enclosing constraint is already specialized
+        // by this point, so the formal there is concrete too, but a
+        // type variable free only in the `default` slot leaves the
+        // formal wild and the argument is left to re-report its
+        // original "cannot infer type of default here" error - a
+        // `default` argument never itself contributes to binding a
+        // type variable.
+        //
+        // A resolved formal with a declared .NET default value (an
+        // optional CLR parameter) takes that value rather than the
+        // type's zero value, so a positionally-written `default`
+        // behaves exactly like omitting the same parameter by name.
+        _resolve_deferred_defaults(
+            function: Semantic.Symbols.Function,
+            argument_expressions: Collections.List[Trees.Expressions.Expression],
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type]
+        ) is
+            if !has_unresolved_default_argument(argument_expressions) then
+                return;
+            fi
+
+            _logger.roll_back();
+            _logger.speculate();
+            _flow.restore();
+
+            for (index, a) in argument_expressions |> index() do
+                if
+                    COMPILE_CALLS.is_unresolved_default_argument(a) /\
+                    index < function.arguments.count /\
+                    !function.arguments[index].is_wild
+                then
+                    let formal_type = function.arguments[index];
+
+                    let stored =
+                        if index < function.argument_defaults.count then
+                            function.argument_defaults[index]
+                        else
+                            null
+                        fi;
+
+                    if stored? then
+                        a.compile_expressions_state.value = DEFAULT_ARGUMENT_VALUES.build(stored, formal_type, _innate_symbol_lookup);
+                    else
+                        a.set_expected_type(formal_type, "");
+                        a.walk(_visitor);
+                    fi
+                elif isa Trees.Expressions.DEFAULT(a) then
+                    // A `default[T]` argument, or a `DEFAULT` node
+                    // `_apply_named_permutation` synthesised to fill an
+                    // omitted named argument with the callee's own
+                    // declared default value, already carries its
+                    // final value. Re-walking either through
+                    // `visit_default` would overwrite that value with
+                    // the type's zero value - visit_default has no way
+                    // to tell "already resolved to the right thing"
+                    // from "resolved once, resolve again" - so leave
+                    // it untouched. A still-unresolved `default` whose
+                    // formal is wild has no value to protect and is
+                    // walked below to re-report its own error under
+                    // this fresh speculation level.
+                    if COMPILE_CALLS.is_unresolved_default_argument(a) then
+                        a.walk(_visitor);
+                    fi
+                else
+                    // ensure any error messages are committed
+                    a.walk(_visitor);
+                fi
+
+                if let value: Value = a.value /\ value.type? then
+                    arguments[index] = value;
+                    argument_types[index] = value.type!;
+                fi
+            od
+        si
+
         _compile_one_argument(
             a: Trees.Expressions.Expression,
             arguments: Collections.LIST[Value],
@@ -698,6 +810,8 @@ namespace Syntax.Process is
 
             function = _owner_constraint_specializer.specialize_from_constraint(location, function, constraint);
             function = _type_arg_placeholder_registry.specialize_with_placeholders(location, function, cache_key);
+
+            _resolve_deferred_defaults(function, argument_expressions.expressions, arguments, argument_types);
 
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
@@ -1339,6 +1453,8 @@ namespace Syntax.Process is
                     fi
 
                     let function = overload_result.function;
+
+                    _resolve_deferred_defaults(function, call.arguments.expressions, arguments, argument_types);
 
                     _visitor.note_reference_arguments(call, function);
 

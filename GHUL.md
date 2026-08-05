@@ -89,7 +89,7 @@ result = compute();
 
 A deferred-init local is still covered by definite-assignment analysis: reading it on a path that has not assigned it draws a `definite-assignment` warning, so the default value is a backstop rather than something to lean on.
 
-A `mut` variable still cannot change type. Either form can also take its value from a `default` expression — `let i = default` takes its type from the local's own annotation or from later use, with `default[T]` to pin it explicitly. A bare `default` in a position that supplies no type of its own, such as a call argument, is an error (`cannot infer type of default here`).
+A `mut` variable still cannot change type. Either form can also take its value from a `default` expression — `let i = default` takes its type from the local's own annotation or from later use, with `default[T]` to pin it explicitly. A bare `default` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `default` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. A `default` argument is never itself used to infer a generic type variable — one pinned only by the `default` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `default[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
 
 A single `let` can declare several variables, mixing inferred and explicit types:
 
