@@ -172,7 +172,7 @@ To create a new test case run `./integration-tests/create.sh` and enter a kebab-
 
 #### Running all tests
 
-To run all tests, from the repo root directory run `./integration-tests/test.sh`
+To run all tests, run `dotnet ghul-test integration-tests`.
 
 #### Running a specific test
 
