@@ -1220,10 +1220,12 @@ class BOX: Ghul.Comparable[BOX], Ghul.Equatable[BOX] is
 
     init(v: int) is _v = v; si
 
-    <>(other: BOX?) -> int => if other? then _v - other._v else 1 fi;
-    =~(other: BOX?) -> bool => other? /\ _v == other._v;
+    <>(other: BOX) -> int => _v - other._v;
+    =~(other: BOX) -> bool => _v == other._v;
 si
 ```
+
+The parameter is written non-optional: presence is settled where the operator is used, so the body is only handed present values. On a reference type the optional spelling is accepted too, for a body that wants to defend against a null arriving from a caller in another language without the compiler reporting the test as redundant. A value type has no such choice, since its `T?` is a different type rather than the same one annotated.
 
 `<>` answers how its operands are ordered: negative when the left is the lesser, zero when neither is, positive otherwise. The relational operators are written in terms of it — `a < b` is `a <> b` reduced against zero — so defining `<>` is what gives a type all four.
 
