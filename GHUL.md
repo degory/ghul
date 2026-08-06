@@ -717,7 +717,7 @@ let secondary: string? = second();
 let chosen = primary ?? secondary ?? "fallback"; // string
 ```
 
-Structural equality reaches across optionals without narrowing first. A `=~` declares its parameter at the declaring type, so its body is written over present values and never sees an absent one; presence is settled at the call site instead. Two absent values are equal, one absent value is never equal to a present one, and neither case enters the body. `!~` negates the relation entire, so two absent values are not unequal:
+`=~` can compare values that may be null, with no narrowing first. The compiler writes the null checks around the call: two absent values are equal, an absent value and a present one are not, and the operator's own body runs only when both sides are present. `!~` negates that whole answer, so two absent values are not unequal:
 
 ```ghul
 let present: BOX? = BOX(3);
@@ -728,6 +728,8 @@ present =~ absent;          // false
 absent =~ also_absent;      // true
 absent !~ also_absent;      // false
 ```
+
+This applies when the operator declares its parameter non-optional, which is the usual way to write one: the body is then only ever handed present values. An operator that declares an optional parameter is handling absence itself, so it is called as written and decides the answer for a null operand on its own.
 
 ## control flow
 
