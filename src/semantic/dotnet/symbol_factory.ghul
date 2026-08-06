@@ -44,7 +44,29 @@ namespace Semantic.DotNet is
         _void_type: TYPE;
         _object_type: TYPE;
         _value_type: TYPE;
+        _bool_type: TYPE;
+        _int_type: TYPE;
+        _equatable_open_type: TYPE;
+        _comparable_open_type: TYPE;
         _tuple_types: List[TYPE];
+
+        // The types whose `<>` / `=~` is an intrinsic lowering to
+        // opcodes (`compare.order` and friends in the runtime's
+        // intrinsics). Their reflected interface members are hidden
+        // from binary-operator resolution so `a < b` keeps the opcode
+        // and its semantics — on `single`, `CompareTo` is a total
+        // order that sorts NaN below everything, where the opcode is
+        // the IEEE comparison. All are sealed, so the hidden member
+        // can have no sibling overloads to shadow.
+        //
+        // `string` has an innate `=~` but no innate order, so it is in
+        // the equality set only, and ordering one reaches
+        // `System.String.CompareTo`. That comparison is culture-
+        // sensitive: `"a" < "B"` answers true under a typical current
+        // culture and false under invariant globalization, so a string
+        // ordering is not machine-independent the way a scalar's is.
+        _innate_order_type_names: SET[string];
+        _innate_equality_type_names: SET[string];
 
         _ambiguous_method_checker: AMBIGUOUS_METHOD_CHECKER;
 
@@ -62,6 +84,25 @@ namespace Semantic.DotNet is
             _void_type = _type_source.get_type("System.Void");
             _object_type = _type_source.get_type("System.Object");
             _value_type = _type_source.get_type("System.ValueType");
+            _bool_type = _type_source.get_type("System.Boolean");
+            _int_type = _type_source.get_type("System.Int32");
+            _equatable_open_type = _type_source.get_type("System.IEquatable`1");
+            _comparable_open_type = _type_source.get_type("System.IComparable`1");
+
+            _innate_order_type_names = SET([
+                "System.Char",
+                "System.SByte", "System.Byte",
+                "System.Int16", "System.UInt16",
+                "System.Int32", "System.UInt32",
+                "System.Int64", "System.UInt64",
+                "System.IntPtr", "System.UIntPtr",
+                "System.Single", "System.Double",
+                "System.Decimal"
+            ]);
+
+            _innate_equality_type_names = SET([
+                "System.String"
+            ]);
 
             _tuple_types = _type_source.get_types([
                 "System.ValueTuple`1",
@@ -130,6 +171,8 @@ namespace Semantic.DotNet is
             if dotnet_type.is_enum then
                 result = Symbols.ENUM_STRUCT(Source.LOCATION.reflected, Source.LOCATION.reflected, owner, ghul_type_name, owner);
                 result.mark_overrides_resolved();
+
+                Symbols.ENUM_ORDER_OPERATOR.register(result);
             elif dotnet_type.is_class /\ has_union_attribute(dotnet_type) then
                 result = Symbols.UNION(Source.LOCATION.reflected, Source.LOCATION.reflected, owner, ghul_type_name, arguments, owner);
                 result.mark_overrides_resolved();
@@ -698,12 +741,35 @@ namespace Semantic.DotNet is
         si
 
         add_method(
-            owner: Symbols.Scoped, 
-            type: TYPE, 
-            properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS], 
+            owner: Symbols.Scoped,
+            type: TYPE,
+            properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
             indexers: SET[System.Reflection.MethodInfo],
             methods: LIST[(function: Symbols.Function, method_info: MethodInfo)],
             method: MethodInfo
+        ) is
+            add_method(owner, type, properties, indexers, methods, method, null);
+        si
+
+        // `force_name`, when non-null, supplies the ghūl name instead of
+        // deriving one from the method. Used to surface a single
+        // reflected method under a second name: the derivation is
+        // skipped so the alias cannot re-trigger the side effects some
+        // of its branches carry.
+        //
+        // An alias of an abstract interface member is built as a
+        // default trait method rather than an abstract one. Only the
+        // primary name carries the obligation to implement, so a type
+        // satisfies the interface by supplying that one member, while
+        // both names remain callable.
+        add_method(
+            owner: Symbols.Scoped,
+            type: TYPE,
+            properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
+            indexers: SET[System.Reflection.MethodInfo],
+            methods: LIST[(function: Symbols.Function, method_info: MethodInfo)],
+            method: MethodInfo,
+            force_name: string?
         ) is
             if !_is_reachable_from_other_assembly(method) then
                 return;
@@ -713,13 +779,29 @@ namespace Semantic.DotNet is
             let location = Source.LOCATION.reflected;
 
             let name: string mut;
+            let hide_from_operator_resolution mut = false;
+
+            // Set when the method is also to be reached under its
+            // ordinary de-camelled name, alongside the operator
+            // spelling picked below.
+            let alias_name: string? mut = null;
 
             let property_details: PROPERTY_DETAILS mut;
 
-            if properties.try_get_value(method, property_details ref) then
+            if force_name? then
+                name = force_name!;
+            elif properties.try_get_value(method, property_details ref) then
                 name = _type_name_map.get_member_name(owner.qualified_name, method.name, method.is_private, true);
             elif method.name =~ "get_Item" \/ method.name =~ "set_Item" then
                 name = method.name;
+            elif method.name =~ "Equals" /\ _is_self_relational_interface_target(type, method, _equatable_open_type, _bool_type) then
+                name = "=~";
+                alias_name = _plain_member_name(owner, indexers, method);
+                hide_from_operator_resolution = type.full_name? /\ _innate_equality_type_names.contains(type.full_name!);
+            elif method.name =~ "CompareTo" /\ _is_self_relational_interface_target(type, method, _comparable_open_type, _int_type) then
+                name = "<>";
+                alias_name = _plain_member_name(owner, indexers, method);
+                hide_from_operator_resolution = type.full_name? /\ _innate_order_type_names.contains(type.full_name!);
             elif method.name =~ "get_Current" /\ method.declaring_type == _type_source.get_type("System.Collections.IEnumerator") then
                 return;
             elif method.name =~ "GetEnumerator" then
@@ -736,7 +818,7 @@ namespace Semantic.DotNet is
 
                 property_details = PROPERTY_DETAILS(iterator_property, method, null);
             else
-                name = _type_name_map.get_member_name(owner.qualified_name, method.name, method.is_private, method.is_special_name /\ !indexers.contains(method));
+                name = _plain_member_name(owner, indexers, method);
             fi
 
             let declaring_symbol: Symbols.Symbol mut = owner;
@@ -778,7 +860,7 @@ namespace Semantic.DotNet is
                 fi
             elif mdt? /\ mdt.is_value_type then
                 result = Symbols.STRUCT_METHOD(location, location, declaring_symbol, name, owner);
-            elif method.is_abstract then
+            elif method.is_abstract /\ !force_name? then
                 result = Symbols.ABSTRACT_METHOD(location, location, declaring_symbol, name, owner);
             elif mdt? /\ mdt.is_interface then
                 result = Symbols.DEFAULT_TRAIT_METHOD(location, location, declaring_symbol, name, owner);
@@ -818,6 +900,7 @@ namespace Semantic.DotNet is
             fi
             
             result.il_name_override = method.name;
+            result.is_hidden_from_operator_resolution = hide_from_operator_resolution;
 
             if _has_pure_attribute(method.get_custom_attributes_data()) then
                 // the marker carries the declared-pure contract: the
@@ -926,7 +1009,29 @@ namespace Semantic.DotNet is
             fi
 
             methods.add((result, method));
+
+            // `IEquatable[T].Equals` and `IComparable[T].CompareTo` are
+            // reached as the operators `=~` and `<>`, and also under the
+            // ordinary de-camelled name, so a call spelled `equals` or
+            // `compare_to` resolves as well. Both symbols carry the same
+            // `il_name_override`, so either spelling emits a call to the
+            // one underlying method.
+            if alias_name? then
+                add_method(owner, type, properties, indexers, methods, method, alias_name);
+            fi
         si
+
+        _plain_member_name(
+            owner: Symbols.Scoped,
+            indexers: SET[System.Reflection.MethodInfo],
+            method: MethodInfo
+        ) -> string =>
+            _type_name_map.get_member_name(
+                owner.qualified_name,
+                method.name,
+                method.is_private,
+                method.is_special_name /\ !indexers.contains(method)
+            );
 
         get_assembly_name(type: TYPE) -> string is
             let assembly = type.assembly;
@@ -1052,6 +1157,53 @@ namespace Semantic.DotNet is
             yrt
 
             return false;
+        si
+
+        // True when `method` is `type`'s implementation of the
+        // self-instantiated generic interface named by `open_interface_name`
+        // (`System.IEquatable\`1` or `System.IComparable\`1`) — i.e. `type`
+        // implements `IEquatable[type]`/`IComparable[type]`, not some other
+        // instantiation, and `method` is that interface member rather than
+        // an unrelated same-named overload (`object.Equals`, the
+        // non-generic `IComparable.CompareTo(object)`).
+        //
+        // `Type.GetInterfaceMap` would answer this directly but throws
+        // `NotSupportedException` under the `MetadataLoadContext` this
+        // reflection runs in (import assemblies are loaded for metadata
+        // only, never executed), so this matches by signature instead:
+        // `IEquatable[T].Equals`/`IComparable[T].CompareTo` are always
+        // exactly `(T) -> bool`/`(T) -> int`, and no other member can
+        // satisfy that interface with a different parameter type. The one
+        // gap this leaves is a type that implements the interface
+        // *explicitly* (`bool IEquatable<Box>.Equals(Box other)`) — that
+        // member doesn't surface under its simple name in `GetMethods()`
+        // at all, with or without `GetInterfaceMap`, so it's an existing
+        // reflection-layer limitation rather than one this check adds.
+        _is_self_relational_interface_target(type: TYPE, method: MethodInfo, open_interface: TYPE, expected_return_type: TYPE) -> bool is
+            if method.return_type != expected_return_type then
+                return false;
+            fi
+
+            let parameters = method.get_parameters();
+
+            if parameters.count != 1 then
+                return false;
+            fi
+
+            // `IEquatable[T].=~`/`IComparable[T].<>` on the trait's own
+            // declaration: `type` is the open interface itself (reflecting
+            // `Ghul.Equatable[T]`'s member list, not a concrete
+            // implementer), and the parameter is its own type parameter.
+            if type == open_interface then
+                return parameters[0].parameter_type == open_interface.get_generic_arguments()[0];
+            fi
+
+            // An implementer: `type` closed-implements `IEquatable[type]`
+            // and the parameter is `type` itself.
+            let closed_interface = open_interface.make_generic_type([type]);
+
+            return type.get_interfaces() |> any(i => i == closed_interface)
+                /\ parameters[0].parameter_type == type;
         si
 
         // The intrinsic operation name (e.g. "arithmetic.add") carried by
