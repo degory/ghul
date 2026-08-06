@@ -717,19 +717,19 @@ let secondary: string? = second();
 let chosen = primary ?? secondary ?? "fallback"; // string
 ```
 
-`=~` can compare values that may be null, with no narrowing first. The compiler writes the null checks around the call: two absent values are equal, an absent value and a present one are not, and the operator's own body runs only when both sides are present. `!~` negates that whole answer, so two absent values are not unequal:
+`=~` can compare values that may be null, with no narrowing first. The compiler writes the null checks around the call: two absent values are equal, and an absent value and a present one are not. `!~` negates that whole answer, so two absent values are not unequal:
 
 ```ghul
-let present: BOX? = BOX(3);
-let absent: BOX? = null;
-let also_absent: BOX? = null;
+let present: THING? = THING(3);
+let absent: THING? = null;
+let also_absent: THING? = null;
 
 present =~ absent;          // false
 absent =~ also_absent;      // true
 absent !~ also_absent;      // false
 ```
 
-This applies when the operator declares its parameter non-optional, which is the usual way to write one: the body is then only ever handed present values. An operator that declares an optional parameter is handling absence itself, so it is called as written and decides the answer for a null operand on its own.
+An absent value on the left is always answered this way, whatever the operator declares: there is no receiver to call a method on. What the operator's declaration decides is the *right* operand. Declared non-optional, an absent one is answered here too and the body is only ever handed present values. Declared optional — as `Ghul.Equatable[T]`'s example below writes it — the body is handed the absent value and answers for it itself.
 
 ## control flow
 
