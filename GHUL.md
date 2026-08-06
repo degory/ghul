@@ -717,6 +717,18 @@ let secondary: string? = second();
 let chosen = primary ?? secondary ?? "fallback"; // string
 ```
 
+Structural equality reaches across optionals without narrowing first. A `=~` declares its parameter at the declaring type, so its body is written over present values and never sees an absent one; presence is settled at the call site instead. Two absent values are equal, one absent value is never equal to a present one, and neither case enters the body. `!~` negates the relation entire, so two absent values are not unequal:
+
+```ghul
+let present: BOX? = BOX(3);
+let absent: BOX? = null;
+let also_absent: BOX? = null;
+
+present =~ absent;          // false
+absent =~ also_absent;      // true
+absent !~ also_absent;      // false
+```
+
 ## control flow
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.
