@@ -264,6 +264,18 @@ namespace Syntax.Process is
             let left_is_consumable = left_value.check_is_consumable(_logger, binary.left.location);
             let right_is_consumable = right_value.check_is_consumable(_logger, binary.right.location);
 
+            // `=~` over an optional operand gets its null checks
+            // written around the call. This runs ahead of resolution
+            // rather than as a fallback: only an optional *argument*
+            // fails to resolve, while an optional *receiver* resolves
+            // to an ordinary member call and dereferences null.
+            let null_safe = _try_null_safe_equality(binary, left_value, right_value);
+
+            if null_safe? then
+                binary.compile_expressions_state.value = null_safe;
+                return;
+            fi
+
             // Two separate value/type/expression lists. The free-function
             // path takes both operands as arguments; the member-call path
             // takes only the right operand (left is the receiver). The
@@ -462,6 +474,120 @@ namespace Syntax.Process is
                 binary.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), binary.location);
             fi
         si
+
+        // `a =~ b` where an operand is optional. Resolve against the
+        // operands' non-optional types and write the null checks
+        // around the call.
+        //
+        // An absent left operand is always answered here: there is no
+        // receiver to dispatch on. An absent right operand is answered
+        // here only when the operator declares its parameter
+        // non-optional and so could never have been handed one.
+        //
+        // Answers null for anything else, leaving the operands to
+        // resolve however they did before.
+        _try_null_safe_equality(
+            binary: Trees.Expressions.BINARY,
+            left_value: Value,
+            right_value: Value
+        ) -> Value? is
+            if !(binary.operation.name =~ "=~") then
+                return null;
+            fi
+
+            let left_type = left_value.type;
+            let right_type = right_value.type;
+
+            if !NULL_SAFE_EQUALITY_GATE.accepts_operands(left_type, right_type) then
+                return null;
+            fi
+
+            let left_inner = _non_optional(left_type!);
+            let right_inner = _non_optional(right_type!);
+
+            if !left_inner? \/ !right_inner? \/ left_inner.is_value_type then
+                return null;
+            fi
+
+            let member_symbol = left_inner.find_member("=~");
+
+            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
+                return null;
+            fi
+
+            let overload_result =
+                _overload_resolver.resolve(
+                    binary.location,
+                    cast Semantic.Symbols.FUNCTION_GROUP(member_symbol),
+                    Collections.LIST[Type]([right_inner!]),
+                    false,
+                    true,
+                    false
+                );
+
+            if !overload_result? then
+                return null;
+            fi
+
+            let function = overload_result.function;
+
+            if !NULL_SAFE_EQUALITY_GATE.accepts_operator(function, _innate_symbol_lookup.get_bool_type()) then
+                return null;
+            fi
+
+            let guards_argument = NULL_SAFE_EQUALITY_GATE.guards_argument(function);
+
+            // With an operator that answers for an absent argument
+            // itself, a present left operand needs nothing doing: the
+            // call already resolves and already reaches the body.
+            if !left_type.is_optional /\ !guards_argument then
+                return null;
+            fi
+
+            _symbol_use_locations.add_symbol_use(binary.operation.location, function);
+
+            let block = IR.Values.BLOCK(_innate_symbol_lookup.get_bool_type());
+
+            // Each operand is read up to twice — once by the presence
+            // test, once by the call — so spill anything that is not
+            // already a repeatable load.
+            let load_left = left_value.get_temp_copier(block, "equality_left");
+            let load_right = right_value.get_temp_copier(block, "equality_right");
+
+            let call =
+                function.call(
+                    binary.location,
+                    load_left(),
+                    Collections.LIST[Value]([load_right()]),
+                    null,
+                    _function_caller
+                );
+
+            let result: Value mut =
+                IR.Values.NULL_SAFE_EQUALITY(
+                    load_left(),
+                    load_right(),
+                    call,
+                    guards_argument,
+                    _innate_symbol_lookup.get_bool_type()
+                );
+
+            if binary.actual_operation =~ "!~" then
+                result = NOT(result);
+            fi
+
+            block.add(result);
+            block.close();
+
+            return block;
+        si
+
+        _non_optional(type: Type) -> Type? =>
+            if type.is_optional then
+                type.optional_inner_type;
+            else
+                type;
+            fi;
 
         // `a ?? b` — short-circuit null-coalesce. Result type is the
         // LUB of the left's underlying type and the right's type, with

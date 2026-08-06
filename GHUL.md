@@ -717,6 +717,20 @@ let secondary: string? = second();
 let chosen = primary ?? secondary ?? "fallback"; // string
 ```
 
+`=~` can compare values that may be null, with no narrowing first. The compiler writes the null checks around the call: two absent values are equal, and an absent value and a present one are not. `!~` negates that whole answer, so two absent values are not unequal:
+
+```ghul
+let present: THING? = THING(3);
+let absent: THING? = null;
+let also_absent: THING? = null;
+
+present =~ absent;          // false
+absent =~ also_absent;      // true
+absent !~ also_absent;      // false
+```
+
+An absent value on the left is always answered this way, whatever the operator declares: there is no receiver to call a method on. What the operator's declaration decides is the *right* operand. Declared non-optional, an absent one is answered here too and the body is only ever handed present values. Declared optional — as `Ghul.Equatable[T]`'s example below writes it — the body is handed the absent value and answers for it itself.
+
 ## control flow
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.
