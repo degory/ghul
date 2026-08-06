@@ -731,6 +731,8 @@ absent !~ also_absent;      // false
 
 An absent value on the left is always answered this way, whatever the operator declares: there is no receiver to call a method on. What the operator's declaration decides is the *right* operand. Declared non-optional, an absent one is answered here too and the body is only ever handed present values. Declared optional — as `Ghul.Equatable[T]`'s example below writes it — the body is handed the absent value and answers for it itself.
 
+All three optional forms behave the same way, so a `T?` over a value type or over an unconstrained type parameter compares exactly as one over a reference does.
+
 ## control flow
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.
