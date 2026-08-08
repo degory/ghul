@@ -1229,6 +1229,8 @@ The parameter is written non-optional: presence is settled where the operator is
 
 `<>` answers how its operands are ordered: negative when the left is the lesser, zero when neither is, positive otherwise. The relational operators are written in terms of it — `a < b` is `a <> b` reduced against zero — so defining `<>` is what gives a type all four.
 
+Defining `=~` also settles how .NET itself compares the type. A type that declares one gets a matching `Equals(object)`, so the operator is what runs when the runtime reaches for equality — using the value as a dictionary key, or searching for it in a collection. Without that a class would compare by reference there and a struct field-by-field, either way ignoring the operator. Writing an `equals(other: object?)` member explicitly replaces it. Define `get_hash_code` alongside `=~`: .NET requires values that compare equal to hash equal, and a dictionary consults the hash first.
+
 An identifier that collides with a ghūl keyword is escaped with a backtick — `` `class `` is the identifier `class`.
 
 A static property or field takes `snake_case` however constant-like it reads, since only enum members become `MACRO_CASE` — `CancellationToken.None` is `System.Threading.CancellationToken.none`.
