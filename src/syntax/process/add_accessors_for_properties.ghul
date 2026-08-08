@@ -373,7 +373,20 @@ namespace Syntax.Process is
         pre(`struct: Definitions.STRUCT) -> bool is
             _stack.push(`struct.body);
 
+            // The bridge is for an operator the user wrote, so it is
+            // settled before anything is synthesised. What is
+            // synthesised below agrees with the default .NET already
+            // applies - memberwise for a struct, identity for a class
+            // - so it needs no bridge of its own.
             add_object_equals_bridge(`struct);
+
+            if !`struct.is_poisoned /\ !declares_function(`struct.body, "=~") then
+                `struct.body.add(get_memberwise_equals_for_struct(`struct));
+
+                if !declares_function(`struct.body, "get_hash_code") then
+                    `struct.body.add(get_memberwise_hash(`struct.location, `struct.body));
+                fi
+            fi
 
             return false;
         si
@@ -1013,6 +1026,173 @@ namespace Syntax.Process is
         );
 
         return init_function;
+    si
+
+    // The declarations holding a type's state, in source order: an
+    // auto-property or a `field`, which are both a PROPERTY with
+    // neither accessor written. A property that supplies a body is
+    // derived from that state rather than part of it, and a static one
+    // belongs to the type rather than the value, so neither counts.
+    // Read before the property rewrite splits these into a backing
+    // variable and accessors, so members are named as the user wrote
+    // them.
+    get_state_members(body: Definitions.LIST) -> Collections.LIST[Definitions.PROPERTY] static is
+        let result = Collections.LIST[Definitions.PROPERTY]();
+
+        for definition in body do
+            if
+                isa Definitions.PROPERTY(definition) /\
+                definition.name? /\
+                !definition.is_poisoned /\
+                !definition.modifiers.is_static /\
+                !definition.read_body? /\
+                !definition.assign_body?
+            then
+                result.add(definition);
+            fi
+        od
+
+        return result;
+    si
+
+    // Compare two members with `object.equals`, as the variant bodies
+    // do. It answers for every kind a member can be - boxing a value
+    // type, comparing strings by value, and reaching a user-defined
+    // `=~` through the Equals a type declaring one carries - where
+    // `=~` written directly does not resolve at all on an enum or an
+    // array, and emits invalid IL on an unconstrained type parameter.
+    get_member_equals_call(
+        location: LOCATION,
+        member_name: string,
+        other: Trees.Expressions.Expression
+    ) -> Trees.Expressions.Expression static =>
+        Trees.Expressions.CALL(
+            location,
+            Trees.Expressions.MEMBER(
+                location,
+                Trees.Expressions.IDENTIFIER(location, Identifiers.Identifier(location, "object")),
+                Identifiers.Identifier(location, "equals"),
+                location
+            ),
+            Trees.Expressions.LIST(
+                location,
+                Collections.LIST[Trees.Expressions.Expression]([
+                    cast Trees.Expressions.Expression(
+                        Trees.Expressions.MEMBER(
+                            location,
+                            Trees.Expressions.SELF(location),
+                            Identifiers.Identifier(location, member_name),
+                            location
+                        )
+                    ),
+                    cast Trees.Expressions.Expression(
+                        Trees.Expressions.MEMBER(
+                            location,
+                            other,
+                            Identifiers.Identifier(location, member_name),
+                            location
+                        )
+                    )
+                ])
+            )
+        );
+
+    // A struct compares memberwise. The parameter is non-optional: a
+    // struct value has no absent form, and an absent operand of a
+    // value-type optional is answered by the null checks written
+    // around the call rather than reaching the body.
+    get_memberwise_equals_for_struct(`struct: Definitions.STRUCT) -> Definitions.FUNCTION is
+        // The type's own location, not an internal one: the body reads
+        // members through `self` and `other`, and an access check with
+        // no enclosing declaration to place it in rejects a member the
+        // type is entitled to read.
+        let location = `struct.location;
+
+        let other_argument = Variables.VARIABLE(
+            location,
+            Identifiers.Identifier(location, "other"),
+            get_classy_type_expression(`struct),
+            false,
+            false,
+            null
+        );
+
+        let condition: Trees.Expressions.Expression mut =
+            Trees.Expressions.Literals.BOOLEAN(location, "true");
+
+        for member in get_state_members(`struct.body) do
+            condition = Trees.Expressions.BINARY(
+                location,
+                Identifiers.Identifier(location, "/\\"),
+                "/\\",
+                condition,
+                get_member_equals_call(
+                    location,
+                    member.name!.name,
+                    Trees.Expressions.IDENTIFIER(location, Identifiers.Identifier(location, "other"))
+                )
+            );
+        od
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "=~"),
+            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]([other_argument])),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
+            Modifiers.LIST(location, null, null),
+            Trees.Bodies.EXPRESSION(location, condition)
+        );
+    si
+
+    // The hash a memberwise comparison implies: every member that the
+    // comparison reads, mixed by XOR. Cheap rather than strong, and
+    // consistent with the equality above, which is what the .NET
+    // contract asks for.
+    get_memberwise_hash(location: LOCATION, body: Definitions.LIST) -> Definitions.FUNCTION is
+
+        let combined: Trees.Expressions.Expression mut =
+            Trees.Expressions.Literals.INTEGER(location, "0");
+
+        for member in get_state_members(body) do
+            let boxed = Trees.Expressions.CAST(
+                location,
+                TypeExpressions.NAMED(location, Identifiers.Identifier(location, "object")),
+                Trees.Expressions.MEMBER(
+                    location,
+                    Trees.Expressions.SELF(location),
+                    Identifiers.Identifier(location, member.name!.name),
+                    location
+                )
+            );
+
+            combined = Trees.Expressions.BINARY(
+                location,
+                Identifiers.Identifier(location, "^"),
+                "^",
+                combined,
+                Trees.Expressions.CALL(
+                    location,
+                    Trees.Expressions.MEMBER(
+                        location,
+                        boxed,
+                        Identifiers.Identifier(location, "get_hash_code"),
+                        location
+                    ),
+                    Trees.Expressions.LIST(location, Collections.LIST[Trees.Expressions.Expression]())
+                )
+            );
+        od
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "get_hash_code"),
+            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]()),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "int")),
+            Modifiers.LIST(location, null, null),
+            Trees.Bodies.EXPRESSION(location, combined)
+        );
     si
 
     // A TypeExpression naming the type itself, mirroring its own type
