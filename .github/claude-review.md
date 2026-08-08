@@ -55,7 +55,7 @@ Flag type-system PRs that don't follow this.
 
 ## Versioning
 
-The compiler is in v1.x. **The next breaking change goes to v3.0.0** - v2 was accidentally published once during the 1.0.6x sequence and is permanently contaminated (NuGet unlisted, can't republish). From v3.0.0 onward: strict semver.
+The compiler is on v27.x and follows strict semver.
 
 Bump table:
 
