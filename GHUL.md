@@ -511,7 +511,7 @@ si
 
 Inheriting two *concrete* defaults for the same member from different traits is an error rather than a silent pick, so a diamond has to be resolved by overriding the member in the implementing type.
 
-An override or trait implementation must keep the overridden member's optionality contract. It may strengthen it - a non-optional return or property where the base declares optional, an optional parameter where the base declares non-optional - but weakening it in either position is a compile error: returning `T?` where the base promises `T` would hand null to callers that use the base type, and requiring a non-optional parameter where the base accepts `T?` would receive null from them. A property with an assign accessor faces both directions at once, so its type must match the base's optionality exactly.
+An override or trait implementation must keep the overridden member's optionality contract. It may strengthen it - a non-optional return or property where the base declares optional, an optional parameter where the base declares non-optional - but weakening it in either position is a compile error: returning `T?` where the base promises `T` would hand null to callers that use the base type, and requiring a non-optional parameter where the base accepts `T?` would receive null from them. A property with an assign accessor faces both directions at once, so its type must match the base's optionality exactly. The equality and order operators `=~` and `<>` are the one exception on the parameter side: presence is settled where the operator is used and the body is only handed present values, so an implementation may declare its parameter non-optional even where the overridden member spells it optional.
 
 ### unions
 
@@ -1220,10 +1220,12 @@ class BOX: Ghul.Comparable[BOX], Ghul.Equatable[BOX] is
 
     init(v: int) is _v = v; si
 
-    <>(other: BOX?) -> int => if other? then _v - other._v else 1 fi;
-    =~(other: BOX?) -> bool => other? /\ _v == other._v;
+    <>(other: BOX) -> int => _v - other._v;
+    =~(other: BOX) -> bool => _v == other._v;
 si
 ```
+
+The parameter is written non-optional: presence is settled where the operator is used, so the body is only handed present values. On a reference type the optional spelling is accepted too, for a body that wants to defend against a null arriving from a caller in another language without the compiler reporting the test as redundant. A value type has no such choice, since its `T?` is a different type rather than the same one annotated.
 
 `<>` answers how its operands are ordered: negative when the left is the lesser, zero when neither is, positive otherwise. The relational operators are written in terms of it — `a < b` is `a <> b` reduced against zero — so defining `<>` is what gives a type all four.
 
