@@ -51,6 +51,13 @@ describe how it fails, rather than filing it under "already broken".
 - Prefer a small reproduction to iterating against the full suite. A focused
   integration test that runs in seconds tells you the same thing as a bootstrap
   cycle that takes minutes.
+- Smaller still, when you only want to know what the compiler says about a
+  snippet: compile it on its own. `ghul-compiler probe.ghul` needs no project
+  file and exits non-zero if it reports an error. Diagnostics go to standard
+  error, so redirect with `2>&1` if you are capturing them - redirecting only
+  standard output gives you an empty file whatever the compiler said.
+  `ghul-compiler --help` lists the options. A compiled program that uses the
+  ghūl runtime needs `ghul-runtime.dll` beside it before it will run.
 
 ## Reporting your work
 
