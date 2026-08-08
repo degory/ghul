@@ -1930,6 +1930,143 @@ namespace Analysis is
         si
     si
 
+    // Turns each file's replaced span into that file's whole new text,
+    // then hands the result to the ordinary edit path.
+    //
+    // Reconstruction rather than partial reparsing is the whole of what
+    // this saves: a client sending a keystroke's worth of text instead of
+    // a whole file pays for the edit it made rather than for the size of
+    // the file it made it in. Everything downstream sees exactly what an
+    // edit carrying the same text would.
+    //
+    // Keeping the two copies of a file in step is the client's job: it
+    // sends a delta only when it knows what the analyser holds, and sends
+    // whole text whenever it does not. `expected_length` is the assertion
+    // that it did so, not a negotiation - splicing a span into text that
+    // is not the text it was computed against yields a plausible file
+    // rather than a failure, and every later delta compounds it. So a
+    // mismatch, or a delta for a file the analyser does not hold, is
+    // treated as the desync it is: the analyser recycles, and the
+    // replacement is primed with full text by the same path that primes
+    // any freshly-spawned one.
+    class EDIT_DELTA_HANDLER(
+        _watchdog: WATCHDOG,
+        _file_edited_handler: FILE_EDITED_HANDLER
+    ): RequestHandler[Protocol.Request.EDIT_DELTA] is
+        super();
+
+        handle_request(request: Protocol.Request.EDIT_DELTA, writer: IO.TextWriter) is
+            let files = Collections.LIST[Protocol.EDIT_FILE]();
+
+            for delta in request.files do
+                let retained = _file_edited_handler.find_source_file(delta.path)?.source_text;
+
+                if !retained? then
+                    _desynchronized(writer, delta.path, "no retained text for this file");
+
+                    return;
+                fi
+
+                if retained.length != delta.expected_length then
+                    _desynchronized(
+                        writer,
+                        delta.path,
+                        "retained text is {retained.length} characters, "
+                        "the delta expected {delta.expected_length}"
+                    );
+
+                    return;
+                fi
+
+                let edited = _apply(retained, delta);
+
+                if !edited? then
+                    _desynchronized(
+                        writer,
+                        delta.path,
+                        "the replaced span falls outside the retained text"
+                    );
+
+                    return;
+                fi
+
+                files.add(Protocol.EDIT_FILE(delta.path, edited));
+            od
+
+            _file_edited_handler.handle_request(Protocol.Request.EDIT(files), writer);
+        si
+
+        // Report the desync and recycle. Recycling rather than answering
+        // is what makes this safe to get wrong in only one direction: the
+        // analyser never carries on holding text it cannot account for,
+        // and the process that replaces it starts from whatever the
+        // client sends it.
+        _desynchronized(writer: IO.TextWriter, path: string, reason: string) is
+            Std.error.write_line("edit delta for {path} cannot be applied: {reason}");
+            Std.error.flush();
+
+            _watchdog.recycle(writer, "edit delta out of step with retained text");
+        si
+
+        // `text` with the delta's span replaced by its new text, or null
+        // when the span does not lie within `text`.
+        _apply(text: string, delta: Protocol.EDIT_DELTA_FILE) -> string? is
+            let start = _offset_of(text, delta.start_line, delta.start_column);
+            let stop = _offset_of(text, delta.end_line, delta.end_column);
+
+            if start < 0 \/ stop < start then
+                return null;
+            fi
+
+            let result = System.Text.StringBuilder();
+
+            result.append(text.substring(0, start));
+            result.append(delta.new_text);
+            result.append(text.substring(stop));
+
+            return result.to_string();
+        si
+
+        // Character offset of a 1-based line and column in `text`, or -1
+        // when the position lies outside it. Lines are delimited by a
+        // newline and a carriage return belongs to the line it ends, so a
+        // column counts the characters a client's own buffer holds
+        // whichever line endings the file uses.
+        _offset_of(text: string, line: int, column: int) -> int static is
+            if line < 1 \/ column < 1 then
+                return -1;
+            fi
+
+            let offset mut = 0;
+            let current_line mut = 1;
+
+            while current_line < line do
+                let next_line_start = text.index_of('\n', offset);
+
+                if next_line_start < 0 then
+                    return -1;
+                fi
+
+                offset = next_line_start + 1;
+                current_line = current_line + 1;
+            od
+
+            let line_end mut = text.index_of('\n', offset);
+
+            if line_end < 0 then
+                line_end = text.length;
+            fi
+
+            let result = offset + column - 1;
+
+            if result > line_end then
+                return -1;
+            fi
+
+            return result;
+        si
+    si
+
     // Does a full compile of all files.
     class COMPILE_HANDLER(
         _watchdog: WATCHDOG,
