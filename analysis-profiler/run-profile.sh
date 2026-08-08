@@ -22,10 +22,11 @@ WORKLOAD="${2:-}"
 # --no-analysis-heap-watchdog: suppress the watchdog's post-compile heap
 #   sampling. It forces a full GC after every compile, which otherwise
 #   dominates the trace (≈37% of CPU) and masks the genuine hotspots.
-# --incremental-analysis: opt the analyser into the incremental body
-#   re-walk for interface-preserving single-file EDITs (off by default).
-#   The profiler exists to measure this path's win on a real workload.
-export ANALYSER_EXTRA_ARGS="--show-analysis-stats --no-analysis-heap-watchdog --incremental-analysis"
+# The incremental body re-walk for interface-preserving single-file EDITs
+# is on by default, and the profiler exists to measure its win on a real
+# workload. For a non-incremental baseline to compare against, add
+# --no-incremental-analysis here and run again.
+export ANALYSER_EXTRA_ARGS="--show-analysis-stats --no-analysis-heap-watchdog"
 
 echo "==> building analysis-profiler (and the compiler under test)"
 dotnet build analysis-profiler.ghulproj -c Debug
