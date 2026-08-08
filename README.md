@@ -78,7 +78,7 @@ Applications written in ghūl require the [.NET 10 runtime](https://dotnet.micro
 
 ### Dev container
 
-Any dev container image with the .NET 10 SDK will do — for example [`mcr.microsoft.com/devcontainers/dotnet:10.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
+Any dev container image with the .NET 10 SDK will do - for example [`mcr.microsoft.com/devcontainers/dotnet:10.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
 
 ## Basic ghūl language tutorial
 
@@ -86,4 +86,8 @@ For a short ghūl programming language tutorial and reference, see [GHUL.md](./G
 
 ## Gotchas
 
-The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. Like any compiler it has [bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug) — issue reports are welcome.
+The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. Like any compiler it has [bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug) - issue reports are welcome.
+
+## Contributing
+
+Bug reports, language questions, documentation fixes and code are all welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for how to build and test the compiler and how to raise a pull request, and [SECURITY.md](./SECURITY.md) for how to report a suspected vulnerability.

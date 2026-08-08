@@ -1,16 +1,26 @@
 # Copilot & AI Agent Instructions
 
-AI agents and automated contributors must follow the project-specific requirements in:
+AI agents and other automated contributors must follow:
 
-- [AGENTS.md](../AGENTS.md) – AI agent workflow, test, and contribution rules
-- [GHUL.md](../GHUL.md) – ghūl language reference
-- [README.md](../README.md) – Project overview
-- [integration-tests/README.md](../integration-tests/README.md) – Integration test details
+- [CONTRIBUTING.md](../CONTRIBUTING.md) - how to build, test, and raise a pull
+  request. The authority, and it applies to automated contributors in full.
+- [AGENTS.md](../AGENTS.md) - the additional rules for working without a human
+  at the keyboard.
+- [GHUL.md](../GHUL.md) - ghūl language reference. Read it; don't work from
+  memory of the syntax.
+- [README.md](../README.md) - project overview.
+- [integration-tests/README.md](../integration-tests/README.md) - integration
+  test file formats and the capture workflow.
 
 **Summary:**
-- All changes must pass all required tests before submission.
-- For new or changed functionality, update or add integration tests as described in the docs above.
-- If unrelated tests fail, flag for human review.
-- Keep changes minimal and well-documented.
 
-Refer to the linked documentation for full details and always follow the instructions provided there.
+- All required tests must pass before a change is submitted.
+- Any change in behaviour needs a test. Type-system changes need unit tests too.
+- The compiler is self-hosting: `src/` is compiled by the previously published
+  release, so a new language feature cannot be used in `src/` in the change that
+  adds it.
+- If a test fails and you cannot explain it, flag it for a human rather than
+  working around it.
+- Keep changes minimal and scoped to what was asked.
+
+Follow the linked documents for the detail; this page is only a pointer.

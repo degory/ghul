@@ -1,0 +1,258 @@
+# Contributing to the ghūl compiler
+
+Thanks for your interest. Bug reports, language questions, documentation fixes
+and code are all welcome.
+
+This is the compiler for the [ghūl programming language](https://ghul.dev), and
+it is written in ghūl itself. That shapes almost everything below, so it is
+worth reading the [self-hosting](#self-hosting-and-the-bootstrap-rule) section
+even if you skip the rest.
+
+Automated contributors have a few extra rules in [AGENTS.md](./AGENTS.md); the
+requirements on this page apply to them too.
+
+## Reporting a bug
+
+Open an [issue](https://github.com/degory/ghul/issues/new/choose). The most
+useful bug report is a short program that shows the problem, plus what you
+expected to happen and what happened instead. A program that is a few lines long
+and compiles on its own is worth far more than a description of a problem inside
+a large project.
+
+If the compiler reported an internal error, include the whole message.
+
+## Asking about the language
+
+If you are not sure whether something is a bug or the language working as
+designed, ask. [GHUL.md](./GHUL.md) is the language reference and the
+[website](https://ghul.dev) covers the same ground at more length, but both are
+works in progress and the compiler does not always agree with them. A question
+that turns out to be a documentation gap is a useful contribution in itself.
+
+## Setting up
+
+You need the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).
+Nothing else is required - the compiler that builds this repository is itself a
+.NET tool, restored into the working tree:
+
+```sh
+git clone https://github.com/degory/ghul.git
+cd ghul
+dotnet tool restore
+dotnet build
+```
+
+[Visual Studio Code](https://code.visualstudio.com) with the
+[ghūl extension](https://marketplace.visualstudio.com/items?itemName=degory.ghul)
+gives you diagnostics, hover, completion and go-to-definition while you work.
+
+## Self-hosting and the bootstrap rule
+
+The compiler compiles itself. When you change `src/`, your change is compiled by
+the **previously published** release of `ghul.compiler`, not by the compiler your
+branch produces.
+
+The practical consequence catches everyone out once: **a compiler feature cannot
+be used in `src/` in the same change that adds it.** The published compiler has
+never heard of it, so the build fails before your version exists. Add the
+feature in one pull request; start using it in `src/` in a later one, after the
+first has been released.
+
+The version pinned in `.config/dotnet-tools.json` is only a local fallback so
+that `dotnet tool restore` has some compiler to run. CI resolves the latest
+published release at run time and builds with that, so that is the version your
+change actually has to satisfy. To match CI locally:
+
+```sh
+dotnet tool update --local ghul.compiler
+```
+
+Never commit a manifest pinned to a `0.0.0-*` local version - it breaks the
+build for everyone else.
+
+`./build/bootstrap.sh` is the check that self-hosting still works. It builds the
+compiler with itself four times over and compares the output of the last two
+passes, which must be identical.
+
+## Testing
+
+Everything below must pass before a pull request can merge, and CI runs all of
+it on every pull request. Run what is relevant to your change locally; there is
+no need to run the whole suite yourself, because CI will.
+
+| Suite | Command | Time | Notes |
+|---|---|---|---|
+| Unit | `dotnet test unit-tests` | seconds | Deliberately selective - see [Changing the type system](#changing-the-type-system) for the exception |
+| Integration | `dotnet publish --output publish/ && dotnet ghul-test integration-tests` | ~3 min | Snapshot-based; see [integration-tests/README.md](integration-tests/README.md) |
+| Cross-assembly | `dotnet publish --output publish/ && dotnet ghul-test --use-dotnet-build cross-assembly-tests` | ~1 min | Real MSBuild projects; see [cross-assembly-tests/README.md](cross-assembly-tests/README.md) |
+| Analysis | `dotnet test analysis-tests` | seconds | Drives the language-service mode the editor extension uses |
+| Bootstrap | `./build/bootstrap.sh` | ~1-2 min | Self-hosting; produces little output until each pass finishes |
+
+**Publish before running the integration or cross-assembly tests.** Both find the
+compiler under `publish/`. Skip the publish step and they quietly test the last
+*published* compiler instead of your change, and pass regardless of what you did.
+
+Times are from a reasonably fast machine, and can be several times longer in a
+container or on a small VM.
+
+### Adding a test
+
+Any change in behaviour needs a test. Integration tests are the main net, and
+`./integration-tests/create.sh` scaffolds one. They live in four groups by what
+they assert:
+
+- `integration-tests/execution` - the program builds, runs, and prints the
+  expected output.
+- `integration-tests/il` - the emitted IL.
+- `integration-tests/parse` - parse errors and warnings.
+- `integration-tests/semantic` - semantic errors and warnings.
+
+Each test is a directory of ghūl source plus `*.expected` snapshot files;
+`./tasks/capture.sh <test-directory>` promotes what the compiler currently
+produces into those snapshots. Check what it captured before committing it - 
+capture records the behaviour that exists, which is only the behaviour you want
+if your change is already correct.
+
+A test for a bug fix should fail before your fix and pass after it. Check that
+it does, rather than assuming.
+
+### Changing the type system
+
+The type system and inference machinery - `src/semantic/types/`,
+`src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference
+paths in `src/syntax/process/compile_expressions.ghul`, and the IR value gates
+around them - are the most fragile part of the compiler. A patch that works in
+isolation can still interact badly with constraint accumulation, least-upper-bound
+widening, retry-loop convergence, or IL emission. So the bar here is higher than
+"the integration tests pass":
+
+- **Put new logic in its own class, with a single clear responsibility.** Prefer
+  a small new class to another long method on an existing one.
+- **Consolidate duplication the change reveals.** Don't refactor speculatively,
+  but when one change shows you the same logic in two places, move it somewhere
+  focused rather than copying it a third time.
+- **Add unit tests under `unit-tests/src/`** pinning the behaviour you care
+  about. A fast fixture around a small class is far easier to maintain than an
+  integration test through the whole pipeline, and it documents what the class
+  is supposed to guarantee.
+- **Pin behaviour that looks wrong, too.** If you find a corner case that
+  behaves oddly and you are not fixing it here, still add a test recording what
+  it does today, with a comment saying what looks wrong and what the right
+  answer would be. A later change then either flips the test deliberately, with
+  the reasoning visible in the diff, or notices it broke something.
+
+Unit tests go in `unit-tests/src/`, one file per class under test, named
+`<class>_tests.ghul`. See the files already there for the `@test()` annotation
+and assertion conventions.
+
+## Documentation
+
+If you work something out that should have been written down, write it down.
+When a `README.md`, `AGENTS.md`, `GHUL.md`, this file, or the explanatory
+comment at the top of a source file turns out to be wrong or unclear, fix it as
+part of your change.
+
+Don't delete instructions from those files without asking first - something you
+can see no reason for is often load-bearing.
+
+Code comments are a different matter: the default is not to write one. Comment
+where a reader who knows the codebase would still need the context - a
+non-obvious invariant, an ordering requirement, a workaround whose reason isn't
+visible from the code. Don't narrate what the code does, and don't write
+comments that only make sense to someone who read the pull request.
+
+## Pull requests
+
+Pull requests are squash-merged, so **the description becomes the commit message
+and the release-notes entry**. It is the one part of a pull request that lasts,
+and it is worth more care than the individual commit messages.
+
+Write it for someone reading `git log` in a few years with no other context.
+Open directly with one or more of these sections - they are plain text, not
+markdown headings:
+
+```plaintext
+Enhancements:
+- Something a user of the language or the compiler would notice (closes #1234)
+
+Bugs fixed:
+- What was broken, phrased as the issue title is (closes #1235)
+
+Technical:
+- An internal change: a refactor, a test, a build tweak
+```
+
+Use only the sections you have content for, and keep every bullet to one line.
+A typical description is under fifteen lines in total.
+
+What does **not** go in the description:
+
+- `## Summary`, `## Overview`, `## Test plan` or `## Testing` headings. The
+  description is the summary, and passing CI is implied.
+- Justification. State what changed; don't argue that it was right.
+- A prose preamble explaining the problem. The bullet says it in one line.
+- Links that won't outlive the pull request.
+
+Anything a reviewer needs but a changelog reader does not - why this approach
+over an obvious alternative, an oddity that is deliberate, an invariant the diff
+doesn't reveal - is genuinely useful, and belongs in a **comment on the pull
+request**. Comments aren't part of the squashed commit, so nothing there is
+constrained by the rules above. Most pull requests need no comment; reach for
+one when a reviewer would otherwise reasonably flag something that is fine.
+
+Other things worth knowing:
+
+- Keep the title under about seventy characters. Don't append the pull request
+  number - GitHub does that on merge.
+- Every pull request needs a passing CI run and an approving review before it
+  can merge, and its branch must be up to date with `main`.
+- Source files use Unix line endings. The one deliberate exception is
+  `integration-tests/parse/carriage-returns/test.ghul`, which is test data.
+- If a test fails and you cannot see how your change caused it, say so in the
+  pull request rather than working around it. The same goes for a test that
+  passes and fails at random.
+
+## Contributing from a fork
+
+You do not need write access to this repository. Fork it, push a branch to your
+fork, and open a pull request against `main` here.
+
+```sh
+git clone https://github.com/<you>/ghul.git
+cd ghul
+git remote add upstream https://github.com/degory/ghul.git
+dotnet tool restore
+git switch -c my-change
+```
+
+When `main` moves on underneath you, bring your branch up to date - the merge
+button stays disabled until you do:
+
+```sh
+git fetch upstream
+git rebase upstream/main
+```
+
+CI behaves differently for a pull request from a fork, in ways that are worth
+knowing before they surprise you:
+
+- **The first one you open waits for a maintainer.** GitHub holds workflow runs
+  from a new contributor until someone approves them, so expect no checks at all
+  for a while. This is normal and is not a problem with your branch.
+- **The tests run on GitHub's runners rather than this repository's**, so they
+  are slower than the timings above. Everything else about them is the same, and
+  the full suite still has to pass.
+- **Two jobs are skipped.** GitHub withholds repository secrets from a fork - 
+  correctly, since anyone can open a pull request. The automated code review and
+  the beta package publish both need them, so both sit out. A maintainer reviews
+  your change by hand instead, which is also how it gets the approval it needs to
+  merge.
+
+Nothing about a fork stops a change being merged. It just means a person, rather
+than a workflow, does the reviewing.
+
+## Licence
+
+The compiler is licensed under the
+[GNU Affero General Public License v3.0](./LICENSE). Contributions are accepted
+under the same licence.

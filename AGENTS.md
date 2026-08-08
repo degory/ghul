@@ -1,68 +1,72 @@
-# AI Agent Guide for ghūl Compiler
+# AI Agent Guide for the ghūl Compiler
 
 ## Purpose
 
-This guide is primarily for AI agents (and automated contributors) working on the ghūl programming language compiler. Human contributors may also find it useful. Please follow these instructions to ensure changes are made safely and tested thoroughly.
+This guide is for AI agents and other automated contributors working on the ghūl
+compiler.
 
-## Background
+**[CONTRIBUTING.md](./CONTRIBUTING.md) is the authority, and it applies to you in
+full.** Read it first. The test requirements, the bootstrap rule, the protocol
+for type-system changes, the documentation and comment rules, and the pull
+request description format all live there and are not repeated here. What
+follows is only the part that is specific to working without a human at the
+keyboard.
 
-The ghūl compiler is written in ghūl. Before making changes:
-- Consult the ghūl language quick tutorial and reference ([GHUL.md](./GHUL.md))
-- Optionally review the [ghūl programming language website](https://ghul.dev/)
-- The compiler source code in this repository is the largest ghūl codebase and serves as a key reference
-- The language and compiler are a work in progress; actual behavior may differ from documentation, and bugs are expected
+## Before you start
 
-## Test Requirements
+Read [GHUL.md](./GHUL.md) rather than working from what you remember of ghūl.
+The syntax is unusual enough that a half-remembered version of it produces
+confident, wrong code, and you will not find out until the build fails. The
+compiler's own source under `src/` is the largest body of ghūl in existence and
+is the best secondary reference for idiom.
 
-All tests must pass before submitting a pull request. The test suite includes:
+The language and the compiler are both works in progress. The documentation
+describes what is intended; the compiler does what it does. Where they disagree,
+say so rather than quietly coding around it.
 
-| Test Type      | How to Run                                   | Typical Duration (agent environment)         | Notes                                                                 |
-|----------------|----------------------------------------------|-----------------------------------------|-----------------------------------------------------------------------|
-| Unit Tests     | `dotnet test unit-tests`                     | Seconds                                | Coverage is intentionally selective for most areas (rely on integration tests). The *type system and inference paths* are an exception — see "Type-system changes" below.           |
-| Bootstrap      | `./build/bootstrap.sh`                       | ~1 minute                              | Verifies compiler self-hosting. May appear to pause during builds; produces little output until each build completes. Can take longer on less powerful machines or in agent environments. |
-| Integration    | `dotnet publish --output publish/ && dotnet ghul-test integration-tests` | ~3 minutes | Snapshot-based; see [integration-tests/README.md](integration-tests/README.md) for details. Produces continuous output. Requires compiler to be published to `./publish/` first. May take longer in agent/dev environments. |
-| Cross-assembly | `dotnet publish --output publish/ && dotnet ghul-test --use-dotnet-build cross-assembly-tests` | ~1 minute | Real MSBuild projects compiling against a separate assembly; covers what survives metadata. Publish first: without a `publish/` directory the projects build with the published compiler from `.config/dotnet-tools.json` rather than your changes. See [cross-assembly-tests/README.md](cross-assembly-tests/README.md). |
+## A failing test is your change
 
-### Integration Test Groups
+Assume every test failure you see was caused by what you just did. "That test
+was already broken" is almost never true here: CI runs the whole suite on every
+pull request, branch protection blocks the merge unless it is green, and the
+same suite runs again on `main` after the merge. A published release has passed
+it twice.
 
-- `integration-tests/execution`: Asserts a binary is created, runs, and specific text output is produced.
-- `integration-tests/il`: Asserts IL output.
-- `integration-tests/parse`: Asserts parsing errors/warnings.
-- `integration-tests/semantic`: Asserts semantic correctness/errors.
+Before concluding otherwise, reproduce the failure against the latest published
+compiler on an unmodified checkout, and find the CI run where it failed. If you
+cannot produce that evidence, the failure is yours - or it is local state: a
+stale `publish/` directory, a half-reverted edit, leftover `failed` markers from
+an earlier run.
 
-**For new or changed functionality, add or update integration tests in the appropriate subfolder.**
+Genuinely intermittent tests are a separate thing. If you find one, name it and
+describe how it fails, rather than filing it under "already broken".
 
-## Type-system changes
+## Working within the limits of your environment
 
-The type system and inference machinery (`src/semantic/types/`, `src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference paths in `src/syntax/process/compile_expressions.ghul`, related IR-value gates) are complex and fragile. Patches that work in isolation can interact badly with constraint accumulation, LUB widening, retry-loop convergence, or IL emission gating. Aim higher here than the general "integration tests are enough" baseline:
+- The timings in CONTRIBUTING.md assume a reasonably fast machine. In a
+  container or on a small VM, expect several times that. Budget for it instead
+  of concluding a run has hung.
+- `./build/bootstrap.sh` and the integration suite produce little output for long
+  stretches. Silence is not failure.
+- Prefer a small reproduction to iterating against the full suite. A focused
+  integration test that runs in seconds tells you the same thing as a bootstrap
+  cycle that takes minutes.
 
-- **Implement new logic in distinct classes with a single clear responsibility.** Prefer a small new class to a long method on an existing one. If a new method on an existing class is the right call, keep its responsibility narrow.
-- **Move existing logic into a new or existing focused class when the surrounding change makes it natural.** Don't refactor speculatively, but do consolidate when a single change reveals duplicated logic across sites (e.g. ancestor-walks in `_back_feed_pair` and `_try_specialize_owner_from_constraint`, sibling-arg binding logic shared between resolve_constructor and the function-call retry).
-- **Write unit tests under `unit-tests/src/` that pin the behaviour you care about.** Fast, focused fixtures around the new class are far easier to maintain than integration tests across the full compiler pipeline, and they document the intended contract.
-- **Capture observed behaviour even when it seems wrong.** If a corner case behaves unexpectedly but you're not changing it in this PR, *still* add a test that pins the current behaviour. Mark it with a clear note: a comment explaining what looks off, why it's not being fixed here, and what the corrected behaviour would be. Future changes will then either flip the test deliberately (with the rationale visible in the diff) or notice they've broken the existing expectation.
+## Reporting your work
 
-This guidance overrides the general "minimal unit-test coverage" framing for type-system work specifically. Don't take it as license to gold-plate every PR — the rule is: when you touch type-system internals, leave the unit-test suite stronger than you found it.
+- Keep changes minimal and scoped to what was asked.
+- If something fails and you cannot explain it, say so plainly in the pull
+  request and leave it for a human, rather than working around it or leaving it
+  out of the description.
+- Describe what you actually did. If you skipped a test, ran a narrower suite
+  than usual, or left part of the task undone, that belongs in the pull request,
+  not in a summary that implies otherwise.
 
-## Additional Notes
+## See also
 
-- If unrelated tests fail, report or flag them for human review.
-- If you encounter flaky or brittle tests, note them in your PR or commit message.
-- Use imperative instructions and keep changes minimal and well-documented.
-- Be aware that test durations may be significantly longer in AI agent/dev environments with limited resources.
-
-## Documentation hygiene
-
-When preparing a pull request, verify the accuracy and clarity of documentation:
-
-- Any `AGENTS.md` file
-- Any `README.md` file
-- `GHUL.md`
-- The explanatory comment at the top of any source file
-
-If you discover information in these files that is incorrect, fix it. If wording is confusing, clarify it. When you spend time working out something that should be documented but is missing, add that information. Avoid removing explicit instructions from these files unless you have confirmation from the user.
-
-## See Also
-- [GHUL.md](./GHUL.md) – Language reference
-- [integration-tests/README.md](integration-tests/README.md) – Integration test details
-- [README.md](./README.md) – Project overview
-
+- [CONTRIBUTING.md](./CONTRIBUTING.md) - how to build, test, and raise a pull
+  request. Applies to you.
+- [GHUL.md](./GHUL.md) - language tutorial and reference.
+- [README.md](./README.md) - project overview.
+- [integration-tests/README.md](integration-tests/README.md) - integration test
+  file formats and the capture workflow.
