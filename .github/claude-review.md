@@ -55,7 +55,7 @@ Flag type-system PRs that don't follow this.
 
 ## Versioning
 
-The compiler is on v27.x and follows strict semver.
+The compiler follows strict semver. Read the current version out of the `VERSION` file rather than assuming one; majors are cut often.
 
 Bump table:
 
