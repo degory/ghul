@@ -53,9 +53,11 @@ describe how it fails, rather than filing it under "already broken".
   cycle that takes minutes.
 - Smaller still, when you only want to know what the compiler says about a
   snippet: compile it on its own. `ghul-compiler probe.ghul` needs no project
-  file, writes diagnostics to standard output, and exits non-zero if any of them
-  is an error. `ghul-compiler --help` lists the options. A compiled program that
-  uses the ghūl runtime needs `ghul-runtime.dll` beside it before it will run.
+  file and exits non-zero if it reports an error. Diagnostics go to standard
+  error, so redirect with `2>&1` if you are capturing them - redirecting only
+  standard output gives you an empty file whatever the compiler said.
+  `ghul-compiler --help` lists the options. A compiled program that uses the
+  ghūl runtime needs `ghul-runtime.dll` beside it before it will run.
 
 ## Reporting your work
 
