@@ -22,6 +22,7 @@ Flag:
 - Bugs and likely-bugs.
 - Violations of the contracts below (type-system change protocol, cross-assembly test traps).
 - Deprecated idioms (e.g. `new Type(...)` instead of `Type(...)`).
+- **Any new use of rendered text as an entity's identity** - see the contract below. This one is a rejection, not a suggestion.
 - Missing tests where CONTRIBUTING.md requires one (any behavioural change wants an integration test; type-system changes additionally want unit tests).
 - `GHUL.md` falling out of step with reality - a PR introduces a feature `GHUL.md` doesn't document, changes documented behaviour without updating it, or otherwise leaves the reference contradicting the code.
 
@@ -47,6 +48,16 @@ For changes here, CONTRIBUTING.md requires:
 - Test coverage even for corner cases that behave oddly but aren't being fixed in this PR - pin the current behaviour with a comment explaining what looks off.
 
 Flag type-system PRs that don't follow this.
+
+### Rendered text is never identity
+
+**Reject any new code that renders a symbol, type, function, signature or other semantic entity to text and then uses that text as the entity's identity.** That covers a `to_string()`, qualified name, description or mangled name used as a map or cache key, a set member, a dedup discriminator, an equality or "is this the same thing?" test, or a match against a literal name. The correct spelling is the entity itself - reference identity, or `=~` plus `get_hash_code` - or an explicit non-text key type built from the fields that actually distinguish it.
+
+This is a hard rule rather than a preference because rendering is lossy in both directions and neither direction shows up at the point of use. Distinct entities render alike - overloads, same-named generics from different assemblies, a generic and one of its specializations, a type parameter named `T` in two unrelated scopes - so the key silently conflates them and the bug surfaces far away as a wrong symbol, a wrong type or bad IL. The same entity renders differently in different contexts - relative versus qualified naming, narrowed versus declared type, unsettled inference and placeholder states - so the key silently misses. And the renderer is presentation code: someone changing how a type is displayed in a diagnostic then changes the behaviour of a mechanism they have never read.
+
+What this does *not* cover: a source-level identifier used as a name is the datum, not a proxy for one. Scope and member lookup, completion prefix matching, `use` imports, suppression slugs, diagnostic codes, file paths - all legitimate, don't flag them. The rule is about a rendered *description* of an entity standing in for the entity.
+
+Existing text-keyed mechanisms (the `MAP[string, Type]` type-argument maps in the specializers and the placeholder registry, the state-machine frame's function-name-keyed class map, the name-keyed symbol and definition maps) are not to be ripped out on sight, and a PR that merely touches one in passing is fine. But a PR that **significantly changes or extends** one - a new consumer, a new key format, a new entity kind flowing through it, a rework of how the keys are built - must say in its description why it is not being migrated to a non-text identity as part of the work. Any concrete reason is acceptable; silence is not. If the statement is missing, request changes and ask for it.
 
 ### Cross-assembly tests
 
