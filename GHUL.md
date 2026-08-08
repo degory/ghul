@@ -384,7 +384,7 @@ struct POINT is
 si
 ```
 
-A struct gets no equality operator of its own — define `=~` explicitly if the type needs one.
+A struct gets no equality operator of its own — define `=~` explicitly if the type needs one. `==` and `!=` compare only primitive scalars, enums, `decimal`, tuples and references; on any other struct operand — ghūl-declared or imported, `System.DateTime` for example — they are compile errors directing to `=~` / `!~`. A type parameter keeps both operators — the comparison is scalar or reference equality per instantiation.
 
 A bare member declaration like `x: double;` is an auto-**property**, not a field, and a struct's property getter hands back a *copy*. That matters when a struct is held in a heap object: mutating it through the property mutates the copy and the write is lost, so the compiler rejects a store through one. Declare a real field with the `field` modifier where a struct member is to be mutated in place:
 
