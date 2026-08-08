@@ -306,7 +306,54 @@ namespace Syntax.Process is
         pre(`class: Definitions.CLASS) -> bool is
             _stack.push(`class.body);
 
+            add_object_equals_bridge(`class);
+
             return false;
+        si
+
+        // A type that declares `=~` gets the `Object.Equals` bridge so
+        // .NET reaches the operator the user wrote. Skipped when the
+        // body already supplies that method, which is then the
+        // author's own bridge and is left alone.
+        //
+        // The bridge also requires the type to declare its own
+        // `get_hash_code`. .NET pairs the two - values that compare
+        // equal must hash equal, and a hash-based collection consults
+        // the hash first - and a type that declares neither is
+        // consistent as it stands, comparing and hashing by identity.
+        // Bridging on its own would break that pair rather than
+        // complete it: equality would answer by the operator while the
+        // hash still answered by identity, so two equal keys would
+        // land in different buckets. The hash cannot be synthesised
+        // either, since an operator is free to be coarser than the
+        // fields it reads and a memberwise hash would then disagree
+        // with it. So the type is left alone and the missing half is
+        // reported.
+        add_object_equals_bridge(classy: Definitions.Classy) is
+            if
+                classy.is_poisoned \/
+                !declares_function(classy.body, "=~") \/
+                declares_object_equals(classy.body)
+            then
+                return;
+            fi
+
+            if !declares_function(classy.body, "get_hash_code") then
+                IoC.CONTAINER.instance.logger.warn(
+                    classy.name.location,
+                    "equality-without-hash",
+                    "{classy.name.name} defines =~ but no get_hash_code, so .NET comparisons will not use the operator"
+                );
+
+                return;
+            fi
+
+            classy.body.add(
+                get_object_equals_bridge(
+                    LOCATION.internal,
+                    get_classy_type_expression(classy)
+                )
+            );
         si
 
         visit(`class: Definitions.CLASS) is
@@ -325,6 +372,8 @@ namespace Syntax.Process is
 
         pre(`struct: Definitions.STRUCT) -> bool is
             _stack.push(`struct.body);
+
+            add_object_equals_bridge(`struct);
 
             return false;
         si
@@ -964,6 +1013,206 @@ namespace Syntax.Process is
         );
 
         return init_function;
+    si
+
+    // A TypeExpression naming the type itself, mirroring its own type
+    // parameters where it has them. Internal location, so the
+    // synthesised reference is not recorded as a use of the type.
+    get_classy_type_expression(classy: Definitions.Classy) -> TypeExpressions.TypeExpression static =>
+        if classy.arguments? /\ classy.arguments.count > 0 then
+            TypeExpressions.GENERIC(
+                Source.LOCATION.internal,
+                Identifiers.Identifier(Source.LOCATION.internal, classy.name.name),
+                get_type_argument_references(classy.arguments!)
+            )
+        else
+            TypeExpressions.NAMED(
+                Source.LOCATION.internal,
+                Identifiers.Identifier(Source.LOCATION.internal, classy.name.name)
+            )
+        fi;
+
+    // Whether a type's own body declares a member of the given name.
+    // Only the body is consulted, so a member arriving from a
+    // `partial` or `impl` block is not seen here: those are declared
+    // later, in declare-members, and a type reopened that way does
+    // not get the synthesised bridge below.
+    declares_function(body: Definitions.LIST, name: string) -> bool static is
+        for definition in body do
+            if
+                isa Definitions.FUNCTION(definition) /\
+                definition.name? /\
+                definition.name.name =~ name
+            then
+                return true;
+            fi
+        od
+
+        return false;
+    si
+
+    // A type expression naming `object`, with or without a `?`.
+    is_object_type_expression(type_expression: TypeExpressions.TypeExpression) -> bool static is
+        let inner =
+            if isa TypeExpressions.OPTIONAL(type_expression) then
+                type_expression.element
+            else
+                type_expression
+            fi;
+
+        return
+            isa TypeExpressions.NAMED(inner) /\
+            inner.name.name =~ "object";
+    si
+
+    // Whether the body already supplies the `Object.Equals` the bridge
+    // would add. Both spellings reach it: a member named `equals`, and
+    // `=~` itself when its parameter is `object` - an equality
+    // operator over `object` is emitted under the name `Equals` and so
+    // already overrides it. Adding a bridge alongside either produces
+    // a duplicate method.
+    declares_object_equals(body: Definitions.LIST) -> bool static is
+        for definition in body do
+            if !isa Definitions.FUNCTION(definition) \/ !definition.name? then
+                continue;
+            fi
+
+            let name = definition.name.name;
+
+            if !(name =~ "equals") /\ !(name =~ "=~") then
+                continue;
+            fi
+
+            if definition.arguments.count == 1 then
+                for argument in definition.arguments do
+                    if is_object_type_expression(argument.type_expression) then
+                        return true;
+                    fi
+                od
+            fi
+
+            if name =~ "equals" then
+                return true;
+            fi
+        od
+
+        return false;
+    si
+
+    // `=~` is emitted as a typed `Equals` method, which .NET does not
+    // recognise as an equality implementation on its own: an
+    // `EqualityComparer[T]` reaches for `IEquatable[T]` and then for
+    // `Object.Equals(object)`, and a type carrying neither falls back
+    // to the default for its kind. A class then compares by reference
+    // and a struct by reflected memberwise comparison, so a user's own
+    // `=~` is bypassed either way when the value is used as a
+    // dictionary key or searched for in a collection.
+    //
+    // Bridge it: a type whose body declares `=~` gets an
+    // `equals(other: object?)` that casts and delegates, so the
+    // operator the user wrote is what .NET calls. Written as a cast to
+    // the optional form and a presence test rather than an `isa`
+    // narrow, which is the one shape that holds for a struct as well
+    // as a class, and which accepts either spelling of the operator's
+    // own parameter.
+    get_object_equals_bridge(
+        location: LOCATION,
+        type_expression: TypeExpressions.TypeExpression
+    ) -> Definitions.FUNCTION static is
+        let other_argument = Variables.VARIABLE(
+            location,
+            Identifiers.Identifier(location, "other"),
+            TypeExpressions.OPTIONAL(
+                location,
+                TypeExpressions.NAMED(location, Identifiers.Identifier(location, "object"))
+            ),
+            false,
+            false,
+            null
+        );
+
+        let narrowed = Variables.VARIABLE(
+            location,
+            Identifiers.Identifier(location, "narrowed"),
+            TypeExpressions.INFER(location),
+            false,
+            false,
+            Trees.Expressions.CAST(
+                location,
+                TypeExpressions.OPTIONAL(location, type_expression),
+                Trees.Expressions.IDENTIFIER(
+                    location,
+                    Identifiers.Identifier(location, "other")
+                )
+            )
+        );
+
+        let narrowed_reference =
+            Trees.Expressions.IDENTIFIER(
+                location,
+                Identifiers.Identifier(location, "narrowed")
+            );
+
+        let then_branch = Trees.Statements.IF_BRANCH(
+            location,
+            Trees.Expressions.HAS_VALUE(location, narrowed_reference),
+            Trees.Statements.LIST(
+                location,
+                Collections.LIST[Statements.Statement]([
+                    Trees.Statements.RETURN(
+                        location,
+                        Trees.Expressions.BINARY(
+                            location,
+                            Identifiers.Identifier(location, "=~"),
+                            "=~",
+                            Trees.Expressions.SELF(location),
+                            Trees.Expressions.IDENTIFIER(
+                                location,
+                                Identifiers.Identifier(location, "narrowed")
+                            )
+                        )
+                    )
+                ]: Statements.Statement)
+            )
+        );
+
+        let body = Trees.Bodies.BLOCK(
+            location,
+            Trees.Statements.LIST(
+                location,
+                Collections.LIST[Statements.Statement]([
+                    Trees.Statements.LET(
+                        location,
+                        false,
+                        Variables.LIST(
+                            location,
+                            Collections.LIST[Variables.VARIABLE]([narrowed])
+                        )
+                    ),
+                    Trees.Statements.IF(
+                        location,
+                        Collections.LIST[Trees.Statements.IF_BRANCH]([then_branch])
+                    ),
+                    Trees.Statements.RETURN(
+                        location,
+                        Trees.Expressions.Literals.BOOLEAN(location, "false")
+                    )
+                ]: Statements.Statement)
+            )
+        );
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "equals"),
+            TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(
+                location,
+                Collections.LIST[Variables.VARIABLE]([other_argument])
+            ),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
+            Modifiers.LIST(location, null, null),
+            body
+        );
     si
 
 si
