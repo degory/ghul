@@ -21,7 +21,7 @@ Flag:
 
 - Bugs and likely-bugs.
 - Violations of the contracts below (type-system change protocol, cross-assembly test traps).
-- Deprecated idioms (e.g. `new Type(...)` instead of `Type(...)`).
+- Deprecated idioms.
 - **Any new use of rendered text as an entity's identity** - see the contract below. This one is a rejection, not a suggestion.
 - Missing tests where CONTRIBUTING.md requires one (any behavioural change wants an integration test; type-system changes additionally want unit tests).
 - `GHUL.md` falling out of step with reality - a PR introduces a feature `GHUL.md` doesn't document, changes documented behaviour without updating it, or otherwise leaves the reference contradicting the code.

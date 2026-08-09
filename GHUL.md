@@ -91,6 +91,15 @@ A deferred-init local is still covered by definite-assignment analysis: reading 
 
 A `mut` variable still cannot change type. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
 
+Applied to an argument list, `_(...)` *constructs* the type the context expects instead of taking its zero value, so a value can be built without naming its type a second time:
+
+```ghul
+let xs: LIST[int] = _();
+let b: BOX[int] = _(42);
+```
+
+The type comes from the same places the bare `_` takes it from: the annotation on a `let`, the left-hand side of an assignment, or the formal type of a call argument. An optional context is unwrapped first — `let b: BOX? = _(1)` constructs a `BOX`, which then widens to the optional — and with nothing to infer from, it is an error (`cannot infer the type to construct here`). `_[T](...)` is not accepted: with the type written out, `T(...)` already says it.
+
 `_` in a binding or pattern position — `let _ = expr`, a destructure leaf `(_, b)`, a `for _`, an `if let _`, a lambda discard formal `_ => ...` or `(_, y) => ...`, a typed discard `(_: T)` — is the discard placeholder, a different meaning from the default-value expression above; the positions are syntactically distinct so the two meanings never collide. `_[T]` has no reading as a lambda formal — a formal's type comes from `_: T`, not `_[T]` — so writing `_[T]` where a formal is expected is a compile error rather than a silently-dropped type argument.
 
 A single `let` can declare several variables, mixing inferred and explicit types:
@@ -1185,6 +1194,14 @@ A bound's *static* members are reachable through the type parameter itself, writ
 use System.IParsable;
 
 parse[T: IParsable[T]](s: string) -> T => T.parse(s, null);
+```
+
+A bound can also be a **kind**: `class` for a reference type, `struct` for a value type, `optional` for one that can be absent, and `init` for a type exposing an accessible parameterless constructor. Kinds combine with each other and with a type bound, space-separated, and take no parentheses:
+
+```ghul
+make[T: init]() -> T;
+find[T: class init](key: string) -> T;
+build[T: Named class init](name: string) -> T;
 ```
 
 The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS) when the constructor arguments alone don't pin every owner-generic slot:
