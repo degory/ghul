@@ -7,12 +7,19 @@ namespace Semantic.Symbols is
     // Decides whether a type argument satisfies a type parameter's
     // declared constraints — a kind constraint (`class` / `struct` /
     // `optional`), a type bound (`[T: SomeBase]`), and the
-    // parameterless-constructor (`new()`) constraint read from .NET
-    // metadata.
+    // parameterless-constructor (`init`) constraint.
     //
-    // Type variables, sentinels and unresolved or error types are not
-    // checkable: the conservative answer is that the constraint holds,
-    // so no false positive is reported.
+    // Sentinels and unresolved or error types are not checkable: the
+    // conservative answer is that the constraint holds, so no false
+    // positive is reported.
+    //
+    // A type variable is checkable. It is a declared type parameter
+    // carrying its own constraints, so whether it satisfies another
+    // parameter's is decided by whether what it guarantees entails what
+    // is required — an unbounded one guarantees nothing. Answering
+    // "satisfied" instead would let a call through that the CLR rejects
+    // when it is reached, as a VerificationException with no source
+    // location.
     class GENERIC_CONSTRAINT_CHECKER is
         init() is si
 
@@ -22,6 +29,68 @@ namespace Semantic.Symbols is
             !actual.is_type_variable /\
             !actual.is_sentinel;
 
+        // As is_checkable, but admitting a type variable — a declared type
+        // parameter whose own constraints decide the answer.
+        is_declared_type_checkable(actual: Type?) -> bool =>
+            actual? /\
+            actual.is_settled /\
+            !actual.is_sentinel;
+
+        // Whether a type variable's own declared constraints guarantee
+        // `kind`. A type variable is not an unknown type — it is a declared
+        // type parameter, and what it guarantees is exactly what it was
+        // declared to guarantee. Its `is_value_type` is unconditionally
+        // true (values of one are boxed), so the answer has to come from
+        // the symbol rather than from the type.
+        satisfies_kind_as_type_variable(kind: TypeParameterConstraintKind, actual: Type) -> bool =>
+            _satisfies_kind_as_type_variable(kind, actual, Collections.SET[Symbol]());
+
+        _satisfies_kind_as_type_variable(
+            kind: TypeParameterConstraintKind,
+            actual: Type,
+            seen: Collections.SET[Symbol]
+        ) -> bool is
+            if actual.symbol.constraint_kind == kind then
+                return true;
+            fi
+
+            if kind != TypeParameterConstraintKind.REFERENCE then
+                return false;
+            fi
+
+            // A class bound guarantees the reference kind, the way a CLR
+            // `where T : SomeClass` satisfies a `where U : class`. A trait
+            // bound does not — a struct can implement one — and neither does
+            // the `object` ancestor an unbounded parameter carries, since a
+            // value type is an object too. Getting either wrong reintroduces
+            // the same VerificationException this check exists to prevent.
+            let bound = actual.bound_type;
+
+            if !bound? \/ bound.is_object \/ bound.is_trait then
+                return false;
+            fi
+
+            // A bound that is itself a type parameter (`[TDerived: TBase]`)
+            // guarantees whatever its own effective bound guarantees, so the
+            // chain is walked to its end. The test has to precede the value-
+            // type one, whose answer for a type variable is unconditionally
+            // true. `seen` stops a cyclic declaration looping.
+            if bound.is_type_variable then
+                if !seen.add(actual.symbol) then
+                    return false;
+                fi
+
+                return _satisfies_kind_as_type_variable(kind, bound, seen);
+            fi
+
+            return !bound.is_value_type;
+        si
+
+        // A type-variable actual answers satisfied here whatever it
+        // declares, since is_checkable excludes one: the real decision is
+        // deferred to check_argument_type_bounds, which runs once its bound
+        // is attached. Deciding it here as well would report the same
+        // violation twice at a call site, where both checks run.
         is_satisfied(kind: TypeParameterConstraintKind, actual: Type) -> bool is
             if
                 kind == TypeParameterConstraintKind.NONE \/
@@ -76,13 +145,22 @@ namespace Semantic.Symbols is
         si
 
         // True when `actual` has its own accessible parameterless
-        // constructor — what a `new()` constraint requires. A value type
+        // constructor — what an `init` constraint requires. A value type
         // always has one; a class or struct carries the answer on its
         // symbol (`Classy.has_parameterless_constructor`), recorded when
         // the type is declared or imported — a ghūl constructor's
         // signature is not resolved early enough to inspect here. Any
         // other type shape is not checkable, so the answer is true.
         has_accessible_parameterless_constructor(actual: Type) -> bool is
+            // A type variable guarantees a constructor only if it was
+            // declared to — either directly, or by being a non-nullable
+            // value type, which always has one.
+            if actual.is_type_variable then
+                return
+                    actual.symbol.has_constructor_constraint \/
+                    actual.symbol.constraint_kind == TypeParameterConstraintKind.VALUE;
+            fi
+
             if actual.is_value_type then
                 return true;
             fi
@@ -101,7 +179,11 @@ namespace Semantic.Symbols is
         // `type_map` maps every parameter name to its actual so a bound
         // that references a sibling parameter (`[TDerived: TBase]`) is
         // substituted before the assignability check. No bound, or an
-        // unresolved / error / type-variable actual, reports nothing.
+        // unresolved or error actual, reports nothing.
+        //
+        // A type-variable actual is reported on: assignability reads its
+        // declared bound, so an unbounded one satisfies nothing and a
+        // bounded one satisfies whatever its bound is assignable to.
         report_bound_violation(
             location: LOCATION,
             logger: Logger,
@@ -127,11 +209,48 @@ namespace Semantic.Symbols is
             fi
         si
 
-        // Checks only the type bounds of each actual type argument.
-        // Used at type-expression positions (`f: CC[X]`, `-> CC[X]`,
-        // `let x: CC[X]`), where the kind and `new()` constraints are
-        // already checked as the type expression resolves but the bound
-        // is not yet attached to the parameter symbol at that point.
+        // Reports the kind and constructor constraints for a type-variable
+        // actual. They live here rather than in check_argument_kinds
+        // because their answer reads the actual's own declared bound, which
+        // is only attached during resolve-explicit-types — after every type
+        // expression has resolved, and so after the kinds are checked at a
+        // type-expression position. Running them there instead reports a
+        // bounded parameter as satisfying nothing, since its bound is not
+        // attached yet.
+        report_type_variable_kind_violations(
+            location: LOCATION,
+            logger: Logger,
+            owner: Symbol,
+            index: int,
+            name: string,
+            actual: Type
+        ) is
+            let kind = owner.get_argument_constraint_kind(index);
+
+            if kind != TypeParameterConstraintKind.NONE /\ !satisfies_kind_as_type_variable(kind, actual) then
+                logger.error(
+                    location,
+                    "type argument {actual} for {name} must be {describe(kind)}"
+                );
+            fi
+
+            if
+                owner.get_argument_has_constructor_constraint(index) /\
+                !has_accessible_parameterless_constructor(actual)
+            then
+                logger.error(
+                    location,
+                    "type argument {actual} for {name} must have an accessible parameterless constructor"
+                );
+            fi
+        si
+
+        // Checks the type bounds of each actual type argument, and every
+        // constraint of a type-variable actual. Used at type-expression
+        // positions (`f: CC[X]`, `-> CC[X]`, `let x: CC[X]`), where the
+        // kind and `init` constraints of an ordinary actual are already
+        // checked as the type expression resolves but the bound is not yet
+        // attached to the parameter symbol at that point.
         check_argument_type_bounds(
             location: LOCATION,
             logger: Logger,
@@ -144,9 +263,15 @@ namespace Semantic.Symbols is
             for i in 0 .. actual_type_arguments.count do
                 let actual = actual_type_arguments[i];
 
-                if is_checkable(actual) then
+                if is_declared_type_checkable(actual) then
                     if !type_map? then
                         type_map = build_type_map(argument_names, actual_type_arguments);
+                    fi
+
+                    if actual.is_type_variable then
+                        report_type_variable_kind_violations(
+                            location, logger, owner, i, argument_names[i], actual
+                        );
                     fi
 
                     report_bound_violation(location, logger, owner, i, argument_names[i], actual, type_map);
@@ -157,7 +282,7 @@ namespace Semantic.Symbols is
         // Checks each actual type argument of a generic class or
         // function against its declared constraints — a kind constraint
         // (`class` / `struct` / `optional`), a type bound
-        // (`[T: SomeBase]`), and the `new()` constructor constraint.
+        // (`[T: SomeBase]`), and the `init` constructor constraint.
         // `owner` is the generic whose scope holds the type-parameter
         // symbols.
         check_arguments(
@@ -172,7 +297,7 @@ namespace Semantic.Symbols is
         si
 
         // Checks only the kind (`class` / `struct` / `optional`) and
-        // `new()` constructor constraints — the checks that do not depend
+        // `init` constructor constraints — the checks that do not depend
         // on the type bound being attached. Used at type-expression
         // positions as the type expression resolves; the bound is checked
         // afterwards by check_argument_type_bounds once it is attached.
