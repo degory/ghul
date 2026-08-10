@@ -78,7 +78,7 @@ Applications written in ghūl require the [.NET 10 runtime](https://dotnet.micro
 
 ### Dev container
 
-Any dev container image with the .NET 10 SDK will do - for example [`mcr.microsoft.com/devcontainers/dotnet:10.0`](https://hub.docker.com/r/microsoft/devcontainers-dotnet). Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
+Any container image with the .NET 10 SDK will do. The one configured here is [`mcr.microsoft.com/dotnet/sdk:10.0`](https://hub.docker.com/r/microsoft/dotnet-sdk), which carries the SDK, git and curl and little else, so it is roughly half the download of the fuller `mcr.microsoft.com/devcontainers/dotnet` image. Pin `ghul.compiler` in your project's local .NET tool manifest and the compiler will be restored automatically when the container starts. A minimal worked example is in [this gist](https://gist.github.com/degory/1d6894fe1cf0bf73bb75cbf9c9176a0a).
 
 ## Basic ghūl language tutorial
 
