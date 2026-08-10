@@ -20,24 +20,40 @@ namespace Syntax.Process is
         // untyped interpolation fragment, an await or yield, ...
         is_disqualified: bool public;
 
-        // The same, except a store to the receiver's own instance
-        // field does not set it — that write hits only a fresh object
-        // when the function is a constructor reached through a `NEW`.
-        // The fixpoint reads it to classify a constructor
-        // construction-store-free even when its own-field writes leave
-        // it not strictly store-free.
+        // The same, except a write to the receiver's own instance state
+        // does not set it. That write is invisible to every caller when
+        // the receiver is an object nothing else can reach yet, which
+        // is what both consumers of this bit guarantee: a constructor
+        // run by a `NEW`, and a member reached on `self` from inside
+        // such a constructor. So it says "writes nothing but the state
+        // of the object it is called on", and is only ever read where
+        // that object is known to be fresh.
         is_construction_disqualified: bool public;
 
         // Statically-bounded callees. The function is store-free
         // only if every one of them proves store-free too.
         callees: Collections.MutableList[Function];
 
+        // Callees reached on a receiver that is fresh, or that is the
+        // fresh receiver the caller is itself being constructed on: a
+        // constructor run by a construction, and the assign accessor
+        // of a property written on `self` inside a constructor. Their
+        // own-state writes cannot touch a slot any caller holds a fact
+        // about, so these are bounded by the construction-store-free
+        // classification rather than the strict one.
+        construction_callees: Collections.MutableList[Function];
+
         init() is
             callees = Collections.LIST[Function]();
+            construction_callees = Collections.LIST[Function]();
         si
 
         add_callee(callee: Function) is
             callees.add(callee);
+        si
+
+        add_construction_callee(callee: Function) is
+            construction_callees.add(callee);
         si
     si
 
@@ -269,7 +285,7 @@ namespace Syntax.Process is
         si
 
         // A store the strict analysis rejects but a construction does
-        // not: writing the receiver's own instance field touches only
+        // not: writing the receiver's own instance state touches only
         // the fresh object a `NEW` is building.
         _disqualify_strict_only() is
             if _current? then
@@ -280,9 +296,9 @@ namespace Syntax.Process is
         _in_constructor: bool =>
             _current_function? /\ _current_function.is_constructor;
 
-        // A `self.field` target naming an instance field of the type
-        // under construction. `self` is the only receiver that resolves
-        // to the fresh object; a member on any other receiver stays a
+        // A `self.field` target naming an instance field of the
+        // receiver. `self` is the only receiver the construction bit
+        // says anything about; a member on any other receiver stays a
         // heap store.
         _writes_own_instance_field_member(target: Trees.Expressions.Expression?) -> bool is
             if !target? \/ !isa Trees.Expressions.MEMBER(target) then
@@ -306,6 +322,49 @@ namespace Syntax.Process is
             return field_symbol? /\ field_symbol.is_field /\ field_symbol.is_instance;
         si
 
+        // The assign accessor behind a `self.property` target on the
+        // type under construction. Writing a property runs its
+        // accessor rather than storing directly, so the write is only
+        // as safe as that accessor is — an auto-property's accessor
+        // writes nothing but its own backing field and qualifies, a
+        // hand-written one that stores elsewhere does not. Null for any
+        // target that is not an instance property on `self`.
+        _writes_own_instance_property_member(target: Trees.Expressions.Expression?) -> Function? is
+            if !target? \/ !isa Trees.Expressions.MEMBER(target) then
+                return null;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(target);
+
+            if !isa Trees.Expressions.SELF(member.left) then
+                return null;
+            fi
+
+            let context = current_instance_context;
+
+            if !context? then
+                return null;
+            fi
+
+            return _instance_property_assign(context.find_member(member.identifier.name));
+        si
+
+        // A constructor delegating to another constructor on the same
+        // object — `super.init(…)` from a subclass, `self.init(…)` from
+        // a secondary constructor.
+        _is_constructor_chain(member: Trees.Expressions.MEMBER) -> bool =>
+            _in_constructor /\
+            member.identifier.name =~ "init" /\
+            (isa Trees.Expressions.SELF(member.left) \/ isa Trees.Expressions.SUPER(member.left));
+
+        _instance_property_assign(symbol: Symbol?) -> Function? is
+            if !symbol? \/ !symbol.is_instance \/ !isa Semantic.Symbols.Property(symbol) then
+                return null;
+            fi
+
+            return (cast Semantic.Symbols.Property(symbol)).assign_function;
+        si
+
         _add_callee(callee: Function?) is
             if !_current? then
                 return;
@@ -324,6 +383,26 @@ namespace Syntax.Process is
             fi
 
             _current.add_callee(root);
+        si
+
+        _add_construction_callee(callee: Function?) is
+            if !_current? then
+                return;
+            fi
+
+            if !callee? then
+                _disqualify();
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if !root? then
+                _disqualify();
+                return;
+            fi
+
+            _current.add_construction_callee(root);
         si
 
         _add_callee_edges(symbol: Symbol?) is
@@ -346,11 +425,38 @@ namespace Syntax.Process is
                 // constructing a fresh exception writes only that new
                 // object, never a pre-existing heap slot, so it cannot
                 // invalidate a narrowing
+            elif isa Semantic.Symbols.Classy(symbol) /\ !symbol.is_reflected then
+                _add_construction_edges((cast Semantic.Symbols.Classy(symbol)).find_member("init"));
             else
-                // a constructor, a delegate-typed value, or something
-                // stranger: the call's effect cannot be bounded
+                // a delegate-typed value, an imported constructor, or
+                // something stranger: the call's effect cannot be
+                // bounded
                 _disqualify();
             fi
+        si
+
+        // Constructing a source-declared type runs a constructor on an
+        // object nothing else can reach yet, so the caller is bounded
+        // by the constructor's construction-store-free classification
+        // rather than its strict one — a constructor writing its own
+        // instance state stays store-free from where the construction
+        // is written. Overload resolution has not run, so every `init`
+        // the type declares has to qualify.
+        _add_construction_edges(constructors: Symbol?) is
+            if isa Semantic.Symbols.FUNCTION_GROUP(constructors) then
+                for function in (cast Semantic.Symbols.FUNCTION_GROUP(constructors)).functions do
+                    _add_construction_callee(function);
+                od
+
+                return;
+            fi
+
+            if isa Function(constructors) then
+                _add_construction_callee(cast Function(constructors));
+                return;
+            fi
+
+            _disqualify();
         si
 
         // Constructing an imported exception type is store-free for
@@ -505,11 +611,21 @@ namespace Syntax.Process is
         si
 
         _classify_simple_store(target: Trees.Expressions.Expression?) is
-            if _in_constructor /\ _writes_own_instance_field_member(target) then
-                // `self.field = …` on the fresh receiver a constructor
-                // is building: disqualifies the strict bit but not
+            if _writes_own_instance_field_member(target) then
+                // `self.field = …` writes only the receiver's own
+                // state: disqualifies the strict bit but not
                 // construction, exactly like the bare-field form below
                 _disqualify_strict_only();
+                return;
+            fi
+
+            let member_assign_function = _writes_own_instance_property_member(target);
+
+            if member_assign_function? then
+                // `self.property = …` reaches that same state through
+                // the property's accessor
+                _disqualify_strict_only();
+                _add_construction_callee(member_assign_function);
                 return;
             fi
 
@@ -538,12 +654,21 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if _in_constructor /\ symbol? /\ symbol.is_field /\ symbol.is_instance then
+            if symbol? /\ symbol.is_field /\ symbol.is_instance then
                 // a bare instance-field name resolves to the receiver's
-                // own field; in a constructor the receiver is the fresh
-                // object a `NEW` is building, so the write disqualifies
-                // the strict bit but not construction
+                // own field, so the write disqualifies the strict bit
+                // but not construction
                 _disqualify_strict_only();
+                return;
+            fi
+
+            let assign_function = _instance_property_assign(symbol);
+
+            if assign_function? then
+                // the bare-name form of the own-property write handled
+                // above
+                _disqualify_strict_only();
+                _add_construction_callee(assign_function);
                 return;
             fi
 
@@ -596,6 +721,26 @@ namespace Syntax.Process is
 
             if isa Trees.Expressions.MEMBER(target) then
                 let member = cast Trees.Expressions.MEMBER(target);
+
+                if _is_constructor_chain(member) then
+                    // `super.init(…)` or `self.init(…)` runs on the
+                    // object this constructor is itself being run on,
+                    // so it is bounded the same way a construction is —
+                    // and writes that receiver's own state, so it
+                    // disqualifies the strict bit just as writing a
+                    // field directly does
+                    _disqualify_strict_only();
+
+                    let receiver_type = _typer.try_type(member.left);
+
+                    if !receiver_type? then
+                        _disqualify();
+                        return;
+                    fi
+
+                    _add_construction_edges(receiver_type.find_member("init"));
+                    return;
+                fi
 
                 let as_identifier = member.try_copy_as_identifer();
 
