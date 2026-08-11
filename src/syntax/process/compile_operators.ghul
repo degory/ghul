@@ -7,12 +7,24 @@ namespace Syntax.Process is
 
     use IR.Values;
 
+    // An operator or index expression whose operand walks are held
+    // under a speculation because an operand takes its type from
+    // context and has none to offer resolution. `retried` records that
+    // the resolved formal type has been pushed in and the operand
+    // walked again, so that happens once however the second walk turns
+    // out.
+    class DEFERRED_OPERANDS(node: Trees.Node) is
+        retried: bool public;
+    si
+
     // Compiles unary, binary and index expressions. Split out of
     // COMPILE_EXPRESSIONS, which delegates visit(unary), pre(binary),
     // visit(binary) and visit(index) here. The exception-handling
     // wrappers of visit(binary) / visit(index) stay on the visitor;
     // visit_binary / visit_index are the enclosed logic.
     class COMPILE_OPERATORS is
+        _deferred_operands: Collections.LIST[DEFERRED_OPERANDS] field;
+
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
@@ -50,6 +62,7 @@ namespace Syntax.Process is
             _condition_analyzer = condition_analyzer;
             _visitor = visitor;
             _value_boxer = IR.VALUE_BOXER(logger);
+            _deferred_operands = Collections.LIST[DEFERRED_OPERANDS]();
         si
 
         visit_unary(unary: Trees.Expressions.UNARY) is
@@ -237,10 +250,166 @@ namespace Syntax.Process is
                 return true;
             fi
 
+            // An operand that takes its type from context has none to
+            // offer resolution, and reports so as it walks. Open a
+            // speculation over the operand walks, the way visit_call
+            // does over its argument walks, so that error can be rolled
+            // back once resolution has settled on a formal type to push
+            // in. The operands still walk in their ordinary order and
+            // through the ordinary walker — only the diagnostics are
+            // held.
+            if binary.left.awaits_context_type \/ binary.right.awaits_context_type then
+                _deferred_operands.add(DEFERRED_OPERANDS(binary));
+
+                _logger.speculate();
+                _flow.speculate();
+            fi
+
             return false;
         si
 
+        // The operand walks of a binary carrying a context-typed
+        // operand run inside a speculation opened by pre_binary; close
+        // it here, whichever way the resolution below went.
         visit_binary(binary: Trees.Expressions.BINARY) is
+            if !_deferred_for(binary)? then
+                _visit_binary(binary);
+
+                return;
+            fi
+
+            try
+                _visit_binary(binary);
+            finally
+                _deferred_operands.remove_at(_deferred_operands.count - 1);
+
+                _flow.commit();
+                _logger.commit();
+            yrt
+        si
+
+        // The innermost binary currently deferring an operand, when it
+        // is this one. Nested binaries push in walk order, so only the
+        // top of the stack can be the node being visited.
+        _deferred_for(node: Trees.Node) -> DEFERRED_OPERANDS? is
+            if _deferred_operands.count == 0 then
+                return null;
+            fi
+
+            let top = _deferred_operands[_deferred_operands.count - 1];
+
+            return if top.node == node then top else null fi;
+        si
+
+        // Once resolution has settled on a single `function`, push its
+        // formal type into an operand that was still waiting for one
+        // and walk that operand again — the same step visit_call takes
+        // for a waiting argument, and for the same reason: nothing
+        // could type the operand until the callee was known. Resolution
+        // reaches a function at all because an untyped operand carries
+        // the ERROR type, which matches any formal, so the operator's
+        // own declaration decides the target type rather than anything
+        // being assumed about how operators are declared.
+        //
+        // True when an operand was re-walked, which invalidates every
+        // type resolution just read off the operands; the caller starts
+        // over against the settled ones. `retried` keeps that to a
+        // single attempt, so an operand left error-typed by its second
+        // walk does not drive another.
+        _resolve_deferred_operands(
+            binary: Trees.Expressions.BINARY,
+            function: Semantic.Symbols.Function
+        ) -> bool is
+            let deferred = _deferred_for(binary);
+
+            if !deferred? \/ deferred.retried then
+                return false;
+            fi
+
+            // An instance operator takes the left operand as its
+            // receiver, so only the right is one of its arguments. A
+            // waiting left operand cannot reach that path at all: its
+            // ERROR type has no members, so no operator is found on it.
+            let left_formal =
+                if function.is_instance then null else _formal_type(function, 0) fi;
+
+            let right_formal =
+                _formal_type(function, if function.is_instance then 0 else 1 fi);
+
+            let left_type = if binary.left.awaits_context_type then left_formal else null fi;
+            let right_type = if binary.right.awaits_context_type then right_formal else null fi;
+
+            if !left_type? /\ !right_type? then
+                return false;
+            fi
+
+            deferred.retried = true;
+
+            _logger.roll_back();
+            _logger.speculate();
+            _flow.restore();
+
+            if left_type? then
+                binary.left.set_expected_type(left_type, "");
+            fi
+
+            if right_type? then
+                binary.right.set_expected_type(right_type, "");
+            fi
+
+            binary.left.walk(_visitor);
+            binary.right.walk(_visitor);
+
+            return true;
+        si
+
+        // The index counterpart of _resolve_deferred_operands: the
+        // resolved indexer's first formal is the index argument's type.
+        // Both accessors take the index there, so `get_Item` and
+        // `set_Item` need no distinguishing.
+        _resolve_deferred_index(
+            index: Trees.Expressions.INDEX,
+            function: Semantic.Symbols.Function
+        ) -> bool is
+            let deferred = _deferred_for(index);
+
+            if !deferred? \/ deferred.retried then
+                return false;
+            fi
+
+            let formal = _formal_type(function, 0);
+
+            if !formal? \/ !index.index.awaits_context_type then
+                return false;
+            fi
+
+            deferred.retried = true;
+
+            _logger.roll_back();
+            _logger.speculate();
+            _flow.restore();
+
+            index.index.set_expected_type(formal, "");
+            index.index.walk(_visitor);
+
+            return true;
+        si
+
+        // The formal at `index`, or null when the function has no such
+        // argument or the one it has is wild — a type variable free
+        // only in the waiting operand's own slot pins nothing, and the
+        // operand is left to report that it still has no type.
+        _formal_type(function: Semantic.Symbols.Function, index: int) -> Type? is
+            if index >= function.arguments.count then
+                return null;
+            fi
+
+            let formal = function.arguments[index];
+
+            return if formal.is_wild then null else formal fi;
+        si
+
+        _visit_binary(binary: Trees.Expressions.BINARY) is
             binary.compile_expressions_state.value = null;
 
             if !binary.left.value? \/ !binary.right.value? then
@@ -362,6 +531,16 @@ namespace Syntax.Process is
             fi
 
             if function? then
+                // An operand that was waiting for a type now has the
+                // resolved formal to take one from. Everything read off
+                // the operands above is stale once it has been walked
+                // again, so resolve the whole operator afresh.
+                if _resolve_deferred_operands(binary, function) then
+                    _visit_binary(binary);
+
+                    return;
+                fi
+
                 _symbol_use_locations.add_symbol_use(binary.operation.location, function);
 
                 // Mirror the inferred-T constraint check in compile_calls: an
@@ -774,7 +953,40 @@ namespace Syntax.Process is
             return coerced;
         si
 
+        // An index argument takes its type from the indexer resolution
+        // settles on, so it walks under a speculation for the same
+        // reason an operator operand does. The receiver is not a
+        // candidate: an untyped one has no members for the indexer to
+        // be found on, so there is nothing to resolve against.
+        pre_index(index: Trees.Expressions.INDEX) -> bool is
+            if index.index.awaits_context_type then
+                _deferred_operands.add(DEFERRED_OPERANDS(index));
+
+                _logger.speculate();
+                _flow.speculate();
+            fi
+
+            return false;
+        si
+
         visit_index(index: Trees.Expressions.INDEX) is
+            if !_deferred_for(index)? then
+                _visit_index(index);
+
+                return;
+            fi
+
+            try
+                _visit_index(index);
+            finally
+                _deferred_operands.remove_at(_deferred_operands.count - 1);
+
+                _flow.commit();
+                _logger.commit();
+            yrt
+        si
+
+        _visit_index(index: Trees.Expressions.INDEX) is
             let existing_value = index.value;
             let need_store = existing_value? /\ existing_value.is_need_store;
 
@@ -889,6 +1101,12 @@ namespace Syntax.Process is
                 fi
 
                 let function = overload_result.function;
+
+                if _resolve_deferred_index(index, function) then
+                    _visit_index(index);
+
+                    return;
+                fi
 
                 // Record the indexer-accessor use over the `[...]`
                 // bracket span — from the column after the LHS (the
