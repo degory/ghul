@@ -16,6 +16,16 @@ namespace Semantic.Symbols is
     use Types.Type;
 
     class Classy: ScopedWithEnclosingScope, ClosureContext is
+        // Whether the type is visible outside its declaring assembly.
+        // Mirrors gen_access: an underscore-prefixed type under the
+        // private or protected policy is assembly-internal.
+        is_public_readable: bool => val
+            let policy = IoC.CONTAINER.instance.build_flags.underscore_access;
+
+            !(name.starts_with('_') /\
+                (policy == Compiler.UnderscoreAccess.PRIVATE \/ policy == Compiler.UnderscoreAccess.PROTECTED))
+        lav;
+
         _ancestors: Collections.LIST[Type];
         _implementors: Collections.LIST[Symbol]?;
         _enclosing_symbols: Collections.MAP[string,Symbol];
@@ -445,6 +455,62 @@ namespace Semantic.Symbols is
             return GENERIC(location, self, actual_type_arguments);
         si
 
+        // This type applied to its own type parameters.
+        //
+        // It is what its members' receiver is from inside its own
+        // methods, and what a subtype of it extends. The open type a
+        // generic is declared as is not a type anything can name at run
+        // time, so a row or a reference that needs to name this one has
+        // to construct it. A non-generic type is already itself.
+        own_instantiation: Type is
+            if argument_names.count == 0 then
+                return type!;
+            fi
+
+            let arguments = Collections.LIST[Type]();
+
+            for index in 0..argument_names.count do
+                let parameter = type_parameter_at(index);
+
+                assert parameter? else
+                    "generic type '{name}' has no type parameter '{argument_names[index]}'";
+
+                arguments.add(parameter.type!);
+            od
+
+            return Types.GENERIC(LOCATION.internal, self, arguments);
+        si
+
+        // The symbol standing for the type parameter at `index`, or null
+        // when there is none to be had.
+        //
+        // A type that writes its parameters declares them into its own
+        // scope, so the name it wrote finds them. A closure frame is the
+        // exception: its parameters are the enclosing function's,
+        // reached at a position the lowering installs rather than
+        // redeclared, so it answers with those symbols instead.
+        type_parameter_at(index: int) -> Symbol? is
+            if index < 0 \/ index >= argument_names.count then
+                return null;
+            fi
+
+            if let declared = find_direct(argument_names[index]) then
+                return declared;
+            fi
+
+            // An imported generic carries its parameters positionally
+            // and does not declare them into its own scope, so there is
+            // no name to find and the position is the whole answer. A
+            // type declared in this compilation that cannot find one has
+            // something wrong with it, and says so rather than being
+            // given a parameter it never declared.
+            if is_reflected then
+                return CLASSY_GENERIC_ARGUMENT(location, self, argument_names[index], index);
+            fi
+
+            return null;
+        si
+
         // The kind constraint of the type parameter at `index`. Imported
         // generics carry it in the `argument_constraint_kinds` list (the
         // type-parameter symbols are not declared in scope); ghūl-declared
@@ -455,7 +521,7 @@ namespace Semantic.Symbols is
             fi
 
             if index >= 0 /\ index < argument_names.count then
-                let argument = find_direct(argument_names[index]);
+                let argument = type_parameter_at(index);
 
                 if argument? then
                     return argument.constraint_kind;
@@ -477,7 +543,7 @@ namespace Semantic.Symbols is
             fi
 
             if index >= 0 /\ index < argument_names.count then
-                let argument = find_direct(argument_names[index]);
+                let argument = type_parameter_at(index);
 
                 if argument? then
                     return argument.has_constructor_constraint;
@@ -497,7 +563,7 @@ namespace Semantic.Symbols is
             fi
 
             if index >= 0 /\ index < argument_names.count then
-                let argument = find_direct(argument_names[index]);
+                let argument = type_parameter_at(index);
 
                 if argument? /\ argument.is_type_variable then
                     let ancestors = argument.ancestors;
@@ -1777,6 +1843,12 @@ namespace Semantic.Symbols is
         _constructor: Method?;
         _captures: Collections.LIST[Field];
 
+        // The closure whose captures this frame holds. Its method is a
+        // member of the frame in the emitted assembly, but it is
+        // declared into the function the literal was written in, so a
+        // walk over the frame's own symbols does not find it.
+        closure: Closure => _closure;
+
         next_id: int static is
             let result = _next_id;
 
@@ -1914,9 +1986,27 @@ namespace Semantic.Symbols is
             fi
         si
 
+        // The enclosing function's type-parameter symbols, in the order
+        // this frame's own parameters mirror them. A frame does not
+        // redeclare them: the closure installs an emitted position on
+        // each for as long as its body is being emitted, which is what
+        // makes them render at the frame's index rather than at their
+        // own.
+        _type_parameters: Collections.List[Symbol]?;
+
+        type_parameter_at(index: int) -> Symbol? is
+            if let self._type_parameters? /\ index >= 0 /\ index < _type_parameters.count then
+                return _type_parameters[index];
+            fi
+
+            return super.type_parameter_at(index);
+        si
+
         set_type_arguments(arguments: Collections.Iterable[Symbol]) is
-            // self.arguments = arguments |> map(a => a.type) |> collect();
-            self.argument_names = arguments |> map(a => a.name) |> collect();
+            let symbols = arguments |> collect_list();
+
+            _type_parameters = symbols;
+            self.argument_names = symbols |> map(a => a.name) |> collect();
         si
 
         gen_all(context: IR.CONTEXT, symbol_loader: SYMBOL_LOADER) is
@@ -1941,12 +2031,16 @@ namespace Semantic.Symbols is
 
         gen_constructor(context: IR.CONTEXT, symbol_loader: SYMBOL_LOADER) is
             let internal = LOCATION.internal;
-           
-            _constructor!.gen_definition_header(context);
 
-            context.write_line("{{");
+            // The constructor is encoded into a body of its own.
+            // Without one its row carries no code at all, which is
+            // not a constructor a runtime will accept: the image is
+            // rejected outright, before any type in it is loaded.
+            let assembly_emitter = context.srm_assembly_emitter;
+            let enclosing = context.current_srm_body_emitter;
+            let body_emitter = IR.Emitter.SRM_METHOD_BODY_EMITTER();
 
-            context.indent();
+            context.current_srm_body_emitter = body_emitter;
 
             try
                 for c in _captures |> filter(c => c.name !~ "$recurse") do
@@ -1954,21 +2048,27 @@ namespace Semantic.Symbols is
                     argument.set_type(c.type!);
 
                     c.store(
-                        internal, 
-                        IR.Values.Load.REFERENCE_SELF(self), 
+                        internal,
+                        IR.Values.Load.REFERENCE_SELF(self),
                         argument.load(LOCATION.internal, null, symbol_loader),
                         symbol_loader,
                         true
                     ).gen(context);
                 od
             catch ex: System.Exception
-                IoC.CONTAINER.instance.logger.exception(location, ex, "error generating closure frame constructor");
-            yrt            
-            
-            context.write_line("ret");
+                IoC.CONTAINER.instance.logger.exception(
+                    location, ex, "error generating closure frame constructor");
+            yrt
 
-            context.outdent();
-            context.write_line("}}");
+            body_emitter.ret();
+
+            assembly_emitter.handles.set_body_offset(
+                _constructor!, body_emitter.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(
+                _constructor!, body_emitter.il_outputs);
+
+            context.current_srm_body_emitter = enclosing;
+
         si
 
         gen_closure(context: IR.CONTEXT) is
@@ -2001,8 +2101,7 @@ namespace Semantic.Symbols is
                         IR.Values.NEW(specialized_self.type, ctor, actual_arguments)
                     else
                         IR.Values.NEW(type!, _constructor!, actual_arguments)
-                    fi
-                        .freeze();
+                    fi;
             catch ex: System.Exception
                 CONTAINER.instance.logger.exception(self.location, ex, "trying to generate frame instance");
             yrt
@@ -2029,8 +2128,9 @@ namespace Semantic.Symbols is
         // The number it denotes, absent when `value` is not an integer
         // in int32's range. `value` is the source token verbatim, so it
         // can carry digit grouping, a radix prefix and a type suffix,
-        // none of which a consumer can emit: ilasm rejects
-        // `int32(200l)`.
+        // none of which a consumer can emit: an enum member's value has
+        // to reach metadata as a number, not as the text that was
+        // written for it.
         //
         // Absent rather than zero, because zero is a legitimate enum
         // value. A reflected member of an enum wider than int32 arrives

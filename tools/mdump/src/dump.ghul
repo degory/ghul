@@ -1,0 +1,184 @@
+namespace MetadataDump is
+    use IO.Std.write_line;
+
+    use System.Reflection.Metadata.MetadataReader;
+    use System.Reflection.Metadata.Ecma335.MetadataTokens;
+    use System.Reflection.Metadata.TypeDefinition;
+    use System.Reflection.Metadata.MethodDefinition;
+    use System.Reflection.Metadata.EntityHandle;
+    use System.Reflection.PortableExecutable.PEReader;
+    use System.Reflection.Metadata.PEReaderExtensions;
+
+    // Dumps an assembly's metadata tables.
+    //
+    // Deliberately not a disassembler: ilspycmd already renders IL well,
+    // and renders it the way a reader wants rather than the way the
+    // tables hold it. What it does not show is what a back end gets
+    // wrong — which row a definition landed on, where a type's member
+    // runs start, whether a method row points at a body at all, and what
+    // a signature blob actually says. Those are what this prints.
+    class DUMP(_path: string) is
+        write() is
+            let use stream = IO.File.open_read(_path);
+            let use pe = PEReader(stream);
+
+            let metadata = PEReaderExtensions.get_metadata_reader(pe);
+            let signatures = SIGNATURE_READER(metadata);
+
+            _write_types(pe, metadata, signatures);
+        si
+
+        _write_types(pe: PEReader, metadata: MetadataReader, signatures: SIGNATURE_READER) is
+            for handle in metadata.type_definitions do
+                let type = metadata.get_type_definition(handle);
+
+                write_line(
+                    "TypeDef#{_row(cast EntityHandle(handle))} {_full_name(metadata, type)}");
+
+                write_line("  flags 0x{cast int(type.attributes):X}");
+
+                if !type.base_type.is_nil then
+                    write_line("  extends {_handle(type.base_type)}");
+                fi
+
+                _write_interfaces(metadata, type);
+                _write_type_parameters(metadata, type);
+                _write_fields(metadata, signatures, type);
+                _write_methods(pe, metadata, signatures, type);
+                _write_method_implementations(metadata, type);
+
+                write_line("");
+            od
+        si
+
+        _write_interfaces(metadata: MetadataReader, type: TypeDefinition) is
+            for handle in type.get_interface_implementations() do
+                let implementation = metadata.get_interface_implementation(handle);
+
+                write_line("  implements {_handle(implementation.`interface)}");
+            od
+        si
+
+        _write_type_parameters(metadata: MetadataReader, type: TypeDefinition) is
+            for handle in type.get_generic_parameters() do
+                let parameter = metadata.get_generic_parameter(handle);
+
+                write_line(
+                    "  type parameter !{parameter.index} {metadata.get_string(parameter.name)}");
+            od
+        si
+
+        // Fields and methods are runs: a type's members are the rows
+        // from its own first-member pointer up to the next type's. A
+        // member numbered into the wrong run reads as belonging to a
+        // type that never declared it, which is why the row numbers are
+        // printed rather than just the order.
+        _write_fields(
+            metadata: MetadataReader,
+            signatures: SIGNATURE_READER,
+            type: TypeDefinition
+        ) is
+            for handle in type.get_fields() do
+                let `field = metadata.get_field_definition(handle);
+
+                write_line(
+                    "  Field#{_row(cast EntityHandle(handle))} "
+                    "{metadata.get_string(`field.name)} : "
+                    "{signatures.blob(`field.signature)}");
+            od
+        si
+
+        _write_methods(
+            pe: PEReader,
+            metadata: MetadataReader,
+            signatures: SIGNATURE_READER,
+            type: TypeDefinition
+        ) is
+            for handle in type.get_methods() do
+                let method = metadata.get_method_definition(handle);
+
+                // A method row with no body points at RVA 0. That is a
+                // legal row for an abstract or bodyless member and a
+                // silent disaster for anything else, so it is called
+                // out rather than printed as a number.
+                let body =
+                    if method.relative_virtual_address == 0 then
+                        "NO BODY"
+                    else
+                        "rva 0x{method.relative_virtual_address:X}"
+                    fi;
+
+                write_line(
+                    "  Method#{_row(cast EntityHandle(handle))} "
+                    "{metadata.get_string(method.name)} "
+                    "{signatures.blob(method.signature)} [{body}]");
+
+                _write_method_type_parameters(metadata, method);
+                _write_locals(pe, metadata, signatures, method);
+            od
+        si
+
+        _write_method_type_parameters(metadata: MetadataReader, method: MethodDefinition) is
+            for handle in method.get_generic_parameters() do
+                let parameter = metadata.get_generic_parameter(handle);
+
+                write_line(
+                    "    type parameter !!{parameter.index} {metadata.get_string(parameter.name)}");
+            od
+        si
+
+        // The local variable signature a body header points at. An MVAR
+        // here, in a method with no type parameters of its own, is the
+        // shape the runtime rejects at load — and it is invisible in a
+        // disassembly that prints locals by their resolved names.
+        _write_locals(
+            pe: PEReader,
+            metadata: MetadataReader,
+            signatures: SIGNATURE_READER,
+            method: MethodDefinition
+        ) is
+            if method.relative_virtual_address == 0 then
+                return;
+            fi
+
+            let body = PEReaderExtensions.get_method_body(pe, method.relative_virtual_address);
+
+            if body.local_signature.is_nil then
+                return;
+            fi
+
+            let signature = metadata.get_standalone_signature(body.local_signature);
+
+            write_line("    locals {signatures.blob(signature.signature)}");
+        si
+
+        // MethodImpl rows hang off the type that carries them rather
+        // than off a table of their own, so they are read per type.
+        _write_method_implementations(metadata: MetadataReader, type: TypeDefinition) is
+            for handle in type.get_method_implementations() do
+                let implementation = metadata.get_method_implementation(handle);
+
+                write_line(
+                    "  overrides {_handle(implementation.method_declaration)} "
+                    "with {_handle(implementation.method_body)}");
+            od
+        si
+
+        _full_name(metadata: MetadataReader, type: TypeDefinition) -> string is
+            let space = metadata.get_string(type.`namespace);
+            let name = metadata.get_string(type.name);
+
+            return if space.length == 0 then name else "{space}.{name}" fi;
+        si
+
+        // A handle as its table and row. Resolving it to a name would
+        // answer a different question — the tables are what is being
+        // checked.
+        _handle(handle: EntityHandle) -> string =>
+            "{handle.kind}#{_row(handle)}";
+
+        // A typed handle does not convert to EntityHandle on its own,
+        // so every caller casts and the row number is read here.
+        _row(handle: EntityHandle) -> int static => MetadataTokens.get_row_number(handle);
+    si
+si

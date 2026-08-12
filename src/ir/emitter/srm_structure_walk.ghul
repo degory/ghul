@@ -1,0 +1,1231 @@
+namespace IR.Emitter is
+    use System.Reflection.Metadata.EntityHandle;
+    use System.Reflection.Metadata.TypeDefinitionHandle;
+    use System.Reflection.Metadata.Ecma335.MetadataTokens;
+
+    use Semantic.Symbols.Scope;
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.Function;
+    use Semantic.Symbols.Field;
+
+    // A method this assembly defines together with the interface member
+    // it explicitly implements, held until the owning type has a handle
+    // for the MethodImpl row to name.
+    class SRM_BOUND_METHOD(body: EntityHandle, declaration: EntityHandle);
+
+    // One attribute the compiler applies to a return or parameter slot,
+    // held until the caller knows whether the slot has a Param row.
+    class SRM_SLOT_ATTRIBUTE(
+        assembly_name: string,
+        qualified_name: string,
+        argument_types: Collections.List[Semantic.Types.Type],
+        value: ubyte[]
+    );
+
+    // One type parameter, held until every row it could be ordered
+    // against exists.
+    //
+    // GenericParam is sorted on its owner, and an owner is a coded index
+    // over TypeDef *and* MethodDef, so the two row kinds interleave by
+    // row number. A type's parameters therefore cannot be written as the
+    // walk reaches the type: a later type's row can sort ahead of an
+    // earlier type's method. Unlike the other sorted side tables, SRM
+    // validates this one rather than ordering it, and rejects the
+    // assembly outright.
+    class SRM_TYPE_PARAMETER(
+        owner: EntityHandle,
+        index: int,
+        name: string,
+        attributes: System.Reflection.GenericParameterAttributes,
+        // The type this parameter is bounded by, or null when it is
+        // unbounded. Held rather than resolved to a handle here: the
+        // constraint row has to follow its parameter's row, and the
+        // parameters are not in that order until they are sorted.
+        bound: Semantic.Types.Type?,
+        // The closure whose mapping the bound has to be encoded under,
+        // for a parameter belonging to a closure frame. See
+        // SRM_SIGNATURE_ENCODER.frame_mapping - a bound naming the
+        // parameter itself encodes at the parameter's method-level
+        // position otherwise, which on a frame class names a method
+        // that is not there.
+        mapping: Semantic.Symbols.Closure?
+    ) is
+        // The coded index the table is sorted on: the owner's row,
+        // tagged with which table it points into.
+        order: int =>
+            MetadataTokens.get_row_number(owner) * 2 +
+                if owner.kind == System.Reflection.Metadata.HandleKind.METHOD_DEFINITION then 1 else 0 fi;
+    si
+
+    // Derives the emitted assembly's structure from the symbol table, in
+    // two passes over the same sequence.
+    //
+    // `number` runs before any body is encoded and assigns every type,
+    // method and field its metadata row, so a body can embed a token for
+    // a target whose row does not exist yet. `write_rows` runs after the
+    // tree walk and writes those rows, in the order `number` assumed.
+    // Between the two, the tree walk deposits body offsets against
+    // function symbols.
+    //
+    // A row number is only a prediction until `write_rows` makes it
+    // true, and nothing checks: a member run written in a different
+    // order — or at a different length — than it was numbered reparents
+    // members onto the wrong type and still loads. `number` therefore
+    // records the sequence it used and `write_rows` replays it, rather
+    // than each deriving one from a symbol table that changes between
+    // them: compiling a state machine's body declares the frame fields
+    // that body needs, long after numbering has run.
+    class SRM_STRUCTURE_WALK(_assembly: SRM_ASSEMBLY_EMITTER) is
+        _handles: SRM_HANDLES => _assembly.handles;
+        _signatures: SRM_SIGNATURE_ENCODER;
+        _blobs: SRM_ATTRIBUTE_BLOB_ENCODER;
+        _type_parameters: Collections.LIST[SRM_TYPE_PARAMETER];
+
+        init(..) is
+            _signatures = SRM_SIGNATURE_ENCODER(_assembly);
+            _blobs =
+                SRM_ATTRIBUTE_BLOB_ENCODER(IoC.CONTAINER.instance.innate_symbol_lookup);
+            _type_parameters = Collections.LIST[SRM_TYPE_PARAMETER]();
+        si
+
+        number(root: Scope) is
+            // <Module> already occupies TypeDef row 1, and its member
+            // runs start at 1 and are empty, so user rows follow it.
+            let next_type mut = _assembly.next_type_row;
+            let next_method mut = _assembly.next_method_row;
+            let next_field mut = _assembly.next_field_row;
+
+            for type in SRM_MEMBER_ORDER.types(root) do
+                let fields = SRM_MEMBER_ORDER.fields(type);
+                let methods = SRM_MEMBER_ORDER.methods(type);
+
+                _handles.emission_plan.add(type, fields, methods);
+
+                if let declared = type.declared then
+                    _handles.set_type_definition(declared, MetadataTokens.type_definition_handle(next_type));
+                fi
+
+                next_type = next_type + 1;
+
+                for `field in fields do
+                    _handles.set_field_definition(`field, MetadataTokens.field_definition_handle(next_field));
+
+                    next_field = next_field + 1;
+                od
+
+                if _is_unit_variant(type) then
+                    _handles.set_unit_variant_instance(
+                        type.declared!, MetadataTokens.field_definition_handle(next_field));
+
+                    next_field = next_field + 1;
+                fi
+
+                // An enum's storage field and its members are fields of
+                // the emitted type but not of the symbol table's, so
+                // they are counted here rather than by the member order.
+                next_field = next_field + _enum_field_count(type);
+
+                for method in methods do
+                    _handles.set_method_definition(method, MetadataTokens.method_definition_handle(next_method));
+
+                    next_method = next_method + 1;
+                od
+
+                if _is_unit_variant(type) then
+                    _handles.set_unit_variant_initializer(
+                        type.declared!, MetadataTokens.method_definition_handle(next_method));
+
+                    next_method = next_method + 1;
+                fi
+
+                for member in _synthesised_frame_members(type) do
+                    _handles.set_frame_member(
+                        cast Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type.declared!),
+                        member,
+                        MetadataTokens.method_definition_handle(next_method));
+
+                    next_method = next_method + 1;
+                od
+
+                next_method = next_method + _boilerplate_members(type).count;
+            od
+        si
+
+        // An iterable or iterator type satisfies the non-generic
+        // framework interfaces its generic ones derive from with a
+        // member apiece. Neither is a declaration the symbol table
+        // holds, so both passes take them from here, last in the
+        // method run.
+        //
+        // One list, read by both passes, in one order — the same
+        // discipline `FRAME_MEMBERS` keeps, and for the same reason: a
+        // member run written in a different order than it was numbered
+        // reparents members onto the wrong type and still loads.
+        _boilerplate_members(type: SRM_EMITTED_TYPE) -> Collections.List[BoilerplateMember] static is
+            let result = Collections.LIST[BoilerplateMember]();
+
+            let declared = type.declared;
+
+            if !declared? then
+                return result;
+            fi
+
+            if declared.is_derived_from_iterable_trait then
+                result.add(BoilerplateMember.ENUMERABLE_GET_ENUMERATOR);
+            fi
+
+            if declared.is_derived_from_iterator_trait then
+                result.add(BoilerplateMember.ENUMERATOR_GET_CURRENT);
+            fi
+
+            return result;
+        si
+
+        // The members a state-machine frame carries that no symbol
+        // declares: MoveNext and the iterator surface every consumer
+        // reaches it through.
+        //
+        // The frame's *constructor* is not among them — `declare()`
+        // declares it into the frame's own scope, so the member order
+        // already yields it and it already has a row.
+        //
+        // One list, read by both passes, in one order. A frame's rows
+        // are numbered from this and written from this, and nothing
+        // checks that the two agree — a member run written in a
+        // different order than it was numbered reparents members onto
+        // the wrong type and still loads.
+        FRAME_MEMBERS: Collections.List[FrameMember] static =>
+            [
+                FrameMember.MOVE_NEXT,
+                FrameMember.GET_CURRENT,
+                FrameMember.GET_ENUMERATOR,
+                FrameMember.DISPOSE,
+                FrameMember.RESET,
+                FrameMember.TO_STRING
+            ];
+
+
+        // The members a state machine's frame carries that no symbol
+        // declares, for whichever kind of state machine this type is.
+        // Empty for everything else.
+        //
+        // One list per kind, read by both passes, in one order — a
+        // member run written in a different order than it was numbered
+        // reparents members onto the wrong type and still loads.
+        _synthesised_frame_members(type: SRM_EMITTED_TYPE) -> Collections.List[FrameMember] static is
+            if isa Semantic.Symbols.STATE_MACHINE_FRAME(type.declared) then
+                return FRAME_MEMBERS;
+            fi
+
+            if isa Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME(type.declared) then
+                return ASYNC_FRAME_MEMBERS;
+            fi
+
+            return Collections.LIST[FrameMember]();
+        si
+
+        // An async frame satisfies `IAsyncStateMachine`, whose two
+        // members it has no symbol for. Its MoveNext returns void,
+        // unlike a generator's.
+        ASYNC_FRAME_MEMBERS: Collections.List[FrameMember] static =>
+            [
+                FrameMember.MOVE_NEXT,
+                FrameMember.SET_STATE_MACHINE
+            ];
+
+        _write_async_frame_members(type: SRM_EMITTED_TYPE) is
+            let frame = cast Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME?(type.declared);
+
+            if !frame? then
+                return;
+            fi
+
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let void = lookup.get_void_type();
+
+            for member in ASYNC_FRAME_MEMBERS do
+                let arguments = Collections.LIST[Semantic.Types.Type]();
+
+                if member == FrameMember.SET_STATE_MACHINE then
+                    arguments.add(lookup.get_async_state_machine_interface_type()!);
+                fi
+
+                _assembly.add_method_definition(
+                    SRM_FLAGS.frame_member_attributes(member),
+                    cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                    _assembly.get_or_add_string(_frame_member_name(member)),
+                    _assembly.get_or_add_blob(
+                        _signatures.call_signature(void, arguments, true)),
+                    _handles.frame_member_body(frame, member) ?? -1,
+                    MetadataTokens.parameter_handle(_assembly.next_parameter_row));
+            od
+        si
+
+        // The rows for a frame's synthesised members, in the order
+        // FRAME_MEMBERS gives and the numbering pass assumed. Each body
+        // was deposited by the tree walk against the same key.
+        _write_frame_members(type: SRM_EMITTED_TYPE) is
+            let frame = cast Semantic.Symbols.STATE_MACHINE_FRAME?(type.declared);
+
+            if !frame? then
+                return;
+            fi
+
+            let element = frame.class_element_type;
+
+            // The frame already carries its own `Iterator[T]` as an
+            // ancestor, constructed over the same element type, so
+            // GetEnumerator's return type is read off it rather than
+            // rebuilt from the innate lookup.
+            let iterator = _iterator_ancestor(frame);
+
+            for member in FRAME_MEMBERS do
+                _assembly.add_method_definition(
+                    SRM_FLAGS.frame_member_attributes(member),
+                    cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                    _assembly.get_or_add_string(_frame_member_name(member)),
+                    _assembly.get_or_add_blob(
+                        _frame_member_signature(member, element, iterator)),
+                    _handles.frame_member_body(frame, member) ?? -1,
+                    MetadataTokens.parameter_handle(_assembly.next_parameter_row));
+            od
+        si
+
+        _iterator_ancestor(frame: Classy) -> Semantic.Types.Type is
+            let unspecialized =
+                IoC.CONTAINER.instance.innate_symbol_lookup.get_unspecialized_iterator_type();
+
+            if let found = frame.find_ancestor(unspecialized) then
+                return found;
+            fi
+
+            assert false else
+                "state-machine frame '{frame.name}' does not implement Iterator[T]";
+
+            return unspecialized;
+        si
+
+        // The CLR names these members, not ghūl: each satisfies an
+        // interface the frame implements.
+        _frame_member_name(member: FrameMember) -> string static is
+            if member == FrameMember.MOVE_NEXT then
+                return "MoveNext";
+            elif member == FrameMember.GET_CURRENT then
+                return "get_Current";
+            elif member == FrameMember.GET_ENUMERATOR then
+                return "GetEnumerator";
+            elif member == FrameMember.DISPOSE then
+                return "Dispose";
+            elif member == FrameMember.RESET then
+                return "Reset";
+            elif member == FrameMember.SET_STATE_MACHINE then
+                return "SetStateMachine";
+            fi
+
+            return "ToString";
+        si
+
+        _frame_member_signature(
+            member: FrameMember,
+            element: Semantic.Types.Type,
+            iterator: Semantic.Types.Type
+        ) -> ubyte[] is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let none = Collections.LIST[Semantic.Types.Type]();
+
+            if member == FrameMember.MOVE_NEXT then
+                return _signatures.call_signature(lookup.get_bool_type(), none, true);
+            elif member == FrameMember.GET_CURRENT then
+                return _signatures.call_signature(element, none, true);
+            elif member == FrameMember.GET_ENUMERATOR then
+                return _signatures.call_signature(iterator, none, true);
+            elif member == FrameMember.DISPOSE \/ member == FrameMember.RESET then
+                return _signatures.call_signature(lookup.get_void_type(), none, true);
+            fi
+
+            return _signatures.call_signature(lookup.get_string_type(), none, true);
+        si
+
+        // A unit variant's interned instance and the static constructor
+        // that fills it are synthesised here rather than read from the
+        // symbol table, so both passes have to place them at the same
+        // point in the type's member runs: last in each.
+        _is_unit_variant(type: SRM_EMITTED_TYPE) -> bool is
+            if let variant: Semantic.Symbols.VARIANT = type.declared then
+                return variant.is_unit_variant;
+            fi
+
+            return false;
+        si
+
+        write_rows() is
+            for planned in _handles.emission_plan.types do
+                let type = planned.type;
+
+                let first_field = MetadataTokens.field_definition_handle(_assembly.next_field_row);
+                let first_method = MetadataTokens.method_definition_handle(_assembly.next_method_row);
+
+                for `field in planned.fields do
+                    _write_field(`field);
+                od
+
+                if _is_unit_variant(type) then
+                    _write_unit_variant_instance(type.declared!);
+                fi
+
+                _write_enum_fields(type);
+
+                for method in planned.methods do
+                    _write_method(method);
+                od
+
+                if _is_unit_variant(type) then
+                    _write_unit_variant_initializer(type.declared!);
+                fi
+
+                _write_frame_members(type);
+                _write_async_frame_members(type);
+
+                let boilerplate = _write_boilerplate(type);
+
+                let handle =
+                    _assembly.add_type_definition(
+                        _type_attributes(type),
+                        _assembly.get_or_add_string(_namespace_name(type)),
+                        _assembly.get_or_add_string(type.name),
+                        _base_type(type),
+                        first_field,
+                        first_method);
+
+                if let declared = type.declared then
+                    let names = declared.argument_names;
+
+                    for i in 0..names.count do
+                        _type_parameters.add(
+                            SRM_TYPE_PARAMETER(
+                                cast EntityHandle(handle),
+                                i,
+                                names[i],
+                                SRM_FLAGS.type_parameter_attributes(
+                                    declared.get_argument_variance(i),
+                                    declared.get_argument_constraint_kind(i),
+                                    declared.get_argument_has_constructor_constraint(i)),
+                                declared.get_argument_type_bound(i),
+                                SRM_SIGNATURE_ENCODER.frame_mapping(declared)));
+                    od
+
+                    for `interface in _interfaces(declared) do
+                        _assembly.add_interface_implementation(handle, `interface);
+                    od
+                fi
+
+                for bound in boilerplate do
+                    _assembly.add_method_implementation(handle, bound.body, bound.declaration);
+                od
+
+                _write_properties(handle, type);
+
+                _write_marker_attributes(cast EntityHandle(handle), type);
+            od
+
+            _write_type_parameters();
+        si
+
+        // A type's properties, and the map pointing at the run of rows
+        // they occupy.
+        //
+        // Without these an importing compiler sees the accessor methods
+        // and no property at all, and reports the property as a member
+        // that does not exist — a diagnostic that reads as a resolution
+        // problem rather than as missing metadata.
+        //
+        // A property is not a member in its own right at run time: the
+        // getter and setter are ordinary methods and already have their
+        // rows, and the property row only names them. So there is
+        // nothing here for a method body to refer to, and nothing that
+        // has to be numbered before bodies are encoded.
+        _write_properties(parent: TypeDefinitionHandle, type: SRM_EMITTED_TYPE) is
+            let properties = SRM_MEMBER_ORDER.properties(type);
+
+            if properties.count == 0 then
+                return;
+            fi
+
+            // PropertyList is a run pointer, so it names the first row
+            // of this type's run. The rows are written immediately
+            // below, in this same iteration, so the two cannot disagree
+            // — unlike the field and method runs, which are numbered in
+            // one pass and written in another.
+            let first = MetadataTokens.property_definition_handle(_assembly.next_property_row);
+
+            for property in properties do
+                let handle =
+                    _assembly.add_property(
+                        _assembly.get_or_add_string(SRM_FLAGS.property_name(property)),
+                        _signatures.property_signature(property));
+
+                if let read = property.read_function then
+                    if let accessor = _handles.method_definition(read) then
+                        _assembly.add_property_accessor(handle, accessor, true);
+                    fi
+                fi
+
+                if let assign = property.assign_function then
+                    if let accessor = _handles.method_definition(assign) then
+                        _assembly.add_property_accessor(handle, accessor, false);
+                    fi
+                fi
+
+                // The reader looks at the property before falling back
+                // to its getter's return slot, so the attributes have to
+                // be here as well as on the accessor.
+                _write_slot(cast EntityHandle(handle), _slot_attributes(property.type));
+
+                if let attributes = property.custom_attributes then
+                    _write_attributes(cast EntityHandle(handle), attributes);
+                fi
+            od
+
+            _assembly.add_property_map(parent, first);
+        si
+
+        // The attributes that carry to another assembly what the source
+        // said but the metadata cannot otherwise express: that a type is
+        // a union, a variant, the default variant, closed to extension,
+        // or a namespace's globals carrier.
+        //
+        // Without them an importing compiler reads a union as an
+        // ordinary class and its variants as unrelated types that happen
+        // to share a name prefix — which is why a consumer sees the
+        // union's own name as a namespace rather than as a type.
+        _write_marker_attributes(handle: EntityHandle, type: SRM_EMITTED_TYPE) is
+            let declared = type.declared;
+
+            if !declared? then
+                // A globals carrier stands for a namespace rather than
+                // for a declared type, and is marked so that an importer
+                // reads the members inside it as globals rather than as
+                // static members of a class.
+                _mark(handle, Semantic.DotNet.GLOBALS_CARRIER.attribute_name);
+
+                return;
+            fi
+
+            if isa Semantic.Symbols.UNION(declared) then
+                _mark(handle, "Ghul.Internal.UNION_ATTRIBUTE");
+            fi
+
+            if let variant: Semantic.Symbols.VARIANT = declared then
+                _mark(handle, "Ghul.Internal.VARIANT_ATTRIBUTE");
+
+                if let owner: Semantic.Symbols.UNION = variant.owner then
+                    if owner.default_variant == variant then
+                        _mark(handle, "Ghul.Internal.DEFAULT_VARIANT_ATTRIBUTE");
+                    fi
+                fi
+            fi
+
+            if let `class: Semantic.Symbols.CLASS = declared then
+                if !`class.is_open then
+                    _mark(handle, "Ghul.Internal.CLOSED_ATTRIBUTE");
+                fi
+            fi
+
+            if let attributes = declared.custom_attributes then
+                _write_attributes(handle, attributes);
+            fi
+        si
+
+        // A marker takes no arguments, so they all share one value blob
+        // and differ only in which constructor they name.
+        //
+        // The name is qualified, and split here rather than written as a
+        // namespace and a simple name at each call site: one of these is
+        // already a qualified constant, and a reference built from the
+        // two halves out of step names a type that does not exist while
+        // still emitting cleanly.
+        _mark(parent: EntityHandle, qualified_name: string) is
+            _attach(
+                parent,
+                "ghul-runtime",
+                qualified_name,
+                Collections.LIST[Semantic.Types.Type](),
+                SRM_ASSEMBLY_EMITTER.NO_ARGUMENT_ATTRIBUTE_VALUE);
+        si
+
+        _attach(
+            parent: EntityHandle,
+            assembly_name: string,
+            qualified_name: string,
+            argument_types: Collections.List[Semantic.Types.Type],
+            value: ubyte[]
+        ) is
+            _assembly.add_named_attribute(
+                parent, assembly_name, qualified_name, argument_types, value);
+        si
+
+        _write_type_parameters() is
+            _type_parameters.sort(
+                (left: SRM_TYPE_PARAMETER, right: SRM_TYPE_PARAMETER) -> int is
+                    let by_owner = left.order - right.order;
+
+                    if by_owner != 0 then
+                        return by_owner;
+                    fi
+
+                    return left.index - right.index;
+                si);
+
+            for type_parameter in _type_parameters do
+                let handle =
+                    _assembly.add_generic_parameter(
+                        type_parameter.owner,
+                        type_parameter.index,
+                        type_parameter.name,
+                        type_parameter.attributes);
+
+                // GenericParamConstraint is sorted on the parameter it
+                // constrains, so writing each parameter's constraint as
+                // the parameter itself is written keeps the table in
+                // order without a second sort.
+                if let type_parameter.bound then
+                    let mapping = type_parameter.mapping;
+
+                    if mapping? then
+                        mapping.map_type_arguments();
+                    fi
+
+                    try
+                        _assembly.add_generic_parameter_constraint(
+                            handle, _type_token(bound));
+                    finally
+                        if mapping? then
+                            mapping.unmap_type_arguments();
+                        fi
+                    yrt
+                fi
+            od
+        si
+
+        _write_field(`field: Field) is
+            let handle =
+                _assembly.add_field_definition(
+                    SRM_FLAGS.field_attributes(`field),
+                    _assembly.get_or_add_string(`field.name),
+                    _assembly.get_or_add_blob(_signatures.field_signature(`field)));
+
+            // A field declares a type the same way a parameter does, so
+            // it needs the same attributes to carry what the type alone
+            // cannot say — a tuple's element names, a reference type's
+            // nullability.
+            _write_slot(cast EntityHandle(handle), _slot_attributes(`field.type));
+
+            if let attributes = `field.custom_attributes then
+                _write_attributes(cast EntityHandle(handle), attributes);
+            fi
+        si
+
+        // An enum is a value type whose members are compile-time
+        // constants, so the symbol table holds them as members of the
+        // enum rather than as fields of anything. The emitted shape is
+        // fixed by ECMA-335: one instance field named `value__` holding
+        // the value, and one static literal per member.
+        _enum_members(type: SRM_EMITTED_TYPE) -> Collections.List[Semantic.Symbols.ENUM_STRUCT_MEMBER] is
+            let result = Collections.LIST[Semantic.Symbols.ENUM_STRUCT_MEMBER]();
+
+            if !isa Semantic.Symbols.ENUM_STRUCT(type.declared) then
+                return result;
+            fi
+
+            for symbol in type.scope.symbols do
+                if let member: Semantic.Symbols.ENUM_STRUCT_MEMBER = symbol then
+                    result.add(member);
+                fi
+            od
+
+            return result;
+        si
+
+        // The `value__` field plus one per member, or none at all when
+        // the type is not an enum.
+        _enum_field_count(type: SRM_EMITTED_TYPE) -> int is
+            if !isa Semantic.Symbols.ENUM_STRUCT(type.declared) then
+                return 0;
+            fi
+
+            return _enum_members(type).count + 1;
+        si
+
+        _write_enum_fields(type: SRM_EMITTED_TYPE) is
+            if !isa Semantic.Symbols.ENUM_STRUCT(type.declared) then
+                return;
+            fi
+
+            let enum_type = type.declared!.type!;
+
+            _assembly.add_field_definition(
+                SRM_FLAGS.enum_value_attributes(),
+                _assembly.get_or_add_string("value__"),
+                _assembly.get_or_add_blob(
+                    _signatures.field_signature(
+                        IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type())));
+
+            for member in _enum_members(type) do
+                let handle =
+                    _assembly.add_field_definition(
+                        SRM_FLAGS.enum_member_attributes(),
+                        _assembly.get_or_add_string(member.name),
+                        _assembly.get_or_add_blob(_signatures.field_signature(enum_type)));
+
+                // The value is stored as the enum's underlying type, not
+                // as the enum: a Constant row holds a primitive.
+                _assembly.add_constant(
+                    cast EntityHandle(handle),
+                    cast object(member.numeric_value));
+            od
+        si
+
+        // The interned instance a unit variant hands out. Its type is
+        // the variant applied to its own parameters: a generic variant's
+        // open form names no type the field could hold.
+        _write_unit_variant_instance(variant: Classy) is
+            _assembly.add_field_definition(
+                SRM_FLAGS.unit_variant_instance_attributes(),
+                _assembly.get_or_add_string("_instance"),
+                _assembly.get_or_add_blob(
+                    _signatures.field_signature(variant.own_instantiation)));
+        si
+
+        _write_unit_variant_initializer(variant: Classy) is
+            _assembly.add_method_definition(
+                SRM_FLAGS.static_initializer_attributes(),
+                cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                _assembly.get_or_add_string(".cctor"),
+                _assembly.get_or_add_blob(_signatures.static_initializer_signature()),
+                _handles.unit_variant_initializer_body(variant) ?? -1,
+                MetadataTokens.parameter_handle(_assembly.next_parameter_row));
+        si
+
+        _write_method(method: Function) is
+            // A function with no deposited body never had one walked:
+            // an abstract declaration, or a trait member left to its
+            // implementors. -1 is the metadata encoding of "no body".
+            let body_offset = _handles.body_offset(method) ?? -1;
+
+            // A MethodDef's ParamList is a run pointer like a TypeDef's
+            // member lists, so it names the next free row even when the
+            // method takes nothing; a nil handle is not an empty run,
+            // it is an invalid index that faults on first read.
+            let first_parameter = MetadataTokens.parameter_handle(_assembly.next_parameter_row);
+
+            // The return slot is parameter zero, and has no row of its
+            // own unless something has to hang off it. Written first so
+            // the run reads in sequence order.
+            let return_slot = _slot_attributes(method.return_type);
+
+            if return_slot.count > 0 then
+                let parameter = _assembly.add_parameter(_assembly.get_or_add_string(""), 0);
+
+                _write_slot(cast EntityHandle(parameter), return_slot);
+            fi
+
+            let names = method.argument_names;
+
+            for i in 0..names.count do
+                let parameter =
+                    _assembly.add_parameter(_assembly.get_or_add_string(names[i]), i + 1);
+
+                _write_slot(cast EntityHandle(parameter), _slot_attributes(method.arguments[i]));
+
+                if let attributes = method.find_direct(names[i])?.custom_attributes then
+                    _write_attributes(cast EntityHandle(parameter), attributes);
+                fi
+            od
+
+            let handle = _assembly.add_method_definition(
+                SRM_FLAGS.method_attributes(method),
+                cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                _assembly.get_or_add_string(SRM_FLAGS.method_name(method)),
+                _assembly.get_or_add_blob(_signatures.method_signature(method)),
+                body_offset,
+                first_parameter);
+
+            let type_parameters = method.generic_arguments;
+
+            for i in 0..type_parameters.count do
+                _type_parameters.add(
+                    SRM_TYPE_PARAMETER(
+                        cast EntityHandle(handle),
+                        i,
+                        type_parameters[i].name ?? "T{i}",
+                        // A method's type parameter cannot be variant —
+                        // the CLR allows variance only on an interface
+                        // or delegate type — so only the kind
+                        // constraints reach the row.
+                        SRM_FLAGS.type_parameter_attributes(
+                            Semantic.Types.TypeVariance.INVARIANT,
+                            method.get_argument_constraint_kind(i),
+                            method.get_argument_has_constructor_constraint(i)),
+                        method.get_argument_type_bound(i),
+                        SRM_SIGNATURE_ENCODER.frame_mapping(method)));
+            od
+
+            if method.is_declared_pure then
+                _mark(cast EntityHandle(handle), PURE_ATTRIBUTE_NAME);
+            fi
+
+            if let attributes = method.custom_attributes then
+                _write_attributes(cast EntityHandle(handle), attributes);
+            fi
+
+            // `@IL.output` ranges captured while this body was emitted, if
+            // any. The attribute is synthetic - referenced by name only, and
+            // never resolved - so it need not exist in any referenced
+            // assembly; the test runner reads the raw blob without resolving
+            // the constructor.
+            if let outputs = _handles.il_outputs(method) then
+                _attach(
+                    cast EntityHandle(handle),
+                    "ghul-runtime",
+                    IL_OUTPUT_ATTRIBUTE_NAME,
+                    _il_output_ranges_constructor_types(),
+                    SRM_ATTRIBUTE_BLOB_ENCODER.encode_il_output_ranges(outputs));
+            fi
+
+            if let entry_point = _assembly.entry_point_function then
+                if entry_point == method then
+                    _assembly.set_entry_point(handle);
+                fi
+            fi
+        si
+
+        PURE_ATTRIBUTE_NAME: string static => "Ghul.Internal.PURE_ATTRIBUTE";
+
+        NULLABLE_ATTRIBUTE_NAME: string static =>
+            "System.Runtime.CompilerServices.NullableAttribute";
+
+        TUPLE_ELEMENT_NAMES_ATTRIBUTE_NAME: string static =>
+            "System.Runtime.CompilerServices.TupleElementNamesAttribute";
+
+        IL_OUTPUT_ATTRIBUTE_NAME: string static =>
+            "Ghul.Internal.IL_OUTPUT_ATTRIBUTE";
+
+        // What a return or parameter slot carries beyond its type: the
+        // reference nullability the CLR has no way to express, the
+        // element names a value tuple loses on the way into metadata,
+        // and whether the slot's function type was declared pure.
+        //
+        // Returned rather than written so the caller can decide whether
+        // the slot needs a Param row at all — the return slot has none
+        // unless something hangs off it.
+        _slot_attributes(type: Semantic.Types.Type?) -> Collections.LIST[SRM_SLOT_ATTRIBUTE] is
+            let result = Collections.LIST[SRM_SLOT_ATTRIBUTE]();
+
+            if !type? then
+                return result;
+            fi
+
+            let nullable = Semantic.DotNet.NULLABILITY.compute_bytes(type);
+
+            if Semantic.DotNet.NULLABILITY.needs_attribute_for_bytes(nullable) then
+                if nullable.count == 1 then
+                    result.add(
+                        SRM_SLOT_ATTRIBUTE(
+                            "System.Runtime",
+                            NULLABLE_ATTRIBUTE_NAME,
+                            _byte_constructor_types(),
+                            SRM_ATTRIBUTE_BLOB_ENCODER.encode_byte_argument(nullable[0])));
+                else
+                    result.add(
+                        SRM_SLOT_ATTRIBUTE(
+                            "System.Runtime",
+                            NULLABLE_ATTRIBUTE_NAME,
+                            _byte_array_constructor_types(),
+                            SRM_ATTRIBUTE_BLOB_ENCODER.encode_byte_array_argument(nullable)));
+                fi
+            fi
+
+            if let names = Semantic.DotNet.TUPLE_ELEMENT_NAMES.attribute_names_for_type(type) then
+                result.add(
+                    SRM_SLOT_ATTRIBUTE(
+                        "System.Runtime",
+                        TUPLE_ELEMENT_NAMES_ATTRIBUTE_NAME,
+                        _string_array_constructor_types(),
+                        SRM_ATTRIBUTE_BLOB_ENCODER.encode_string_array_argument(names)));
+            fi
+
+            if type.is_pure_function then
+                result.add(
+                    SRM_SLOT_ATTRIBUTE(
+                        "ghul-runtime",
+                        PURE_ATTRIBUTE_NAME,
+                        Collections.LIST[Semantic.Types.Type](),
+                        SRM_ASSEMBLY_EMITTER.NO_ARGUMENT_ATTRIBUTE_VALUE));
+            fi
+
+            return result;
+        si
+
+        _write_slot(parent: EntityHandle, attributes: Collections.List[SRM_SLOT_ATTRIBUTE]) is
+            for attribute in attributes do
+                _attach(
+                    parent,
+                    attribute.assembly_name,
+                    attribute.qualified_name,
+                    attribute.argument_types,
+                    attribute.value);
+            od
+        si
+
+        _byte_constructor_types() -> Collections.LIST[Semantic.Types.Type] is
+            let types = Collections.LIST[Semantic.Types.Type]();
+
+            types.add(IoC.CONTAINER.instance.innate_symbol_lookup.get_ubyte_type());
+
+            return types;
+        si
+
+        _byte_array_constructor_types() -> Collections.LIST[Semantic.Types.Type] is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let types = Collections.LIST[Semantic.Types.Type]();
+
+            types.add(lookup.get_array_type(lookup.get_ubyte_type()));
+
+            return types;
+        si
+
+        _string_array_constructor_types() -> Collections.LIST[Semantic.Types.Type] is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let types = Collections.LIST[Semantic.Types.Type]();
+
+            types.add(lookup.get_array_type(lookup.get_string_type()));
+
+            return types;
+        si
+
+        // `IL_OUTPUT_ATTRIBUTE(string[], int32[], int32[], int32[])`:
+        // paths, starts, ends, sequences.
+        _il_output_ranges_constructor_types() -> Collections.LIST[Semantic.Types.Type] is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+            let types = Collections.LIST[Semantic.Types.Type]();
+
+            let string_array = lookup.get_array_type(lookup.get_string_type());
+            let int_array = lookup.get_array_type(lookup.get_int_type());
+
+            types.add(string_array);
+            types.add(int_array);
+            types.add(int_array);
+            types.add(int_array);
+
+            return types;
+        si
+
+        // Every attribute a pragma resolved onto a symbol. An argument
+        // the encoder cannot express is left off rather than emitted
+        // wrong: the resolver has already reported anything the source
+        // got wrong, so reaching here means the two disagree about what
+        // is expressible, and a truncated blob would fault the reader
+        // rather than say so.
+        _write_attributes(
+            parent: EntityHandle,
+            attributes: Collections.List[Semantic.CUSTOM_ATTRIBUTE]
+        ) is
+            for attribute in attributes do
+                let value = _blobs.encode(attribute);
+
+                if !value? then
+                    throw System.NotImplementedException(
+                        "the binary back end cannot yet encode the arguments of "
+                        "'{attribute.constructor.owner}'");
+                fi
+
+                _assembly.add_custom_attribute(
+                    parent,
+                    _constructor_handle(attribute.constructor),
+                    value!);
+            od
+        si
+
+        // A constructor this assembly defines is named by its own row;
+        // an imported one by a reference through its type.
+        _constructor_handle(constructor: Function) -> EntityHandle is
+            if let definition = _handles.method_definition(constructor) then
+                return cast EntityHandle(definition);
+            fi
+
+            let owner = cast Classy?(constructor.owner);
+
+            if !owner? then
+                throw System.NotImplementedException(
+                    "the binary back end cannot reference an attribute constructor "
+                    "with no owning type");
+            fi
+
+            return cast EntityHandle(
+                _assembly.add_constructor_reference(
+                    cast EntityHandle(_signatures.type_reference_for(owner)),
+                    "{owner.qualified_name}::.ctor",
+                    constructor.arguments));
+        si
+
+        // A globals carrier is abstract and sealed: never constructed,
+        // never extended, only a home for static members.
+        _type_attributes(type: SRM_EMITTED_TYPE) -> System.Reflection.TypeAttributes is
+            if let declared = type.declared then
+                return SRM_FLAGS.type_attributes(declared);
+            fi
+
+            return SRM_FLAGS.globals_carrier_type_attributes();
+        si
+
+        // A type's metadata namespace is its owning namespace's
+        // qualified name. The symbol table's root namespace has an empty
+        // name and qualifies its children with a leading separator, so
+        // that is stripped rather than emitted as part of the name.
+        _namespace_name(type: SRM_EMITTED_TYPE) -> string is
+            let owner = type.owning_namespace;
+
+            if !owner? then
+                return "";
+            fi
+
+            // A union's variants are owned by the union rather than by a
+            // namespace. They are emitted flat, under a name that carries
+            // the union's, so what stands in front of a variant is the
+            // union's own namespace followed by the union's name — built
+            // the same way the union's own row builds it, rather than
+            // read off `qualified_name`, so the two cannot disagree.
+            if !owner.is_namespace then
+                if let owning_type: Classy = owner then
+                    let outer = owning_type.owner;
+
+                    let prefix = if outer? then _strip_root(outer.qualified_name) else "" fi;
+
+                    return
+                        if prefix.length == 0 then
+                            owning_type.name
+                        else
+                            "{prefix}.{owning_type.name}"
+                        fi;
+                fi
+
+                return "";
+            fi
+
+            return _strip_root(owner.qualified_name);
+        si
+
+        _strip_root(qualified: string) -> string static =>
+            if qualified.starts_with('.') then
+                qualified.substring(1);
+            else
+                qualified;
+            fi;
+
+        // The first non-trait ancestor, which is what the type extends;
+        // traits extend nothing, and a class with no declared superclass
+        // extends System.Object.
+        _base_type(emitted: SRM_EMITTED_TYPE) -> EntityHandle is
+            let type = emitted.declared;
+
+            if !type? then
+                return cast EntityHandle(
+                    _assembly.add_type_reference_by_name("System.Runtime", "System", "Object"));
+            fi
+
+            if type.is_trait then
+                return _[EntityHandle];
+            fi
+
+            // An enum is a struct in the symbol table, but the runtime
+            // only treats it as an enum — reading its value through
+            // `value__`, converting, comparing — when it descends from
+            // System.Enum rather than from System.ValueType directly.
+            if isa Semantic.Symbols.ENUM_STRUCT(type) then
+                return cast EntityHandle(
+                    _assembly.add_type_reference_by_name("System.Runtime", "System", "Enum"));
+            fi
+
+            for ancestor in type.ancestors do
+                if ancestor.is_trait then
+                    continue;
+                fi
+
+                // Through the token rather than the symbol: a generic
+                // union's variant extends the union constructed over
+                // the variant's own parameters, and the open type it
+                // was declared from is not a type anything can extend.
+                //
+                // A constructed ancestor's symbol is a `Symbols.GENERIC`
+                // wrapping the definition rather than being one, so a
+                // test for `Classy` alone answers false for exactly the
+                // ancestors that need constructing — and the walk falls
+                // through to Object, which loads and is wrong.
+                if
+                    isa Classy(ancestor.symbol) \/
+                    isa Semantic.Symbols.GENERIC(ancestor.symbol)
+                then
+                    return _type_token(ancestor);
+                fi
+            od
+
+            if type.is_value_type then
+                return cast EntityHandle(
+                    _assembly.add_type_reference_by_name("System.Runtime", "System", "ValueType"));
+            fi
+
+            return cast EntityHandle(
+                _assembly.add_type_reference_by_name("System.Runtime", "System", "Object"));
+        si
+
+        // `System.Collections.IEnumerable` and `System.Collections.
+        // IEnumerator` are the non-generic interfaces the generic ones
+        // derive from, and a type implementing the generic form has to
+        // satisfy them too. ghūl has no declaration for either member,
+        // so each is emitted here: an explicit implementation, named for
+        // the interface, returning the untyped form and answering null.
+        //
+        // The body is never called — every consumer reaches the generic
+        // member — so answering null costs nothing and saves the walk
+        // from having to reach the type's own iterator.
+        _write_boilerplate(type: SRM_EMITTED_TYPE) -> Collections.List[SRM_BOUND_METHOD] is
+            let result = Collections.LIST[SRM_BOUND_METHOD]();
+
+            for member in _boilerplate_members(type) do
+                case member
+                when BoilerplateMember.ENUMERABLE_GET_ENUMERATOR then
+                    let `interface =
+                        _assembly.add_type_reference_by_name(
+                            "System.Runtime", "System.Collections", "IEnumerator");
+
+                    let signature =
+                        _signatures.nullary_instance_signature(cast EntityHandle(`interface));
+
+                    result.add(
+                        _write_explicit_implementation(
+                            "System.Collections.IEnumerable.GetEnumerator",
+                            signature,
+                            false,
+                            "System.Collections",
+                            "IEnumerable",
+                            "GetEnumerator",
+                            signature));
+
+                when BoilerplateMember.ENUMERATOR_GET_CURRENT then
+                    let signature = _signatures.nullary_instance_signature_returning_object();
+
+                    result.add(
+                        _write_explicit_implementation(
+                            "System.Collections.IEnumerator.get_Current",
+                            signature,
+                            true,
+                            "System.Collections",
+                            "IEnumerator",
+                            "get_Current",
+                            signature));
+                esac
+            od
+
+            return result;
+        si
+
+        // One explicit-implementation member: the row, its `ldnull; ret`
+        // body, and the interface member it answers for, which the
+        // MethodImpl row binds it to once the type has a handle.
+        _write_explicit_implementation(
+            name: string,
+            signature: ubyte[],
+            is_special_name: bool,
+            interface_namespace: string,
+            interface_name: string,
+            member_name: string,
+            member_signature: ubyte[]
+        ) -> SRM_BOUND_METHOD is
+            let body = SRM_METHOD_BODY_EMITTER();
+
+            body.ldnull();
+            body.ret();
+
+            let definition =
+                _assembly.add_method_definition(
+                    SRM_FLAGS.explicit_implementation_attributes(is_special_name),
+                    cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                    _assembly.get_or_add_string(name),
+                    _assembly.get_or_add_blob(signature),
+                    body.flush(_assembly),
+                    MetadataTokens.parameter_handle(_assembly.next_parameter_row));
+
+            let `interface =
+                _assembly.add_type_reference_by_name(
+                    "System.Runtime", interface_namespace, interface_name);
+
+            let declaration =
+                _assembly.add_named_member_reference(
+                    cast EntityHandle(`interface),
+                    member_name,
+                    "{interface_namespace}.{interface_name}::{member_name}",
+                    member_signature);
+
+            return SRM_BOUND_METHOD(
+                cast EntityHandle(definition),
+                cast EntityHandle(declaration));
+        si
+
+        // The traits a type declares, in declaration order, each named
+        // by a handle the InterfaceImpl row can carry.
+        //
+        // `ancestors` mixes the superclass in with the traits, so the
+        // superclass is filtered back out here.
+        _interfaces(type: Classy) -> Collections.List[EntityHandle] is
+            let result = Collections.LIST[EntityHandle]();
+
+            for ancestor in type.ancestors do
+                if !ancestor.is_trait then
+                    continue;
+                fi
+
+                result.add(_type_token(ancestor));
+            od
+
+            return result;
+        si
+
+        // A type named in a row rather than in a signature. A
+        // constructed generic has no row of its own and is named by a
+        // specification carrying its shape; anything else resolves to
+        // its own TypeDef row, or to an imported reference.
+        //
+        // The same choice as IR.CONTEXT.resolve_type_token, which the
+        // structure walk cannot reach: it runs without an IR context.
+        _type_token(type: Semantic.Types.Type) -> EntityHandle is
+            // A type variable has no row of its own either: it is named
+            // by position, which only a signature can express. Reached
+            // by a bound that is itself a type parameter
+            // (`[TBase: BOX, TDerived: TBase]`).
+            if type.arguments.count > 0 \/ type.is_type_variable then
+                return cast EntityHandle(_assembly.add_type_specification(type));
+            fi
+
+            let symbol =
+                if let generic: Semantic.Symbols.GENERIC = type.symbol then
+                    generic.symbol
+                else
+                    cast Classy?(type.symbol)
+                fi;
+
+            assert symbol? else "cannot name the type '{type}' in a metadata row";
+
+            return _type_handle(symbol);
+        si
+
+        // A same-assembly ancestor resolves to its own TypeDef row;
+        // anything else is an ordinary imported reference.
+        _type_handle(symbol: Classy) -> EntityHandle is
+            if let definition = _handles.type_definition(symbol) then
+                return cast EntityHandle(definition);
+            fi
+
+            return cast EntityHandle(_signatures.type_reference_for(symbol));
+        si
+    si
+si

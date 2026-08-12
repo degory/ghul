@@ -7,10 +7,15 @@ namespace Syntax.Process is
     use System.Text.StringBuilder;
 
     // Resolves an attribute pragma — a pragma whose name is not a built-in
-    // compiler pragma — to a .NET attribute type and constructor, formats
-    // its arguments into the ilasm textual custom-attribute form, and
-    // attaches the resolved CUSTOM_ATTRIBUTE to the target symbol so the
-    // IL generator can emit a `.custom` directive.
+    // compiler pragma — to a .NET attribute type and constructor, and
+    // attaches the resolved CUSTOM_ATTRIBUTE to the target symbol, from
+    // which the emitter encodes the attribute's value blob.
+    //
+    // The `format_*` half renders the arguments as assembler source. The
+    // rendering itself is unused (see CUSTOM_ATTRIBUTE), but an argument
+    // shape it cannot render makes it answer null, and that is what
+    // rejects the attribute — so it is the argument validation, spelled
+    // as a renderer.
     class ATTRIBUTE_RESOLVER is
         _logger: Logger;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
@@ -69,7 +74,16 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let arguments_text = format_arguments(pragma, attribute_type, constructor, positional);
+            let completed = complete_positional_arguments(constructor, positional);
+
+            let named = resolve_named_arguments(attribute_type, pragma);
+
+            if !named? then
+                return;
+            fi
+
+            let arguments_text =
+                format_arguments(pragma, constructor, completed, named);
 
             if !arguments_text? then
                 return;
@@ -79,7 +93,104 @@ namespace Syntax.Process is
                 target.custom_attributes = Collections.LIST[Semantic.CUSTOM_ATTRIBUTE]();
             fi
 
-            target.custom_attributes!.add(Semantic.CUSTOM_ATTRIBUTE(constructor, arguments_text));
+            target.custom_attributes!.add(
+                Semantic.CUSTOM_ATTRIBUTE(constructor, arguments_text, completed, named));
+        si
+
+        // The constructor's parameters filled out from what the call
+        // site supplied, so that both back ends encode the same
+        // arguments in the same order rather than each deciding what an
+        // omitted trailing parameter meant.
+        //
+        // A parameter beyond what was supplied is only reachable through
+        // resolve_constructor_with_omitted_optionals, which has already
+        // established that every one of them carries a usable literal
+        // default.
+        complete_positional_arguments(
+            constructor: Semantic.Symbols.Function,
+            positional: Collections.List[IR.Values.Value]
+        ) -> Collections.List[IR.Values.Value] is
+            let parameters = constructor.arguments;
+            let completed = Collections.LIST[IR.Values.Value]();
+
+            for i in 0..parameters.count do
+                if i < positional.count then
+                    completed.add(positional[i]);
+                else
+                    completed.add(
+                        DEFAULT_ARGUMENT_VALUES.build(
+                            constructor.argument_defaults[i],
+                            parameters[i],
+                            _innate_symbol_lookup
+                        ));
+                fi
+            od
+
+            return completed;
+        si
+
+        // Every `name = value` argument resolved against the attribute's
+        // own members, or null once one of them has been reported as
+        // naming nothing, naming something that is neither a field nor a
+        // property, or having no usable type.
+        resolve_named_arguments(
+            attribute_type: Semantic.Symbols.Classy,
+            pragma: Trees.Pragmas.PRAGMA
+        ) -> Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT]? is
+            let resolved = Collections.LIST[Semantic.NAMED_ATTRIBUTE_ARGUMENT]();
+
+            let named = pragma.named_arguments;
+
+            if !named? then
+                return resolved;
+            fi
+
+            for named_argument in named do
+                let name = named_argument.name.to_string();
+
+                let member = attribute_type.find_member(name);
+
+                if !member? then
+                    _logger.error(
+                        named_argument.name.location,
+                        "attribute {attribute_type.name} has no field or property {name}");
+
+                    return null;
+                fi
+
+                let is_field = member.symbol_kind == Semantic.Symbols.SymbolKind.FIELD;
+
+                if
+                    !is_field /\
+                    member.symbol_kind != Semantic.Symbols.SymbolKind.PROPERTY
+                then
+                    _logger.error(
+                        named_argument.name.location,
+                        "{name} is not a field or property of attribute {attribute_type.name}");
+
+                    return null;
+                fi
+
+                let member_type = member.type;
+
+                if !member_type? then
+                    _logger.error(
+                        named_argument.name.location,
+                        "attribute argument {name} has an unsupported type");
+
+                    return null;
+                fi
+
+                resolved.add(
+                    Semantic.NAMED_ATTRIBUTE_ARGUMENT(
+                        is_field,
+                        member.il_name_override ?? name,
+                        member_type,
+                        named_argument.value.value,
+                        named_argument.value.location));
+            od
+
+            return resolved;
         si
 
         // Resolve the pragma name to a .NET attribute class, accepting the
@@ -312,12 +423,11 @@ namespace Syntax.Process is
         // Returns null if any argument is not a compile-time constant.
         format_arguments(
             pragma: Trees.Pragmas.PRAGMA,
-            attribute_type: Semantic.Symbols.Classy,
             constructor: Semantic.Symbols.Function,
-            positional: Collections.List[IR.Values.Value]
+            positional: Collections.List[IR.Values.Value],
+            named: Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT]
         ) -> string? is
-            let named = pragma.named_arguments;
-            let have_named = named? /\ named.count > 0;
+            let have_named = named.count > 0;
 
             if constructor.arguments.count == 0 /\ !have_named then
                 return "( 01 00 00 00 )";
@@ -330,24 +440,7 @@ namespace Syntax.Process is
             buffer.append("{{");
 
             for i in 0..parameter_types.count do
-                let parameter_type = parameter_types[i];
-
-                // A trailing parameter beyond what was supplied only
-                // reaches here via resolve_constructor_with_omitted_
-                // optionals, which already guarantees a usable literal
-                // default at this index.
-                let argument =
-                    if i < positional.count then
-                        positional[i];
-                    else
-                        DEFAULT_ARGUMENT_VALUES.build(
-                            constructor.argument_defaults[i],
-                            parameter_type,
-                            _innate_symbol_lookup
-                        );
-                    fi;
-
-                let formatted = format_argument(parameter_type, argument);
+                let formatted = format_argument(parameter_types[i], positional[i]);
 
                 if !formatted? then
                     _logger.error(pragma.location, "attribute argument {i + 1} is not a compile-time constant");
@@ -358,8 +451,8 @@ namespace Syntax.Process is
             od
 
             if have_named then
-                for named_argument in named! do
-                    let formatted = format_named_argument(attribute_type, named_argument);
+                for named_argument in named do
+                    let formatted = format_named_argument(named_argument);
 
                     if !formatted? then
                         return null;
@@ -376,60 +469,31 @@ namespace Syntax.Process is
 
         // One `name = value` argument in the ilasm textual form —
         // `property <type> 'Name' = <value>` or `field <type> 'Name' = ...`.
-        // Returns null (after logging) if the name does not resolve to a
-        // field or property of the attribute, or the value is unsupported.
+        // Returns null (after logging) if the member's type or the value
+        // cannot be rendered.
         format_named_argument(
-            attribute_type: Semantic.Symbols.Classy,
-            named_argument: Trees.Pragmas.NAMED_ARGUMENT
+            named_argument: Semantic.NAMED_ATTRIBUTE_ARGUMENT
         ) -> string? is
-            let name = named_argument.name.to_string();
+            let name = named_argument.il_name;
 
-            let member = attribute_type.find_member(name);
+            let keyword = if named_argument.is_field then "field" else "property" fi;
 
-            if !member? then
-                _logger.error(named_argument.name.location, "attribute {attribute_type.name} has no field or property {name}");
-                return null;
-            fi
-
-            let keyword: string mut;
-
-            if member.symbol_kind == Semantic.Symbols.SymbolKind.PROPERTY then
-                keyword = "property";
-            elif member.symbol_kind == Semantic.Symbols.SymbolKind.FIELD then
-                keyword = "field";
-            else
-                _logger.error(named_argument.name.location, "{name} is not a field or property of attribute {attribute_type.name}");
-                return null;
-            fi
-
-            let member_type = member.type;
-
-            if !member_type? then
-                _logger.error(named_argument.name.location, "attribute argument {name} has an unsupported type");
-                return null;
-            fi
-
-            let type_token = named_argument_type_token(member_type);
+            let type_token = named_argument_type_token(named_argument.member_type);
 
             if !type_token? then
-                _logger.error(named_argument.name.location, "attribute argument {name} has an unsupported type");
+                _logger.error(named_argument.location, "attribute argument {name} has an unsupported type");
                 return null;
             fi
 
-            let formatted_value = format_argument(member_type, named_argument.value.value);
+            let formatted_value =
+                format_argument(named_argument.member_type, named_argument.value);
 
             if !formatted_value? then
-                _logger.error(named_argument.value.location, "attribute argument {name} is not a compile-time constant");
+                _logger.error(named_argument.location, "attribute argument {name} is not a compile-time constant");
                 return null;
             fi
 
-            // The blob must carry the member's real .NET name. For a
-            // reflected attribute that is its IL name (`TypeDiscriminator-
-            // PropertyName`), not the snake_case identifier the call site
-            // uses (`type_discriminator_property_name`).
-            let il_member_name = if member.il_name_override? then member.il_name_override else name fi;
-
-            return "{keyword} {type_token} '{il_member_name}' = {formatted_value}";
+            return "{keyword} {type_token} '{name}' = {formatted_value}";
         si
 
         // One positional or named-value argument in the ilasm textual
@@ -625,7 +689,7 @@ namespace Syntax.Process is
         // negative literal — or null if `value` is not a numeric constant.
         try_get_number_text(value: IR.Values.Value) -> string? is
             if let number: IR.Values.Literal.NUMBER = value then
-                return number.value;
+                return number.rendered;
             fi
 
             if let innate_call: IR.Values.Call.INNATE = value then
@@ -634,7 +698,7 @@ namespace Syntax.Process is
                     innate_call.arguments.count == 1
                 then
                     if let number: IR.Values.Literal.NUMBER = innate_call.arguments[0] then
-                        return "-{number.value}";
+                        return "-{number.rendered}";
                     fi
                 fi
             fi

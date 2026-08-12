@@ -62,6 +62,7 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 | `warn.expected` | Expected compiler warning output. |
 | `run.expected` | Expected stdout from running the compiled binary. |
 | `il.expected` | Expected IL disassembly output. |
+| `il.item` | If present, scopes the IL disassembly to one type or member (`Namespace.TYPE` or `Namespace.TYPE::member`). Without it the whole assembly is disassembled. |
 | `ghul.json` | Configuration file pointing at the compiler (created from the template). |
 | `disabled*` | Any file beginning with `disabled` causes the test to be skipped. |
 | `tags` | Zero or more whitespace-separated tag names, used to select a subset of tests with `--tag`. See 'Tags' below. |
@@ -101,6 +102,44 @@ mismatched one, or add a new tag to the list above (updating this section) when
 an existing test clearly needs a feature tag that doesn't exist yet. Don't go
 looking for mistagged tests outside of what you're already touching — this is
 opportunistic upkeep, not a project.
+
+## The IL snapshot tests
+
+Tests under `il/` carrying an `il.expected` snapshot assert the shape of what
+the compiler emits. Originally these captured the text-IL emitter's output;
+this repository replaced that emitter with direct binary emission, so the
+snapshots are recaptured from the emitted assembly disassembled by ildasm
+(Microsoft's own, so the snapshot reads what the runtime reads rather than what
+the compiler's encoder thinks it wrote).
+
+A re-enabled test builds as a library (`--library`), the emitted assembly is
+disassembled by ildasm, and the result is compared to `il.expected`. The scope
+of the dump is chosen by the test:
+
+- A whole type or member, via an `il.item` file naming it
+  (`Namespace.TYPE` or `Namespace.TYPE::member`). This suits type-level tests.
+- The individual statements an `@IL.output("il.out")` pragma marks. The binary
+  back end records each marked statement's instruction byte-offset range and
+  carries it out of the assembly as a synthetic method attribute; the runner
+  reads that, disassembles each method, and keeps only the instructions whose
+  offset falls in a marked range, laying them out in source order. This suits
+  statement- and expression-level tests, and lets one test cover many constructs
+  the way the text emitter's per-pragma output did.
+
+Re-enable a statement-level test by switching its `--assembler` flag to
+`--library` (leaving the `@IL.output` pragmas in place), removing its `disabled`
+file, and recapturing `il.expected` via `tasks/capture.sh`. The recaptured
+snapshot is ildasm's rendering, so locals are slot-indexed (`ldloc.1`) where the
+old text-IL snapshots named them (`ldloc 'x.1'`).
+
+Most of the group's 86 tests are still disabled; the mechanism above is proven
+on representative statement- and expression-level cases (arithmetic operators,
+numeric casts), and re-enabling the rest is mechanical.
+
+Disabled rather than deleted for two reasons: the snapshots record what the
+emitter is expected to produce, which is the reference the binary back end is
+written against; and keeping the directories in place lets merges from upstream
+ghul apply to them cleanly.
 
 ## Expectation comparison workflow
 

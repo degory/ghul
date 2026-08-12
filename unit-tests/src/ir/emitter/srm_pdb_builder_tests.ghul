@@ -1,0 +1,201 @@
+namespace IR.Emitter.UnitTests is
+    use Collections.LIST;
+    use Collections.List;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    use System.Reflection.Metadata.BlobBuilder;
+    use System.Reflection.Metadata.BlobContentId;
+    use System.Reflection.Metadata.MetadataReaderProvider;
+    use System.Reflection.Metadata.Ecma335.MetadataBuilder;
+    use System.Reflection.Metadata.Ecma335.MetadataTokens;
+
+    use IR.Emitter.SRM_PDB_BUILDER;
+    use IR.Emitter.SRM_SEQUENCE_POINT;
+
+    // Tests for the sequence-point blob, read back through the same
+    // decoder a debugger and a coverage tool use rather than asserted as
+    // bytes.
+    //
+    // The encoding is almost entirely deltas, so a single wrong baseline
+    // does not corrupt one record - it shifts every record after it. A
+    // byte-level assertion would pin the mistake at the first divergence
+    // and say nothing about that; a round trip shows what a consumer
+    // will actually be told.
+    class SRM_PDB_BUILDER_TESTS is
+        @test()
+
+        init() is si
+
+        // A PDB names the row counts of the assembly it describes. No
+        // assembly is built here, so an empty set of counts stands in:
+        // nothing read back depends on them.
+        _empty_row_counts() -> System.Collections.Immutable.ImmutableArray[int] static =>
+            MetadataBuilder(0, 0, 0, 0).get_row_counts();
+
+        _content_id(
+            content: Collections.Iterable[System.Reflection.Metadata.Blob]
+        ) -> BlobContentId static =>
+            BlobContentId(System.Guid.empty, 0u);
+
+        // Serializes `builder` and hands back a provider over the
+        // result. The provider owns the memory the reader reads, so it
+        // is what the caller holds; a reader outliving it reads freed
+        // memory.
+        _read_back(builder: SRM_PDB_BUILDER) -> MetadataReaderProvider static is
+            let blob = BlobBuilder(1024);
+
+            builder.serialize(
+                blob,
+                _empty_row_counts(),
+                _[System.Reflection.Metadata.MethodDefinitionHandle],
+                _content_id);
+
+            let stream: IO.Stream = IO.MemoryStream(blob.to_array());
+
+            return
+                MetadataReaderProvider.from_portable_pdb_stream(
+                    stream, System.Reflection.Metadata.MetadataStreamOptions.PREFETCH_METADATA, 0);
+        si
+
+        _point(
+            il_offset: int,
+            file_name: string,
+            start_line: int,
+            start_column: int
+        ) -> SRM_SEQUENCE_POINT static =>
+            SRM_SEQUENCE_POINT(
+                il_offset, file_name, start_line, start_column, start_line, start_column + 4);
+
+        // Every point of one method, in the order the decoder yields
+        // them, as `offset:line:column` - compact enough to assert as a
+        // single string.
+        _decoded(provider: MetadataReaderProvider, row: int) -> string static is
+            let result = LIST[string]();
+
+            let reader =
+                provider.get_metadata_reader(
+                    System.Reflection.Metadata.MetadataReaderOptions.DEFAULT, null);
+
+            let information =
+                reader.get_method_debug_information(
+                    MetadataTokens.method_debug_information_handle(row));
+
+            for point in information.get_sequence_points() do
+                result.add("{point.offset}:{point.start_line}:{point.start_column}");
+            od
+
+            return result | .join(" ");
+        si
+
+        // The full extent of every point, as
+        // `startLine,startColumn-endLine,endColumn`.
+        _decoded_spans(provider: MetadataReaderProvider, row: int) -> string static is
+            let result = LIST[string]();
+
+            let reader =
+                provider.get_metadata_reader(
+                    System.Reflection.Metadata.MetadataReaderOptions.DEFAULT, null);
+
+            let information =
+                reader.get_method_debug_information(
+                    MetadataTokens.method_debug_information_handle(row));
+
+            for point in information.get_sequence_points() do
+                result.add(
+                    "{point.start_line},{point.start_column}-{point.end_line},{point.end_column}");
+            od
+
+            return result | .join(" ");
+        si
+
+        // A point that ends on a later line than it starts takes the
+        // signed column delta, and its end column is free to fall to the
+        // left of its start column - which is what makes the delta
+        // signed, and what an unsigned write would mangle.
+        A_point_spanning_lines_decodes_to_what_was_written() is
+            @test()
+
+            let builder = SRM_PDB_BUILDER();
+
+            builder.add_method_debug_information(
+                [
+                    SRM_SEQUENCE_POINT(0, "/src/a.ghul", 10, 20, 12, 3),
+                    SRM_SEQUENCE_POINT(9, "/src/a.ghul", 14, 2, 14, 30)
+                ]);
+
+            Assert.are_equal(
+                "10,20-12,3 14,2-14,30", _decoded_spans(_read_back(builder), 1));
+        si
+
+        A_method_with_no_points_decodes_to_nothing() is
+            @test()
+
+            let builder = SRM_PDB_BUILDER();
+
+            builder.add_method_debug_information(null);
+
+            Assert.are_equal("", _decoded(_read_back(builder), 1));
+        si
+
+        Points_in_one_document_decode_to_what_was_written() is
+            @test()
+
+            let builder = SRM_PDB_BUILDER();
+
+            builder.add_method_debug_information(
+                [
+                    _point(0, "/src/a.ghul", 10, 5),
+                    _point(7, "/src/a.ghul", 11, 9),
+                    // Backwards on both line and column: the deltas for
+                    // these are signed, and a writer that treats them as
+                    // unsigned still produces a blob that decodes, just
+                    // not to this.
+                    _point(23, "/src/a.ghul", 4, 1)
+                ]);
+
+            Assert.are_equal(
+                "0:10:5 7:11:9 23:4:1", _decoded(_read_back(builder), 1));
+        si
+
+        // A document-change record carries no position of its own, so
+        // the records around it have to keep running from the last real
+        // point. Resetting the deltas there shifts every offset and line
+        // after the change.
+        Points_spanning_two_documents_decode_to_what_was_written() is
+            @test()
+
+            let builder = SRM_PDB_BUILDER();
+
+            builder.add_method_debug_information(
+                [
+                    _point(0, "/src/a.ghul", 10, 5),
+                    _point(7, "/src/b.ghul", 30, 2),
+                    _point(23, "/src/b.ghul", 31, 6),
+                    _point(40, "/src/a.ghul", 12, 3)
+                ]);
+
+            Assert.are_equal(
+                "0:10:5 7:30:2 23:31:6 40:12:3", _decoded(_read_back(builder), 1));
+        si
+
+        // Rows are read positionally against the assembly's MethodDef
+        // table, so a method with nothing to say still occupies one and
+        // the methods after it keep their own.
+        An_empty_row_does_not_displace_the_rows_after_it() is
+            @test()
+
+            let builder = SRM_PDB_BUILDER();
+
+            builder.add_method_debug_information([_point(0, "/src/a.ghul", 1, 1)]);
+            builder.add_method_debug_information(null);
+            builder.add_method_debug_information([_point(0, "/src/a.ghul", 99, 7)]);
+
+            let provider = _read_back(builder);
+
+            Assert.are_equal("0:1:1", _decoded(provider, 1));
+            Assert.are_equal("", _decoded(provider, 2));
+            Assert.are_equal("0:99:7", _decoded(provider, 3));
+        si
+    si
+si

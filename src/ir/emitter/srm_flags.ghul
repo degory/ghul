@@ -1,0 +1,248 @@
+namespace IR.Emitter is
+    use System.Reflection.TypeAttributes;
+    use System.Reflection.MethodAttributes;
+    use System.Reflection.FieldAttributes;
+
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.Function;
+    use Semantic.Symbols.Field;
+
+    // The metadata flag words for a definition, derived from the
+    // symbol's own predicates. Kept together here, and out of the
+    // symbol classes, so what a symbol means and how it is encoded
+    // stay separable.
+    //
+    // Instance methods are emitted virtual without newslot, so a
+    // same-named member in a subclass overrides by name and signature,
+    // which is the dispatch behaviour ghūl source already relies on.
+    class SRM_FLAGS is
+        _PUBLIC_TYPE: int static => 1;
+        _INTERFACE: int static => 32;
+        _ABSTRACT_TYPE: int static => 128;
+        _SEALED: int static => 256;
+        _SEQUENTIAL_LAYOUT: int static => 8;
+        _BEFORE_FIELD_INIT: int static => 1048576;
+
+        type_attributes(type: Classy) -> TypeAttributes static is
+            let flags mut = _PUBLIC_TYPE;
+
+            if !type.is_public_readable then
+                flags = 0;
+            fi
+
+            if type.is_trait then
+                return cast TypeAttributes(flags | _INTERFACE | _ABSTRACT_TYPE);
+            fi
+
+            // An enum is sealed like any other value type, but takes
+            // auto layout: the runtime treats it as its underlying
+            // scalar, and a sequential-layout enum is rejected as
+            // malformed rather than merely laid out differently.
+            if isa Semantic.Symbols.ENUM_STRUCT(type) then
+                flags = flags | _SEALED;
+            elif type.is_value_type then
+                flags = flags | _SEALED | _SEQUENTIAL_LAYOUT;
+            elif type.is_abstract then
+                flags = flags | _ABSTRACT_TYPE;
+            fi
+
+            // A type declaring its own static constructor must not
+            // carry beforefieldinit, which lets the CLR run the
+            // `.cctor` at an unspecified point before first use rather
+            // than precisely before it.
+            if type.has_static_constructor then
+                return cast TypeAttributes(flags);
+            fi
+
+            return cast TypeAttributes(flags | _BEFORE_FIELD_INIT);
+        si
+
+        globals_carrier_type_attributes() -> TypeAttributes static =>
+            cast TypeAttributes(_PUBLIC_TYPE | _ABSTRACT_TYPE | _SEALED);
+
+        _PRIVATE_METHOD: int static => 1;
+        _ASSEMBLY_METHOD: int static => 3;
+        _PUBLIC_METHOD: int static => 6;
+        _STATIC: int static => 16;
+        _FINAL: int static => 32;
+        _VIRTUAL: int static => 64;
+        _HIDE_BY_SIG: int static => 128;
+        _NEW_SLOT: int static => 256;
+        _ABSTRACT_METHOD: int static => 1024;
+        _SPECIAL_NAME: int static => 2048;
+        _RT_SPECIAL_NAME: int static => 4096;
+
+        method_attributes(method: Function) -> MethodAttributes static is
+            // A `.cctor` is reached by the runtime rather than by any
+            // call site, and only the rtspecialname mark tells it so.
+            // Without it the row is an ordinary static method that
+            // happens to be named `.cctor`, and nothing ever runs it.
+            if method.is_static_constructor then
+                return static_initializer_attributes();
+            fi
+
+            let flags mut =
+                if method.is_public_readable then _PUBLIC_METHOD else _ASSEMBLY_METHOD fi;
+
+            flags = flags | _HIDE_BY_SIG;
+
+            // A constructor is never virtual: it is reached through the
+            // type it constructs, so there is no slot for a subclass to
+            // take over, and the runtime rejects the combination.
+            if !method.is_emitted_with_receiver then
+                flags = flags | _STATIC;
+            elif method.is_virtual /\ !method.is_constructor then
+                flags = flags | _VIRTUAL;
+            fi
+
+            // A constructor's IL name is reserved, which is what
+            // rtspecialname asserts; the runtime rejects a `.ctor`
+            // without it.
+            if method.is_constructor then
+                flags = flags | _SPECIAL_NAME | _RT_SPECIAL_NAME;
+            elif method.is_internal then
+                flags = flags | _SPECIAL_NAME;
+            fi
+
+            // A body-less declaration — an interface member, or an
+            // abstract method — has no body for the row to point at.
+            if method.is_abstract then
+                flags = flags | _ABSTRACT_METHOD | _VIRTUAL;
+            fi
+
+            return cast MethodAttributes(flags);
+        si
+
+        // A state-machine frame's synthesised members. Each satisfies an
+        // interface the frame implements, so each is a newslot virtual;
+        // ToString overrides Object's and takes the slot it already has.
+        frame_member_attributes(member: FrameMember) -> MethodAttributes static is
+            if member == FrameMember.TO_STRING then
+                return cast MethodAttributes(_PUBLIC_METHOD | _VIRTUAL | _HIDE_BY_SIG);
+            fi
+
+            let flags mut =
+                _PUBLIC_METHOD | _FINAL | _VIRTUAL | _HIDE_BY_SIG | _NEW_SLOT;
+
+            if member == FrameMember.GET_CURRENT \/ member == FrameMember.GET_ENUMERATOR then
+                flags = flags | _SPECIAL_NAME;
+            fi
+
+            return cast MethodAttributes(flags);
+        si
+
+        // An explicit interface implementation: private, because it is
+        // reached only through the interface, and newslot because it
+        // takes a slot of its own rather than overriding anything the
+        // base declares. Final, since a name carrying dots cannot be
+        // overridden by a subclass member anyway.
+        explicit_implementation_attributes(is_special_name: bool) -> MethodAttributes static is
+            let flags mut =
+                _PRIVATE_METHOD | _FINAL | _VIRTUAL | _HIDE_BY_SIG | _NEW_SLOT;
+
+            if is_special_name then
+                flags = flags | _SPECIAL_NAME;
+            fi
+
+            return cast MethodAttributes(flags);
+        si
+
+        // A static constructor: private, static, and reserved-named.
+        // Shared by a declared `init() static` and by the one the back
+        // end synthesises to intern a unit variant.
+        static_initializer_attributes() -> MethodAttributes static =>
+            cast MethodAttributes(
+                _PRIVATE_METHOD | _HIDE_BY_SIG | _STATIC | _SPECIAL_NAME | _RT_SPECIAL_NAME);
+
+        method_name(method: Function) -> string static => method.il_name;
+
+        property_name(property: Semantic.Symbols.Property) -> string static =>
+            property.il_name;
+
+        _COVARIANT: int static => 1;
+        _CONTRAVARIANT: int static => 2;
+        _REFERENCE_TYPE_CONSTRAINT: int static => 4;
+        _VALUE_TYPE_CONSTRAINT: int static => 8;
+        _DEFAULT_CONSTRUCTOR_CONSTRAINT: int static => 16;
+
+        // What a GenericParam row says about one type parameter beyond
+        // its name: which way it varies, which kind of type can
+        // instantiate it, and whether it must be constructible.
+        //
+        // All three are read back by an importing compiler and enforced
+        // by the CLR, so a row left at zero silently turns a covariant
+        // trait invariant and drops a `class`, `struct` or `init` bound.
+        // A bound naming a type is a GenericParamConstraint row instead,
+        // and cannot be expressed here.
+        type_parameter_attributes(
+            variance: Semantic.Types.TypeVariance,
+            constraint: Semantic.Symbols.TypeParameterConstraintKind,
+            has_constructor_constraint: bool
+        ) -> System.Reflection.GenericParameterAttributes static is
+            let flags mut = 0;
+
+            if has_constructor_constraint then
+                flags = flags | _DEFAULT_CONSTRUCTOR_CONSTRAINT;
+            fi
+
+            if variance == Semantic.Types.TypeVariance.COVARIANT then
+                flags = flags | _COVARIANT;
+            elif variance == Semantic.Types.TypeVariance.CONTRAVARIANT then
+                flags = flags | _CONTRAVARIANT;
+            fi
+
+            // OPTIONAL constrains what the parameter can hold rather
+            // than which kind of type it is, and has no CLR counterpart.
+            if constraint == Semantic.Symbols.TypeParameterConstraintKind.REFERENCE then
+                flags = flags | _REFERENCE_TYPE_CONSTRAINT;
+            elif constraint == Semantic.Symbols.TypeParameterConstraintKind.VALUE then
+                flags = flags | _VALUE_TYPE_CONSTRAINT;
+            fi
+
+            return cast System.Reflection.GenericParameterAttributes(flags);
+        si
+
+        _PRIVATE_FIELD: int static => 1;
+        _ASSEMBLY_FIELD: int static => 3;
+        _PUBLIC_FIELD: int static => 6;
+        _STATIC_FIELD: int static => 16;
+
+        _LITERAL_FIELD: int static => 64;
+        _HAS_DEFAULT_FIELD: int static => 32768;
+
+        // FieldAttributes numbers these differently from
+        // MethodAttributes, which uses 0x0800 / 0x1000 for the same two
+        // marks.
+        _SPECIAL_NAME_FIELD: int static => 512;
+        _RT_SPECIAL_NAME_FIELD: int static => 1024;
+
+        unit_variant_instance_attributes() -> FieldAttributes static =>
+            cast FieldAttributes(_PUBLIC_FIELD | _STATIC_FIELD);
+
+        // An enum's members are compile-time constants: each is a static
+        // literal of the enum's own type, whose value lives in a Constant
+        // row rather than in any initializer.
+        enum_member_attributes() -> FieldAttributes static =>
+            cast FieldAttributes(
+                _PUBLIC_FIELD | _STATIC_FIELD | _LITERAL_FIELD | _HAS_DEFAULT_FIELD);
+
+        // The instance field an enum's value is actually stored in. Its
+        // name is fixed by ECMA-335 and the runtime finds it by the
+        // rtspecialname mark rather than by position.
+        enum_value_attributes() -> FieldAttributes static =>
+            cast FieldAttributes(_PUBLIC_FIELD | _SPECIAL_NAME_FIELD | _RT_SPECIAL_NAME_FIELD);
+
+        field_attributes(`field: Field) -> FieldAttributes static is
+            let flags mut =
+                if `field.is_public_readable then _PUBLIC_FIELD else _ASSEMBLY_FIELD fi;
+
+            if isa Semantic.Symbols.STATIC_FIELD(`field) \/
+               isa Semantic.Symbols.GLOBAL_VARIABLE(`field)
+            then
+                flags = flags | _STATIC_FIELD;
+            fi
+
+            return cast FieldAttributes(flags);
+        si
+    si
+si

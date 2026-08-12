@@ -1,0 +1,490 @@
+namespace IR.Emitter is
+    use Semantic.Symbols.Symbol;
+    use Semantic.Symbols.Scope;
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.Function;
+    use Semantic.Symbols.Field;
+    use Semantic.Symbols.Property;
+    use Semantic.Symbols.FUNCTION_GROUP;
+    use Semantic.Symbols.TYPE_GROUP;
+    use Semantic.Symbols.NAMESPACE;
+
+    // One type in the emitted assembly.
+    //
+    // Most are declared: a class, struct, trait, union or variant the
+    // source wrote, and a symbol the emitter can read everything from.
+    // A namespace holding global functions or variables has no such
+    // symbol - `$globals` is a naming convention the back end applies,
+    // not a declaration - so the namespace stands in for its carrier and
+    // supplies the same answers.
+    class SRM_EMITTED_TYPE is
+        declared: Classy?;
+        globals_of: NAMESPACE?;
+
+        init(declared: Classy) is
+            self.declared = declared;
+        si
+
+        init(globals_of: NAMESPACE) is
+            self.globals_of = globals_of;
+        si
+
+        is_globals_carrier: bool => globals_of?;
+
+        name: string =>
+            if let d = declared then d.name else Semantic.DotNet.GLOBALS_CARRIER.name fi;
+
+        // The scope whose members become this type's members, and whose
+        // owner supplies the metadata namespace. For a carrier both are
+        // the namespace itself.
+        scope: Scope => if let d = declared then d else globals_of! fi;
+
+        owning_namespace: Scope? =>
+            if let d = declared then d.owner else globals_of! fi;
+    si
+
+    // The order in which types and their members are written to
+    // metadata.
+    //
+    // Two separate passes read this: one to assign row numbers before
+    // any body is encoded, and one to write the rows afterwards. They
+    // must produce the same sequence or every pre-computed handle names
+    // the wrong row, so both go through here rather than iterating a
+    // scope directly.
+    //
+    // A scope stores its members in a map keyed by name, so iterating it
+    // yields neither declaration order nor an order that is obviously
+    // stable against unrelated edits. Sorting on source position
+    // recovers declaration order, which a struct's sequential layout
+    // depends on, and gives the same answer however the map chose to
+    // enumerate. Overloads share one name, so a scope yields a
+    // FUNCTION_GROUP where the tables want one row per function; the
+    // group is flattened here.
+    class SRM_MEMBER_ORDER is
+        // Every type the assembly defines. Imported types are reachable
+        // from the same root and are excluded: they are referenced,
+        // never defined, here.
+        types(root: Scope) -> Collections.List[SRM_EMITTED_TYPE] static is
+            let declared = Collections.LIST[Classy]();
+            let namespaces = Collections.LIST[NAMESPACE]();
+
+            _collect(root, declared, namespaces, Collections.SET[Classy]());
+
+            _sort_by_declaration(declared);
+            _sort_by_declaration(namespaces);
+
+            let result = Collections.LIST[SRM_EMITTED_TYPE]();
+
+            for type in declared do
+                result.add(SRM_EMITTED_TYPE(type));
+            od
+
+            // Closure frames are types in the emitted assembly, but no
+            // scope holds them: a frame's owner is the enclosing
+            // namespace, and nothing declares it there. Declaring one
+            // would make `$frame_0` a name that resolution, completion
+            // and symbol search could all see, so they are collected
+            // from the closures that own them instead. A closure is
+            // declared into the function the literal was written in,
+            // and is itself a scope that can hold further closures.
+            for frame in _frames(declared, namespaces) do
+                result.add(SRM_EMITTED_TYPE(frame));
+            od
+
+            // Carriers last, so that adding a global to a namespace
+            // cannot renumber any declared type's members.
+            for `namespace in namespaces do
+                if _has_globals(`namespace) then
+                    result.add(SRM_EMITTED_TYPE(`namespace));
+                fi
+            od
+
+            return result;
+        si
+
+        // A type's scope can reach back to a type already collected -
+        // a union names itself from each of its variants - so a type is
+        // descended into once.
+        _collect(
+            scope: Scope,
+            declared: Collections.LIST[Classy],
+            namespaces: Collections.LIST[NAMESPACE],
+            seen: Collections.SET[Classy]
+        ) static is
+            for symbol in scope.symbols do
+                if symbol.is_reflected then
+                    continue;
+                fi
+
+                if let `namespace: NAMESPACE = symbol then
+                    namespaces.add(`namespace);
+
+                    _collect(`namespace, declared, namespaces, seen);
+                elif let group: TYPE_GROUP = symbol then
+                    // Same-name types at different argument counts are
+                    // one symbol in the scope and separate types in the
+                    // assembly, so the group is descended into rather
+                    // than emitted.
+                    for type in group.classies do
+                        _collect_type(type, declared, namespaces, seen);
+                    od
+                elif let type: Classy = symbol then
+                    _collect_type(type, declared, namespaces, seen);
+                fi
+            od
+        si
+
+        _collect_type(
+            type: Classy,
+            declared: Collections.LIST[Classy],
+            namespaces: Collections.LIST[NAMESPACE],
+            seen: Collections.SET[Classy]
+        ) static is
+            if seen.contains(type) then
+                return;
+            fi
+
+            seen.add(type);
+            declared.add(type);
+
+            // A union's variants are declared into the union's own
+            // scope rather than into the namespace, and are types in
+            // their own right in the emitted assembly.
+            _collect(type, declared, namespaces, seen);
+        si
+
+        _frames(
+            declared: Collections.LIST[Classy],
+            namespaces: Collections.LIST[NAMESPACE]
+        ) -> Collections.List[Classy] static is
+            let result = Collections.LIST[Classy]();
+
+            for type in declared do
+                _collect_frames(type, result);
+            od
+
+            for `namespace in namespaces do
+                _collect_frames(`namespace, result);
+            od
+
+            _sort_by_declaration(result);
+
+            return result;
+        si
+
+        _collect_frames(scope: Scope, into: Collections.LIST[Classy]) static is
+            for symbol in scope.symbols do
+                if let group: FUNCTION_GROUP = symbol then
+                    for function in group.functions do
+                        _collect_frames_from_function(function, into);
+                    od
+                elif let function: Function = symbol then
+                    _collect_frames_from_function(function, into);
+                fi
+            od
+        si
+
+        _collect_frames_from_function(function: Function, into: Collections.LIST[Classy]) static is
+            // A generator or async function compiles into a state
+            // machine whose frame is a type of its own, reached from
+            // the function rather than from any scope.
+            if let state_machine = Semantic.Symbols.state_machine_for(function) then
+                if let frame = state_machine.frame then
+                    into.add(frame);
+                fi
+            fi
+
+            if let async_state_machine = Semantic.Symbols.async_state_machine_for(function) then
+                if let frame = async_state_machine.frame then
+                    into.add(frame);
+                fi
+            fi
+
+            for symbol in function.symbols do
+                if let closure: Semantic.Symbols.Closure = symbol then
+                    if let frame = closure.frame then
+                        into.add(frame);
+                    fi
+
+                    // A closure body can declare closures of its own.
+                    _collect_frames_from_function(closure, into);
+                fi
+            od
+        si
+
+        _has_globals(`namespace: NAMESPACE) -> bool static =>
+            fields(SRM_EMITTED_TYPE(`namespace)).count > 0 \/
+            methods(SRM_EMITTED_TYPE(`namespace)).count > 0;
+
+        fields(type: SRM_EMITTED_TYPE) -> Collections.List[Field] static is
+            let result = Collections.LIST[Field]();
+
+            for symbol in type.scope.symbols do
+                // A scope holds members it does not declare: pulling a
+                // super's symbols down adds them here, and a member
+                // whose owner is elsewhere belongs to that owner's rows,
+                // not to these. A member with no overloads arrives as
+                // itself and is answered for here; one with overloads
+                // arrives inside a group, which is dealt with below.
+                if !_is_owned_by(symbol, type) then
+                    continue;
+                fi
+
+                if symbol.is_reflected then
+                    continue;
+                fi
+
+                if let `field: Field = symbol then
+                    result.add(`field);
+                fi
+            od
+
+            // A memoized stateless delegate caches in a static field
+            // built on demand while expressions were compiled. It is a
+            // real symbol but is declared into no scope, so it is
+            // collected from the closures that own it - and it lands on
+            // the enclosing class, or on the namespace's carrier for a
+            // global one, which is not always where the closure is
+            // written.
+            _collect_delegate_caches(type, result);
+
+            _sort_by_declaration(result);
+
+            return result;
+        si
+
+        _collect_delegate_caches(type: SRM_EMITTED_TYPE, into: Collections.LIST[Field]) static is
+            let closures = Collections.LIST[Semantic.Symbols.Closure]();
+
+            // A cache field lands on the enclosing class, or on the
+            // namespace's carrier when the closure is a global anonymous
+            // function - and a class method can hold one of those - so
+            // the search starts from the owning namespace rather than
+            // from the type, and the owner check below selects.
+            _collect_closures(type.owning_namespace ?? type.scope, closures, Collections.SET[Scope]());
+
+            for closure in closures do
+                if !closure.has_delegate_cache_field then
+                    continue;
+                fi
+
+                let `field = closure.delegate_cache_field;
+
+                if _is_owned_by(`field, type) then
+                    into.add(`field);
+                fi
+            od
+        si
+
+        _collect_closures(
+            scope: Scope,
+            into: Collections.LIST[Semantic.Symbols.Closure],
+            seen: Collections.SET[Scope]
+        ) static is
+            if seen.contains(scope) then
+                return;
+            fi
+
+            seen.add(scope);
+
+            for symbol in scope.symbols do
+                if let group: FUNCTION_GROUP = symbol then
+                    for function in group.functions do
+                        _collect_closures(function, into, seen);
+                    od
+                elif let closure: Semantic.Symbols.Closure = symbol then
+                    into.add(closure);
+
+                    _collect_closures(closure, into, seen);
+                elif let inner: Scope = symbol then
+                    _collect_closures(inner, into, seen);
+                fi
+            od
+        si
+
+        // The properties a type declares, in the order their rows are
+        // written.
+        //
+        // Unlike the field and method runs this order is not agreed
+        // across the two passes: nothing outside the property's own rows
+        // names it, so the rows and the map that points at them are both
+        // written in the same iteration and cannot disagree.
+        //
+        // Sorted all the same. A scope enumerates by name-keyed map
+        // order, so without this an unrelated edit elsewhere in the same
+        // scope reorders the emitted rows while nothing about the
+        // properties has changed — which the planned byte-comparison of
+        // two bootstrap assemblies would read as a difference.
+        properties(type: SRM_EMITTED_TYPE) -> Collections.List[Property] static is
+            let result = Collections.LIST[Property]();
+
+            for symbol in type.scope.symbols do
+                if !_is_owned_by(symbol, type) then
+                    continue;
+                fi
+
+                if symbol.is_reflected then
+                    continue;
+                fi
+
+                if let property: Property = symbol then
+                    result.add(property);
+                fi
+            od
+
+            _sort_by_declaration(result);
+
+            return result;
+        si
+
+        methods(type: SRM_EMITTED_TYPE) -> Collections.List[Function] static is
+            let result = Collections.LIST[Function]();
+
+            // An enum emits no methods. Its ordering operator is innate,
+            // compiled at each call site against the underlying value,
+            // and its symbol carries no body — emitting a row for it
+            // yields a method with no code, which makes the whole type
+            // fail to load.
+            if isa Semantic.Symbols.ENUM_STRUCT(type.declared) then
+                return result;
+            fi
+
+            // A frame's closure method belongs to the frame in the
+            // emitted assembly but is declared elsewhere, so the walk
+            // over the frame's own symbols does not reach it.
+            if let frame: Semantic.Symbols.FRAME = type.declared then
+                result.add(frame.closure);
+            fi
+
+            for symbol in type.scope.symbols do
+                // A scope holds members it does not declare: pulling a
+                // super's symbols down adds them here, and a member
+                // whose owner is elsewhere belongs to that owner's rows,
+                // not to these. A member with no overloads arrives as
+                // itself and is answered for here; one with overloads
+                // arrives inside a group, which is dealt with below.
+                if !_is_owned_by(symbol, type) then
+                    continue;
+                fi
+
+                if symbol.is_reflected then
+                    continue;
+                fi
+
+                if let group: FUNCTION_GROUP = symbol then
+                    // The group is the subclass's own, but it holds the
+                    // functions it inherits alongside the ones declared
+                    // here, and those still belong to the type that
+                    // declared them. Checking the group answers for the
+                    // group, not for what is in it.
+                    for function in group.functions do
+                        if _is_owned_by(function, type) /\ _is_emitted(function) then
+                            result.add(function);
+                        fi
+                    od
+                elif let function: Function = symbol then
+                    if _is_emitted(function) then
+                        result.add(function);
+                    fi
+                fi
+            od
+
+            _collect_anonymous_functions(type, result);
+
+            _sort_by_declaration(result);
+
+            return result;
+        si
+
+        // A function literal with no frame is emitted onto the type that
+        // encloses it - as a static method when it captures nothing, as
+        // an instance one when all it captures is `self` - but it is
+        // declared into the function it was written in. `owner` points
+        // at the emitted home without the symbol store there holding it,
+        // so the walk over that home's own symbols does not reach one.
+        // Same shape as a closure frame, and as the cache field a
+        // memoized one stores itself in.
+        _collect_anonymous_functions(
+            type: SRM_EMITTED_TYPE,
+            into: Collections.LIST[Function]
+        ) static is
+            let closures = Collections.LIST[Semantic.Symbols.Closure]();
+
+            _collect_closures(type.owning_namespace ?? type.scope, closures, Collections.SET[Scope]());
+
+            for closure in closures do
+                if !closure.frame? /\ _is_owned_by(closure, type) then
+                    into.add(closure);
+                fi
+            od
+        si
+
+        // Whether a member is emitted onto this type.
+        //
+        // A member's owner is sometimes the namespace symbol and
+        // sometimes the scope standing for it, and the two are distinct
+        // objects, so comparing owners directly answers false for a
+        // member that does belong here. Both sides are resolved to the
+        // namespace before comparing.
+        // An `impl` or `partial` block's scope stands for the type it
+        // injects into in the same way, so it is resolved here too: a
+        // closure written in an injected member is emitted onto the
+        // target, not onto the block.
+        // An innate is a call site's instruction sequence wearing a
+        // symbol, not a method: it has no body to encode, and the
+        // declaration it stands for is emitted separately by whichever
+        // type actually declares it. A compilation that declares its own
+        // intrinsics gets one registered into `Ghul` for every intrinsic
+        // it declares, all of them owned by that namespace - so the
+        // ownership test above admits them and only this turns them away.
+        _is_emitted(function: Function) -> bool static => !function.is_innate;
+
+        _is_owned_by(member: Symbol, type: SRM_EMITTED_TYPE) -> bool static =>
+            _emitted_home(member.owner) == _emitted_home(type.scope);
+
+        _emitted_home(scope: Scope?) -> Scope? static =>
+            if let injection: Semantic.INJECTION_SCOPE = scope then
+                injection.target;
+            else
+                _as_namespace(scope) ?? scope;
+            fi;
+
+        _as_namespace(scope: Scope?) -> Scope? static =>
+            if let declared: NAMESPACE = scope then
+                declared;
+            elif let namespace_scope: Semantic.NAMESPACE_SCOPE = scope then
+                namespace_scope.containing_namespace;
+            else
+                null;
+            fi;
+
+        // Overloads declared on one line, and synthesised members that
+        // share the internal location, would otherwise order
+        // arbitrarily; name and then description break the tie so the
+        // sequence is reproducible.
+        _sort_by_declaration[T: Symbol](symbols: Collections.LIST[T]) static is
+            symbols.sort(
+                (left: T, right: T) -> int is
+                    let by_file = left.location.file_name <> right.location.file_name;
+
+                    if by_file != 0 then
+                        return by_file;
+                    fi
+
+                    let by_position = left.location.start - right.location.start;
+
+                    if by_position != 0 then
+                        return by_position;
+                    fi
+
+                    let by_name = left.name <> right.name;
+
+                    if by_name != 0 then
+                        return by_name;
+                    fi
+
+                    return left.description <> right.description;
+                si);
+        si
+    si
+si

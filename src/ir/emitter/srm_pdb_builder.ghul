@@ -1,0 +1,215 @@
+namespace IR.Emitter is
+    use System.Reflection.Metadata.BlobBuilder;
+    use System.Reflection.Metadata.BlobContentId;
+    use System.Reflection.Metadata.DocumentHandle;
+    use System.Reflection.Metadata.Ecma335.MetadataBuilder;
+    use System.Reflection.Metadata.Ecma335.PortablePdbBuilder;
+
+    // One source position the debugger or a coverage tool can stop at,
+    // paired with the instruction offset it starts at.
+    class SRM_SEQUENCE_POINT(
+        il_offset: int,
+        file_name: string,
+        start_line: int,
+        start_column: int,
+        end_line: int,
+        end_column: int
+    );
+
+    // A run of instructions an `@IL.output` pragma marks. The binary back
+    // end records one per marked statement and carries them out of the
+    // method as a custom attribute, which the IL test runner reads back to
+    // slice the disassembly to just the statement's instructions. The
+    // sequence number is compilation-global, so a test marking statements
+    // in more than one method can rebuild their source order.
+    class SRM_IL_OUTPUT_RANGE(
+        path: string,
+        start_offset: int,
+        end_offset: int,
+        sequence: int
+    );
+
+    // Builds the portable PDB that sits beside the emitted assembly.
+    //
+    // A PDB is its own metadata file with its own tables, so this holds
+    // a second MetadataBuilder rather than adding to the assembly's.
+    // The one hard coupling between them is MethodDebugInformation:
+    // its rows are not looked up by key, they are read positionally
+    // against MethodDef, so row N here has to describe method N there.
+    // Nothing checks - a missing row shifts every method after it onto
+    // another method's line numbers, which reads as a compiler that
+    // emits plausible but wrong debug info rather than as a broken
+    // file. `add_method_debug_information` is therefore called once per
+    // MethodDef row from the one place that adds them, including for
+    // the methods that have no sequence points at all.
+    class SRM_PDB_BUILDER is
+        _metadata: MetadataBuilder;
+        _documents: Collections.MAP[string, DocumentHandle];
+
+        init() is
+            _metadata = MetadataBuilder(0, 0, 0, 0);
+            _documents = Collections.MAP[string, DocumentHandle]();
+        si
+
+        _EMPTY_HASH: ubyte[] static => [];
+
+        _document(file_name: string) -> DocumentHandle is
+            let existing: DocumentHandle mut;
+
+            if _documents.try_get_value(file_name, existing ref) then
+                return existing;
+            fi
+
+            // No hash and no language: a hash commits the PDB to one
+            // byte-for-byte revision of the source, which is what a
+            // debugger checks before binding a breakpoint, and the
+            // compiler does not keep the bytes it read by the time the
+            // assembly is written. Line lookup and coverage attribution
+            // read the name and the sequence points, and need neither.
+            let handle =
+                _metadata.add_document(
+                    _metadata.get_or_add_document_name(file_name),
+                    _[System.Reflection.Metadata.GuidHandle],
+                    _metadata.get_or_add_blob(_EMPTY_HASH),
+                    _[System.Reflection.Metadata.GuidHandle]);
+
+            _documents[file_name] = handle;
+
+            return handle;
+        si
+
+        // One row, whether or not there is anything to say - see the
+        // positional coupling above. A method with no sequence points
+        // (an abstract declaration, a compiler-synthesised member, any
+        // method at all in a non-debug build) gets an empty row.
+        add_method_debug_information(points: Collections.List[SRM_SEQUENCE_POINT]?) is
+            if !points? \/ points.count == 0 then
+                _metadata.add_method_debug_information(
+                    _[DocumentHandle], _[System.Reflection.Metadata.BlobHandle]);
+
+                return;
+            fi
+
+            let initial_document = _document(points[0].file_name);
+
+            _metadata.add_method_debug_information(
+                initial_document,
+                _metadata.get_or_add_blob(_sequence_point_blob(points, initial_document)));
+        si
+
+        // The sequence-point blob, as ECMA-335 II.24.2.1 defines it:
+        // a header naming the method's local signature, then one record
+        // per point, each expressed as a delta from the one before so
+        // the common case costs a handful of bytes.
+        //
+        // The first record carries absolute values; every later one
+        // carries deltas, and its IL-offset delta must be non-zero,
+        // because a zero there is the marker for a document-change
+        // record instead.
+        _sequence_point_blob(
+            points: Collections.List[SRM_SEQUENCE_POINT],
+            initial_document: DocumentHandle
+        ) -> ubyte[] is
+            let buffer = BlobBuilder(32);
+
+            // Local signature. The back end emits no StandAloneSig row
+            // for a body's locals, so there is none to name.
+            buffer.write_compressed_integer(0);
+
+            let previous mut = _[SRM_SEQUENCE_POINT?];
+            let current_document mut = initial_document;
+
+            for point in points do
+                let document = _document(point.file_name);
+
+                if !(document =~ current_document) then
+                    // A document-change record: the zero IL-offset
+                    // delta that no ordinary record can carry, then the
+                    // document being switched to.
+                    //
+                    // It changes which document the records after it
+                    // belong to and nothing else. The deltas keep
+                    // running from the last real sequence point, so the
+                    // record following it is still a delta rather than
+                    // absolute - resetting the baseline here would
+                    // desynchronise every offset and line after it.
+                    buffer.write_compressed_integer(0);
+                    buffer.write_compressed_integer(
+                        System.Reflection.Metadata.Ecma335.MetadataTokens.get_row_number(
+                            cast System.Reflection.Metadata.EntityHandle(document)));
+
+                    current_document = document;
+                fi
+
+                let delta_lines = point.end_line - point.start_line;
+                let delta_columns = point.end_column - point.start_column;
+
+                if let seen = previous then
+                    buffer.write_compressed_integer(point.il_offset - seen.il_offset);
+                else
+                    buffer.write_compressed_integer(point.il_offset);
+                fi
+
+                buffer.write_compressed_integer(delta_lines);
+
+                // On a point that begins and ends on one line the
+                // column delta is that line's width, which cannot be
+                // negative, so it is unsigned. Across lines the end
+                // column can fall to the left of the start column, so
+                // it is signed.
+                if delta_lines == 0 then
+                    buffer.write_compressed_integer(delta_columns);
+                else
+                    buffer.write_compressed_signed_integer(delta_columns);
+                fi
+
+                if let seen = previous then
+                    buffer.write_compressed_signed_integer(
+                        point.start_line - seen.start_line);
+                    buffer.write_compressed_signed_integer(
+                        point.start_column - seen.start_column);
+                else
+                    buffer.write_compressed_integer(point.start_line);
+                    buffer.write_compressed_integer(point.start_column);
+                fi
+
+                previous = point;
+            od
+
+            return buffer.to_array();
+        si
+
+        // Writes the PDB and hands back the identity the assembly's
+        // debug directory has to name for a runtime to pair the two.
+        // The serialized PDB, for a caller that wants the bytes rather
+        // than a file - reading them back through a metadata reader is
+        // how the blob encoding above is tested.
+        serialize(
+            blob: BlobBuilder,
+            type_system_row_counts: System.Collections.Immutable.ImmutableArray[int],
+            entry_point: System.Reflection.Metadata.MethodDefinitionHandle,
+            content_id_provider: (Collections.Iterable[System.Reflection.Metadata.Blob]) -> BlobContentId
+        ) -> BlobContentId =>
+            PortablePdbBuilder(
+                _metadata, type_system_row_counts, entry_point, content_id_provider)
+                .serialize(blob);
+
+        write_to(
+            path: string,
+            type_system_row_counts: System.Collections.Immutable.ImmutableArray[int],
+            entry_point: System.Reflection.Metadata.MethodDefinitionHandle,
+            content_id_provider: (Collections.Iterable[System.Reflection.Metadata.Blob]) -> BlobContentId
+        ) -> BlobContentId is
+            let blob = BlobBuilder(1024);
+
+            let content_id =
+                serialize(blob, type_system_row_counts, entry_point, content_id_provider);
+
+            let stream = IO.File.create(path);
+            blob.write_content_to(stream);
+            stream.close();
+
+            return content_id;
+        si
+    si
+si

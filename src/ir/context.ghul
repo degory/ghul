@@ -20,11 +20,13 @@ namespace IR is
                 write_line(value);
             else
                 write_line(value);
+
+                
             fi
         si
 
         write_line(indent: int, value: object, comment: object) is
-            if want_comments then
+            if want_comments then               
                 write_indent(indent);
                 write_line("{value}        // {comment}");
             else
@@ -60,22 +62,6 @@ namespace IR is
         si
     si
 
-    class FILE_ASSEMBLER_OUTPUT(
-        path: string,
-        writer: IO.TextWriter,
-        want_comments: bool
-    ): AssemblyOutput is
-        super(want_comments);
-
-        write(value: object) is
-            writer.write(value);
-        si
-
-        close() is
-            writer.close();
-        si
-    si
-
     class NULL_ASSEMBLER_OUTPUT: AssemblyOutput is
         init() is
             super.init(false);
@@ -104,13 +90,65 @@ namespace IR is
         _logger: Logging.Logger;
         _indent: int;
 
-        _seen: Collections.SET[string];
         _outputs: Collections.STACK[AssemblyOutput];
 
         entry_point_name: string public;
         seen_entrypoint: bool public;
 
         throw_on_fixme: bool public;
+
+        // Binary emission state, carried here so that a value's `gen`
+        // can reach the method body it is being emitted into without
+        // every caller threading it through.
+        //
+        // The assembly emitter is installed by the driver before any
+        // pass that emits runs, and every emitting pass requires one, so
+        // it reads as non-optional: a build that reaches emission
+        // without one is a wiring error rather than a state to branch
+        // on, and fails here rather than silently emitting nothing.
+        //
+        // The body emitter is genuinely optional - it tracks the method
+        // the IL visitor currently has open, and is null outside one.
+        _srm_assembly_emitter: Emitter.SRM_ASSEMBLY_EMITTER?;
+
+        // What the emitter was installed as, so a rebuild can make
+        // another one like it. Analysis compiles the project again on
+        // every edit and query miss, and an emitter accumulates a
+        // reference and specification cache per compile: kept across
+        // rebuilds it grows for as long as the editor session lasts.
+        _srm_module_name: string?;
+        _srm_module_version: string?;
+        _srm_want_library: bool;
+
+        srm_assembly_emitter: Emitter.SRM_ASSEMBLY_EMITTER =>
+            _srm_assembly_emitter!;
+
+        install_srm_assembly_emitter(
+            module_name: string,
+            module_version: string,
+            want_library: bool
+        ) is
+            _srm_module_name = module_name;
+            _srm_module_version = module_version;
+            _srm_want_library = want_library;
+
+            reset_srm_assembly_emitter();
+        si
+
+        // Called wherever the symbol table is abandoned: the handles the
+        // old emitter holds name symbols that no longer exist.
+        reset_srm_assembly_emitter() is
+            if let module_name = _srm_module_name then
+                _srm_assembly_emitter =
+                    Emitter.SRM_ASSEMBLY_EMITTER(
+                        "{module_name}.{if _srm_want_library then "dll" else "exe" fi}",
+                        module_name,
+                        _srm_module_version!,
+                        _srm_want_library);
+            fi
+        si
+
+        current_srm_body_emitter: Emitter.SRM_METHOD_BODY_EMITTER? public;
 
         // Reads `--debug` off the shared build-flags singleton so
         // non-debug builds pay nothing for the `mark_location` check.
@@ -127,6 +165,11 @@ namespace IR is
         _last_line_line: int;
         _last_line_column: int;
 
+        // Compilation-global counter assigning each `@IL.output` region a
+        // sequence number, so the runner can rebuild source order across
+        // methods. Bumped once per region, at its start.
+        _il_output_sequence: int;
+
         init(
             logger: Logging.Logger,
             entry_point_name: string
@@ -134,7 +177,6 @@ namespace IR is
             _logger = logger;
             self.entry_point_name = entry_point_name;
 
-            _seen = Collections.SET[string]();
             _outputs = Collections.STACK[AssemblyOutput]();
 
             _outputs.push(NULL_ASSEMBLER_OUTPUT());
@@ -147,6 +189,17 @@ namespace IR is
         // instruction. Internal / sentinel locations are ignored.
         mark_location(location: Source.LOCATION?) is
             if !want_debug_info \/ !location? \/ location.is_internal then
+                return;
+            fi
+
+            // A position is recorded against the instruction offset the
+            // body has reached, which is only meaningful while one is
+            // open. A repeated position at the same offset replaces its
+            // predecessor; at a later offset it is a distinct point
+            // that a debugger and a coverage tool both want.
+            if let body = current_srm_body_emitter then
+                body.mark_sequence_point(location);
+
                 return;
             fi
 
@@ -201,11 +254,43 @@ namespace IR is
             current_output.write(value);
         si
             
+        // Text IL reaching this while a method body is being encoded
+        // means some value has no binary branch and has fallen through
+        // to its text one. There is no file open to receive it, so
+        // without this it would be dropped: the encoded body would
+        // simply be missing those instructions, and the first sign of
+        // it would be a JIT-time InvalidProgramException naming the
+        // method but nothing inside it. Failing here names the
+        // instruction that was not emitted.
+        _reject_text_in_binary_body(value: object) is
+            if !current_srm_body_emitter? then
+                return;
+            fi
+
+            let text = "{value}";
+
+            // `.maxstack` is a body-header field that
+            // MethodBodyStreamEncoder takes as an argument rather than
+            // an instruction, and `.line` is a debug sequence point
+            // that is not emitted yet. Neither is a dropped
+            // instruction.
+            if text.starts_with(".maxstack") \/ text.starts_with(".line") \/ text.starts_with("//") then
+                return;
+            fi
+
+            throw System.NotImplementedException(
+                "the binary back end has no emission for '{value}' yet");
+        si
+
         write_line(value: object) is
+            _reject_text_in_binary_body(value);
+
             current_output.write_line(_indent, value);
         si
 
         write_line(value: object, comment: object) is            
+            _reject_text_in_binary_body(value);
+
             current_output.write_line(_indent, value, comment);
         si
 
@@ -235,31 +320,12 @@ namespace IR is
             _outputs.pop();
         si
 
-        enter_file(path: string, want_comments: bool) is
-            let writer: IO.TextWriter mut;
+        next_il_output_sequence() -> int is
+            _il_output_sequence = _il_output_sequence + 1;
 
-            if _seen.contains(path) then
-                writer = File.append_text(path);
-            else
-                writer = File.create_text(path);
-                _seen.add(path);
-            fi
-            
-            _outputs.push(FILE_ASSEMBLER_OUTPUT(path, writer, want_comments));
+            return _il_output_sequence;
         si
 
-        leave_file(path: string) is
-            assert
-                _outputs.count > 0 /\
-                isa FILE_ASSEMBLER_OUTPUT(current_output) /\
-                cast FILE_ASSEMBLER_OUTPUT(current_output).path =~ path
-            else
-                "IL output context stack corrupt";
-            
-            current_output.close();
-            _outputs.pop();
-        si
-        
         enter_buffer(want_comments: bool) is
             _outputs.push(BUFFER_ASSEMBLER_OUTPUT(want_comments));
         si
@@ -276,6 +342,918 @@ namespace IR is
             _outputs.pop();
 
             return result.to_string();
+        si
+
+        // Resolves a call target to a member reference. Handles the two
+        // owner shapes a call can have: a ghūl global function, hosted on
+        // its namespace's $globals carrier, and a static method, hosted
+        // directly on its declaring type.
+        //
+        // Only void-returning signatures taking zero or one string
+        // argument are encoded; anything else needs the signature blob
+        // built from the function's actual argument and return types.
+        // The CLR parameter index of a named argument.
+        //
+        // Arguments are addressed by name up to here, and metadata has
+        // only positions. An instance method's slot 0 is the receiver,
+        // so a declared argument sits one further along.
+        resolve_argument_index(symbol: Semantic.Symbols.Symbol) -> int is
+            let function = cast Semantic.Symbols.Function?(symbol.owner);
+
+            assert function? else
+                "argument '{symbol.name}' is not owned by a function";
+
+            let names = function.argument_names;
+
+            for i in 0..names.count do
+                if names[i] =~ symbol.name then
+                    return if function.is_emitted_with_receiver then i + 1 else i fi;
+                fi
+            od
+
+            assert false else
+                "argument '{symbol.name}' is not declared by {function.name}";
+
+            return 0;
+        si
+
+        // The metadata token naming a type, for instructions that take
+        // one directly (box, castclass, isinst). A constructed generic
+        // needs a TypeSpec rather than a bare reference, which is not
+        // built yet, so those report rather than emitting a token that
+        // names the open definition.
+        // A unit variant is constructed by loading the one interned
+        // instance the back end synthesises for it, rather than by
+        // calling its constructor.
+        resolve_unit_variant_instance(
+            variant: Semantic.Scope
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            // A specialization holds the open definition rather than
+            // being one, and only the definition has a row.
+            let classy =
+                if let generic: Semantic.Symbols.GENERIC = variant then
+                    cast Semantic.Symbols.Classy?(generic.symbol)
+                else
+                    cast Semantic.Symbols.Classy?(variant)
+                fi;
+
+            assert classy? else "unit variant '{variant.name}' is not a type";
+
+            // A generic variant's instance field belongs to the
+            // instantiation, so it is reached through a reference whose
+            // parent is that instantiation's specification. The field's
+            // own type is written open — the variant applied to its own
+            // parameters — because the reference names the field on the
+            // open definition and the instantiation lives in the parent.
+            if classy.is_generic then
+                if let constructed: Semantic.Symbols.GENERIC = variant then
+                    return cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_named_member_reference(
+                            resolve_type_token(constructed.type),
+                            "_instance",
+                            "_instance {constructed.type}",
+                            Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                                .field_signature(classy.own_instantiation)));
+                fi
+
+                // Reached from inside the variant's own static
+                // initializer, where there is no instantiation to hand:
+                // the parent is the variant applied to its own
+                // parameters, which is what the field's row names too.
+                return cast System.Reflection.Metadata.EntityHandle(
+                    emitter.add_named_member_reference(
+                        resolve_type_token(classy.own_instantiation),
+                        "_instance",
+                        "_instance {classy.own_instantiation}",
+                        Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                            .field_signature(classy.own_instantiation)));
+            fi
+
+            let instance = emitter.handles.unit_variant_instance(classy);
+
+            if instance? then
+                return cast System.Reflection.Metadata.EntityHandle(instance);
+            fi
+
+            // A variant of a union another assembly declares. Its
+            // interned instance is a field over there, so it is reached
+            // by reference rather than by the row this assembly would
+            // have written for one of its own.
+            assert classy.is_reflected else
+                "unit variant '{variant.name}' has no interned instance";
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(classy.type!),
+                    "_instance",
+                    "_instance {classy.type}",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter).field_signature(classy.type!)));
+        si
+
+        // A token for a type named rather than resolved: the compiler
+        // synthesises code around a few framework types it knows by
+        // name and has no symbol for, the way the assert helper names
+        // its own exception.
+        resolve_type_token_by_name(
+            assembly_name: string,
+            namespace_name: string,
+            name: string
+        ) -> System.Reflection.Metadata.EntityHandle =>
+            cast System.Reflection.Metadata.EntityHandle(
+                srm_assembly_emitter.add_type_reference_by_name(
+                    assembly_name, namespace_name, name));
+
+        resolve_type_token(type: Semantic.Types.Type) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            // A constructed generic has no row of its own, and neither
+            // does a type parameter or a primitive: all three are
+            // structural types, named by a specification carrying their
+            // encoded shape. A primitive especially cannot be named by
+            // reference — its il_name_override is the assembler keyword
+            // (`int8`, `int32`), which is not what the type is called.
+            if type.arguments.count > 0 \/
+               isa Semantic.Symbols.GenericArgument(type.symbol) \/
+               type.symbol.il_is_primitive_type
+            then
+                return cast System.Reflection.Metadata.EntityHandle(
+                    emitter.add_type_specification(type));
+            fi
+
+            // Same unwrapping as the signature encoder: a constructed
+            // generic's symbol holds the open definition rather than
+            // being one, and only the definition has a row.
+            let symbol =
+                if let generic: Semantic.Symbols.GENERIC = type.symbol then
+                    generic.symbol
+                else
+                    cast Semantic.Symbols.Classy?(type.symbol)
+                fi;
+
+            assert symbol? else "cannot name the type '{type}' in an instruction";
+
+            if let definition = emitter.handles.type_definition(symbol) then
+                return cast System.Reflection.Metadata.EntityHandle(definition);
+            fi
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                Emitter.SRM_SIGNATURE_ENCODER(emitter).type_reference_for(symbol));
+        si
+
+        // Invoking a function value calls Invoke on the delegate type.
+        resolve_delegate_invoke(
+            func_type: Semantic.Types.Type,
+            argument_count: int,
+            is_action: bool
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(func_type),
+                    "Invoke",
+                    "Invoke {func_type}",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .delegate_invoke_signature(argument_count, is_action)));
+        si
+
+        // A tuple and a wrapped optional are both a constructed generic
+        // built from one value per type parameter, so both reach their
+        // constructor the same way: through the owning TypeSpec, with
+        // the parameters written as indexes.
+        resolve_generic_constructor(
+            type: Semantic.Types.Type,
+            argument_count: int
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(type),
+                    ".ctor",
+                    ".ctor {type}/{argument_count}",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .generic_constructor_signature(argument_count)));
+        si
+
+        // `assert` joins its location to its message and wraps the
+        // result in an exception. Both members belong to types no symbol
+        // in this compilation names, so both are built from their known
+        // shapes rather than read off a declaration.
+        resolve_string_concat() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_object_type());
+            arguments.add(lookup.get_object_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_type_reference_by_name("System.Runtime", "System", "String")),
+                    "Concat",
+                    "String::Concat(object,object)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .static_signature(lookup.get_string_type(), arguments)));
+        si
+
+        // `=~` on two strings lowers to the framework's own equality
+        // operator rather than to an instruction, so it needs a member
+        // reference like any other imported static.
+        resolve_string_equality() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_string_type());
+            arguments.add(lookup.get_string_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_type_reference_by_name("System.Runtime", "System", "String")),
+                    "op_Equality",
+                    "String::op_Equality(string,string)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .static_signature(lookup.get_bool_type(), arguments)));
+        si
+
+        resolve_assert_failed_constructor() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_string_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_constructor_reference(
+                    cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_type_reference_by_name(
+                            "ghul-runtime", "Ghul", "AssertFailedException")),
+                    "AssertFailedException::.ctor(string)",
+                    arguments));
+        si
+
+        // `Pipe[T].join(string)`, which a state-machine frame's
+        // ToString calls to stringify itself the way every other pipe
+        // does. The frame reaches it through the trait rather than
+        // declaring it, so the caller passes the frame's own already-
+        // constructed `Pipe[T]` ancestor: rebuilding it from the
+        // element type means naming the open symbol, and a reflected
+        // generic answers `symbol` with something that is not a type.
+        resolve_pipe_join(
+            pipe_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_string_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(pipe_type),
+                    "join",
+                    "Pipe::join(string)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .call_signature(lookup.get_string_type(), arguments, true)));
+        si
+
+        // The three members of the async method builder an async
+        // function's outer method calls. None is declared by any symbol
+        // in the compilation, so each is built from its known shape.
+        //
+        // The builder is a value type, and for a value-returning async
+        // function a constructed generic one, so the reference hangs off
+        // its instantiation while the signature is written in the
+        // builder's own terms — `Create` returns `Builder<!0>` rather
+        // than the constructed form. For a void-returning one the
+        // builder is not generic and the two coincide, which is what the
+        // caller passes when it has no open form to give.
+        resolve_async_builder_create(
+            builder_type: Semantic.Types.Type,
+            open_builder_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "Create",
+                    "{builder_type}::Create()",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .static_signature(
+                            open_builder_type, Collections.LIST[Semantic.Types.Type]())));
+        si
+
+        resolve_async_builder_get_task(
+            builder_type: Semantic.Types.Type,
+            open_task_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "get_Task",
+                    "{builder_type}::get_Task()",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .call_signature(
+                            open_task_type, Collections.LIST[Semantic.Types.Type](), true)));
+        si
+
+        // `Start` is generic in the state machine it drives, so the
+        // reference names the open method and a specification supplies
+        // the frame type.
+        resolve_async_builder_start(
+            builder_type: Semantic.Types.Type,
+            state_machine_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            let reference =
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "Start",
+                    "{builder_type}::Start<>(!!0&)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter).async_builder_start_signature());
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(state_machine_type);
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_method_specification(
+                    cast System.Reflection.Metadata.EntityHandle(reference),
+                    "{builder_type}::Start<{state_machine_type}>",
+                    arguments));
+        si
+
+        // The members one `await` reaches: the awaited task's
+        // `GetAwaiter`, the awaiter's `get_IsCompleted` and `GetResult`,
+        // and the builder's `AwaitUnsafeOnCompleted`.
+        //
+        // Each hangs off the constructed type while its signature is
+        // written in that type's own terms — an awaiter's `GetResult`
+        // returns `!0`, not the `T` this instantiation supplied.
+        resolve_await_get_awaiter(
+            awaited_type: Semantic.Types.Type,
+            open_awaiter_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(awaited_type),
+                    "GetAwaiter",
+                    "{awaited_type}::GetAwaiter()",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .call_signature(
+                            open_awaiter_type,
+                            Collections.LIST[Semantic.Types.Type](),
+                            true)));
+        si
+
+        resolve_awaiter_is_completed(
+            awaiter_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(awaiter_type),
+                    "get_IsCompleted",
+                    "{awaiter_type}::get_IsCompleted()",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .call_signature(
+                            IoC.CONTAINER.instance.innate_symbol_lookup.get_bool_type(),
+                            Collections.LIST[Semantic.Types.Type](),
+                            true)));
+        si
+
+        resolve_awaiter_get_result(
+            awaiter_type: Semantic.Types.Type,
+            has_result: bool
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let signatures = Emitter.SRM_SIGNATURE_ENCODER(emitter);
+
+            let signature =
+                if has_result then
+                    signatures.open_result_signature()
+                else
+                    signatures.call_signature(
+                        IoC.CONTAINER.instance.innate_symbol_lookup.get_void_type(),
+                        Collections.LIST[Semantic.Types.Type](),
+                        true)
+                fi;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(awaiter_type),
+                    "GetResult",
+                    "{awaiter_type}::GetResult/{has_result}",
+                    signature));
+        si
+
+        resolve_await_unsafe_on_completed(
+            builder_type: Semantic.Types.Type,
+            awaiter_type: Semantic.Types.Type,
+            state_machine_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            let reference =
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "AwaitUnsafeOnCompleted",
+                    "{builder_type}::AwaitUnsafeOnCompleted<,>(!!0&, !!1&)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .async_await_on_completed_signature());
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(awaiter_type);
+            arguments.add(state_machine_type);
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_method_specification(
+                    cast System.Reflection.Metadata.EntityHandle(reference),
+                    "{builder_type}::AwaitUnsafeOnCompleted<{awaiter_type}, {state_machine_type}>",
+                    arguments));
+        si
+
+        // `System.Type.GetTypeFromHandle`, which turns the handle
+        // `ldtoken` pushes into the `System.Type` a `typeof` yields.
+        // Neither the method nor either of the types it mentions is
+        // declared by any symbol in the compilation.
+        resolve_get_type_from_handle() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            let system_type =
+                emitter.add_type_reference_by_name("System.Runtime", "System", "Type");
+
+            let handle_type =
+                emitter.add_type_reference_by_name(
+                    "System.Runtime", "System", "RuntimeTypeHandle");
+
+            let builder = System.Reflection.Metadata.BlobBuilder(16);
+
+            let return_type: System.Reflection.Metadata.Ecma335.ReturnTypeEncoder mut;
+            let parameters: System.Reflection.Metadata.Ecma335.ParametersEncoder mut;
+
+            System.Reflection.Metadata.Ecma335.BlobEncoder(builder)
+                .method_signature(
+                    System.Reflection.Metadata.SignatureCallingConvention.DEFAULT, 0, false)
+                .parameters(1, return_type ref, parameters ref);
+
+            return_type.`type(false).`type(
+                cast System.Reflection.Metadata.EntityHandle(system_type), false);
+
+            parameters.add_parameter().`type(false).`type(
+                cast System.Reflection.Metadata.EntityHandle(handle_type), true);
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    cast System.Reflection.Metadata.EntityHandle(system_type),
+                    "GetTypeFromHandle",
+                    "System.Type::GetTypeFromHandle(RuntimeTypeHandle)",
+                    builder.to_array()));
+        si
+
+        // A no-argument attribute on something this assembly defines.
+        //
+        // The value blob of an attribute applied with no arguments is
+        // the same four bytes whatever the attribute is, so all that
+        // varies is which constructor the row names.
+        attach_no_argument_attribute(
+            parent: System.Reflection.Metadata.EntityHandle,
+            assembly_name: string,
+            namespace_name: string,
+            simple_name: string
+        ) is
+            let emitter = srm_assembly_emitter;
+
+            let attribute_type =
+                emitter.add_type_reference_by_name(
+                    assembly_name, namespace_name, simple_name);
+
+            let constructor =
+                emitter.add_constructor_reference(
+                    cast System.Reflection.Metadata.EntityHandle(attribute_type),
+                    "{namespace_name}.{simple_name}::.ctor()",
+                    Collections.LIST[Semantic.Types.Type]());
+
+            emitter.add_custom_attribute(
+                parent,
+                cast System.Reflection.Metadata.EntityHandle(constructor),
+                Emitter.SRM_ASSEMBLY_EMITTER.NO_ARGUMENT_ATTRIBUTE_VALUE);
+        si
+
+        // The two members MoveNext's trailer completes the task
+        // through. `SetResult` takes the builder's own class-T for a
+        // value-returning async function and nothing for a void one, so
+        // the parameterless case is spelled separately rather than as a
+        // zero-length list of class-T.
+        resolve_async_builder_set_result(
+            builder_type: Semantic.Types.Type,
+            has_result: bool
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let signatures = Emitter.SRM_SIGNATURE_ENCODER(emitter);
+
+            // `generic_constructor_signature(1)` is instance-void of one
+            // parameter written as the owner's own `!0`, which is
+            // exactly this signature.
+            let signature =
+                if has_result then
+                    signatures.generic_constructor_signature(1)
+                else
+                    signatures.call_signature(
+                        IoC.CONTAINER.instance.innate_symbol_lookup.get_void_type(),
+                        Collections.LIST[Semantic.Types.Type](),
+                        true)
+                fi;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "SetResult",
+                    "{builder_type}::SetResult/{has_result}",
+                    signature));
+        si
+
+        resolve_async_builder_set_exception(
+            builder_type: Semantic.Types.Type,
+            exception_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(exception_type);
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token(builder_type),
+                    "SetException",
+                    "{builder_type}::SetException(Exception)",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .call_signature(
+                            IoC.CONTAINER.instance.innate_symbol_lookup.get_void_type(),
+                            arguments,
+                            true)));
+        si
+
+        // `System.Object`'s constructor, which every constructor that
+        // does not chain to a declared superclass calls first. Named
+        // here because no symbol in the compilation declares it.
+        resolve_object_constructor() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_constructor_reference(
+                    cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_type_reference_by_name("System.Runtime", "System", "Object")),
+                    "Object::.ctor()",
+                    Collections.LIST[Semantic.Types.Type]()));
+        si
+
+        // `System.Decimal`'s full-resolution constructor, which a
+        // decimal literal is built through. Named here for the same
+        // reason as `Object`'s: no symbol in the compilation declares
+        // it.
+        resolve_decimal_constructor() -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_int_type());
+            arguments.add(lookup.get_int_type());
+            arguments.add(lookup.get_int_type());
+            arguments.add(lookup.get_bool_type());
+            arguments.add(lookup.get_ubyte_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_constructor_reference(
+                    resolve_type_token_by_name("System.Runtime", "System", "Decimal"),
+                    "Decimal::.ctor(int32, int32, int32, bool, unsigned int8)",
+                    arguments));
+        si
+
+        // A static method on `System.Decimal`. Decimal has no IL
+        // opcodes of its own, so both its arithmetic and its
+        // conversions to and from other scalars are calls to one of
+        // these.
+        resolve_decimal_method(
+            method_name: string,
+            parameter_types: Collections.List[Semantic.Types.Type],
+            return_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    resolve_type_token_by_name("System.Runtime", "System", "Decimal"),
+                    method_name,
+                    "Decimal::{method_name}/{parameter_types.count} -> {return_type}",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter)
+                        .static_signature(return_type, parameter_types)));
+        si
+
+        // A range struct is constructed from its two integer bounds.
+        resolve_range_constructor(
+            range_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_int_type());
+            arguments.add(lookup.get_int_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_constructor_reference(
+                    resolve_type_token(range_type),
+                    "range .ctor {range_type}",
+                    arguments));
+        si
+
+        // A delegate is constructed from a receiver and a function
+        // pointer, so its constructor always takes (object, native int).
+        // The delegate type is normally a constructed generic, which
+        // has no reference row of its own: its TypeSpec is the owner.
+        resolve_delegate_constructor(
+            delegate_type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup;
+
+            let arguments = Collections.LIST[Semantic.Types.Type]();
+
+            arguments.add(lookup.get_object_type());
+            arguments.add(lookup.get_word_type());
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_constructor_reference(
+                    resolve_type_token(delegate_type),
+                    "delegate .ctor {delegate_type}",
+                    arguments));
+        si
+
+        // The metadata token naming a field, for a load or store.
+        // Same rule as resolve_call_target: a field this assembly
+        // defines is named by its own FieldDef row, whose number the
+        // numbering pass has already fixed.
+        resolve_field_target(`field: Semantic.Symbols.Field) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            if let definition = emitter.handles.field_definition(`field) then
+                if !_owner_is_generic(`field) then
+                    return cast System.Reflection.Metadata.EntityHandle(definition);
+                fi
+            fi
+
+            let root = cast Semantic.Symbols.Field?(`field.root_specialized_from) ?? `field;
+
+            // The parent names the constructed owner while the name and
+            // signature come from the open definition: a reference to a
+            // field of `Pair[int]` hangs off a specification for that
+            // instantiation, and says its type is `!0`. Taking both from
+            // the unspecialized field points the reference at the open
+            // type, which is not a type any instantiation has.
+            //
+            // The name is the CLR one. A reflected member can be
+            // renamed on the way in — a tuple's `Item1` is `0` in ghūl —
+            // and it is the original the metadata has to carry.
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_named_member_reference(
+                    _member_owner_handle(`field),
+                    root.il_name,
+                    "field {root.owner}::{root.il_name}",
+                    Emitter.SRM_SIGNATURE_ENCODER(emitter).field_signature(root)));
+        si
+
+        // Whether a member is declared by a generic type.
+        //
+        // A member of one cannot be named by its own definition row even
+        // when this assembly declares it: within the type's own methods
+        // the receiver is the type applied to its own parameters, and a
+        // definition row names the open type, which no instantiation is.
+        _owner_is_generic(member: Semantic.Symbols.Symbol) -> bool is
+            let owner = _owning_scope(member);
+
+            if isa Semantic.Symbols.GENERIC(owner) then
+                return true;
+            fi
+
+            if let classy: Semantic.Symbols.Classy = owner then
+                return classy.is_generic;
+            fi
+
+            return false;
+        si
+
+        // An `impl` or `partial` block owns its members through the
+        // block's own scope, but they are members of the type the block
+        // injects into, and it is that type they hang off.
+        _owning_scope(member: Semantic.Symbols.Symbol) -> Semantic.Scope? =>
+            if let injection: Semantic.INJECTION_SCOPE = member.owner then
+                injection.target
+            else
+                member.owner
+            fi;
+
+        // The reference row for the type an imported member hangs off.
+        // A global function or variable hangs off its namespace's
+        // globals carrier, which is a naming convention rather than a
+        // declared type; everything else hangs off its owning type.
+        _member_owner_handle(
+            member: Semantic.Symbols.Symbol
+        ) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            let owner = _owning_scope(member);
+
+            // A member of a constructed generic hangs off the
+            // instantiation, which is named by a specification. The
+            // open type's own reference names a type of no arguments
+            // by that name, which does not exist, so a reference
+            // through it fails to load.
+            if let constructed: Semantic.Symbols.GENERIC = owner then
+                return resolve_type_token(constructed.type);
+            fi
+
+            // A member reached from inside its own generic type: the
+            // receiver is that type applied to its own parameters, so
+            // the reference hangs off a specification for exactly that,
+            // rendered `Type<!0, !1, ...>`.
+            //
+            // `Classy.type` is the *open* type (`Types.NAMED(self)`), so
+            // the instantiation has to be built here from the type
+            // parameters the class declared into its own scope.
+            if let classy: Semantic.Symbols.Classy = owner then
+                if classy.is_generic then
+                    return cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_type_specification(classy.own_instantiation));
+                fi
+            fi
+
+            let globals_assembly_name =
+                if let global_function: Semantic.Symbols.GLOBAL_FUNCTION = member then
+                    global_function.il_assembly_name ?? "";
+                elif let global_variable: Semantic.Symbols.GLOBAL_VARIABLE = member then
+                    global_variable.il_assembly_name ?? "";
+                else
+                    null;
+                fi;
+
+            // Anything a namespace owns is emitted onto that namespace's
+            // globals carrier, whatever kind of member it is. The owner
+            // is sometimes the namespace symbol and sometimes the scope
+            // standing for it, and only the latter answers
+            // `containing_namespace`.
+            let owner_namespace =
+                if let declared: Semantic.Symbols.NAMESPACE = owner then
+                    declared;
+                elif let scope: Semantic.NAMESPACE_SCOPE = owner then
+                    scope.containing_namespace;
+                else
+                    null;
+                fi;
+
+            if owner_namespace? then
+                return cast System.Reflection.Metadata.EntityHandle(emitter.add_type_reference(
+                    owner_namespace,
+                    _referenced_assembly(globals_assembly_name ?? "", owner_namespace),
+                    owner_namespace.qualified_name.substring(1),
+                    Semantic.DotNet.GLOBALS_CARRIER.name));
+            fi
+
+            let owner_classy = cast Semantic.Symbols.Classy?(owner);
+
+            assert owner_classy? else "cannot reference a member owned by {owner}";
+
+            // A type this assembly defines is named by its own
+            // definition row rather than by a reference into another
+            // assembly. The row does not exist yet — the numbering pass
+            // fixed which row it will be, and the token resolves once
+            // the structure walk writes it.
+            //
+            // This comes after the generic branches above: a definition
+            // row names the open type, so an instantiation still needs
+            // a specification even when this assembly declares it.
+            if let definition = emitter.handles.type_definition(owner_classy) then
+                return cast System.Reflection.Metadata.EntityHandle(definition);
+            fi
+
+            // il_name_override on an imported type is the CLR-side
+            // dotted full name, unlike qualified_name which is the
+            // ghūl-mapped spelling (e.g. "IO.Std" for System.Console).
+            let il_name =
+                owner_classy.il_name_override ?? owner_classy.qualified_name;
+
+            let clr_type_name =
+                Emitter.SRM_SIGNATURE_ENCODER.clr_name_for_primitive(il_name) ?? il_name;
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                Emitter.SRM_SIGNATURE_ENCODER(emitter).reference_for_clr_name(
+                    owner_classy,
+                    _referenced_assembly(owner_classy.il_assembly_name ?? "", owner_classy),
+                    clr_type_name));
+        si
+
+        // A type reference names the assembly it points into, which has
+        // to have a row of its own before anything can name it.
+        //
+        // An empty name is not a usable reference: it produces a row the
+        // runtime resolves to the assembly being built, so every type
+        // named through it appears to be one this assembly defines and
+        // fails to load. Refuse it rather than emit that.
+        _referenced_assembly(assembly_name: string, owner: Semantic.Symbols.Symbol) -> string is
+            assert assembly_name.length > 0 else
+                "'{owner.qualified_name}' names no assembly to reference it through";
+
+            srm_assembly_emitter.add_assembly_reference(assembly_name, "8:0:0:0");
+
+            return assembly_name;
+        si
+
+        resolve_call_target(function: Semantic.Symbols.Function) -> System.Reflection.Metadata.EntityHandle is
+            let emitter = srm_assembly_emitter;
+
+            // A target this assembly defines is called through its own
+            // MethodDef row. The row does not exist yet — the numbering
+            // pass fixed which row it will be, and the token embedded
+            // here resolves once the structure walk writes it.
+            //
+            // Two cases cannot use it. A member of a generic type needs
+            // a reference through the instantiation, because a
+            // definition row names the open type. A generic method
+            // called at an instantiation needs a MethodSpec over its
+            // open definition, because a definition row names the
+            // uninstantiated method and the runtime refuses to call one.
+            if let definition = emitter.handles.method_definition(function) then
+                if !_owner_is_generic(function) /\ function.generic_arguments.count == 0 then
+                    return cast System.Reflection.Metadata.EntityHandle(definition);
+                fi
+            fi
+
+            // An instantiation of a generic method is named by a
+            // MethodSpec over the open method, not by a reference of its
+            // own: the reference carries the method's own type
+            // parameters as indexes, and the arguments live in the spec.
+            let root = cast Semantic.Symbols.Function?(function.root_specialized_from) ?? function;
+
+            // The open method this assembly defines is already a row of
+            // its own, and a MethodSpec can name it directly. Building a
+            // reference to it instead would name the same method twice,
+            // once as a definition and once as a reference into this
+            // assembly, which is not a shape the format has.
+            //
+            // Only when the owner is non-generic. A generic method on a
+            // generic type needs both instantiations — the owner's, in a
+            // reference through its TypeSpec, and the method's own — and
+            // a definition row carries neither.
+            if !_owner_is_generic(function) /\ function.generic_arguments.count > 0 then
+                if let open_row = emitter.handles.method_definition(root) then
+                    return cast System.Reflection.Metadata.EntityHandle(
+                        emitter.add_method_specification(
+                            cast System.Reflection.Metadata.EntityHandle(open_row),
+                            "{function}",
+                            function.generic_arguments));
+                fi
+            fi
+
+            let owner_ref = _member_owner_handle(function);
+
+            let signature = Emitter.SRM_SIGNATURE_ENCODER(emitter).method_signature(root);
+
+            let reference =
+                emitter.add_named_member_reference(
+                    owner_ref,
+                    Emitter.SRM_FLAGS.method_name(root),
+                    "method {function.owner}::{root.description}",
+                    signature);
+
+            if function.generic_arguments.count == 0 then
+                return cast System.Reflection.Metadata.EntityHandle(reference);
+            fi
+
+            return cast System.Reflection.Metadata.EntityHandle(
+                emitter.add_method_specification(
+                    cast System.Reflection.Metadata.EntityHandle(reference),
+                    "{function}",
+                    function.generic_arguments));
         si
     si
 si
