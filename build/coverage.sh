@@ -3,7 +3,7 @@
 # coverage.sh — measure how much of the compiler's own ghūl source the test
 # suites execute.
 #
-# The compiler is built with debug information so ilasm emits a Portable PDB
+# The compiler is built with debug information so a Portable PDB is emitted
 # mapping IL back to .ghul source. For the integration and cross-assembly
 # suites, coverlet rewrites the built assembly to record which sequence
 # points are hit; unit tests use coverlet's in-process VSTest collector

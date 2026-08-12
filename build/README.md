@@ -2,7 +2,7 @@
 Scripts required for local and CI builds. Most of these scripts are internal to the build process, but `bootstrap.sh` and `coverage.sh` can be run directly.
 
 ## `bootstrap.sh`
-Bootstraps the compiler by compiling it with itself, then checks that the result reproduces itself: it runs four pack-and-install passes and diffs the IL of pass 3 against pass 4, which should differ only in the version information carried in a custom attribute. Must be run with the working directory set to the root of the repo.
+Bootstraps the compiler by compiling it with itself, then checks that the result reproduces itself: it runs four pack-and-install passes and compares the assemblies pass 3 and pass 4 produced byte for byte, which must be identical. That is a fair comparison only because emission is deterministic — the module version id is a hash of the content and the PE stamp comes from the same hash, so nothing carries the clock, and every pass stamps the same assembly version. Must be run with the working directory set to the root of the repo.
 
 ## `coverage.sh`
 Measures how much of the compiler's own ghūl source each test suite executes: unit, integration, cross-assembly, and analysis.
