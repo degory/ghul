@@ -9,10 +9,9 @@ on:
   push:
     branches: [main]
 
-# Serialize release builds: pushes to a given ref (main) run one at a time
-# so concurrent release builds can't race over version numbers, changelogs,
-# or the latest-release pointer. PR builds keep their own per-ref group and
-# cancel superseded runs.
+# Serialize builds: pushes to a given ref run one at a time so concurrent
+# builds can't race over version numbers or the published package. PR builds
+# keep their own per-ref group and cancel superseded runs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -188,15 +187,30 @@ jobs:
     - name: Run unit tests
       run: dotnet test unit-tests
 
+  # The compiler compiles itself, the compiler that produces does the same,
+  # and the two agree byte for byte. Everything downstream then consumes
+  # the fourth pass, so what the tests run and what the feed receives is a
+  # compiler emitted by the emitter in this commit, rather than by the last
+  # published one.
+  #
+  # That distinction is not academic. A single-pass build is emitted by the
+  # previous release, so a defect in the new back end that only shows when
+  # the compiler itself carries it is invisible to every test: the whole
+  # suite passed while the back end could not produce a working compiler,
+  # because nothing under test had been through it.
+  #
+  # A failure here therefore stops the test jobs rather than merely
+  # reporting alongside them. That is deliberate: a compiler that cannot
+  # reproduce itself makes the suite's verdict meaningless.
   bootstrap:
-    name: Bootstrap compiler
     needs: [version]
-    # Single-thread-bound: the ghul compiler doesn't parallelise the source
-    # walk, and the 4 bootstrap passes are sequential. 2 vCPU is enough for
-    # dotnet pack/install/clean alongside one compiler pass.
+    name: Bootstrap compiler
+
+    # Four sequential compiler passes, and the compiler does not
+    # parallelise its source walk, so cores past the second buy nothing.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-2' }}
 
-    timeout-minutes: 5
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -227,11 +241,11 @@ jobs:
         done
         exit 1
 
-    - name: Bootstrap compiler
-      run: ./build/bootstrap.sh
+    - name: Bootstrap
       env:
-        TAG_VERSION: ${{ needs.version.outputs.tag }}
+        CI: true
         PACKAGE_VERSION: ${{ needs.version.outputs.package }}
+      run: ./build/bootstrap.sh
 
     - uses: actions/upload-artifact@v7
       with:
@@ -241,12 +255,9 @@ jobs:
     # Separate artefact for consumers that need to spawn the bootstrapped
     # compiler as a process (e.g. analysis_tests). The whole tool tree is
     # required, not just ghul.dll: the .NET host needs ghul.runtimeconfig.json
-    # / ghul.deps.json beside the dll, and the compiler needs sibling
-    # assemblies (ghul-runtime, System.IO.Abstractions, ...), the IL
-    # templates under lib/dotnet/il/, and the native ilasm under
-    # runtimes/. Extracted here once because
-    # bootstrap.sh's trailing `dotnet clean` wipes bin/.
-    - name: Extract bootstrapped tool tree
+    # / ghul.deps.json beside the dll, and the compiler needs its sibling
+    # assemblies (ghul-runtime, System.IO.Abstractions, ...).
+    - name: Extract compiler tool tree
       run: |
         unzip -o nupkg/ghul.compiler.${{ needs.version.outputs.package }}.nupkg \
           'tools/net10.0/any/*' -d extracted-tool
@@ -266,6 +277,7 @@ jobs:
       with:
         name: ghul-analysis-protocol-package
         path: ./analysis-protocol/nupkg/ghul.analysis.protocol.${{ needs.version.outputs.package }}.nupkg
+
 
   integration_tests:
     needs: [version, bootstrap]
@@ -307,8 +319,8 @@ jobs:
     - name: Add GHCR package source
       run: dotnet nuget add source --username USERNAME --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/degory/index.json"
 
-    - name: Install ghul.compiler
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
+    - name: Install the freshly-built compiler
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
 
     - name: Restore local .NET tools
       run: dotnet tool restore
@@ -330,6 +342,11 @@ jobs:
         name: test-results
         path: test-results.txt
 
+
+  # Drives --analyse, which emits nothing. It still needs the emission
+  # surface, because its fixtures build the analysis-protocol library
+  # with the freshly built compiler - which is why it could not run
+  # while that library came out empty.
   analysis_tests:
     needs: [version, bootstrap]
     name: Run analysis tests
@@ -384,13 +401,15 @@ jobs:
       run: dotnet tool restore
 
     - name: Install the freshly-built compiler
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
 
     - name: Run analysis tests
       env:
         ANALYSIS_TESTS_COMPILER_DLL: ${{ github.workspace }}/bootstrap-tool/ghul.dll
       run: dotnet test analysis-tests -p:SkipCompilerProjectRef=true
 
+  # Real .ghulproj builds against a separate assembly, so they need the
+  # emission surface too.
   cross_assembly_tests:
     needs: [version, bootstrap]
     name: Run cross-assembly tests
@@ -423,8 +442,8 @@ jobs:
     - name: Add GHCR package source
       run: dotnet nuget add source --username USERNAME --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/degory/index.json"
 
-    - name: Install ghul.compiler
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
+    - name: Install the freshly-built compiler
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
 
     - name: Restore local .NET tools
       run: dotnet tool restore
@@ -472,8 +491,8 @@ jobs:
     - name: Add GHCR package source
       run: dotnet nuget add source --username USERNAME --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/degory/index.json"
 
-    - name: Install ghul.compiler
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
+    - name: Install the freshly-built compiler
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
 
     - name: Restore local .NET tools
       run: dotnet tool restore
@@ -497,6 +516,8 @@ jobs:
         dotnet ghul-compiler --help > help.txt
         grep -q "usage: ghul-compiler" help.txt
 
+  # Builds ghul-runtime against the freshly built compiler, so it needs
+  # the emission surface to be complete rather than merely correct.
   runtime_tests:
     needs: [version, bootstrap]
     name: Run runtime tests
@@ -562,9 +583,9 @@ jobs:
         name: ghul-compiler-package
         path: nupkg
 
-    - name: Install bootstrapped ghul.compiler in ghul-runtime
+    - name: Install the freshly-built compiler in ghul-runtime
       working-directory: ghul-runtime
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source ../nupkg
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source ../nupkg
 
     - name: Add GHCR package source
       working-directory: ghul-runtime
@@ -582,6 +603,9 @@ jobs:
       working-directory: ghul-runtime
       run: dotnet test tests/tests.ghulproj
 
+  # Builds ghul-examples against the freshly built compiler, so it
+  # exercises the emission surface end to end: a consumer repository has
+  # to compile against what the bootstrapped compiler produced.
   examples_tests:
     needs: [version, bootstrap]
     name: Run examples tests
@@ -648,9 +672,9 @@ jobs:
         name: ghul-compiler-package
         path: nupkg
 
-    - name: Install bootstrapped ghul.compiler in ghul-examples
+    - name: Install the freshly-built compiler in ghul-examples
       working-directory: ghul-examples
-      run: dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source ../nupkg
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source ../nupkg
 
     - name: Add GHCR package source
       working-directory: ghul-examples
@@ -707,8 +731,14 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # Skipped on a fork: pushing to the package feed needs a write-scoped token,
-    # and GitHub downgrades the one a fork's pull request gets to read-only.
+    # Declared rather than inherited: this repository's default workflow token
+    # is read-only, and pushing to the GitHub feed needs packages:write.
+    permissions:
+      contents: read
+      packages: write
+
+    # Skipped on a fork regardless: GitHub downgrades the token a fork's pull
+    # request gets to read-only, so the scope above cannot be granted there.
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
     steps:
     - uses: actions/checkout@v6
@@ -742,6 +772,12 @@ jobs:
     timeout-minutes: 5
 
     runs-on: ubuntu-latest
+
+    # Declared rather than inherited: this repository's default workflow token
+    # is read-only, and pushing to the GitHub feed needs packages:write.
+    permissions:
+      contents: read
+      packages: write
 
     if: ${{ github.event_name != 'pull_request' }}
 
@@ -796,7 +832,7 @@ jobs:
       with:
         fetch-depth: '0'
 
-    - name: Download ghul compiler tool package
+    - name: Download ghul.compiler package
       uses: actions/download-artifact@v8
       with:
         name: ghul-compiler-package

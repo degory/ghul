@@ -1,0 +1,321 @@
+namespace IR.Emitter is
+    use System.Reflection.Metadata.BlobBuilder;
+    use System.Reflection.Metadata.EntityHandle;
+    use System.Reflection.Metadata.Ecma335.InstructionEncoder;
+    use System.Reflection.Metadata.Ecma335.ControlFlowBuilder;
+    use System.Reflection.Metadata.Ecma335.LabelHandle;
+    use System.Reflection.Metadata.ILOpCode;
+
+    use Semantic.Types.Type;
+
+    // Instruction-level surface for one method body. Backed by SRM's
+    // InstructionEncoder; `flush` hands the encoded body to the owning
+    // assembly emitter's method body stream and returns the body offset
+    // that AddMethodDefinition takes directly (not a handle).
+    //
+    // Locals are addressed by name here even though the encoded
+    // instructions address them by slot index. Names like `result.0`
+    // are invented all over generate-il and the IR values, so taking
+    // them as given keeps the slot numbering in one place rather than
+    // threading it through every site that declares a local.
+    class SRM_METHOD_BODY_EMITTER is
+        _encoder: InstructionEncoder;
+
+        _local_slots: Collections.MAP[string, int];
+        _local_types: Collections.LIST[Type];
+
+        // IR label to the encoder's own label. A branch can name a
+        // label the walk has not reached yet - every forward jump does,
+        // and a loop's exit is always one - so the handle is defined on
+        // first mention from either side and the encoder patches the
+        // offsets in when the body is serialized.
+        //
+        // Keyed on the label's rendered name, which carries its pass as
+        // well as its id. The id counter restarts per pass and per
+        // class, so compile-expressions and generate-il both issue an id
+        // 0; keying on the id alone merges the two into one handle, and
+        // a branch then lands wherever the other pass's label was
+        // marked.
+        _labels: Collections.MAP[string, LabelHandle];
+
+        // Protected-region boundaries. SRM takes four labels per
+        // region rather than a nesting, so each boundary has to be
+        // marked as the walk passes it and held until both ends are
+        // known. These labels have no
+        // IR.LABEL behind them - nothing branches to them - so they
+        // are numbered here rather than sharing `_labels`.
+        _region_labels: Collections.LIST[LabelHandle];
+
+        // Source positions for this body, in emission order, or null in
+        // a build that was not asked for debug information.
+        _sequence_points: Collections.LIST[SRM_SEQUENCE_POINT]?;
+
+        // Open `@IL.output` regions awaiting their end offset (a stack so
+        // nested regions close innermost-first), and the completed ranges.
+        _il_output_stack: Collections.LIST[(string, int, int)];
+        _il_outputs: Collections.LIST[SRM_IL_OUTPUT_RANGE]?;
+
+        init() is
+            _encoder = InstructionEncoder(BlobBuilder(32), ControlFlowBuilder());
+
+            _local_slots = Collections.MAP[string, int]();
+            _local_types = Collections.LIST[Type]();
+            _labels = Collections.MAP[string, LabelHandle]();
+            _region_labels = Collections.LIST[LabelHandle]();
+            _il_output_stack = Collections.LIST[(string, int, int)]();
+        si
+
+        // Marks the current position and returns a handle on it that
+        // `add_catch_region` / `add_finally_region` take. An int rather
+        // than the SRM label so the walk that decides where regions
+        // begin and end needs no metadata types of its own.
+        mark_region_boundary() -> int is
+            let handle = _encoder.define_label();
+
+            _encoder.mark_label(handle);
+
+            _region_labels.add(handle);
+
+            return _region_labels.count - 1;
+        si
+
+        // Regions must be added innermost first: ECMA-335 requires the
+        // ordering and the runtime relies on it, but nothing validates
+        // it, so getting it wrong yields an assembly that loads and
+        // then runs the wrong handler. Each `try` adds its own region
+        // as it closes, which puts an inner one ahead of the outer one
+        // that contains it.
+        add_catch_region(
+            try_start: int,
+            try_end: int,
+            handler_start: int,
+            handler_end: int,
+            catch_type: EntityHandle
+        ) is
+            _encoder.control_flow_builder.add_catch_region(
+                _region_labels[try_start],
+                _region_labels[try_end],
+                _region_labels[handler_start],
+                _region_labels[handler_end],
+                catch_type);
+        si
+
+        add_finally_region(
+            try_start: int,
+            try_end: int,
+            handler_start: int,
+            handler_end: int
+        ) is
+            _encoder.control_flow_builder.add_finally_region(
+                _region_labels[try_start],
+                _region_labels[try_end],
+                _region_labels[handler_start],
+                _region_labels[handler_end]);
+        si
+
+        _label(label: IR.LABEL) -> LabelHandle is
+            let key = "{label}";
+
+            if _labels.contains_key(key) then
+                return _labels[key];
+            fi
+
+            let handle = _encoder.define_label();
+
+            _labels[key] = handle;
+
+            return handle;
+        si
+
+        mark_label(label: IR.LABEL) is
+            _encoder.mark_label(_label(label));
+        si
+
+        branch(op_code: ILOpCode, label: IR.LABEL) is
+            _encoder.branch(op_code, _label(label));
+        si
+
+        // Declaring the same name twice is not an error: at least one
+        // value declares its temp on both arms of a branch. The first
+        // declaration wins, so the slot a later load resolves to is
+        // the one already in use.
+        declare_local(name: string, type: Type) -> int is
+            if _local_slots.contains_key(name) then
+                return _local_slots[name];
+            fi
+
+            let slot = _local_types.count;
+
+            _local_types.add(type);
+            _local_slots[name] = slot;
+
+            return slot;
+        si
+
+        // A load of a name that was never declared means the value that
+        // declares it has no binary branch yet. Failing here names the
+        // local, which is a far shorter path to the culprit than the
+        // invalid program it would otherwise produce.
+        _slot(name: string) -> int is
+            assert _local_slots.contains_key(name) else
+                "local '{name}' is loaded but never declared";
+
+            return _local_slots[name];
+        si
+
+        has_locals: bool => _local_types.count > 0;
+        local_types: Collections.List[Type] => _local_types;
+
+        ldloc(name: string) is _encoder.load_local(_slot(name)); si
+        stloc(name: string) is _encoder.store_local(_slot(name)); si
+        ldloca(name: string) is _encoder.load_local_address(_slot(name)); si
+
+        ldarg(index: int) is _encoder.load_argument(index); si
+        starg(index: int) is _encoder.store_argument(index); si
+        ldarga(index: int) is _encoder.load_argument_address(index); si
+
+        ldstr(metadata: SRM_ASSEMBLY_EMITTER, value: string) is
+            _encoder.load_string(metadata.get_or_add_user_string(value));
+        si
+
+        ldc_i4(value: int) is _encoder.load_constant_i4(value); si
+        ldc_i8(value: long) is _encoder.load_constant_i8(value); si
+        ldc_r4(value: single) is _encoder.load_constant_r4(value); si
+        ldc_r8(value: double) is _encoder.load_constant_r8(value); si
+        ldnull() is _encoder.op_code(ILOpCode.LDNULL); si
+
+        call(target: EntityHandle) is _encoder.call(target); si
+
+        // Prefixes the following call with the type its receiver is
+        // reached through, which is how a call on a value whose type is
+        // a type parameter dispatches without the caller knowing whether
+        // that parameter will be a value or a reference type.
+        constrained(type: EntityHandle) is
+            _encoder.op_code(ILOpCode.CONSTRAINED);
+            _encoder.token(type);
+        si
+        call_virtual(target: EntityHandle) is _encoder.op_code(ILOpCode.CALLVIRT); _encoder.token(target); si
+        new_object(constructor: EntityHandle) is _encoder.op_code(ILOpCode.NEWOBJ); _encoder.token(constructor); si
+
+        ldfld(`field: EntityHandle) is _field_instruction(ILOpCode.LDFLD, `field); si
+        ldflda(`field: EntityHandle) is _field_instruction(ILOpCode.LDFLDA, `field); si
+        stfld(`field: EntityHandle) is _field_instruction(ILOpCode.STFLD, `field); si
+        ldsfld(`field: EntityHandle) is _field_instruction(ILOpCode.LDSFLD, `field); si
+        ldsflda(`field: EntityHandle) is _field_instruction(ILOpCode.LDSFLDA, `field); si
+        stsfld(`field: EntityHandle) is _field_instruction(ILOpCode.STSFLD, `field); si
+
+        _field_instruction(op_code: ILOpCode, `field: EntityHandle) is
+            _encoder.op_code(op_code);
+            _encoder.token(`field);
+        si
+
+        ldtoken(type: EntityHandle) is _encoder.op_code(ILOpCode.LDTOKEN); _encoder.token(type); si
+
+        box(type: EntityHandle) is _encoder.op_code(ILOpCode.BOX); _encoder.token(type); si
+        unbox_any(type: EntityHandle) is _encoder.op_code(ILOpCode.UNBOX_ANY); _encoder.token(type); si
+        cast_class(type: EntityHandle) is _encoder.op_code(ILOpCode.CASTCLASS); _encoder.token(type); si
+        is_instance(type: EntityHandle) is _encoder.op_code(ILOpCode.ISINST); _encoder.token(type); si
+
+        new_array(element_type: EntityHandle) is
+            _encoder.op_code(ILOpCode.NEWARR);
+            _encoder.token(element_type);
+        si
+
+        store_element(element_type: EntityHandle) is
+            _encoder.op_code(ILOpCode.STELEM);
+            _encoder.token(element_type);
+        si
+
+        load_element(element_type: EntityHandle) is
+            _encoder.op_code(ILOpCode.LDELEM);
+            _encoder.token(element_type);
+        si
+
+        load_object(type: EntityHandle) is _encoder.op_code(ILOpCode.LDOBJ); _encoder.token(type); si
+        store_object(type: EntityHandle) is _encoder.op_code(ILOpCode.STOBJ); _encoder.token(type); si
+
+        load_function_pointer(method: EntityHandle) is
+            _encoder.op_code(ILOpCode.LDFTN);
+            _encoder.token(method);
+        si
+
+        load_virtual_function_pointer(method: EntityHandle) is
+            _encoder.op_code(ILOpCode.LDVIRTFTN);
+            _encoder.token(method);
+        si
+
+        op(op_code: ILOpCode) is _encoder.op_code(op_code); si
+
+        ret() is _encoder.op_code(ILOpCode.RET); si
+
+        // Note that the instructions emitted from here on belong to a
+        // new source position. Called once per statement.
+        mark_sequence_point(location: Source.LOCATION) is
+            if !_sequence_points? then
+                _sequence_points = Collections.LIST[SRM_SEQUENCE_POINT]();
+            fi
+
+            let offset = _encoder.offset;
+
+            // Two statements can start at the same offset when the
+            // first emits nothing. A sequence-point record after the
+            // first has to advance the offset - a zero delta is the
+            // document-change marker - so the later position replaces
+            // the earlier rather than being appended after it.
+            if _sequence_points.count > 0 /\
+                _sequence_points[_sequence_points.count - 1].il_offset == offset
+            then
+                _sequence_points.remove_at(_sequence_points.count - 1);
+            fi
+
+            _sequence_points.add(
+                SRM_SEQUENCE_POINT(
+                    offset,
+                    IO.Path.get_full_path(location.file_name),
+                    location.start_line,
+                    location.start_column,
+                    location.end_line,
+                    // A sequence point's end column is exclusive, and a
+                    // LOCATION's is not.
+                    location.end_column + 1));
+        si
+
+        // An `@IL.output` pragma opens a region whose emitted instructions
+        // the IL test runner extracts. Only the byte-offset range is
+        // recorded here; the ranges leave with the method as a custom
+        // attribute written by SRM_STRUCTURE_WALK._write_method.
+        begin_il_output(path: string, sequence: int) is
+            _il_output_stack.add((path, _encoder.offset, sequence));
+        si
+
+        end_il_output() is
+            let top = _il_output_stack[_il_output_stack.count - 1];
+
+            _il_output_stack.remove_at(_il_output_stack.count - 1);
+
+            if !_il_outputs? then
+                _il_outputs = Collections.LIST[SRM_IL_OUTPUT_RANGE]();
+            fi
+
+            _il_outputs!.add(
+                SRM_IL_OUTPUT_RANGE(top.`0, top.`1, _encoder.offset, top.`2));
+        si
+
+        il_outputs: Collections.List[SRM_IL_OUTPUT_RANGE]? => _il_outputs;
+
+        flush(assembly_emitter: SRM_ASSEMBLY_EMITTER) -> int is
+            let offset = assembly_emitter.add_method_body(_encoder, self);
+
+            if let points = _sequence_points then
+                assembly_emitter.set_sequence_points(offset, points);
+            fi
+
+            return offset;
+        si
+
+        // The instruction bytes encoded so far. The body is not complete
+        // until it is flushed, which is what fixes branch offsets, so
+        // this is what has been emitted rather than what will be run.
+        encoded: ubyte[] => _encoder.code_builder.to_array();
+    si
+si

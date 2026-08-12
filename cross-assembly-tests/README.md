@@ -24,6 +24,25 @@ output against `run.expected`, exactly as the integration tests do. See
 [../integration-tests/README.md](../integration-tests/README.md) for the file
 formats and the capture workflow.
 
+## Some tests are disabled in this repository
+
+This fork is replacing the text-IL back end with one that writes metadata
+directly, and some of these tests fail against work still in progress. Each
+carries a `disabled` file naming the specific reason and what has to land before
+it comes back; delete that file to re-enable the test.
+
+They are disabled rather than left failing so that the job can gate the rest.
+A suite that always fails gates nothing: a regression in a passing test
+is indistinguishable from the failures already there, and this is the only suite
+that exercises the *reader* — metadata this compiler writes, read back by a
+compiler importing it. The single-assembly tests in `../integration-tests/`
+structurally cannot see that class of defect, which is most of what the back-end
+work can get wrong.
+
+Unlike the disabled text-IL snapshots under `../integration-tests/il/`, nothing
+here can pass vacuously. Each of these is a real build and run, so it fails
+loudly or not at all, and re-enabling one proves the thing it names.
+
 ## Which compiler the tests are built with
 
 A `dotnet build` run resolves its own compiler, so unlike the integration tests

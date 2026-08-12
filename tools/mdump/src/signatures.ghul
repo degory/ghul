@@ -1,0 +1,285 @@
+namespace MetadataDump is
+    use System.Text.StringBuilder;
+    use System.Reflection.Metadata.MetadataReader;
+
+    // A position in a signature blob.
+    //
+    // The bytes are copied out and walked with an index of our own
+    // rather than with a `BlobReader`, which is a struct: handing one to
+    // a helper hands it a copy, so the position advances in the callee
+    // and not in the caller, and a recursive decoder re-reads the same
+    // byte at every level while looking like it works.
+    class CURSOR(_bytes: ubyte[]) is
+        _at: int;
+
+        at_end: bool => _at >= _bytes.count;
+
+        byte() -> int is
+            if at_end then
+                return 0;
+            fi
+
+            let value = cast int(_bytes[_at]);
+
+            _at = _at + 1;
+
+            return value;
+        si
+
+        // ECMA-335 II.23.2: one, two or four bytes, selected by the top
+        // bits of the first.
+        compressed() -> int => _compressed().value;
+
+        // Signed form: the value rotated right by one, with the low bit
+        // carrying the sign — and sign-extended over the width of the
+        // encoding that was used, not over a fixed one. A negative
+        // number written in the two-byte form is offset by 1 << 13, not
+        // by the 1 << 6 the one-byte form takes, so the width has to
+        // come back from the decode rather than be assumed.
+        compressed_signed() -> int is
+            let (value, bits) = _compressed();
+
+            let magnitude = value >> 1;
+
+            if (value & 1) == 0 then
+                return magnitude;
+            fi
+
+            return magnitude - (1 << (bits - 1));
+        si
+
+        // The value and the number of bits it was encoded in.
+        _compressed() -> (value: int, bits: int) is
+            let first = byte();
+
+            if (first & 128) == 0 then
+                return (value = first, bits = 7);
+            fi
+
+            if (first & 64) == 0 then
+                return (value = ((first & 63) << 8) | byte(), bits = 14);
+            fi
+
+            return (
+                value = ((first & 31) << 24) | (byte() << 16) | (byte() << 8) | byte(),
+                bits = 29);
+        si
+    si
+
+    // A signature blob, rendered.
+    //
+    // Decoded by hand rather than through `SignatureDecoder`, because
+    // what is wanted here is the blob as written — a type parameter as
+    // `!0` or `!!0` and its index, a TypeDefOrRef as the table and row
+    // it points at. A provider that resolved those to names would hide
+    // the two things every signature bug so far has turned on.
+    class SIGNATURE_READER(_metadata: MetadataReader) is
+        // Calling conventions: the kind in the low nibble, flags above.
+        _FIELD: int static => 6;
+        _LOCALS: int static => 7;
+        _GENERIC: int static => 16;
+        _HAS_THIS: int static => 32;
+
+        blob(handle: System.Reflection.Metadata.BlobHandle) -> string is
+            let cursor = CURSOR(_metadata.get_blob_bytes(handle));
+            let buffer = StringBuilder();
+
+            let convention = cursor.byte();
+
+            if (convention & _HAS_THIS) != 0 then
+                buffer.append("instance ");
+            fi
+
+            let kind = convention & 15;
+
+            if kind == _FIELD then
+                _type(cursor, buffer);
+
+                return buffer.to_string();
+            fi
+
+            if kind == _LOCALS then
+                _locals(cursor, buffer);
+
+                return buffer.to_string();
+            fi
+
+            if (convention & _GENERIC) != 0 then
+                buffer.append("<{cursor.compressed()}> ");
+            fi
+
+            let parameter_count = cursor.compressed();
+
+            _type(cursor, buffer);
+
+            buffer.append('(');
+
+            for i in 0..parameter_count do
+                if i > 0 then
+                    buffer.append(", ");
+                fi
+
+                _type(cursor, buffer);
+            od
+
+            buffer.append(')');
+
+            return buffer.to_string();
+        si
+
+        _locals(cursor: CURSOR, buffer: StringBuilder) is
+            let count = cursor.compressed();
+
+            for i in 0..count do
+                if i > 0 then
+                    buffer.append(", ");
+                fi
+
+                buffer.append("[{i}] ");
+
+                _type(cursor, buffer);
+            od
+        si
+
+        _type(cursor: CURSOR, buffer: StringBuilder) is
+            let code = cursor.byte();
+
+            // Custom modifiers and `pinned` qualify the type that
+            // follows them, so they are printed and the real type read
+            // after.
+            if code == 31 \/ code == 32 then
+                buffer.append(if code == 31 then "modreq(" else "modopt(" fi);
+                _type_reference(cursor, buffer);
+                buffer.append(") ");
+
+                _type(cursor, buffer);
+
+                return;
+            fi
+
+            if code == 69 then
+                buffer.append("pinned ");
+
+                _type(cursor, buffer);
+
+                return;
+            fi
+
+            if let name = _primitive_name(code) then
+                buffer.append(name);
+
+                return;
+            fi
+
+            if code == 15 then                      // PTR
+                _type(cursor, buffer);
+                buffer.append('*');
+            elif code == 16 then                    // BYREF
+                _type(cursor, buffer);
+                buffer.append('&');
+            elif code == 29 then                    // SZARRAY
+                _type(cursor, buffer);
+                buffer.append("[]");
+            elif code == 17 \/ code == 18 then      // VALUETYPE / CLASS
+                buffer.append(if code == 17 then "valuetype " else "class " fi);
+                _type_reference(cursor, buffer);
+            elif code == 19 then                    // VAR
+                buffer.append("!{cursor.compressed()}");
+            elif code == 30 then                    // MVAR
+                buffer.append("!!{cursor.compressed()}");
+            elif code == 21 then                    // GENERICINST
+                _generic_instance(cursor, buffer);
+            elif code == 20 then                    // ARRAY
+                _array(cursor, buffer);
+            elif code == 27 then                    // FNPTR
+                buffer.append("method*");
+            else
+                buffer.append("<element-type {code}>");
+            fi
+        si
+
+        _generic_instance(cursor: CURSOR, buffer: StringBuilder) is
+            _type(cursor, buffer);
+
+            let count = cursor.compressed();
+
+            buffer.append('<');
+
+            for i in 0..count do
+                if i > 0 then
+                    buffer.append(", ");
+                fi
+
+                _type(cursor, buffer);
+            od
+
+            buffer.append('>');
+        si
+
+        // A multi-dimensional array: element type, rank, then the sizes
+        // and low bounds, which are read to keep the cursor in step even
+        // though only the rank is printed.
+        _array(cursor: CURSOR, buffer: StringBuilder) is
+            _type(cursor, buffer);
+
+            let rank = cursor.compressed();
+
+            let sizes = cursor.compressed();
+
+            for i in 0..sizes do
+                cursor.compressed();
+            od
+
+            let bounds = cursor.compressed();
+
+            for i in 0..bounds do
+                cursor.compressed_signed();
+            od
+
+            buffer.append("[rank {rank}]");
+        si
+
+        // A TypeDefOrRef coded index: two tag bits naming the table, the
+        // rest the row. Printed as table and row rather than resolved to
+        // a name — a row number is what a numbering bug shows up as.
+        _type_reference(cursor: CURSOR, buffer: StringBuilder) is
+            let coded = cursor.compressed();
+            let row = coded >> 2;
+
+            case coded & 3
+            when 0 then
+                buffer.append("TypeDef#{row}");
+            when 1 then
+                buffer.append("TypeRef#{row}");
+            when 2 then
+                buffer.append("TypeSpec#{row}");
+            else
+                buffer.append("Type?#{row}");
+            esac
+        si
+
+        _primitive_name(code: int) -> string? static is
+            case code
+            when 1 then return "void";
+            when 2 then return "bool";
+            when 3 then return "char";
+            when 4 then return "int8";
+            when 5 then return "uint8";
+            when 6 then return "int16";
+            when 7 then return "uint16";
+            when 8 then return "int32";
+            when 9 then return "uint32";
+            when 10 then return "int64";
+            when 11 then return "uint64";
+            when 12 then return "float32";
+            when 13 then return "float64";
+            when 14 then return "string";
+            when 22 then return "typedref";
+            when 24 then return "native int";
+            when 25 then return "native uint";
+            when 28 then return "object";
+            else return null;
+            esac
+        si
+    si
+si

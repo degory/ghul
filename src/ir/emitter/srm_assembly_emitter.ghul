@@ -1,0 +1,760 @@
+namespace IR.Emitter is
+    use System.Reflection.Metadata.BlobBuilder;
+    use System.Reflection.Metadata.EntityHandle;
+    use System.Reflection.Metadata.BlobHandle;
+    use System.Reflection.Metadata.StringHandle;
+    use System.Reflection.Metadata.UserStringHandle;
+    use System.Reflection.Metadata.AssemblyReferenceHandle;
+    use System.Reflection.Metadata.TypeDefinitionHandle;
+    use System.Reflection.Metadata.TypeReferenceHandle;
+    use System.Reflection.Metadata.MemberReferenceHandle;
+    use System.Reflection.Metadata.MethodDefinitionHandle;
+    use System.Reflection.Metadata.MethodAttributes;
+    use System.Reflection.Metadata.MethodImplAttributes;
+    use System.Reflection.Metadata.Ecma335.MetadataBuilder;
+    use System.Reflection.Metadata.Ecma335.MetadataRootBuilder;
+    use System.Reflection.Metadata.Ecma335.MetadataTokens;
+    use System.Reflection.Metadata.Ecma335.MethodBodyStreamEncoder;
+    use System.Reflection.Metadata.Ecma335.InstructionEncoder;
+    use System.Reflection.Metadata.Ecma335.TableIndex;
+
+    use System.Reflection.PortableExecutable.ManagedPEBuilder;
+    use System.Reflection.PortableExecutable.PEHeaderBuilder;
+    use System.Reflection.PortableExecutable.CorFlags;
+
+    // Owns the in-flight assembly: the metadata builder, the method body
+    // stream, and the reference/member handle caches. Deduplication is
+    // this layer's job — a metadata table holds one row per distinct
+    // reference, with no merging of repeats after the fact.
+    //
+    // Emission is split across two objects: this one, and
+    // SRM_METHOD_BODY_EMITTER for one method body's instructions. The
+    // structure of the assembly comes from SRM_STRUCTURE_WALK, which
+    // reads it from the symbol table rather than accumulating it here.
+    class SRM_ASSEMBLY_EMITTER is
+        _metadata: MetadataBuilder;
+        _il_builder: BlobBuilder;
+        _body_stream: MethodBodyStreamEncoder;
+
+        _assembly_refs: Collections.MAP[string, AssemblyReferenceHandle];
+        _type_refs: Collections.MAP[Semantic.Symbols.Symbol, TypeReferenceHandle];
+        _named_type_refs: Collections.MAP[string, TypeReferenceHandle];
+
+
+        _entry_point: MethodDefinitionHandle?;
+        _want_library: bool;
+
+        // The portable PDB format version the debug directory
+        // advertises: 1.0, as every portable PDB emitted to date is.
+        _PORTABLE_PDB_VERSION: ushort static => 0x100us;
+
+        // Non-null only when the build asked for debug information.
+        _pdb: SRM_PDB_BUILDER?;
+
+        // The module version id, left empty until the content that
+        // determines it has been written. Reserving the blob rather
+        // than filling it now is what lets the id be a hash of the
+        // assembly: the hash is taken over these bytes as zeros, and
+        // the result is written back into them afterwards.
+        _module_version_id: System.Reflection.Metadata.Blob field;
+
+        // What an assembly-level attribute hangs off.
+        assembly_handle: EntityHandle;
+
+        // `version` is the colon-separated four-part form ("0:0:0:0")
+        // module_version is already built in, so parsing here avoids a
+        // second version representation at the call site.
+        init(module_name: string, assembly_name: string, version: string, want_library: bool) is
+            let parsed_version = parse_version(version);
+
+            _metadata = MetadataBuilder(0, 0, 0, 0);
+            _il_builder = BlobBuilder(256);
+            _body_stream = MethodBodyStreamEncoder(_il_builder);
+
+            _assembly_refs = Collections.MAP[string, AssemblyReferenceHandle]();
+            _type_refs = Collections.MAP[Semantic.Symbols.Symbol, TypeReferenceHandle]();
+            _named_type_refs = Collections.MAP[string, TypeReferenceHandle]();
+            _named_member_refs = Collections.MAP[(owner: int, name: string, signature: string), MemberReferenceHandle]();
+            _method_specs = Collections.MAP[(method: int, signature: string), System.Reflection.Metadata.MethodSpecificationHandle]();
+            _type_specs = Collections.MAP[string, System.Reflection.Metadata.TypeSpecificationHandle]();
+            handles = SRM_HANDLES();
+
+            _want_library = want_library;
+
+            _sequence_points = Collections.MAP[int, Collections.List[SRM_SEQUENCE_POINT]]();
+
+            if IoC.CONTAINER.instance.build_flags.want_debug then
+                _pdb = SRM_PDB_BUILDER();
+            fi
+
+            // TypeDef row 1 must be <Module>, before any user type.
+            _metadata.add_type_definition(
+                _,
+                _,
+                _metadata.get_or_add_string("<Module>"),
+                _,
+                MetadataTokens.field_definition_handle(1),
+                MetadataTokens.method_definition_handle(1));
+
+            let reserved_module_version_id = _metadata.reserve_guid();
+
+            _module_version_id = reserved_module_version_id.content;
+
+            _metadata.add_module(
+                0,
+                _metadata.get_or_add_string(module_name),
+                reserved_module_version_id.handle,
+                _,
+                _);
+
+            assembly_handle =
+                cast EntityHandle(
+                    _metadata.add_assembly(
+                        _metadata.get_or_add_string(assembly_name),
+                        parsed_version,
+                        _,
+                        _,
+                        _,
+                        _));
+
+            // Reference every assembly needs, for the base type of the
+            // globals carrier.
+            add_assembly_reference("System.Runtime", "8:0:0:0");
+        si
+
+        parse_version(value: string) -> System.Version static is
+            let parts = value.split([':']);
+
+            return System.Version(
+                int.parse(parts[0]),
+                int.parse(parts[1]),
+                int.parse(parts[2]),
+                int.parse(parts[3]));
+        si
+
+        get_or_add_string(value: string) -> StringHandle =>
+            _metadata.get_or_add_string(value);
+
+        get_or_add_user_string(value: string) -> UserStringHandle =>
+            _metadata.get_or_add_user_string(value);
+
+        get_or_add_blob(bytes: ubyte[]) -> BlobHandle =>
+            _metadata.get_or_add_blob(bytes);
+
+        next_field_row: int => _metadata.get_row_count(TableIndex.FIELD) + 1;
+        next_method_row: int => _metadata.get_row_count(TableIndex.METHOD_DEF) + 1;
+        next_type_row: int => _metadata.get_row_count(TableIndex.TYPE_DEF) + 1;
+        next_parameter_row: int => _metadata.get_row_count(TableIndex.PARAM) + 1;
+        next_property_row: int => _metadata.get_row_count(TableIndex.PROPERTY) + 1;
+
+        // The function the entrypoint pragma named during the tree
+        // walk, so the structure walk can mark its row. Which function
+        // is the entry point is not a naming rule the emitter can
+        // reapply: it can be a global function or a static method, and
+        // `@entry` overrides the name entirely.
+        entry_point_function: Semantic.Symbols.Function? public;
+
+        // Every row this assembly has promised a symbol. Held here so
+        // that anything with the emitter can resolve a definition
+        // without being handed a second object.
+        handles: SRM_HANDLES;
+
+        add_assembly_reference(name: string, version: string) -> AssemblyReferenceHandle is
+            if _assembly_refs.contains_key(name) then
+                return _assembly_refs[name];
+            fi
+
+            let handle = _metadata.add_assembly_reference(
+                _metadata.get_or_add_string(name),
+                parse_version(version),
+                _,
+                _,
+                _,
+                _);
+
+            _assembly_refs[name] = handle;
+
+            return handle;
+        si
+
+        add_type_reference(
+            symbol: Semantic.Symbols.Symbol,
+            assembly_name: string,
+            namespace_name: string,
+            simple_name: string
+        ) -> TypeReferenceHandle is
+            if _type_refs.contains_key(symbol) then
+                return _type_refs[symbol];
+            fi
+
+            assert _assembly_refs.contains_key(assembly_name) else
+                "assembly reference '{assembly_name}' must be registered before a type reference into it";
+
+            let assembly_ref = _assembly_refs[assembly_name];
+
+            let handle = _metadata.add_type_reference(
+                cast EntityHandle(assembly_ref),
+                _metadata.get_or_add_string(namespace_name),
+                _metadata.get_or_add_string(simple_name));
+
+            _type_refs[symbol] = handle;
+
+            return handle;
+        si
+
+        // A type nested inside another. Its scope is the enclosing
+        // type's own reference rather than the assembly, and it carries
+        // no namespace of its own — the enclosing reference supplies it.
+        //
+        // Encoded any other way the row names a type that does not
+        // exist: a top-level name containing a separator resolves to
+        // nothing, and the failure surfaces at load as
+        // `Could not load type 'List`1/Enumerator'`.
+        add_nested_type_reference(
+            assembly_name: string,
+            enclosing: TypeReferenceHandle,
+            simple_name: string
+        ) -> TypeReferenceHandle is
+            let key = "{assembly_name}|{MetadataTokens.get_token(cast EntityHandle(enclosing))}|{simple_name}";
+
+            if _named_type_refs.contains_key(key) then
+                return _named_type_refs[key];
+            fi
+
+            let handle = _metadata.add_type_reference(
+                cast EntityHandle(enclosing),
+                _,
+                _metadata.get_or_add_string(simple_name));
+
+            _named_type_refs[key] = handle;
+
+            return handle;
+        si
+
+        // Reference to a type that no symbol names — the framework
+        // types every assembly needs as a base type regardless of what
+        // the source declares.
+        add_type_reference_by_name(
+            assembly_name: string,
+            namespace_name: string,
+            simple_name: string
+        ) -> TypeReferenceHandle is
+            let key = "{assembly_name}|{namespace_name}|{simple_name}";
+
+            if _named_type_refs.contains_key(key) then
+                return _named_type_refs[key];
+            fi
+
+            add_assembly_reference(assembly_name, "8:0:0:0");
+
+            let handle = _metadata.add_type_reference(
+                cast EntityHandle(_assembly_refs[assembly_name]),
+                _metadata.get_or_add_string(namespace_name),
+                _metadata.get_or_add_string(simple_name));
+
+            _named_type_refs[key] = handle;
+
+            return handle;
+        si
+
+        // A TypeSpec names a constructed generic where a table-level
+        // reference is needed. Cached so two references to the same
+        // instantiation are the same row.
+        //
+        // Keyed on the encoded signature rather than on how the type
+        // spells itself: a class type parameter and a method type
+        // parameter of the same name render the same but encode
+        // differently (`!0` against `!!0`), so a spelling key gives
+        // whichever was seen first to both.
+        _type_specs: Collections.MAP[string, System.Reflection.Metadata.TypeSpecificationHandle];
+
+        add_type_specification(
+            type: Semantic.Types.Type
+        ) -> System.Reflection.Metadata.TypeSpecificationHandle is
+            let signature = SRM_SIGNATURE_ENCODER(self).type_specification_signature(type);
+
+            let key = System.Convert.to_base64_string(signature);
+
+            if _type_specs.contains_key(key) then
+                return _type_specs[key];
+            fi
+
+            let handle = _metadata.add_type_specification(_metadata.get_or_add_blob(signature));
+
+            _type_specs[key] = handle;
+
+            return handle;
+        si
+
+        // A reference to a constructor on a type this assembly does not
+        // define. The owner is a handle rather than a symbol because the
+        // constructors that need this are named by a constructed type.
+        // A generic method is called through a MethodSpec naming the
+        // open method plus the arguments it was instantiated with. The
+        // open method keeps one reference row however many
+        // instantiations there are.
+        _method_specs: Collections.MAP[(method: int, signature: string), System.Reflection.Metadata.MethodSpecificationHandle];
+
+        // `key` is a human-readable description for diagnostics only;
+        // the cache is keyed on the open method plus the encoded
+        // arguments, for the same reason add_type_specification is.
+        add_method_specification(
+            method: EntityHandle,
+            key: string,
+            type_arguments: Collections.List[Semantic.Types.Type]
+        ) -> System.Reflection.Metadata.MethodSpecificationHandle is
+            let builder = BlobBuilder(16);
+
+            let encoder =
+                System.Reflection.Metadata.Ecma335.BlobEncoder(builder)
+                    .method_specification_signature(type_arguments.count);
+
+            let signatures = SRM_SIGNATURE_ENCODER(self);
+
+            for argument in type_arguments do
+                signatures.encode_type(encoder.add_argument(), argument);
+            od
+
+            let identity =
+                (
+                    method = MetadataTokens.get_token(method),
+                    signature = System.Convert.to_base64_string(builder.to_array())
+                );
+
+            if _method_specs.contains_key(identity) then
+                return _method_specs[identity];
+            fi
+
+            let handle =
+                _metadata.add_method_specification(method, _metadata.get_or_add_blob(builder.to_array()));
+
+            _method_specs[identity] = handle;
+
+            return handle;
+        si
+
+        add_constructor_reference(
+            owner: EntityHandle,
+            key: string,
+            argument_types: Collections.List[Semantic.Types.Type]
+        ) -> MemberReferenceHandle =>
+            add_named_member_reference(
+                owner,
+                ".ctor",
+                key,
+                SRM_SIGNATURE_ENCODER(self).constructor_signature(argument_types));
+
+        // A reference to a member of a type this assembly does not
+        // define, where the signature is built rather than read off a
+        // symbol. The owner is a handle so that a constructed generic's
+        // TypeSpec can own it.
+        //
+        // `key` is a human-readable description for diagnostics only.
+        // The cache is keyed on what actually identifies the row —
+        // owner, name and encoded signature — because a description
+        // can collide where those differ and differ where they match.
+        //
+        // Several callers have no symbol to key on: `Invoke` on a
+        // delegate type, `String::Concat`, a synthesised `.ctor`, a unit
+        // variant's interned instance. The row's own identity is what
+        // every caller does have, and it is what the CLR compares.
+        add_named_member_reference(
+            owner: EntityHandle,
+            name: string,
+            key: string,
+            signature: ubyte[]
+        ) -> MemberReferenceHandle is
+            let identity =
+                (
+                    owner = MetadataTokens.get_token(owner),
+                    name = name,
+                    signature = System.Convert.to_base64_string(signature)
+                );
+
+            if _named_member_refs.contains_key(identity) then
+                return _named_member_refs[identity];
+            fi
+
+            let handle = _metadata.add_member_reference(
+                owner,
+                _metadata.get_or_add_string(name),
+                _metadata.get_or_add_blob(signature));
+
+            _named_member_refs[identity] = handle;
+
+            return handle;
+        si
+
+        _named_member_refs: Collections.MAP[(owner: int, name: string, signature: string), MemberReferenceHandle];
+
+
+        // A method with locals needs a StandAloneSig naming their
+        // types, in slot order, for the body header to point at.
+        add_method_body(encoder: InstructionEncoder, body: SRM_METHOD_BODY_EMITTER) -> int is
+            let locals =
+                if body.has_locals then
+                    add_local_variable_signature(body.local_types)
+                else
+                    _[System.Reflection.Metadata.StandaloneSignatureHandle]
+                fi;
+
+            // A fixed stack depth is reserved for every body rather
+            // than a bound being computed per body.
+            //
+            // Locals are always initialized: a method that both has
+            // locals and contains a protected region is rejected
+            // outright by the runtime otherwise — an
+            // InvalidProgramException naming the method, with nothing
+            // in the body to point at.
+            return
+                _body_stream.add_method_body(
+                    encoder,
+                    64,
+                    locals,
+                    System.Reflection.Metadata.Ecma335.MethodBodyAttributes.INIT_LOCALS);
+        si
+
+        add_local_variable_signature(
+            types: Collections.List[Semantic.Types.Type]
+        ) -> System.Reflection.Metadata.StandaloneSignatureHandle is
+            let builder = BlobBuilder(32);
+
+            let variables =
+                System.Reflection.Metadata.Ecma335.BlobEncoder(builder)
+                    .local_variable_signature(types.count);
+
+            let signatures = SRM_SIGNATURE_ENCODER(self);
+
+            for type in types do
+                let referenced = SRM_SIGNATURE_ENCODER.pointee(type);
+
+                signatures.encode_type(
+                    variables.add_variable().`type(referenced?, false), referenced ?? type);
+            od
+
+            return _metadata.add_standalone_signature(_metadata.get_or_add_blob(builder.to_array()));
+        si
+
+        // The source positions of the body at `offset`, recorded as the
+        // body is flushed and read back when its MethodDef row is
+        // written. Keyed on the offset because that is the only thing
+        // the two sides share: the body is encoded during the tree
+        // walk and the row is written afterwards, and every body
+        // occupies a distinct offset in the stream.
+        _sequence_points: Collections.MAP[int, Collections.List[SRM_SEQUENCE_POINT]];
+
+        set_sequence_points(
+            body_offset: int,
+            points: Collections.List[SRM_SEQUENCE_POINT]
+        ) is
+            _sequence_points[body_offset] = points;
+        si
+
+        add_method_definition(
+            flags: MethodAttributes,
+            impl_flags: MethodImplAttributes,
+            name: StringHandle,
+            signature: BlobHandle,
+            body_offset: int,
+            parameter_list: System.Reflection.Metadata.ParameterHandle
+        ) -> MethodDefinitionHandle is
+            let handle =
+                _metadata.add_method_definition(
+                    flags, impl_flags, name, signature, body_offset, parameter_list);
+
+            // MethodDebugInformation is read positionally against
+            // MethodDef, so every row added here needs one there -
+            // including the ones with nothing to say. Doing it in the
+            // same call is what keeps the two in step; see
+            // SRM_PDB_BUILDER.
+            if let pdb = _pdb then
+                let points: Collections.List[SRM_SEQUENCE_POINT] mut;
+
+                if !_sequence_points.try_get_value(body_offset, points ref) then
+                    points = null;
+                fi
+
+                pdb.add_method_debug_information(points);
+            fi
+
+            return handle;
+        si
+
+        add_parameter(
+            name: StringHandle,
+            sequence_number: int
+        ) -> System.Reflection.Metadata.ParameterHandle =>
+            _metadata.add_parameter(cast System.Reflection.ParameterAttributes(0), name, sequence_number);
+
+        add_field_definition(
+            flags: System.Reflection.FieldAttributes,
+            name: StringHandle,
+            signature: BlobHandle
+        ) -> System.Reflection.Metadata.FieldDefinitionHandle =>
+            _metadata.add_field_definition(flags, name, signature);
+
+        // The compile-time value of a literal field. The Constant table
+        // is one of the sorted side tables, so SRM orders the rows and
+        // they can be added as each field is written.
+        add_constant(
+            parent: EntityHandle,
+            value: object
+        ) -> System.Reflection.Metadata.ConstantHandle =>
+            _metadata.add_constant(parent, value);
+
+        // A custom attribute on whatever `parent` names — a type, a
+        // method, a parameter, the assembly itself.
+        //
+        // CustomAttribute is sorted on its parent, but SRM sorts it
+        // rather than validating it, so rows can be added as the walk
+        // reaches them.
+        add_custom_attribute(
+            parent: EntityHandle,
+            constructor: EntityHandle,
+            value: ubyte[]
+        ) is
+            _metadata.add_custom_attribute(parent, constructor, get_or_add_blob(value));
+        si
+
+        add_property(
+            name: StringHandle,
+            signature: ubyte[]
+        ) -> System.Reflection.Metadata.PropertyDefinitionHandle =>
+            _metadata.add_property(
+                cast System.Reflection.PropertyAttributes(0),
+                name,
+                get_or_add_blob(signature));
+
+        // Points a type at the run of property rows it owns. PropertyMap
+        // is sorted on its parent, and the walk writes types in
+        // ascending row order, so adding one per type as the walk
+        // reaches it is already in order.
+        add_property_map(
+            parent: TypeDefinitionHandle,
+            first_property: System.Reflection.Metadata.PropertyDefinitionHandle
+        ) is
+            _metadata.add_property_map(parent, first_property);
+        si
+
+        // Ties an accessor method to the property it reads or writes.
+        // MethodSemantics is a sorted side table that SRM orders itself,
+        // so these can be added as the walk reaches them.
+        add_property_accessor(
+            property: System.Reflection.Metadata.PropertyDefinitionHandle,
+            accessor: MethodDefinitionHandle,
+            is_getter: bool
+        ) is
+            _metadata.add_method_semantics(
+                cast EntityHandle(property),
+                if is_getter then
+                    System.Reflection.MethodSemanticsAttributes.GETTER;
+                else
+                    System.Reflection.MethodSemanticsAttributes.SETTER;
+                fi,
+                accessor);
+        si
+
+        // An attribute the compiler applies itself rather than resolving
+        // from a pragma, named rather than reached through a symbol: the
+        // marker attributes carrying what metadata cannot express, the
+        // framework attributes on a return or parameter slot, and the
+        // assembly-level attributes the command line supplies.
+        //
+        // The type name is qualified, and split here rather than written
+        // as a namespace and a simple name at each call site: a
+        // reference built from the two halves out of step names a type
+        // that does not exist while still emitting cleanly.
+        add_named_attribute(
+            parent: EntityHandle,
+            assembly_name: string,
+            qualified_name: string,
+            argument_types: Collections.List[Semantic.Types.Type],
+            value: ubyte[]
+        ) is
+            let dot = qualified_name.last_index_of('.');
+
+            let namespace_name =
+                if dot >= 0 then qualified_name.substring(0, dot) else "" fi;
+
+            let simple_name =
+                if dot >= 0 then qualified_name.substring(dot + 1) else qualified_name fi;
+
+            let attribute_type =
+                add_type_reference_by_name(assembly_name, namespace_name, simple_name);
+
+            add_custom_attribute(
+                parent,
+                cast EntityHandle(
+                    add_constructor_reference(
+                        cast EntityHandle(attribute_type),
+                        "{qualified_name}::.ctor",
+                        argument_types)),
+                value);
+        si
+
+        // The value blob of an attribute applied with no arguments: the
+        // two-byte prolog every attribute blob opens with, then a
+        // named-argument count of zero.
+        NO_ARGUMENT_ATTRIBUTE_VALUE: ubyte[] static => [1ub, 0ub, 0ub, 0ub];
+
+        add_type_definition(
+            flags: System.Reflection.TypeAttributes,
+            namespace_name: StringHandle,
+            simple_name: StringHandle,
+            base_type: EntityHandle,
+            field_list: System.Reflection.Metadata.FieldDefinitionHandle,
+            method_list: MethodDefinitionHandle
+        ) -> System.Reflection.Metadata.TypeDefinitionHandle =>
+            _metadata.add_type_definition(
+                flags, namespace_name, simple_name, base_type, field_list, method_list);
+
+        // A type or method that declares type parameters needs a row per
+        // parameter. Without them the declaration is not generic, and
+        // every signature that names one by index - a field of type !0,
+        // an argument of type !!0 - is naming something the type does
+        // not have.
+        add_generic_parameter(
+            owner: EntityHandle,
+            index: int,
+            name: string,
+            attributes: System.Reflection.GenericParameterAttributes
+        ) -> System.Reflection.Metadata.GenericParameterHandle =>
+            _metadata.add_generic_parameter(
+                owner,
+                attributes,
+                _metadata.get_or_add_string(name),
+                index);
+
+        // The type a parameter is bounded by (`[T: SomeBase]`). The CLR
+        // verifies shared generic code against the declared parameter
+        // rather than against each call site's substitution, so without
+        // this row the parameter is unbounded as far as the runtime is
+        // concerned: a body that relies on the bound fails verification,
+        // and passing the parameter on to a callee declaring the same
+        // bound is rejected as violating it.
+        add_generic_parameter_constraint(
+            parameter: System.Reflection.Metadata.GenericParameterHandle,
+            `type: EntityHandle
+        ) is
+            _metadata.add_generic_parameter_constraint(parameter, `type);
+        si
+
+        // One row per interface a type declares. Without it the type
+        // still loads and its own methods still run, but nothing binds
+        // the interface's slots, so a call through the interface fails
+        // at dispatch rather than at load.
+        //
+        // InterfaceImpl is a sorted table, and SRM orders it on
+        // serialization, so rows go in as the walk reaches them.
+        add_interface_implementation(
+            type: System.Reflection.Metadata.TypeDefinitionHandle,
+            `interface: EntityHandle
+        ) is
+            _metadata.add_interface_implementation(type, `interface);
+        si
+
+        // Binds a method this type defines to the interface slot it
+        // implements, for a member whose name cannot match the slot on
+        // its own — an explicit implementation, named for the interface
+        // it satisfies.
+        add_method_implementation(
+            type: System.Reflection.Metadata.TypeDefinitionHandle,
+            body: EntityHandle,
+            declaration: EntityHandle
+        ) is
+            _metadata.add_method_implementation(type, body, declaration);
+        si
+
+        set_entry_point(method: MethodDefinitionHandle) is
+            _entry_point = method;
+        si
+
+        // The identity a deterministic build gives its output: a hash of
+        // the content, rather than a fresh guid and the wall clock. Two
+        // builds of the same source then produce the same bytes, which
+        // is what lets the self-hosting check be a comparison of two
+        // assemblies rather than of two disassemblies.
+        _content_id_from_content(
+            content: Collections.Iterable[System.Reflection.Metadata.Blob]
+        ) -> System.Reflection.Metadata.BlobContentId static is
+            let hasher =
+                System.Security.Cryptography.IncrementalHash.create_hash(
+                    System.Security.Cryptography.HashAlgorithmName.sha256);
+
+            for blob in content do
+                let bytes = blob.get_bytes();
+
+                hasher.append_data(bytes.array, bytes.offset, bytes.count);
+            od
+
+            return
+                System.Reflection.Metadata.BlobContentId.from_hash(
+                    System.Collections.Immutable.ImmutableArray.create[ubyte](
+                        hasher.get_hash_and_reset()));
+        si
+
+        write_to(path: string) is
+            // The PDB is written first because the assembly has to name
+            // it: a debug directory entry carries the PDB's path and
+            // the identity a runtime checks the two match on, and that
+            // identity is not known until the PDB's bytes are.
+            let debug_directory =
+                if let pdb = _pdb then
+                    let pdb_path = IO.Path.change_extension(path, ".pdb")!;
+
+                    let pdb_content_id =
+                        pdb.write_to(
+                            pdb_path,
+                            _metadata.get_row_counts(),
+                            _entry_point ?? _[MethodDefinitionHandle],
+                            _content_id_from_content);
+
+                    let builder =
+                        System.Reflection.PortableExecutable.DebugDirectoryBuilder();
+
+                    // The name is what the runtime looks for beside the
+                    // assembly, so it is the file's own name rather than
+                    // the path this compiler happened to write it to.
+                    builder.add_code_view_entry(
+                        IO.Path.get_file_name(pdb_path)!,
+                        pdb_content_id,
+                        _PORTABLE_PDB_VERSION);
+
+                    builder;
+                else
+                    _[System.Reflection.PortableExecutable.DebugDirectoryBuilder?];
+                fi;
+
+            let pe_header =
+                if _want_library then
+                    PEHeaderBuilder.create_library_header();
+                else
+                    PEHeaderBuilder.create_executable_header();
+                fi;
+
+            let pe_builder = ManagedPEBuilder(
+                pe_header,
+                MetadataRootBuilder(_metadata, null, false),
+                _il_builder,
+                null,
+                null,
+                null,
+                debug_directory,
+                0,
+                _entry_point ?? _[MethodDefinitionHandle],
+                cast CorFlags(1),   // ILOnly
+                _content_id_from_content);
+
+            let pe_blob = BlobBuilder(1024);
+            let content_id = pe_builder.serialize(pe_blob);
+
+            // Now that the content is fixed, the id derived from it can
+            // go into the space reserved for it above.
+            System.Reflection.Metadata.BlobWriter(_module_version_id).write_guid(content_id.guid);
+
+            let stream = IO.File.create(path);
+            pe_blob.write_content_to(stream);
+            stream.close();
+        si
+    si
+si

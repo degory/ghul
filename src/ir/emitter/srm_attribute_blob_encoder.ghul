@@ -1,0 +1,567 @@
+namespace IR.Emitter is
+    use Collections;
+
+    use System.Reflection.Metadata.BlobBuilder;
+
+    use Semantic.Types.Type;
+
+    // Encodes a custom attribute's value blob: ECMA-335 II.23.3.
+    //
+    // The bytes are encoded from the resolved arguments the attribute
+    // carries, never from any rendering of them: a rendering read back
+    // as data would be taking presentation for fact, and would drift
+    // the first time the rendering changed.
+    //
+    // Every fixed argument is encoded against its parameter's declared
+    // type rather than against the value's own, because the blob has no
+    // room to say which type it meant: the reader walks the constructor
+    // signature alongside the bytes. The one exception is a parameter
+    // typed `object`, whose value is preceded by a tag naming the type
+    // it was boxed from.
+    class SRM_ATTRIBUTE_BLOB_ENCODER is
+        // ECMA-335 II.23.1.16 element type codes, as far as a value blob
+        // can carry them.
+        BOOLEAN: ubyte static => 2ub;
+        CHAR: ubyte static => 3ub;
+        I1: ubyte static => 4ub;
+        U1: ubyte static => 5ub;
+        I2: ubyte static => 6ub;
+        U2: ubyte static => 7ub;
+        I4: ubyte static => 8ub;
+        U4: ubyte static => 9ub;
+        I8: ubyte static => 10ub;
+        U8: ubyte static => 11ub;
+        R4: ubyte static => 12ub;
+        R8: ubyte static => 13ub;
+        STRING: ubyte static => 14ub;
+        SZARRAY: ubyte static => 29ub;
+
+        // II.23.3's own additions, which exist only inside a value blob.
+        TYPE: ubyte static => 80ub;
+        BOXED: ubyte static => 81ub;
+        FIELD: ubyte static => 83ub;
+        PROPERTY: ubyte static => 84ub;
+        ENUM: ubyte static => 85ub;
+
+        _lookup: Semantic.Lookups.InnateSymbolLookup;
+
+        init(lookup: Semantic.Lookups.InnateSymbolLookup) is
+            super.init();
+
+            _lookup = lookup;
+        si
+
+        // The whole blob for an attribute application, or null if any
+        // argument is not a constant this encoder can express.
+        //
+        // The resolver has already rejected an inexpressible argument
+        // with a diagnostic, so a null here means the two disagree about
+        // what is expressible rather than that the source was bad.
+        encode(attribute: Semantic.CUSTOM_ATTRIBUTE) -> ubyte[]? is
+            let buffer = BlobBuilder(32);
+
+            buffer.write_u_int16(1us);
+
+            let parameters = attribute.constructor.arguments;
+            let positional = attribute.positional;
+
+            for i in 0..parameters.count do
+                if i >= positional.count then
+                    return null;
+                fi
+
+                if !_write_fixed(buffer, parameters[i], positional[i]) then
+                    return null;
+                fi
+            od
+
+            let named = attribute.named;
+
+            buffer.write_u_int16(cast ushort(named.count));
+
+            for argument in named do
+                if !_write_named(buffer, argument) then
+                    return null;
+                fi
+            od
+
+            return buffer.to_array();
+        si
+
+        // A `NullableAttribute`, `TupleElementNamesAttribute` or any
+        // other framework attribute the compiler synthesises rather than
+        // resolving from a pragma: the arguments are known here, so the
+        // blob is built from them directly.
+        encode_string_argument(value: string?) -> ubyte[] static is
+            let buffer = BlobBuilder(32);
+
+            buffer.write_u_int16(1us);
+            buffer.write_serialized_string(value);
+            buffer.write_u_int16(0us);
+
+            return buffer.to_array();
+        si
+
+        encode_byte_argument(value: int) -> ubyte[] static is
+            let buffer = BlobBuilder(8);
+
+            buffer.write_u_int16(1us);
+            buffer.write_byte(cast ubyte(value));
+            buffer.write_u_int16(0us);
+
+            return buffer.to_array();
+        si
+
+        encode_byte_array_argument(values: List[int]) -> ubyte[] static is
+            let buffer = BlobBuilder(16);
+
+            buffer.write_u_int16(1us);
+            buffer.write_int32(values.count);
+
+            for value in values do
+                buffer.write_byte(cast ubyte(value));
+            od
+
+            buffer.write_u_int16(0us);
+
+            return buffer.to_array();
+        si
+
+        // A null entry is an unnamed element, which the blob carries as
+        // a null string rather than as an empty one - an empty name
+        // would read back as an element actually called "".
+        encode_string_array_argument(values: List[string?]) -> ubyte[] static is
+            let buffer = BlobBuilder(32);
+
+            buffer.write_u_int16(1us);
+            buffer.write_int32(values.count);
+
+            for value in values do
+                buffer.write_serialized_string(value);
+            od
+
+            buffer.write_u_int16(0us);
+
+            return buffer.to_array();
+        si
+
+        // The four parallel arrays an `@IL.output` ranges attribute carries:
+        // the pragma's file name, the start and end instruction offsets, and
+        // the source-order sequence - one entry per marked statement. Each
+        // array carries its own length prefix, as every fixed array argument
+        // does, and the trailing zero is the named-arguments count.
+        encode_il_output_ranges(ranges: List[SRM_IL_OUTPUT_RANGE]) -> ubyte[] static is
+            let buffer = BlobBuilder(64);
+
+            buffer.write_u_int16(1us);
+
+            buffer.write_int32(ranges.count);
+            for range in ranges do
+                buffer.write_serialized_string(range.path);
+            od
+
+            buffer.write_int32(ranges.count);
+            for range in ranges do
+                buffer.write_int32(range.start_offset);
+            od
+
+            buffer.write_int32(ranges.count);
+            for range in ranges do
+                buffer.write_int32(range.end_offset);
+            od
+
+            buffer.write_int32(ranges.count);
+            for range in ranges do
+                buffer.write_int32(range.sequence);
+            od
+
+            buffer.write_u_int16(0us);
+
+            return buffer.to_array();
+        si
+
+        _write_named(
+            buffer: BlobBuilder,
+            argument: Semantic.NAMED_ATTRIBUTE_ARGUMENT
+        ) -> bool is
+            buffer.write_byte(if argument.is_field then FIELD else PROPERTY fi);
+
+            if !_write_field_or_prop_type(buffer, argument.member_type) then
+                return false;
+            fi
+
+            buffer.write_serialized_string(argument.il_name);
+
+            return _write_fixed(buffer, argument.member_type, argument.value);
+        si
+
+        // The type tag a named argument carries ahead of its value,
+        // because a reader has no signature to walk for one.
+        _write_field_or_prop_type(buffer: BlobBuilder, type: Type) -> bool is
+            if _is_object(type) then
+                buffer.write_byte(BOXED);
+
+                return true;
+            fi
+
+            if let array: Semantic.Types.ARRAY = type then
+                buffer.write_byte(SZARRAY);
+
+                return _write_field_or_prop_type(buffer, array.arguments[0]);
+            fi
+
+            if _is_string(type) then
+                buffer.write_byte(STRING);
+
+                return true;
+            fi
+
+            if _is_type(type) then
+                buffer.write_byte(TYPE);
+
+                return true;
+            fi
+
+            if _is_enum(type) then
+                buffer.write_byte(ENUM);
+                buffer.write_serialized_string(_serialized_type_name(type));
+
+                return true;
+            fi
+
+            let code = _element_type(type);
+
+            if !code? then
+                return false;
+            fi
+
+            buffer.write_byte(code);
+
+            return true;
+        si
+
+        // One value, encoded as the slot's declared type says to read it.
+        _write_fixed(buffer: BlobBuilder, type: Type?, value: IR.Values.Value?) -> bool is
+            if !type? \/ !value? then
+                return false;
+            fi
+
+            if _is_object(type) then
+                return _write_boxed(buffer, value);
+            fi
+
+            if let array: Semantic.Types.ARRAY = type then
+                return _write_array(buffer, array.arguments[0], value);
+            fi
+
+            if _is_string(type) then
+                if isa IR.Values.NULL(value) then
+                    buffer.write_serialized_string(null);
+
+                    return true;
+                fi
+
+                if let text: IR.Values.Literal.STRING = value then
+                    buffer.write_serialized_string(text.value);
+
+                    return true;
+                fi
+
+                return false;
+            fi
+
+            if _is_type(type) then
+                if isa IR.Values.NULL(value) then
+                    buffer.write_serialized_string(null);
+
+                    return true;
+                fi
+
+                if let typeof_value: IR.Values.TYPEOF = value then
+                    buffer.write_serialized_string(
+                        _serialized_type_name(typeof_value.typeof_type));
+
+                    return true;
+                fi
+
+                return false;
+            fi
+
+            return _write_scalar(buffer, type, value);
+        si
+
+        // An array's length prefix is a full four bytes rather than a
+        // compressed integer, and all-ones marks a null array as
+        // distinct from an empty one.
+        _write_array(buffer: BlobBuilder, element_type: Type, value: IR.Values.Value) -> bool is
+            if isa IR.Values.NULL(value) then
+                buffer.write_u_int32(4294967295u);
+
+                return true;
+            fi
+
+            let sequence = cast IR.Values.SEQUENCE?(value);
+
+            if !sequence? then
+                return false;
+            fi
+
+            buffer.write_int32(sequence.values.count);
+
+            for element in sequence.values do
+                if !_write_fixed(buffer, element_type, element) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        // A value in an `object` slot describes itself: the tag says
+        // what type the reader should box it back to. A null reference
+        // has no type to name, and is encoded as a null string - which
+        // is what a C# `[Foo((object) null)]` produces.
+        _write_boxed(buffer: BlobBuilder, value: IR.Values.Value) -> bool is
+            if isa IR.Values.NULL(value) then
+                buffer.write_byte(STRING);
+                buffer.write_serialized_string(null);
+
+                return true;
+            fi
+
+            if let text: IR.Values.Literal.STRING = value then
+                buffer.write_byte(STRING);
+                buffer.write_serialized_string(text.value);
+
+                return true;
+            fi
+
+            if let typeof_value: IR.Values.TYPEOF = value then
+                buffer.write_byte(TYPE);
+                buffer.write_serialized_string(
+                    _serialized_type_name(typeof_value.typeof_type));
+
+                return true;
+            fi
+
+            if let sequence: IR.Values.SEQUENCE = value then
+                buffer.write_byte(SZARRAY);
+
+                if !_write_field_or_prop_type(buffer, sequence.element_type) then
+                    return false;
+                fi
+
+                return _write_array(buffer, sequence.element_type, value);
+            fi
+
+            let value_type = value.type;
+
+            if !value_type? then
+                return false;
+            fi
+
+            if !_write_field_or_prop_type(buffer, value_type) then
+                return false;
+            fi
+
+            return _write_scalar(buffer, value_type, value);
+        si
+
+        // A bool, char, integer or float. An enum is its underlying
+        // value: which enum it was is carried by the signature, or by
+        // the tag a named or boxed argument writes ahead of it.
+        _write_scalar(buffer: BlobBuilder, type: Type, value: IR.Values.Value) -> bool is
+            let constant = _constant_of(value);
+
+            if !constant? then
+                return false;
+            fi
+
+            let code = _element_type(type) ?? I4;
+
+            if code == BOOLEAN then
+                buffer.write_byte(if _as_signed(constant) == 0L then 0ub else 1ub fi);
+            elif code == R4 then
+                buffer.write_single(cast single(_as_real(constant)));
+            elif code == R8 then
+                buffer.write_double(_as_real(constant));
+            elif code == U1 then
+                buffer.write_byte(cast ubyte(_as_signed(constant)));
+            elif code == U2 \/ code == CHAR then
+                buffer.write_u_int16(cast ushort(_as_signed(constant)));
+            elif code == U4 then
+                buffer.write_u_int32(cast uint(_as_signed(constant)));
+            elif code == U8 then
+                buffer.write_u_int64(cast ulong(_as_signed(constant)));
+            elif code == I1 then
+                buffer.write_s_byte(cast byte(_as_signed(constant)));
+            elif code == I2 then
+                buffer.write_int16(cast short(_as_signed(constant)));
+            elif code == I4 then
+                buffer.write_int32(cast int(_as_signed(constant)));
+            elif code == I8 then
+                buffer.write_int64(_as_signed(constant));
+            else
+                return false;
+            fi
+
+            return true;
+        si
+
+        // The integral constant, widened. A narrower target takes the
+        // low bytes of it, which is what the attribute blob holds.
+        _as_signed(constant: IR.Values.Literal.CONSTANT) -> long static =>
+            case constant
+            when i4: IR.Values.Literal.CONSTANT.I4 then cast long(i4.value)
+            when i8: IR.Values.Literal.CONSTANT.I8 then i8.value
+            when r4: IR.Values.Literal.CONSTANT.R4 then cast long(r4.value)
+            when r8: IR.Values.Literal.CONSTANT.R8 then cast long(r8.value)
+            esac;
+
+        _as_real(constant: IR.Values.Literal.CONSTANT) -> double static =>
+            case constant
+            when i4: IR.Values.Literal.CONSTANT.I4 then cast double(i4.value)
+            when i8: IR.Values.Literal.CONSTANT.I8 then cast double(i8.value)
+            when r4: IR.Values.Literal.CONSTANT.R4 then cast double(r4.value)
+            when r8: IR.Values.Literal.CONSTANT.R8 then r8.value
+            esac;
+
+        // The constant a value denotes: a literal, or the unary minus
+        // applied to one - `-5` is a negation over `5` rather than a
+        // negative literal.
+        _constant_of(value: IR.Values.Value) -> IR.Values.Literal.CONSTANT? is
+            if let number: IR.Values.Literal.NUMBER = value then
+                return number.constant;
+            fi
+
+            if let negation: IR.Values.Call.INNATE = value then
+                if negation.function.name =~ "-" /\ negation.arguments.count == 1 then
+                    if let number: IR.Values.Literal.NUMBER = negation.arguments[0] then
+                        return _negate(number.constant);
+                    fi
+                fi
+            fi
+
+            return null;
+        si
+
+        _negate(constant: IR.Values.Literal.CONSTANT) -> IR.Values.Literal.CONSTANT static =>
+            case constant
+            when i4: IR.Values.Literal.CONSTANT.I4 then IR.Values.Literal.CONSTANT.I4(-i4.value)
+            when i8: IR.Values.Literal.CONSTANT.I8 then IR.Values.Literal.CONSTANT.I8(-i8.value)
+            when r4: IR.Values.Literal.CONSTANT.R4 then IR.Values.Literal.CONSTANT.R4(-r4.value)
+            when r8: IR.Values.Literal.CONSTANT.R8 then IR.Values.Literal.CONSTANT.R8(-r8.value)
+            esac;
+
+
+
+
+        // A source literal keeps the shape it was written in: a sign, an
+        // optional radix prefix, and digits that may be grouped.
+        _split_literal(text: string) -> (negative: bool, digits: string, radix: int) static is
+            let negative = text.starts_with("-");
+            let unsigned = if negative then text.substring(1) else text fi;
+            let stripped = unsigned.replace("_", "");
+
+            if stripped.starts_with("0x") \/ stripped.starts_with("0X") then
+                return (negative = negative, digits = stripped.substring(2), radix = 16);
+            fi
+
+            return (negative = negative, digits = stripped, radix = 10);
+        si
+
+        _parse_magnitude(digits: string, radix: int) -> ulong? static is
+            if digits.length == 0 then
+                return null;
+            fi
+
+            try
+                return System.Convert.to_u_int64(digits, radix);
+            catch e: System.Exception
+                return null;
+            yrt
+        si
+
+        // The name a blob carries for a type: assembly-qualified unless
+        // the type comes from the assembly being built or from the core
+        // library, which a reader resolves without being told.
+        _serialized_type_name(type: Type) -> string is
+            // The emitted name, not the source one. A type declared in a
+            // file with no namespace is emitted under a namespace
+            // derived from the file name, which its qualified name does
+            // not carry — so a `typeof` of one would name a type that
+            // does not exist in the assembly it claims to be in.
+            //
+            // This name comes from the renderer rather than from the
+            // symbol, so it arrives quoted the way a rendered name is.
+            // The reflection type resolver that parses it back takes
+            // `'System'.'AttributeTargets'` literally, so the quoting
+            // has to come off again.
+            let name =
+                _strip_assembly_prefix(type.get_il_class_name().trim())
+                    .replace("'", "");
+
+            let symbol = cast Semantic.Symbols.Classy?(type.symbol);
+
+            let assembly_name = symbol?.il_assembly_name;
+
+            // A type this assembly declares is left unqualified, which
+            // is how the resolver is told to look here.
+            if !assembly_name? \/ assembly_name.length == 0 then
+                return name;
+            fi
+
+            return "{name}, {assembly_name}";
+        si
+
+        // An IL class name from an imported assembly is written
+        // `[assembly]Namespace.NAME`; the assembly goes in the blob's
+        // own comma-separated tail instead, if at all.
+        _strip_assembly_prefix(name: string) -> string static is
+            if !name.starts_with("[") then
+                return name;
+            fi
+
+            let close = name.index_of(']');
+
+            if close < 0 then
+                return name;
+            fi
+
+            return name.substring(close + 1);
+        si
+
+        _is_string(type: Type) -> bool => type.matches(_lookup.get_string_type());
+
+        _is_object(type: Type) -> bool => type.matches(_lookup.get_object_type());
+
+        _is_type(type: Type) -> bool => type.matches(_lookup.get_type_type());
+
+        _is_enum(type: Type) -> bool =>
+            type.symbol.symbol_kind == Semantic.Symbols.SymbolKind.ENUM;
+
+        // The element type code for a primitive, or null for anything
+        // else. An enum answers for its underlying type, which the
+        // compiler models as `int` throughout.
+        _element_type(type: Type) -> ubyte? is
+            if type.matches(_lookup.get_bool_type()) then return BOOLEAN; fi
+            if type.matches(_lookup.get_char_type()) then return CHAR; fi
+            if type.matches(_lookup.get_byte_type()) then return I1; fi
+            if type.matches(_lookup.get_ubyte_type()) then return U1; fi
+            if type.matches(_lookup.get_short_type()) then return I2; fi
+            if type.matches(_lookup.get_ushort_type()) then return U2; fi
+            if type.matches(_lookup.get_int_type()) then return I4; fi
+            if type.matches(_lookup.get_uint_type()) then return U4; fi
+            if type.matches(_lookup.get_long_type()) then return I8; fi
+            if type.matches(_lookup.get_ulong_type()) then return U8; fi
+            if type.matches(_lookup.get_single_type()) then return R4; fi
+            if type.matches(_lookup.get_double_type()) then return R8; fi
+
+            if _is_enum(type) then
+                return I4;
+            fi
+
+            return null;
+        si
+    si
+si

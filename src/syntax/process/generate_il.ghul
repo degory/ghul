@@ -1,4 +1,5 @@
 namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
     use IO.Std;
 
     use System.Text.StringBuilder;
@@ -101,13 +102,11 @@ namespace Syntax.Process is
         spill_field: Semantic.Symbols.Field? public;
 
         // Capture-mode cross-try state. The TEMP and label must be
-        // allocated BEFORE the body walk so the `.locals init`
-        // appears in value_block's IL stream OUTSIDE any inner
-        // `.try` the body opens — ilasm scopes locals declared
-        // inside `.try {}` to that block, so a load at the post-
-        // body join site can't find them. VAL_BLOCK.pre pre-
-        // allocates both eagerly when value_block has a non-void
-        // result type and is not spilling.
+        // allocated BEFORE the body walk, so the declaration is
+        // encoded ahead of the load at the post-body join site
+        // rather than somewhere inside the body. VAL_BLOCK.pre
+        // pre-allocates both eagerly when value_block has a
+        // non-void result type and is not spilling.
         //
         // A val-targeted `return E` inside an inner `.try` can't
         // `br end_label` (invalid IL across a protected region)
@@ -158,9 +157,10 @@ namespace Syntax.Process is
     // and the value BLOCK is rewritten to hold just a `ldfld` of the
     // field. Consumers see a clean load.
     //
-    // One spiller per composite. `init` decides spill-vs-capture
-    // from the value's BLOCK type, the SM frame, and whether body
-    // contains a suspend outside nested function literals. `enter`
+    // One spiller per composite. Which mode it is in follows from
+    // whether compile-expressions recorded a frame field for the
+    // node, which is where the spill-vs-capture decision is made.
+    // `enter`
     // opens the BLOCK for direct emission when capturing; `emit
     // _value` emits each tail/branch value (spill or forward);
     // `leave` either rewrites the BLOCK's contents to a field load
@@ -175,9 +175,9 @@ namespace Syntax.Process is
 
         init(
             gen: GENERATE_IL,
+            node: Trees.Node,
             value: IR.Values.Value?,
-            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE?,
-            contains_suspend: bool
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE?
         ) is
             _gen = gen;
 
@@ -185,25 +185,24 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let value_block = cast IR.Values.BLOCK(value);
-            _value_block = value_block;
+            _value_block = cast IR.Values.BLOCK(value);
 
-            if !frame? \/ !contains_suspend then
+            if !frame? then
                 return;
             fi
 
-            // Void-typed value BLOCK: declare_anonymous_field on a
-            // void type produces invalid IL, and the ldarg.0/v/stfld
-            // triple would itself be bogus. Stay in capture mode —
-            // the void value carries no data across the join.
-            let value_type = value_block.type;
+            // Compile-expressions makes the spill-vs-capture decision
+            // and allocates the field, because a frame field first
+            // declared here would be numbered by nothing. An entry
+            // means spill; none means capture.
+            let spill_field = gen.composite_spill_state.get(node);
 
-            if value_type.is_void then
+            if !spill_field? then
                 return;
             fi
 
             _frame = frame;
-            _spill_field = frame.declare_anonymous_field("spill", value_type);
+            _spill_field = spill_field;
         si
 
         is_spilling: bool => _spill_field?;
@@ -221,9 +220,7 @@ namespace Syntax.Process is
             let spill = _spill_field;
 
             if spill? then
-                _gen.add(IR.RAW("ldarg.0"));
-                _gen.add(value);
-                _gen.add("stfld {spill.get_il_reference()}");
+                _gen.add(_gen._build_frame_field_store(_frame!, spill, value));
             else
                 _gen.add(value);
             fi
@@ -271,7 +268,6 @@ namespace Syntax.Process is
     class GENERATE_IL: ScopedVisitor is
         _logger: Logger;
         _symbol_table: Semantic.SYMBOL_TABLE;
-        _int_type: Semantic.Types.NAMED;
         _symbol_loader: Semantic.SYMBOL_LOADER;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
         _function_caller: Semantic.FUNCTION_CALLER;
@@ -280,14 +276,28 @@ namespace Syntax.Process is
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
 
+        // Read by COMPOSITE_VALUE_SPILLER: an entry is compile-
+        // expressions telling this composite to spill.
+        composite_spill_state: COMPOSITE_SPILL_STORE;
+
         _context: CONTEXT;
         _brancher: BRANCHER;
-        _boilerplate_generator: BOILERPLATE_GENERATOR;
         _boxer: VALUE_BOXER;
         _loops: LOOP_LABEL_STACK;
         _block_context: BlockContext;
 
+        // The `.try` block each catch clause currently being walked is
+        // attached to. A catch is visited on its own, after the block
+        // it guards has closed, so it has no other route to the extent
+        // its region needs.
+        _try_extents: Collections.STACK[Values.TRY_EXTENT];
+
         _il_output_depth: int;
+
+        // Set by an `@entry` pragma, and cleared by the next function the
+        // walk enters - the one the pragma annotates.
+        _entrypoint_pragma_pending: bool;
+
         _in_catch_variable: bool;
 
         _indent: int;
@@ -373,14 +383,12 @@ namespace Syntax.Process is
             context: CONTEXT,
             block_context: BlockContext,
             brancher: BRANCHER,
-            boilerplate_generator: BOILERPLATE_GENERATOR,
             boxer: VALUE_BOXER,
-            build_flags: Compiler.GLOBAL_BUILD_FLAGS
+            build_flags: Compiler.GLOBAL_BUILD_FLAGS,
+            composite_spill_state: COMPOSITE_SPILL_STORE
         )
         is
             super.init(logger, symbol_table, namespaces);
-
-            _globals_carriers_marked = Collections.SET[string]();
 
             _logger = logger;
             _symbol_table = symbol_table;
@@ -393,11 +401,12 @@ namespace Syntax.Process is
             _context = context;
             _block_context = block_context;
             _brancher = brancher;
-            _boilerplate_generator = boilerplate_generator;
             _boxer = boxer;
             _build_flags = build_flags;
+            self.composite_spill_state = composite_spill_state;
 
             _loops = LOOP_LABEL_STACK();
+            _try_extents = Collections.STACK[Values.TRY_EXTENT]();
             _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
             _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
             _async_dispatch_stack = Collections.LIST[ASYNC_DISPATCH_HOLDER]();
@@ -528,6 +537,13 @@ namespace Syntax.Process is
             ADDRESS.reset_id();
             TEMP.reset_id();
             LABEL.reset_id();
+
+            // A body that fails to emit unwinds to `Classy.walk`, which
+            // restores the symbol table and the diagnostics but knows
+            // nothing about emission state. Without this the abandoned
+            // body emitter is still installed when the next class opens,
+            // and everything that class emits is reported against it.
+            _context.current_srm_body_emitter = null;
         si
 
         leave_class(symbol: Semantic.Symbols.Classy) is
@@ -542,36 +558,6 @@ namespace Syntax.Process is
             println(buffer);
 
             println("{{");
-        si
-
-        // Namespaces whose carrier has already carried the marker attribute in
-        // this compilation. ilasm merges the repeated `.class` blocks for one
-        // name, so the attribute is emitted on the first block only.
-        _globals_carriers_marked: Collections.SET[string];
-
-        // Open/close a `.class 'NS'.'$globals' { ... }` wrapper around a single
-        // global function/property/variable definition. Multiple wrappers for
-        // the same class get merged by ilasm (partial class definitions).
-        gen_globals_class_open(`namespace: Semantic.Symbols.NAMESPACE) is
-            let header = System.Text.StringBuilder();
-            header.append(".class public abstract auto ansi sealed ");
-            `namespace.gen_globals_class_reference(header, null);
-            header.append(" extends [System.Runtime]System.Object");
-
-            println(header);
-            println("{{");
-            _context.indent();
-
-            if !_globals_carriers_marked.contains(`namespace.qualified_name) then
-                _globals_carriers_marked.add(`namespace.qualified_name);
-
-                println(".custom instance void ['ghul-runtime']{Semantic.DotNet.GLOBALS_CARRIER.attribute_name}::.ctor() = ( 01 00 00 00 )");
-            fi
-        si
-
-        gen_globals_class_close() is
-            _context.outdent();
-            println("}}");
         si
 
         pre(`namespace: Definitions.NAMESPACE) -> bool => super.pre(`namespace);
@@ -616,24 +602,6 @@ namespace Syntax.Process is
             return false;
         si
 
-        // Every attribute a function definition carries, in the one
-        // order ILASM accepts: a `.custom` binds to the target named by
-        // the most recent `.param [N]` directive, so each method-level
-        // attribute has to be written before any per-slot directive or
-        // it silently lands on that parameter instead of on the method.
-        gen_function_attributes(symbol: Semantic.Symbols.Symbol) is
-            gen_purity_attributes(symbol);
-            gen_custom_attributes(symbol);
-
-            gen_tuple_element_name_attributes(symbol);
-            gen_nullability_attributes(symbol);
-            gen_purity_param_attributes(symbol);
-
-            if let function: Semantic.Symbols.Function = symbol then
-                function.gen_argument_custom_attributes(_context);
-            fi
-        si
-
         // Emit a `.custom` directive for each attribute pragma resolved
         // onto this symbol. The caller has already opened the type / method
         // and indented, so the directive lands inside it.
@@ -654,8 +622,6 @@ namespace Syntax.Process is
 
             gen_delegates(closures);
 
-            gen_ienumerable_boilerplate(symbol);
-            gen_ienumerator_boilerplate(symbol);
 
             _context.outdent();
             println("}}");
@@ -670,11 +636,12 @@ namespace Syntax.Process is
             emit_pending_state_machines();
         si
 
-        // A `partial` block emits its members inside a fresh `.class Target { … }`
-        // wrapper; ilasm merges same-named class blocks into one type. The class
-        // header (extends/implements/attributes) is the primary definition's job,
-        // so this only re-opens the type for its members; closures declared here
-        // are emitted by visit(partial), after their bodies are walked.
+        // A `partial` block contributes members to a type declared
+        // elsewhere; the member order collects them onto that type's one
+        // row. The class header (extends/implements/attributes) is the primary
+        // definition's job, so this only walks the block's members; closures
+        // declared here are emitted by visit(partial), after their bodies are
+        // walked.
         pre(`partial: Definitions.PARTIAL) -> bool is
             let symbol = cast Semantic.Symbols.Classy?(symbol_for(`partial))!;
 
@@ -714,10 +681,10 @@ namespace Syntax.Process is
             emit_pending_state_machines();
         si
 
-        // An `impl` block emits its members inside a fresh `.class Target { … }`
-        // wrapper, exactly like `partial`; ilasm merges same-named class blocks.
-        // The interface the target now implements is carried on the target
-        // symbol, so its `implements` clause is emitted by the primary definition.
+        // An `impl` block contributes members to its target exactly as
+        // `partial` does. The interface the target now implements is carried on
+        // the target symbol, so the InterfaceImpl row is written from the
+        // primary definition.
         pre(`impl: Definitions.IMPL) -> bool is
             let symbol = cast Semantic.Symbols.Classy?(symbol_for(`impl))!;
 
@@ -815,8 +782,6 @@ namespace Syntax.Process is
 
             let closures = symbol.get_closures();
 
-            gen_ienumerable_boilerplate(symbol);
-            gen_ienumerator_boilerplate(symbol);
             gen_anon_functions(closures);
 
             _context.outdent();
@@ -859,8 +824,6 @@ namespace Syntax.Process is
 
             _context.indent();
 
-            gen_ienumerable_boilerplate(symbol);
-            gen_ienumerator_boilerplate(symbol);
 
             _context.outdent();
             println("}}");
@@ -927,8 +890,6 @@ namespace Syntax.Process is
 
             let closures = symbol.get_closures();
 
-            gen_ienumerable_boilerplate(symbol);
-            gen_ienumerator_boilerplate(symbol);
             gen_unit_variant_singleton(symbol);
             gen_anon_functions(closures);
 
@@ -954,38 +915,39 @@ namespace Syntax.Process is
                     return;
                 fi
 
-                let ref_buffer = StringBuilder();
-                variant_symbol.gen_reference(ref_buffer);
-                let variant_ref = ref_buffer.to_string();
-
-                println(".field public static {variant_ref}'_instance'");
-                println(".method private hidebysig specialname rtspecialname static default void '.cctor'() cil managed");
-                println("{{");
-                _context.indent();
-                println(".maxstack 1");
-                println("newobj instance void {variant_ref}::'.ctor'()");
-                println("stsfld {variant_ref}{variant_ref}::'_instance'");
-                println("ret");
-                _context.outdent();
-                println("}}");
+                _gen_unit_variant_singleton_srm(variant_symbol);
             fi
         si
 
-        gen_ienumerable_boilerplate(symbol: Semantic.Symbols.Classy) is            
-            if symbol.is_derived_from_iterable_trait then
-                // FIXME: check if class implements these methods and don't emit them if they're not needed:
+        // The rows for the field and this initializer are written by the
+        // structure walk, which cannot encode a body; the body is
+        // deposited here, in the pass that encodes every other body.
+        _gen_unit_variant_singleton_srm(variant: Semantic.Symbols.VARIANT) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let handles = assembly_emitter.handles;
 
-                _boilerplate_generator.gen("ienumerable-boilerplate");
-            fi            
+            let instance = handles.unit_variant_instance(variant);
+
+            if !instance? then
+                return;
+            fi
+
+            let constructors = cast Semantic.Symbols.FUNCTION_GROUP?(variant.find_direct("init"));
+
+            if !constructors? \/ constructors.functions.count == 0 then
+                return;
+            fi
+
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            body.new_object(_context.resolve_call_target(constructors.functions[0]));
+            body.stsfld(_context.resolve_unit_variant_instance(variant));
+            body.ret();
+
+            handles.set_unit_variant_initializer_body(variant, body.flush(assembly_emitter));
         si
+
         
-        gen_ienumerator_boilerplate(symbol: Semantic.Symbols.Classy) is            
-            if symbol.is_derived_from_iterator_trait then
-                // FIXME: check if class implements these methods and don't emit them if they're not needed:
-
-                _boilerplate_generator.gen("ienumerator-boilerplate");
-            fi
-        si
 
         gen_delegates(closures: Collections.Iterable[Semantic.Symbols.Closure]?) is
             if !closures? then
@@ -1037,30 +999,22 @@ namespace Syntax.Process is
         si
 
         // Emit the static cache field backing a memoized stateless
-        // delegate. A static/global anonymous function caches on the
-        // enclosing namespace's `$globals` class, emitted in its own
-        // `$globals` wrapper (ilasm merges them); a stateless instance-
-        // context delegate caches on its enclosing class, whose block is
-        // already open at the call site, so the field is emitted directly.
-        // Keyed on the load site having actually referenced the field, so
-        // definition and frozen load-site IL can't disagree.
+        // delegate. A static or global anonymous function caches on the
+        // enclosing namespace's globals carrier and a stateless
+        // instance-context one on its enclosing class; the field names
+        // its own owner, so both are emitted the same way.
+        //
+        // Keyed on the load site having actually referenced the field,
+        // so definition and frozen load-site IL can't disagree.
         gen_delegate_cache_field(closure: Semantic.Symbols.Closure) is
             if !closure.has_delegate_cache_field then
                 return;
             fi
 
-            let `field = closure.delegate_cache_field;
-
             let field_definition = StringBuilder();
-            `field.gen_definition_header(field_definition);
+            closure.delegate_cache_field.gen_definition_header(field_definition);
 
-            if let owner_namespace: Semantic.Symbols.NAMESPACE = `field.owner then
-                gen_globals_class_open(owner_namespace);
-                _context.write_line(field_definition);
-                gen_globals_class_close();
-            else
-                _context.write_line(field_definition);
-            fi
+            _context.write_line(field_definition);
         si
 
         gen_closures(closures: Collections.Iterable[Semantic.Symbols.Closure]?) is
@@ -1116,6 +1070,11 @@ namespace Syntax.Process is
             // Reset implementations). The split is handled by the
             // gen-generator-function path so the rest of generate_il
             // doesn't need to know.
+            //
+            // Both branches come before ordinary function emission,
+            // because a state machine is a shape rather than a body:
+            // the expansion has to happen before any of the pieces it
+            // produces can be emitted.
             let state_machine = Semantic.Symbols.state_machine_for(cast Semantic.Symbols.Function?(symbol)!);
 
             if state_machine? then
@@ -1129,139 +1088,77 @@ namespace Syntax.Process is
                 return _pre_async_function(function, cast Semantic.Symbols.Function?(symbol)!, async_sm);
             fi
 
-            if let global_function: Semantic.Symbols.GLOBAL_FUNCTION = symbol then
-                gen_globals_class_open(cast Semantic.Symbols.NAMESPACE?(global_function.owner)!);
+            return _pre_function_srm(function, cast Semantic.Symbols.Function?(symbol)!);
+        si
+
+        // Emission for every function the assembly defines. The
+        // structure walk has already
+        // reserved this function's MethodDef row and will write it once
+        // the walk is done, so nothing here touches metadata: the body
+        // is encoded into its own buffer and its offset left against
+        // the symbol.
+        _pre_function_srm(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function) -> bool is
+            // A declaration with no body - an abstract method, or a
+            // trait member left to its implementors - has nothing to
+            // encode, and its row is marked abstract rather than
+            // pointed at an empty body.
+            if symbol.is_abstract then
+                return true;
             fi
-
-            println_comment("define {symbol.description}");
-
-            let buffer = System.Text.StringBuilder();
-            symbol.gen_definition_header(buffer);
-            println(buffer);
-
-            println("{{");
-            _context.indent();
-
-            gen_function_attributes(symbol);
 
             enter_scope(function);
 
-            symbol.gen_body_header(_context);
+            _context.current_srm_body_emitter = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            // Entry-point detection is a semantic question, not a
+            // naming rule the emitter can reapply: it accepts a global
+            // function or a static method, checks the signature, and
+            // reports a second candidate.
+            symbol.gen_entrypoint(_context);
+
+            if _entrypoint_pragma_pending then
+                _entrypoint_pragma_pending = false;
+
+                if let emitter = _context.srm_assembly_emitter then
+                    emitter.entry_point_function = symbol;
+                fi
+            fi
 
             enter_block();
+
             return false;
         si
 
-        // Emit TupleElementNamesAttribute on the return and on any
-        // parameter whose type is a flat named tuple, so a C# or ghūl
-        // consumer recovers the element names — the ValueTuple type
-        // alone carries none.
-        gen_tuple_element_name_attributes(symbol: Semantic.Symbols.Symbol) is
-            let function = cast Semantic.Symbols.Function?(symbol);
+        // The tail of `visit(function)` below.
+        _visit_function_srm(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function) is
+            let body_emitter = _context.current_srm_body_emitter!;
+            let assembly_emitter = _context.srm_assembly_emitter;
 
-            if !function? then
-                return;
+            current_block.gen(_context);
+            leave_block();
+
+            // A non-void function ends with a default value loaded
+            // ahead of the trailing `ret`. The
+            // `ret` is unreachable whenever every path already
+            // returned, but unreachable is not the same as unverified:
+            // a method containing a protected region is checked whole,
+            // so a bare `ret` where a value is due is rejected outright
+            // rather than pruned.
+            if
+                let return_type = symbol.return_type
+                /\ return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
+            then
+                Values.DEFAULT_RETURN(return_type).gen(_context);
             fi
 
-            gen_tuple_element_name_attribute(function.return_type!, 0);
+            body_emitter.ret();
 
-            let arguments = function.arguments;
+            assembly_emitter.handles.set_body_offset(symbol, body_emitter.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(symbol, body_emitter.il_outputs);
 
-            for i in 0..arguments.count do
-                gen_tuple_element_name_attribute(arguments[i], i + 1);
-            od
-        si
+            _context.current_srm_body_emitter = null;
 
-        gen_tuple_element_name_attribute(type: Semantic.Types.Type, parameter_index: int) is
-            let line = Semantic.DotNet.TUPLE_ELEMENT_NAMES.gen_attribute_line_for_type(type);
-
-            if !line? then
-                return;
-            fi
-
-            _context.write_line(".param [{parameter_index}]");
-            _context.write_line(line);
-        si
-
-        // Emit `NullableAttribute` on the return slot and on any
-        // parameter whose tree carries a reference-`?` position, so
-        // the annotation survives cross-assembly reflection. The CLR
-        // has no native carrier for reference nullability — `Foo`
-        // and `Foo?` are the same IL type — so the marker rides on a
-        // per-slot custom attribute. ILASM's `.param [N]` attaches
-        // the attribute to parameter `N`; `[0]` is the return. The
-        // attribute's argument is a single byte for a one-position
-        // slot, or a byte[] walking the type tree pre-order for
-        // nested cases (`List[string?]` -> `[1, 2]`).
-        gen_nullability_attributes(symbol: Semantic.Symbols.Symbol) is
-            let function = cast Semantic.Symbols.Function?(symbol);
-
-            if !function? then
-                return;
-            fi
-
-            gen_nullability_param_attribute(function.return_type!, 0);
-
-            let arguments = function.arguments;
-
-            for i in 0..arguments.count do
-                gen_nullability_param_attribute(arguments[i], i + 1);
-            od
-        si
-
-        gen_nullability_param_attribute(type: Semantic.Types.Type, parameter_index: int) is
-            let line = Semantic.DotNet.NULLABILITY.gen_attribute_line_for_type(type);
-
-            if !line? then
-                return;
-            fi
-
-            _context.write_line(".param [{parameter_index}]");
-            _context.write_line("  {line}");
-        si
-
-        // Purity round-trip: the marker on the method carries the
-        // declared-pure contract to importing assemblies; the marker
-        // on a parameter or return slot marks that slot's top-level
-        // function type pure. Nested pure function types do not
-        // round-trip — a slot whose pureness sits inside a generic
-        // argument imports as the plain shape, which is conservative
-        // on both sides.
-        gen_purity_attributes(symbol: Semantic.Symbols.Symbol) is
-            let function = cast Semantic.Symbols.Function?(symbol);
-
-            if !function? then
-                return;
-            fi
-
-            if function.is_declared_pure then
-                _context.write_line(".custom instance void ['ghul-runtime']Ghul.Internal.PURE_ATTRIBUTE::.ctor() = ( 01 00 00 00 )");
-            fi
-        si
-
-        gen_purity_param_attributes(symbol: Semantic.Symbols.Symbol) is
-            let function = cast Semantic.Symbols.Function?(symbol);
-
-            if !function? then
-                return;
-            fi
-
-            gen_pure_param_attribute(function.return_type, 0);
-
-            let arguments = function.arguments;
-
-            for i in 0..arguments.count do
-                gen_pure_param_attribute(arguments[i], i + 1);
-            od
-        si
-
-        gen_pure_param_attribute(type: Semantic.Types.Type?, parameter_index: int) is
-            if !type? \/ !type.is_pure_function then
-                return;
-            fi
-
-            _context.write_line(".param [{parameter_index}]");
-            _context.write_line(".custom instance void ['ghul-runtime']Ghul.Internal.PURE_ATTRIBUTE::.ctor() = ( 01 00 00 00 )");
+            leave_scope(function);
         si
 
         visit(function: Definitions.FUNCTION) is
@@ -1285,36 +1182,10 @@ namespace Syntax.Process is
                 return;
             fi
 
-            _context.reset_line_tracking();
-            current_block.gen(_context);
-            leave_block();
+            let symbol_function = cast Semantic.Symbols.Function?(symbol)!;
 
-            if symbol? /\ isa Semantic.Symbols.Function(symbol) then
-                let function_symbol = symbol;
-
-                if !function_symbol.is_abstract then
-                    if function.body? /\ isa Bodies.NULL(function.body) then
-                        _context.write_line("newobj instance void class [System.Runtime]System.NotImplementedException::'.ctor'()");
-                        _context.write_line("throw");
-                    elif
-                        function_symbol.return_type? /\
-                        function_symbol.return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
-                    then
-                        _context.write_line(".locals init ({function_symbol.return_type!.get_il_type()} '.default')");
-                        _context.write_line("ldloc '.default'");
-                    fi
-
-                    _context.write_line("ret");
-                fi
-            fi
-
-            leave_scope(function);
-
-            _context.outdent();
-            println("}}");
-
-            if isa Semantic.Symbols.GLOBAL_FUNCTION(symbol) then
-                gen_globals_class_close();
+            if !symbol_function.is_abstract then
+                _visit_function_srm(function, symbol_function);
             fi
         si
 
@@ -1346,60 +1217,11 @@ namespace Syntax.Process is
             // newobj reference and the state-machine class itself.
             frame.declare();
 
-            let owner_is_global = isa Semantic.Symbols.GLOBAL_FUNCTION(symbol);
-
-            if owner_is_global then
-                gen_globals_class_open(cast Semantic.Symbols.NAMESPACE?(symbol.owner)!);
-            fi
-
             // --- Outer user-facing method ---
-            println_comment("define {symbol.description}");
-
-            let outer_buffer = StringBuilder();
-            symbol.gen_definition_header(outer_buffer);
-            println(outer_buffer);
-
-            println("{{");
-            _context.indent();
-
-            gen_function_attributes(symbol);
-
-            symbol.gen_body_header(_context);
-
-            _context.write_line(".maxstack 64");
-
-            // Instance generators pass `this` as the first ctor
-            // argument; the .ctor stores it into _outer_self so the
-            // body's `self`/instance-member access can read through
-            // the frame.
-            if frame.outer_self_field? then
-                _context.write_line("ldarg.0");
-            fi
-
-            // Load each user-declared parameter and pass it through
-            // to the state-machine .ctor. The frame's declare() ran
-            // above so the ctor's signature already matches.
-            for arg_name in symbol.argument_names do
-                _context.write_line("ldarg '{arg_name}'");
-            od
-
-            let ctor_reference = _build_specialized_ctor_reference(
-                frame,
-                frame.constructor,
-                state_machine.get_construction_type_arguments(),
-                symbol.location,
-                "while building ctor reference for generator outer method"
-            );
-
-            _context.write_line("newobj {ctor_reference}");
-            _context.write_line("ret");
-
-            _context.outdent();
-            println("}}");
-
-            if owner_is_global then
-                gen_globals_class_close();
-            fi
+            //
+            // Forward this method's own arguments, construct the
+            // frame, return it.
+            _emit_generator_outer_method_srm(symbol, frame, state_machine);
 
             // --- Walk the body into MoveNext's block ---
             //
@@ -1408,12 +1230,12 @@ namespace Syntax.Process is
             // machines` writes it out inside the class definition
             // once the enclosing user class has closed.
             //
-            // For a generic generator, install gen_type_override on
-            // function-T symbols so any IR.Values inside MoveNext
-            // that baked in function-T (callvirt owner types on the
-            // for-each dispatch, locals init for the iterator
-            // current, etc.) emit `!N` (class-level — MoveNext has
-            // no own type params) rather than `!!N`.
+            // For a generic generator, move each function-T symbol to
+            // a class-level position on the frame, so any IR.Values
+            // inside MoveNext that baked in function-T (callvirt owner
+            // types on the for-each dispatch, locals init for the
+            // iterator current, etc.) reach `!N` — MoveNext has no
+            // type parameters of its own — rather than `!!N`.
             state_machine.install_body_emission_overrides();
 
             enter_scope(function);
@@ -1426,7 +1248,7 @@ namespace Syntax.Process is
             // method body. Add it before the dispatch placeholder
             // so the populated dispatch IL lands after the
             // directive at the start of MoveNext.
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             // Cache the state field to a CLR local at MoveNext
             // entry. Every yield keeps it in sync via `dup; stloc;
@@ -1436,8 +1258,8 @@ namespace Syntax.Process is
             // without branching into a protected region from
             // outside (ECMA-335 forbids that, and the previous
             // centralized-dispatch shape had exactly that bug).
-            let state_field_ref = frame.state_field.get_il_reference();
-            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.gen_state'");
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".gen_state");
 
             // Stash the previous generator-yield-return label so
             // nested generator functions (rare) don't trip over
@@ -1457,20 +1279,19 @@ namespace Syntax.Process is
             // Fell-off-end trailer: mark done, return false. Plain
             // `ret` since we're at the MoveNext outer scope (no
             // open `.try`).
-            add("ldarg.0");
-            add("ldc.i4.m1");
-            add("stfld {state_field_ref}");
-            add("ldc.i4.0");
-            add("ret");
+            add(_build_frame_field_store(
+                frame, frame.state_field, Values.INSTRUCTION(ILOpCode.LDC_I4_M1)));
+            add(Values.INSTRUCTION(ILOpCode.LDC_I4_0));
+            add(Values.RET());
 
             // If any yield inside an inner `.try` used the
             // leave-return-true label, emit it now (outside any try)
             // followed by `ldc.i4.1; ret`. Reached only via `leave
             // L:` from inside a protected region.
-            if _current_generator_yield_return_label? then
-                add("{_current_generator_yield_return_label}:");
-                add("ldc.i4.1");
-                add("ret");
+            if let yield_return_label = _current_generator_yield_return_label then
+                add(Values.MARK_LABEL(yield_return_label));
+                add(Values.INSTRUCTION(ILOpCode.LDC_I4_1));
+                add(Values.RET());
             fi
 
             _current_generator_yield_return_label = prev_yield_return;
@@ -1505,33 +1326,111 @@ namespace Syntax.Process is
         // class-T's appear in the signature; for a non-generic frame,
         // just the default ctor's IL reference. Exceptions in lookup
         // are logged and a sentinel returned.
-        _build_specialized_ctor_reference(
+        // A generator's outer method, encoded rather than written. Its
+        // whole body is: forward this method's own arguments, construct
+        // the frame, return it.
+        //
+        // The row is the function's own, so this deposits its offset the
+        // same way an ordinary method body does.
+        _emit_generator_outer_method_srm(
+            symbol: Semantic.Symbols.Function,
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            state_machine: Semantic.Symbols.STATE_MACHINE
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            // An instance generator hands `this` to the frame's
+            // constructor, which stores it into _outer_self so the
+            // body's `self` access can read back through the frame.
+            let slot mut = if symbol.is_emitted_with_receiver then 1 else 0 fi;
+
+            if frame.outer_self_field? then
+                body.ldarg(0);
+            fi
+
+            for i in 0..symbol.argument_names.count do
+                body.ldarg(slot);
+
+                slot = slot + 1;
+            od
+
+            body.new_object(
+                _context.resolve_call_target(
+                    _specialized_frame_constructor(frame, state_machine, symbol.location)));
+
+            body.ret();
+
+            assembly_emitter.handles.set_body_offset(symbol, body.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(symbol, body.il_outputs);
+        si
+
+        // The frame constructor as it must be named from outside: on the
+        // frame's own instantiation when the frame is generic, and on
+        // the frame itself otherwise.
+        _specialized_frame_constructor(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            state_machine: Semantic.Symbols.STATE_MACHINE,
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function =>
+            _specialized_constructor(
+                frame,
+                frame.constructor,
+                state_machine.get_construction_type_arguments(),
+                location);
+
+        // The same, for any frame: a constructed generic's constructor
+        // is a different symbol from the open type's, and only the
+        // constructed one names a type that exists at run time.
+        _specialized_constructor(
             frame: Semantic.Symbols.Classy,
-            default_ctor: Semantic.Symbols.Method,
+            default_constructor: Semantic.Symbols.Function,
             construction_type_args: Collections.List[Semantic.Types.Type]?,
-            location: Source.LOCATION,
-            error_context: string
-        ) -> string is
-            let ctor_reference: string? mut = null;
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function is
+            // With no type arguments there is nothing to specialize
+            // over, and the constructed form would be a second symbol
+            // for the same constructor — one the numbering pass never
+            // saw, so it has no row and gets named as if it were
+            // imported.
+            if !construction_type_args? \/ construction_type_args.count == 0 then
+                return default_constructor;
+            fi
+
+            if let specialized =
+                _specialized_frame_type(frame, construction_type_args, location)
+            then
+                if let function: Semantic.Symbols.Function = specialized.find_member("init") then
+                    return function;
+                fi
+            fi
+
+            return default_constructor;
+        si
+
+        // The outer method of an async function: everything
+        // ASYNC_METHOD_LAUNCH emits, plus the return that hands back the
+        // builder's task.
+        _emit_async_outer_method_srm(
+            symbol: Semantic.Symbols.Function,
+            launch: IR.Values.ASYNC_METHOD_LAUNCH
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
 
             try
-                if let specialized_frame_type = _specialized_frame_type(frame, construction_type_args, location) then
-                    let specialized_ctor_symbol = specialized_frame_type.find_member("init");
+                launch.gen(_context);
 
-                    if let function: Semantic.Symbols.Function = specialized_ctor_symbol then
-                        ctor_reference = function.get_il_reference();
-                    fi
-                fi
+                body.ret();
 
-                if !ctor_reference? then
-                    ctor_reference = default_ctor.get_il_reference();
-                fi
-            catch e: System.Exception
-                _logger.exception(location, e, error_context);
-                ctor_reference = "/* error */";
+                assembly_emitter.handles.set_body_offset(symbol, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(symbol, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
             yrt
-
-            return ctor_reference!;
         si
 
         // The frame type as it must be named in IL: constructed over the
@@ -1567,37 +1466,11 @@ namespace Syntax.Process is
 
             frame.declare();
 
-            let owner_is_global = isa Semantic.Symbols.GLOBAL_FUNCTION(symbol);
-
-            if owner_is_global then
-                gen_globals_class_open(cast Semantic.Symbols.NAMESPACE?(symbol.owner)!);
-            fi
-
-            // --- Outer method ---
-            println_comment("define {symbol.description}");
-
-            let outer_buffer = StringBuilder();
-            symbol.gen_definition_header(outer_buffer);
-            println(outer_buffer);
-
-            println("{{");
-            _context.indent();
-
-            gen_function_attributes(symbol);
-
-            symbol.gen_body_header(_context);
-
-            _context.write_line(".maxstack 64");
-
             let construction_type_args = async_state_machine.get_construction_type_arguments();
 
-            let ctor_reference = _build_specialized_ctor_reference(
-                frame,
-                frame.constructor,
-                construction_type_args,
-                symbol.location,
-                "while building ctor reference for async outer method"
-            );
+            let constructor =
+                _specialized_constructor(
+                    frame, frame.constructor, construction_type_args, symbol.location);
 
             // The local holding the state machine, and the type argument
             // to builder.Start, both name the frame type. A frame in a
@@ -1611,11 +1484,18 @@ namespace Syntax.Process is
             // `ldarg '<name>'`. Build them as a sequence Value so
             // ASYNC_METHOD_LAUNCH composes them in the right order.
             let ctor_args_block = Values.BLOCK();
+
+            // The enclosing method's own arguments, forwarded
+            // positionally: an instance method's receiver occupies slot
+            // 0, so its declared arguments start at 1.
+            let slot mut = if symbol.is_emitted_with_receiver then 1 else 0 fi;
+
             if frame.outer_self_field? then
-                ctor_args_block.add(IR.RAW("ldarg.0"));
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(0, "ldarg.0"));
             fi
             for arg_name in symbol.argument_names do
-                ctor_args_block.add(IR.RAW("ldarg '{arg_name}'"));
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(slot, "ldarg '{arg_name}'"));
+                slot = slot + 1;
             od
             ctor_args_block.close();
 
@@ -1637,24 +1517,16 @@ namespace Syntax.Process is
             let launch = IR.Values.ASYNC_METHOD_LAUNCH(
                 task_type,
                 state_machine_type,
-                ctor_reference,
+                constructor,
                 ctor_args_block,
                 frame.state_field,
                 frame.builder_field!,
                 unspec_builder,
                 unspec_task,
-                "'.sm'"
+                ".sm"
             );
 
-            launch.gen(_context);
-            _context.write_line("ret");
-
-            _context.outdent();
-            println("}}");
-
-            if owner_is_global then
-                gen_globals_class_close();
-            fi
+            _emit_async_outer_method_srm(symbol, launch);
 
             // --- Walk the body into MoveNext's block ---
             async_state_machine.install_body_emission_overrides();
@@ -1665,7 +1537,7 @@ namespace Syntax.Process is
 
             enter_block(move_next_block);
 
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             // Cache the state field to a CLR local at MoveNext entry.
             // Every AWAIT_SUSPEND keeps this local in sync via
@@ -1678,8 +1550,8 @@ namespace Syntax.Process is
             // `leave` from the AwaitUnsafeOnCompleted path fires the
             // finally before exiting), and side effects must be
             // skipped.
-            let state_field_ref = frame.state_field.get_il_reference();
-            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.async_state'");
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".async_state");
 
             // Labels used by the trailer: success fall-through and
             // the end of the wrapping try/catch. The entire MoveNext
@@ -1711,7 +1583,7 @@ namespace Syntax.Process is
 
             // Body fell off the end: leave success_label so the
             // trailer fires.
-            add("leave {success_label}");
+            add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
 
             _current_async_state_machine = prev_async_sm;
             _current_async_success_label = prev_success;
@@ -1762,13 +1634,13 @@ namespace Syntax.Process is
         // generators — and travels with the holder so inner
         // dispatch sites pick it up.
         _open_state_machine_entry(
-            state_field_ref: string,
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            state_field: Semantic.Symbols.Field,
             state_local_il: string
         ) -> ASYNC_DISPATCH_HOLDER is
-            add(".locals init (int32 {state_local_il})");
-            add("ldarg.0");
-            add("ldfld {state_field_ref}");
-            add("stloc {state_local_il}");
+            add(Values.DECLARE_LOCAL(state_local_il, _innate_symbol_lookup.get_int_type()));
+            add(_build_frame_field_load(frame, state_field));
+            add(Values.STORE_TEMP(state_local_il, _innate_symbol_lookup.get_int_type()));
 
             let block = Values.BLOCK();
             add(block);
@@ -1819,17 +1691,6 @@ namespace Syntax.Process is
             return null;
         si
 
-        // Does `node` contain a state-machine suspend (`await` or
-        // `yield`) outside any nested function literal? Drives the
-        // decision in `LIST.visit` / IF / CASE composite handlers
-        // whether to spill their BLOCK value to a frame field.
-        _contains_suspend(node: Trees.Node) -> bool =>
-            val
-                let scanner = Syntax.Process.CONTAINS_SUSPEND_SCANNER();
-                node.walk(scanner);
-                scanner.found
-            lav;
-
         // Build the IR Value that loads from `field` on the current
         // state-machine frame — used as the spilled BLOCK's stand-in
         // value. The consumer that does `add(block)` reads this
@@ -1839,6 +1700,20 @@ namespace Syntax.Process is
             IR.Values.Load.INSTANCE_FIELD(
                 IR.Values.Load.REFERENCE_SELF(frame, frame.type),
                 spill_field
+            );
+
+        // The counterpart store: `value` is emitted between the frame
+        // reference and the `stfld`, so anything that leaves one item
+        // on the stack can stand in for it.
+        _build_frame_field_store(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            `field: Semantic.Symbols.Field,
+            value: IR.Values.Value
+        ) -> IR.Values.Value =>
+            IR.Values.Store.INSTANCE_FIELD(
+                IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                `field,
+                value
             );
 
         // BLOCK-with-suspend spill path for `Statements.LIST` in
@@ -1851,18 +1726,11 @@ namespace Syntax.Process is
         // load. Returns true if the spill path ran (caller skips
         // the ordinary capture path); false otherwise.
         _try_spill_block_with_suspend(list: Statements.LIST) -> bool is
-            // `want_dispose` lists need their `.try` body inside
-            // the protected region — bypass spill and let the
-            // capture path handle it.
-            if list.want_dispose then
-                return false;
-            fi
-
             let spiller = COMPOSITE_VALUE_SPILLER(
                 self,
+                list,
                 list.value,
-                _current_state_machine_frame(),
-                _contains_suspend(list)
+                _current_state_machine_frame()
             );
 
             if !spiller.is_spilling then
@@ -1931,9 +1799,14 @@ namespace Syntax.Process is
             fi
 
             let skip = LABEL();
-            add("ldloc {state_local_il}");
-            add("ldc.i4.0");
-            add("bge {skip}");
+
+            let int_type = _innate_symbol_lookup.get_int_type();
+
+            get_brancher_for_block().branch(
+                BRANCH.GE,
+                Values.Load.TEMP(state_local_il, int_type),
+                Values.Literal.NUMBER(0, int_type),
+                skip);
 
             return skip;
         si
@@ -1984,9 +1857,12 @@ namespace Syntax.Process is
         // region's body, before any user code.
         _populate_async_dispatch(holder: ASYNC_DISPATCH_HOLDER) is
             for entry in holder.entries do
-                holder.block.add("ldloc {holder.state_local_il}");
-                holder.block.add("ldc.i4 {entry.state}");
-                holder.block.add("beq {entry.cold_resume_label}");
+                holder.block.add(
+                    Values.Load.TEMP(holder.state_local_il, _innate_symbol_lookup.get_int_type()));
+                holder.block.add(
+                    Values.Literal.NUMBER(entry.state, _innate_symbol_lookup.get_int_type()));
+                holder.block.add(
+                    Values.BRANCH_TO(ILOpCode.BEQ, entry.cold_resume_label));
             od
         si
 
@@ -2037,187 +1913,163 @@ namespace Syntax.Process is
 
             async_state_machine.install_body_emission_overrides();
 
-            println_comment("define async state-machine class for {async_state_machine.function.description}");
+            try
+                _gen_async_state_machine_ctor_srm(frame);
 
-            let class_buffer = StringBuilder();
-            frame.gen_definition_header(class_buffer);
-            println(class_buffer);
+                _emit_async_frame_member_body_srm(
+                    frame,
+                    IR.Emitter.FrameMember.MOVE_NEXT,
+                    () is
+                        _gen_async_move_next_srm(
+                            frame, move_next_block, success_label, end_label);
+                    si);
 
-            println("{{");
-            _context.indent();
-
-            // Fields.
-            let state_buf = StringBuilder();
-            frame.state_field.gen_definition_header(state_buf);
-            println(state_buf);
-
-            let builder_field = frame.builder_field;
-            if builder_field? then
-                let builder_buf = StringBuilder();
-                builder_field.gen_definition_header(builder_buf);
-                println(builder_buf);
-            fi
-
-            let result_field = frame.result_field;
-            if result_field? then
-                let result_buf = StringBuilder();
-                result_field.gen_definition_header(result_buf);
-                println(result_buf);
-            fi
-
-            let outer_self_field = frame.outer_self_field;
-            if outer_self_field? then
-                let outer_buf = StringBuilder();
-                outer_self_field.gen_definition_header(outer_buf);
-                println(outer_buf);
-            fi
-
-            for arg_field in frame.argument_fields do
-                let arg_buf = StringBuilder();
-                arg_field.gen_definition_header(arg_buf);
-                println(arg_buf);
-            od
-
-            for local_field in frame.local_fields do
-                let local_buf = StringBuilder();
-                local_field.gen_definition_header(local_buf);
-                println(local_buf);
-            od
-
-            for awaiter_field in frame.awaiter_fields do
-                let awaiter_buf = StringBuilder();
-                awaiter_field.gen_definition_header(awaiter_buf);
-                println(awaiter_buf);
-            od
-
-            // .ctor — same shape as the generator's: chain to
-            // Object::.ctor, then store each ctor arg into its frame
-            // field. Builder isn't initialised here; the outer
-            // method's body calls AsyncTaskMethodBuilder.Create()
-            // and stfld's it after newobj.
-            _gen_async_state_machine_ctor(frame);
-
-            // MoveNext — wraps the user's body in try/catch so
-            // exceptions route through builder.SetException.
-            _gen_async_move_next(async_state_machine, move_next_block, success_label, end_label);
-
-            // SetStateMachine — trivial no-op for class-based SM.
-            _boilerplate_generator.gen("async-set-state-machine");
-
-            _context.outdent();
-            println("}}");
-
-            async_state_machine.uninstall_body_emission_overrides();
+                _emit_async_frame_member_body_srm(
+                    frame,
+                    IR.Emitter.FrameMember.SET_STATE_MACHINE,
+                    () is si);
+            finally
+                async_state_machine.uninstall_body_emission_overrides();
+            yrt
         si
 
-        _gen_async_state_machine_ctor(frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME) is
-            let ctor_buf = StringBuilder();
-            frame.constructor.gen_definition_header(ctor_buf);
-            println(ctor_buf);
+        // A synthesised async frame member, encoded into a body of its
+        // own and deposited against the key the structure walk reads.
+        // `emit` writes the body; SetStateMachine's writes nothing,
+        // because the whole of it is the `ret` added here.
+        _emit_async_frame_member_body_srm(
+            frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME,
+            member: IR.Emitter.FrameMember,
+            emit: () -> void
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
 
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 8");
-            _context.write_line("ldarg.0");
-            _context.write_line("call instance void ['System.Runtime']'System'.'Object'::'.ctor'()");
+            _context.current_srm_body_emitter = body;
 
-            let arg_names = frame.constructor.argument_names;
-            let i mut = 0;
+            try
+                emit();
 
-            let outer_self_field = frame.outer_self_field;
-            if outer_self_field? then
-                _context.write_line("ldarg.0");
-                _context.write_line("ldarg '{arg_names[i]}'");
-                _context.write_line("stfld {outer_self_field.get_il_reference()}");
-                i = i + 1;
-            fi
+                body.ret();
 
-            for arg_field in frame.argument_fields do
-                _context.write_line("ldarg.0");
-                _context.write_line("ldarg '{arg_names[i]}'");
-                _context.write_line("stfld {arg_field.get_il_reference()}");
-                i = i + 1;
-            od
-
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+                assembly_emitter.handles.set_frame_member_body(
+                    frame, member, body.flush(assembly_emitter));
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
         si
 
-        _gen_async_move_next(
-            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE,
+        // MoveNext, wrapped in the try/catch that routes an escaping
+        // exception through the builder. The success path falls out of
+        // the region to `success_label`, completes the task, and both
+        // paths meet at `end_label`.
+        _gen_async_move_next_srm(
+            frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME,
             move_next_block: Values.BLOCK,
             success_label: IR.LABEL,
             end_label: IR.LABEL
         ) is
-            let frame = async_state_machine.frame;
-
-            assert frame? else "async state machine has no frame at IL emission";
+            let body = _context.current_srm_body_emitter!;
 
             let builder_field = frame.builder_field!;
+            let builder_type = builder_field.type!;
+            let exception_type = _innate_symbol_lookup.get_exception_type();
 
-            println(".method public final hidebysig newslot virtual instance default void 'MoveNext'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".override class ['System.Runtime']System.Runtime.CompilerServices.IAsyncStateMachine::MoveNext");
+            let state_field = _context.resolve_field_target(frame.state_field);
+            let builder_reference = _context.resolve_field_target(builder_field);
 
-            // Wrap the move_next_block in a try/catch that routes
-            // exceptions through builder.SetException. The success
-            // fall-through path (leave success_label) calls
-            // builder.SetResult and falls through to end_label/ret.
-            _context.write_line(".try {{");
-            _context.indent();
+            let try_start = body.mark_region_boundary();
 
-            _context.reset_line_tracking();
             move_next_block.gen(_context);
 
-            _context.outdent();
-            _context.write_line("}}");
+            let try_end = body.mark_region_boundary();
+            let handler_start = try_end;
 
-            let exception_il = "class ['System.Runtime']System.Exception";
-            _context.write_line("catch {exception_il} {{");
-            _context.indent();
-            _context.write_line(".locals init ({exception_il} '.exception')");
-            _context.write_line("stloc '.exception'");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldc.i4.m1");
-            _context.write_line("stfld {frame.state_field.get_il_reference()}");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldflda {builder_field.get_il_reference()}");
-            _context.write_line("ldloc '.exception'");
-            let builder_il = builder_field.type!.get_il_type();
-            _context.write_line("call instance void {builder_il}::'SetException'({exception_il})");
-            _context.write_line("leave {end_label}");
-            _context.outdent();
-            _context.write_line("}}");
+            body.declare_local(_EXCEPTION_LOCAL, exception_type);
+            body.stloc(_EXCEPTION_LOCAL);
+            body.ldarg(0);
+            body.ldc_i4(-1);
+            body.stfld(state_field);
+            body.ldarg(0);
+            body.ldflda(builder_reference);
+            body.ldloc(_EXCEPTION_LOCAL);
+            body.call(
+                _context.resolve_async_builder_set_exception(builder_type, exception_type));
+            body.branch(System.Reflection.Metadata.ILOpCode.LEAVE, end_label);
 
-            // Success: state = -1; builder.SetResult(<result>).
-            //
-            // `SetResult(T)` on `AsyncTaskMethodBuilder<T>` takes
-            // class-T; the methodref's arg type slot must be `!0`
-            // (open class-T), not the substituted concrete T. The
-            // non-generic `AsyncTaskMethodBuilder`'s SetResult takes
-            // no value-async result and has no class-T issue.
-            _context.write_line("{success_label}:");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldc.i4.m1");
-            _context.write_line("stfld {frame.state_field.get_il_reference()}");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldflda {builder_field.get_il_reference()}");
+            let handler_end = body.mark_region_boundary();
+
+            body.add_catch_region(
+                try_start,
+                try_end,
+                handler_start,
+                handler_end,
+                _context.resolve_type_token(exception_type));
+
+            body.mark_label(success_label);
+            body.ldarg(0);
+            body.ldc_i4(-1);
+            body.stfld(state_field);
+            body.ldarg(0);
+            body.ldflda(builder_reference);
+
             let result_field = frame.result_field;
+
             if result_field? then
-                _context.write_line("ldarg.0");
-                _context.write_line("ldfld {result_field.get_il_reference()}");
-                _context.write_line("call instance void {builder_il}::'SetResult'(!0)");
-            else
-                _context.write_line("call instance void {builder_il}::'SetResult'()");
+                body.ldarg(0);
+                body.ldfld(_context.resolve_field_target(result_field));
             fi
 
-            _context.write_line("{end_label}:");
-            _context.write_line("ret");
+            body.call(_context.resolve_async_builder_set_result(builder_type, result_field?));
 
-            _context.outdent();
-            println("}}");
+            body.mark_label(end_label);
+        si
+
+        _EXCEPTION_LOCAL: string static => ".exception";
+
+        // The frame's constructor: chain to Object, then copy each
+        // constructor argument into the field the lowering declared for
+        // it. The builder is not among them — the outer method creates
+        // it and stores it after the newobj.
+        _gen_async_state_machine_ctor_srm(frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                body.ldarg(0);
+                body.call(_context.resolve_object_constructor());
+
+                let slot mut = 1;
+
+                if let outer_self_field = frame.outer_self_field then
+                    body.ldarg(0);
+                    body.ldarg(slot);
+                    body.stfld(_context.resolve_field_target(outer_self_field));
+
+                    slot = slot + 1;
+                fi
+
+                for arg_field in frame.argument_fields do
+                    body.ldarg(0);
+                    body.ldarg(slot);
+                    body.stfld(_context.resolve_field_target(arg_field));
+
+                    slot = slot + 1;
+                od
+
+                body.ret();
+
+                assembly_emitter.handles.set_body_offset(
+                    frame.constructor, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(
+                    frame.constructor, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
         si
 
         _emit_state_machine_class(state_machine: Semantic.Symbols.STATE_MACHINE, move_next_block: Values.BLOCK) is
@@ -2231,201 +2083,174 @@ namespace Syntax.Process is
             // method.
             state_machine.install_body_emission_overrides();
 
-            println_comment("define state-machine class for {state_machine.function.description}");
-
-            let class_buffer = StringBuilder();
-            frame.gen_definition_header(class_buffer);
-            println(class_buffer);
-
-            println("{{");
-            _context.indent();
-
-            // Fields.
-            let state_buf = StringBuilder();
-            frame.state_field.gen_definition_header(state_buf);
-            println(state_buf);
-
-            let current_buf = StringBuilder();
-            frame.current_field.gen_definition_header(current_buf);
-            println(current_buf);
-
-            let outer_self_field = frame.outer_self_field;
-            if outer_self_field? then
-                let outer_buf = StringBuilder();
-                outer_self_field.gen_definition_header(outer_buf);
-                println(outer_buf);
-            fi
-
-            for arg_field in frame.argument_fields do
-                let arg_buf = StringBuilder();
-                arg_field.gen_definition_header(arg_buf);
-                println(arg_buf);
-            od
-
-            for local_field in frame.local_fields do
-                let local_buf = StringBuilder();
-                local_field.gen_definition_header(local_buf);
-                println(local_buf);
-            od
-
             // .ctor — parameterless, chains to Object::.ctor.
-            _gen_state_machine_ctor(frame);
+            _gen_state_machine_ctor_srm(frame);
 
             // MoveNext — populated during the body walk.
-            println(".method public final hidebysig newslot virtual instance default bool 'MoveNext'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.reset_line_tracking();
-            move_next_block.gen(_context);
-            _context.outdent();
-            println("}}");
+            _emit_frame_member_body_srm(
+                frame, IR.Emitter.FrameMember.MOVE_NEXT, move_next_block);
 
             // Other Iterator[T] / IDisposable members.
-            _gen_state_machine_accessors(frame);
-
-            gen_ienumerable_boilerplate(frame);
-            gen_ienumerator_boilerplate(frame);
-
-            _context.outdent();
-            println("}}");
+            _gen_state_machine_accessors_srm(frame);
 
             state_machine.uninstall_body_emission_overrides();
         si
 
-        _gen_state_machine_ctor(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
-            let ctor_buf = StringBuilder();
-            frame.constructor.gen_definition_header(ctor_buf);
-            println(ctor_buf);
+        // A frame member the lowering synthesises, encoded into a body
+        // of its own and deposited against the (frame, member) key the
+        // structure walk reads when it writes the row. There is no
+        // symbol to key on: the member exists only in the emitted
+        // assembly.
+        _emit_frame_member_body_srm(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            member: IR.Emitter.FrameMember,
+            block: Values.BLOCK
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let previous = _context.current_srm_body_emitter;
 
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 8");
-            _context.write_line("ldarg.0");
-            _context.write_line("call instance void ['System.Runtime']'System'.'Object'::'.ctor'()");
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
 
-            // Constructor parameter layout (mirrors what
-            // STATE_MACHINE_FRAME.declare set up):
-            //   [$outer_self,] arg0, arg1, ...
-            // The instance-generator outer method passes `this` as
-            // the leading argument; static / global generators
-            // skip that prefix.
-            let arg_names = frame.constructor.argument_names;
-            let i mut = 0;
+            _context.current_srm_body_emitter = body;
 
-            let outer_self_field = frame.outer_self_field;
-            if outer_self_field? then
-                _context.write_line("ldarg.0");
-                _context.write_line("ldarg '{arg_names[i]}'");
-                _context.write_line("stfld {outer_self_field.get_il_reference()}");
-                i = i + 1;
+            block.gen(_context);
+
+            _context.current_srm_body_emitter = previous;
+
+            assembly_emitter.handles.set_frame_member_body(
+                frame, member, body.flush(assembly_emitter));
+        si
+
+        // The frame's constructor: chain to Object, then copy each
+        // constructor argument into the field the lowering declared for
+        // it. It is a declared symbol with a row of its own, so its body
+        // is deposited the same way any other method's is.
+        _gen_state_machine_ctor_srm(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            body.ldarg(0);
+            body.call(_context.resolve_object_constructor());
+
+            // Argument layout mirrors what STATE_MACHINE_FRAME.declare
+            // set up: [$outer_self,] arg0, arg1, ... The constructor is
+            // an instance method, so its declared arguments start at
+            // slot 1.
+            let slot mut = 1;
+
+            if let outer_self_field = frame.outer_self_field then
+                body.ldarg(0);
+                body.ldarg(slot);
+                body.stfld(_context.resolve_field_target(outer_self_field));
+
+                slot = slot + 1;
             fi
 
-            // Copy each user-parameter ctor argument into its
-            // frame field. Parameter order matches argument_fields
-            // by construction.
             for arg_field in frame.argument_fields do
-                _context.write_line("ldarg.0");
-                _context.write_line("ldarg '{arg_names[i]}'");
-                _context.write_line("stfld {arg_field.get_il_reference()}");
+                body.ldarg(0);
+                body.ldarg(slot);
+                body.stfld(_context.resolve_field_target(arg_field));
 
-                i = i + 1;
+                slot = slot + 1;
             od
 
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            body.ret();
+
+            assembly_emitter.handles.set_body_offset(
+                frame.constructor, body.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(
+                frame.constructor, body.il_outputs);
         si
 
-        _gen_state_machine_accessors(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
-            let element_il = StringBuilder();
-            frame.class_element_type.gen_type(element_il);
-            let element_il_text = element_il.to_string();
 
-            let current_field_ref = frame.current_field.get_il_reference();
+        // The iterator surface every consumer reaches a frame through.
+        // Each body is fixed and small, so they are built here rather
+        // than walked: get_Current reads the current field,
+        // GetEnumerator returns self, Dispose does nothing, Reset zeroes
+        // the state, and ToString joins the pipe.
+        _gen_state_machine_accessors_srm(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let handles = assembly_emitter.handles;
 
-            // get_Current — IEnumerator<T>.get_Current
-            println(".method public final hidebysig newslot virtual specialname instance default {element_il_text} 'get_Current'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 1");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldfld {current_field_ref}");
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            // get_Current — read the current field.
+            let get_current = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            get_current.ldarg(0);
+            get_current.ldfld(_context.resolve_field_target(frame.current_field));
+            get_current.ret();
+            handles.set_frame_member_body(
+                frame,
+                IR.Emitter.FrameMember.GET_CURRENT,
+                get_current.flush(assembly_emitter));
 
-            // GetEnumerator — IEnumerable<T>.GetEnumerator returns
-            // self (we implement IEnumerator<T> directly).
-            println(".method public final hidebysig newslot virtual specialname instance default class ['System.Runtime']'System'.'Collections'.'Generic'.'IEnumerator`1'<{element_il_text}> 'GetEnumerator'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 1");
-            _context.write_line("ldarg.0");
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            // GetEnumerator — the frame implements Iterator[T] itself,
+            // so it is its own enumerator.
+            let get_enumerator = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            get_enumerator.ldarg(0);
+            get_enumerator.ret();
+            handles.set_frame_member_body(
+                frame,
+                IR.Emitter.FrameMember.GET_ENUMERATOR,
+                get_enumerator.flush(assembly_emitter));
 
-            // Dispose — no-op. Known gap: if a generator with
-            // yield inside a try-finally is abandoned mid-flight
-            // (the consumer stops calling MoveNext before
-            // exhaustion), the user's finally body never runs. C#
-            // handles this via per-state finally tables walked by
-            // Dispose(); ghūl would need the same wiring. Until
-            // then, generators that own resources should be
-            // consumed to completion or with an explicit
-            // try/finally at the call site.
-            println(".method public final hidebysig newslot virtual instance default void 'Dispose'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 1");
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            // Dispose — a no-op. A generator abandoned mid-flight does
+            // not run the user's finally bodies.
+            let dispose = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            dispose.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.DISPOSE, dispose.flush(assembly_emitter));
 
-            // Reset — rewind to the initial state. The next MoveNext
-            // re-enters at state 0 and re-runs the body from the top,
-            // which re-initializes the body locals (only the captured
-            // parameters and $outer_self persist). C# throws here
-            // because its consumers re-iterate via a fresh GetEnumerator;
-            // ghūl's pipes rewind via reset(), so a resettable generator
-            // iterator is the consistent choice.
-            println(".method public final hidebysig newslot virtual instance default void 'Reset'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 2");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldc.i4.0");
-            _context.write_line("stfld {frame.state_field.get_il_reference()}");
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            // Reset — rewind to the initial state, so the next MoveNext
+            // re-enters at state 0 and re-runs the body from the top.
+            let reset = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            reset.ldarg(0);
+            reset.ldc_i4(0);
+            reset.stfld(_context.resolve_field_target(frame.state_field));
+            reset.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.RESET, reset.flush(assembly_emitter));
 
-            // to_string — a generator is a Pipe[T], so stringify it the
-            // way every other Pipe does: join the elements. The Pipe
-            // trait's default to_string is a default interface method,
-            // which does not override Object.ToString, so each
-            // implementing class (here, the state machine) must provide
-            // its own ToString — same as ADAPTOR_PIPE / MAP_PIPE / etc.
-            println(".method public virtual hidebysig instance default class ['System.Runtime']'System'.'String' 'ToString'() cil managed");
-            println("{{");
-            _context.indent();
-            _context.write_line(".maxstack 8");
-            _context.write_line("ldarg.0");
-            _context.write_line("ldstr \", \"");
-            _context.write_line("callvirt instance class ['System.Runtime']'System'.'String' class ['ghul-runtime']'Ghul'.'Pipes'.'Pipe'<{element_il_text}>::'join'(class ['System.Runtime']'System'.'String')");
-            _context.write_line("ret");
-            _context.outdent();
-            println("}}");
+            // ToString — a generator is a Pipe[T], so stringify it the
+            // way every other Pipe does. The trait's default is a
+            // default interface method and does not override
+            // Object.ToString, so each implementing class needs its own.
+            let to_string = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            to_string.ldarg(0);
+            to_string.ldstr(assembly_emitter, ", ");
+            to_string.call_virtual(_context.resolve_pipe_join(_pipe_ancestor(frame)));
+            to_string.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.TO_STRING, to_string.flush(assembly_emitter));
         si
+
+        // The frame's own `Pipe[T]`, constructed over the element type
+        // it yields. Read off the frame's ancestors rather than rebuilt,
+        // for the reason `resolve_pipe_join` records.
+        _pipe_ancestor(frame: Semantic.Symbols.STATE_MACHINE_FRAME) -> Semantic.Types.Type is
+            let looked_up = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            assert looked_up? else "Pipe[T] is not available";
+
+            let unspecialized: Semantic.Types.Type = looked_up;
+
+            if let found = frame.find_ancestor(unspecialized) then
+                return found;
+            fi
+
+            assert false else
+                "state-machine frame '{frame.name}' does not implement Pipe[T]";
+
+            return unspecialized;
+        si
+
 
         pre(body: Bodies.BLOCK) -> bool is
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             return super.pre(body);
         si
         
         pre(expression_body: Bodies.EXPRESSION) -> bool is
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             return super.pre(expression_body);            
         si
@@ -2449,116 +2274,15 @@ namespace Syntax.Process is
                 // already terminates control flow. Emit a default-value
                 // trailer so the unreachable fall-off is verifiable,
                 // matching statement-bodied functions that end in throw.
-                add(".locals init ({current_function.return_type!.get_il_type()} '.default')");
-                add("ldloc '.default'");
+                add(Values.DEFAULT_RETURN(current_function.return_type!));
             fi
 
-            add("ret");
+            add(Values.RET());
 
             super.visit(expression_body);
         si
 
         pre(property: Definitions.PROPERTY) -> bool is
-            let symbol = symbol_for(property);
-
-            if !symbol? then
-                return true;
-            fi
-
-            // Property AST node carries either a Property symbol or a Variable
-            // symbol (declare_symbols collapses `_name: T;` to a variable). Both
-            // need wrapping when at namespace scope.
-            let globals_namespace: Semantic.Symbols.NAMESPACE? mut = null;
-
-            if let global_property: Semantic.Symbols.GLOBAL_PROPERTY = symbol then
-                globals_namespace = cast Semantic.Symbols.NAMESPACE?(global_property.owner)!;
-            else
-                if let global_variable: Semantic.Symbols.GLOBAL_VARIABLE = symbol then
-                    globals_namespace = cast Semantic.Symbols.NAMESPACE?(global_variable.owner)!;
-                fi
-            fi
-
-            if globals_namespace? then
-                gen_globals_class_open(globals_namespace);
-            fi
-
-            let buffer = System.Text.StringBuilder();
-            symbol.gen_definition_header(buffer);
-
-            // Attribute directives that must associate with the
-            // just-emitted declaration: NullableAttribute for a slot whose
-            // tree carries a reference-`?` position, plus any attribute
-            // pragmas resolved onto the symbol. Two emission shapes hit
-            // this path:
-            //  - `.property ... { .get .set }` — splice the .custom
-            //    inside the braces (where C# puts it, and where ILASM
-            //    associates it).
-            //  - `.field ... 'name'` (declare_symbols collapsed a
-            //    `_name: T;` declaration to a Variable) — append the
-            //    .custom on a following line; ILASM associates a
-            //    `.custom` immediately after a `.field` with it.
-            let attribute_lines = Collections.LIST[string]();
-
-            let slot_type: Semantic.Types.Type? mut = null;
-
-            if let property_symbol: Semantic.Symbols.Property = symbol then
-                slot_type = property_symbol.type;
-            else
-                if let variable_symbol: Semantic.Symbols.Variable = symbol then
-                    slot_type = variable_symbol.type;
-                fi
-            fi
-
-            if let type = slot_type then
-                let nullable_line = Semantic.DotNet.NULLABILITY.gen_attribute_line_for_type(type);
-
-                if nullable_line? then
-                    attribute_lines.add(nullable_line);
-                fi
-
-                let tuple_names_line = Semantic.DotNet.TUPLE_ELEMENT_NAMES.gen_attribute_line_for_type(type);
-
-                if tuple_names_line? then
-                    attribute_lines.add(tuple_names_line);
-                fi
-            fi
-
-            if symbol.custom_attributes? then
-                for attribute in symbol.custom_attributes do
-                    attribute_lines.add(attribute.gen_il_line());
-                od
-            fi
-
-            if attribute_lines.count > 0 then
-                if isa Semantic.Symbols.Property(symbol) then
-                    let rendered = buffer.to_string();
-                    let close = rendered.last_index_of('}');
-
-                    if close >= 0 then
-                        buffer.clear();
-                        buffer.append(rendered.substring(0, close));
-
-                        for line in attribute_lines do
-                            buffer.append(' ');
-                            buffer.append(line);
-                        od
-
-                        buffer.append(" }}");
-                    fi
-                else
-                    for line in attribute_lines do
-                        buffer.append('\n');
-                        buffer.append(line);
-                    od
-                fi
-            fi
-
-            println(buffer.to_string());
-
-            if globals_namespace? then
-                gen_globals_class_close();
-            fi
-
             return true;
         si
        
@@ -2592,19 +2316,17 @@ namespace Syntax.Process is
                 if is_enter then
                     _il_output_depth = _il_output_depth + 1;
 
+                    // Only a statement inside a body has instructions to
+                    // measure; a pragma on a declaration marks nothing.
                     if _block_context.is_in_block then
                         current_block.add(Values.ENTER_FILE(file_name));
-                    else
-                        _context.enter_file(file_name, false);
                     fi
                 else
                     _il_output_depth = _il_output_depth - 1;
 
                     if _block_context.is_in_block then
                         current_block.add(Values.LEAVE_FILE(file_name));
-                    else
-                        _context.leave_file(file_name);
-                    fi                        
+                    fi
                 fi
             elif name =~ "IL.entrypoint" \/ name =~ "entry" then
                 if is_enter then
@@ -2612,26 +2334,88 @@ namespace Syntax.Process is
                         _logger.error(pragma.location, "duplicate entrypoint");
                     else
                         _context.seen_entrypoint = true;
-                        _context.write_line(".entrypoint");
+
+                        // The pragma is processed before the walk enters
+                        // the function it annotates, so the function to
+                        // mark is not in scope yet and is claimed as the
+                        // walk reaches it.
+                        _entrypoint_pragma_pending = true;
                     fi
                 fi
             elif name =~ "test" then
                 if is_enter then
                     if current_function? then
-                        _boilerplate_generator.gen("test-method");
+                        _gen_test_attribute(true);
                     else
-                        _boilerplate_generator.gen("test-class");
+                        _gen_test_attribute(false);
                     fi
                 fi
             elif name =~ "test_class" then
                 if is_enter then
-                    _boilerplate_generator.gen("test-class");
+                    _gen_test_attribute(false);
                 fi
             elif name =~ "test_method" then
                 if is_enter then
-                    _boilerplate_generator.gen("test-method");
+                    _gen_test_attribute(true);
                 fi
             fi
+        si
+
+        // The attribute a `@test` pragma stands for. Its row needs a
+        // parent handle, which is the enclosing method's or the
+        // enclosing type's depending on which the pragma was written
+        // against.
+        _TEST_FRAMEWORK_ASSEMBLY: string static =>
+            "Microsoft.VisualStudio.TestPlatform.TestFramework";
+
+        _TEST_FRAMEWORK_NAMESPACE: string static =>
+            "Microsoft.VisualStudio.TestTools.UnitTesting";
+
+        _gen_test_attribute(on_method: bool) is
+            let handles = _context.srm_assembly_emitter.handles;
+
+            let parent: System.Reflection.Metadata.EntityHandle mut;
+
+            if on_method then
+                // `@test_method` reaches here whatever it was written
+                // against, so there may be no enclosing function to hang
+                // the attribute on. There is then nothing to name as
+                // the row's parent, so it is left off rather than
+                // faulting.
+                let function = current_function;
+
+                if !function? then
+                    return;
+                fi
+
+                let method = handles.method_definition(function);
+
+                if !method? then
+                    return;
+                fi
+
+                parent = cast System.Reflection.Metadata.EntityHandle(method!);
+            else
+                let owner = _symbol_table.current_instance_context;
+
+                if !owner? then
+                    return;
+                fi
+
+                let type = handles.type_definition(owner);
+
+                if !type? then
+                    return;
+                fi
+
+                parent = cast System.Reflection.Metadata.EntityHandle(type!);
+            fi
+
+            _context.attach_no_argument_attribute(
+                parent,
+                _TEST_FRAMEWORK_ASSEMBLY,
+                _TEST_FRAMEWORK_NAMESPACE,
+                if on_method then "TestMethodAttribute" else "TestClassAttribute" fi);
         si
 
         pre(function: Trees.Expressions.FUNCTION) -> bool is
@@ -2679,7 +2463,7 @@ namespace Syntax.Process is
             // visit. (See error.ghul:30-34 for the underlying rule.)
             if closure.return_type? /\ closure.return_type.is_error then
                 _logger.error(function.location, "cannot infer return type here");
-                add("ret");
+                add(Values.RET());
                 _context.enter_buffer(false);
                 _context.reset_line_tracking();
                 current_block.gen(_context);
@@ -2690,6 +2474,17 @@ namespace Syntax.Process is
                 return;
             fi
 
+            // The closure's body is encoded into a method body of its
+            // own. The enclosing method is mid-encode, so its emitter
+            // is set aside for the duration and restored after: the
+            // two bodies are separate, and the instructions of one
+            // must not land in the other.
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body_emitter = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body_emitter;
+
             _gen_closure_destructure_prologue(function, closure);
 
             function.body.walk(self);
@@ -2698,24 +2493,21 @@ namespace Syntax.Process is
                 closure.return_type? /\
                 closure.return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
             then
-                add(".locals init ({closure.return_type!.get_il_type()} '.default')");
-                add("ldloc '.default'");
+                add(Values.DEFAULT_RETURN(closure.return_type!));
             fi
 
-            add("// end IL body {closure}");
+            add(Values.RET());
 
-            add("ret");
-
-            _context.enter_buffer(false);
-
-            _context.reset_line_tracking();
             current_block.gen(_context);
 
             leave_block();
 
-            let body_assembler = _context.leave_buffer();
+            assembly_emitter.handles.set_body_offset(
+                closure, body_emitter.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(
+                closure, body_emitter.il_outputs);
 
-            closure.il_body = body_assembler;
+            _context.current_srm_body_emitter = enclosing;
 
             super.visit(function);
 
@@ -2747,7 +2539,7 @@ namespace Syntax.Process is
                 for name in left.names! do
                     let leaf = closure.find_direct(name.name);
 
-                    if leaf? then
+                    if leaf? /\ !_declare_local(leaf) then
                         leaf.gen_definition_header(buffer);
                     fi
                 od
@@ -2794,14 +2586,14 @@ namespace Syntax.Process is
 
             enter_block(move_next_block);
 
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             // Same V_state caching + per-region dispatch pattern as
             // `_pre_async_function` (see its commentary). Awaits in
             // the closure body register with the outer holder unless
             // an inner `.try` pushes its own.
-            let state_field_ref = frame.state_field.get_il_reference();
-            let outer_dispatch_holder = _open_state_machine_entry(state_field_ref, "'.async_state'");
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".async_state");
 
             let success_label = IR.LABEL();
             let end_label = IR.LABEL();
@@ -2815,7 +2607,7 @@ namespace Syntax.Process is
 
             function.body.walk(self);
 
-            add("leave {success_label}");
+            add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
 
             _current_async_state_machine = prev_async_sm;
             _current_async_success_label = prev_success;
@@ -2830,17 +2622,13 @@ namespace Syntax.Process is
 
             // --- Build launch IL into closure.il_body ---
             enter_block();
-            add(".maxstack 64");
+            add(Values.MAX_STACK(64));
 
             let construction_type_args = async_state_machine.get_construction_type_arguments();
 
-            let ctor_reference = _build_specialized_ctor_reference(
-                frame,
-                frame.constructor,
-                construction_type_args,
-                function.location,
-                "while building ctor reference for async closure"
-            );
+            let constructor =
+                _specialized_constructor(
+                    frame, frame.constructor, construction_type_args, function.location);
 
             let state_machine_type =
                 _specialized_frame_type(frame, construction_type_args, function.location) ?? frame.type!;
@@ -2849,11 +2637,17 @@ namespace Syntax.Process is
             // closure-frame instance, which holds captures), then
             // each user-declared lambda parameter via ldarg '<name>'.
             let ctor_args_block = Values.BLOCK();
+
+            // As above: the closure's receiver, when it has one, takes
+            // slot 0 and its declared parameters follow.
+            let slot mut = if closure.is_emitted_with_receiver then 1 else 0 fi;
+
             if frame.outer_self_field? then
-                ctor_args_block.add(IR.RAW("ldarg.0"));
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(0, "ldarg.0"));
             fi
             for arg_name in closure.argument_names do
-                ctor_args_block.add(IR.RAW("ldarg '{arg_name}'"));
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(slot, "ldarg '{arg_name}'"));
+                slot = slot + 1;
             od
             ctor_args_block.close();
 
@@ -2869,23 +2663,40 @@ namespace Syntax.Process is
             let launch = IR.Values.ASYNC_METHOD_LAUNCH(
                 task_type,
                 state_machine_type,
-                ctor_reference,
+                constructor,
                 ctor_args_block,
                 frame.state_field,
                 frame.builder_field!,
                 unspec_builder,
                 unspec_task,
-                "'.sm'"
+                ".sm"
             );
 
             add(launch);
-            add("ret");
+            add(Values.RET());
 
-            _context.enter_buffer(false);
-            _context.reset_line_tracking();
-            current_block.gen(_context);
+            // The launch is the closure's own method body, not part of
+            // whatever is being emitted around the literal, so it needs
+            // a body emitter of its own or it lands in the enclosing
+            // method.
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                current_block.gen(_context);
+
+                assembly_emitter.handles.set_body_offset(
+                    closure, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(
+                    closure, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
+
             leave_block();
-            closure.il_body = _context.leave_buffer();
 
             _pending_async_state_machines.add(
                 PENDING_ASYNC_STATE_MACHINE(
@@ -2946,9 +2757,9 @@ namespace Syntax.Process is
             // holding just a `ldfld` so consumers see a clean load.
             let spiller = COMPOSITE_VALUE_SPILLER(
                 self,
+                block,
                 block.value,
-                _current_state_machine_frame(),
-                _contains_suspend(block)
+                _current_state_machine_frame()
             );
 
             spiller.enter();
@@ -2971,12 +2782,11 @@ namespace Syntax.Process is
                 frame_il.spill_field = spiller.spill_field;
 
                 // Eagerly allocate the capture-mode cross-try TEMP
-                // so its `.locals init` appears at the head of
-                // value_block's IL stream, before any inner `.try`
-                // the body might open. ilasm scopes locals
-                // declared inside `.try {}` to that block; lazy
-                // allocation mid-body would leave the post-body
-                // ldloc without a visible declaration. The TEMP is
+                // so its declaration is encoded at the head of
+                // value_block rather than somewhere inside the
+                // body: lazy allocation mid-body would leave the
+                // post-body load of it reaching a slot that has
+                // not been declared yet. The TEMP is
                 // unused (and the join block un-emitted) when no
                 // val-targeted return crosses an inner try — set
                 // `cross_try_used` then drives the post-body
@@ -3087,7 +2897,7 @@ namespace Syntax.Process is
             if !operand_type? then return; fi
 
             let suspend =
-                _build_await_suspend(operand_value, operand_type);
+                _build_await_suspend(operand_value, operand_type, `await.awaiter_field);
 
             if !suspend? then
                 return;
@@ -3097,18 +2907,17 @@ namespace Syntax.Process is
 
             assert frame? else "async state machine has no frame at await emission";
 
-            let result_type = await_wrapper.type;
-
-            assert result_type? else "await wrapper has no result type at IL generation";
-
             let suspend_type = suspend.type;
 
             if !suspend_type.is_void then
+                let result_field = `await.result_field;
+
+                assert result_field? else "await has no result field at IL generation";
+
                 let result_temp = TEMP(current_block, "await_bridge", suspend);
-                let result_field = frame.declare_spill_field(result_type);
-                add(IR.RAW("ldarg.0"));
-                add(result_temp.load());
-                add("stfld {result_field.get_il_reference()}");
+
+                add(_build_frame_field_store(frame, result_field, result_temp.load()));
+
                 await_wrapper.value =
                     IR.Values.Load.INSTANCE_FIELD(
                         IR.Values.Load.REFERENCE_SELF(frame, frame.type),
@@ -3146,18 +2955,16 @@ namespace Syntax.Process is
 
             let operand_value = spill.operand.value;
             if !operand_value? then return; fi
-            let spill_type = operand_value.type;
-            if !spill_type? then return; fi
 
             let frame = casm.frame;
 
             assert frame? else "async state machine has no frame at spill emission";
 
-            let spill_field = frame.declare_spill_field(spill_type);
+            let spill_field = spill.spill_field;
 
-            add(IR.RAW("ldarg.0"));
-            add(operand_value);
-            add("stfld {spill_field.get_il_reference()}");
+            assert spill_field? else "spill has no frame field at IL generation";
+
+            add(_build_frame_field_store(frame, spill_field, operand_value));
 
             spill_wrapper.value =
                 IR.Values.Load.INSTANCE_FIELD(
@@ -3218,12 +3025,27 @@ namespace Syntax.Process is
                     fi
 
                     if !is_void then
-                        add("pop");
+                        add(Values.INSTRUCTION(ILOpCode.POP));
                     fi
                 fi
             catch e: System.Exception
                 _logger.exception(expression.location, e, "caught exception generating IL for expression");
             yrt
+        si
+
+        // A local's declaration is a slot in the body's signature, so
+        // it is only a local at all inside a block. Answers whether
+        // the symbol was taken as one.
+        _declare_local(symbol: Semantic.Symbols.Symbol?) -> bool is
+            if !_block_context.is_in_block then
+                return false;
+            fi
+
+            if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol /\ local.type? then
+                current_block.add(Values.DECLARE_LOCAL(local.il_name, local.storage_type!));
+            fi
+
+            return true;
         si
 
         pre(variable: Variables.VARIABLE) -> bool is
@@ -3256,60 +3078,18 @@ namespace Syntax.Process is
                 fi
             fi
 
-            let buffer = System.Text.StringBuilder();
-            let globals_namespace: Semantic.Symbols.NAMESPACE? mut = null;
-
-            for name in variable.names do
-                let symbol = find(name);
-
-                if !symbol? then
-                    continue;
-                fi
-
-                let global_variable = cast Semantic.Symbols.GLOBAL_VARIABLE?(symbol);
-
-                if global_variable? /\ !globals_namespace? then
-                    globals_namespace = cast Semantic.Symbols.NAMESPACE?(global_variable.owner)!;
-                fi
-
-                symbol.gen_definition_header(buffer);
-
-                // For a field whose tree carries a reference-`?`
-                // position, attach NullableAttribute to the just-
-                // emitted .field directive so reflection recovers the
-                // annotation. ILASM associates a `.custom` line that
-                // immediately follows a `.field` with that field; the
-                // leading `\n` keeps the directive on its own line.
-                // Local variables and parameters don't reach here
-                // (the AST node is only used at namespace/class scope
-                // for field-shaped declarations).
-                let field_symbol = cast Semantic.Symbols.Field?(symbol);
-
-                if field_symbol? then
-                    let line = Semantic.DotNet.NULLABILITY.gen_attribute_line_for_type(field_symbol.type!);
-
-                    if line? then
-                        buffer.append('\n');
-                        buffer.append(line);
-                    fi
-                fi
-            od
-
-            if buffer.length > 0 then
-                if _block_context.is_in_block then
-                    current_block.add(buffer.to_string());
-                else
-                    if globals_namespace? then
-                        gen_globals_class_open(globals_namespace);
-                    fi
-
-                    println(buffer.to_string());
-
-                    if globals_namespace? then
-                        gen_globals_class_close();
-                    fi
-                fi
+            // A local's declaration is a value in the block: metadata
+            // has no `.locals init` directive, and the slot it
+            // allocates has to be in place before any load of the
+            // same name is encoded. A declaration at namespace or
+            // class scope is a field, whose row the structure walk
+            // writes, so nothing is emitted for one here.
+            if _block_context.is_in_block then
+                for name in variable.names do
+                    _declare_local(find(name));
+                od
             fi
+
             return false;
         si
         
@@ -3414,25 +3194,11 @@ namespace Syntax.Process is
                 fi
             fi
 
-            let buffer = System.Text.StringBuilder();
-
             for c in rb.clauses do
-                let pattern = c.pattern;
-
-                for name in pattern.names! do
-                    let symbol = find(name);
-
-                    if !symbol? then
-                        continue;
-                    fi
-
-                    symbol.gen_definition_header(buffer);
+                for name in c.pattern.names! do
+                    _declare_local(find(name));
                 od
             od
-
-            if buffer.length > 0 /\ _block_context.is_in_block then
-                current_block.add(buffer.to_string());
-            fi
 
             return false;
         si
@@ -3658,13 +3424,11 @@ namespace Syntax.Process is
                                 expr_value,
                                 class_result_type
                             );
-                        add("ldarg.0");
-                        add(boxed_value);
-                        add("stfld {result_field.get_il_reference()}");
+                        add(_build_frame_field_store(frame, result_field, boxed_value));
                     fi
                 fi
 
-                add("leave {success_label}");
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
                 return;
             fi
 
@@ -3709,7 +3473,7 @@ namespace Syntax.Process is
                     current_try.return_value!.store(value);
                 fi
 
-                current_try.return_needed!.store(Literal.NUMBER("1", _innate_symbol_lookup.get_bool_type(), "i4"));
+                current_try.return_needed!.store(Literal.NUMBER(1, _innate_symbol_lookup.get_bool_type()));
 
                 let brancher = get_brancher_for_block();
 
@@ -3723,7 +3487,7 @@ namespace Syntax.Process is
                     add(value);
                 fi
 
-                add("ret");
+                add(Values.RET());
             fi
         si
 
@@ -3803,11 +3567,15 @@ namespace Syntax.Process is
                 // and `br` are both valid; use `leave` only when
                 // crossing an inner try (where `br` would be
                 // invalid IL).
-                add(IR.RAW("ldarg.0"));
+                let stored = Values.BLOCK();
+
                 if let v = value then
-                    add(v);
+                    stored.add(v);
                 fi
-                add("stfld {spill_field.get_il_reference()}");
+
+                add(
+                    _build_frame_field_store(
+                        _current_state_machine_frame()!, spill_field, stored));
 
                 if crosses_try then
                     get_brancher_for_block().leave(frame.end_label);
@@ -3882,29 +3650,29 @@ namespace Syntax.Process is
 
             _register_resume_with_dispatch(state, resume);
 
-            let current_field_ref = frame.current_field.get_il_reference();
-            let state_field_ref = frame.state_field.get_il_reference();
-
             // Store yielded value into _current.
-            add("ldarg.0");
+            let current = Values.BLOCK();
 
             if `yield.expression.value? then
-                let value =
+                current.add(
                     _boxer.box_if_needed(
                         `yield.expression.value,
                         frame.element_type
-                    );
-
-                add(value);
+                    )
+                );
             fi
 
-            add("stfld {current_field_ref}");
+            add(_build_frame_field_store(frame, frame.current_field, current));
 
             // Stamp the resumption state — keep the CLR local
             // `'.gen_state'` in sync so state-guarded finally
             // bodies see the suspending value when our `leave`
             // (below) fires them.
-            _emit_state_stamp("ldc.i4 {state}", "'.gen_state'", state_field_ref);
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.Literal.NUMBER(state, _innate_symbol_lookup.get_int_type()),
+                ".gen_state");
 
             // Suspend. From INSIDE an inner `.try`, `ret` is
             // invalid IL; emit `leave` to a shared return-true label
@@ -3914,13 +3682,13 @@ namespace Syntax.Process is
                 if !_current_generator_yield_return_label? then
                     _current_generator_yield_return_label = LABEL();
                 fi
-                add("leave {_current_generator_yield_return_label}");
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, _current_generator_yield_return_label!));
             else
-                add("ldc.i4.1");
-                add("ret");
+                add(Values.INSTRUCTION(ILOpCode.LDC_I4_1));
+                add(Values.RET());
             fi
 
-            add("{resume}:");
+            add(Values.MARK_LABEL(resume));
 
             // Cold-resume cleanup: clear state to -1 (and the local)
             // so a subsequent `leave` (next yield's suspend, or the
@@ -3928,22 +3696,31 @@ namespace Syntax.Process is
             // suspending" sentinel. Without this, the finally body's
             // state guard would still see the previous yield's state
             // and skip cleanup forever.
-            _emit_state_stamp("ldc.i4.m1", "'.gen_state'", state_field_ref);
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.INSTRUCTION(ILOpCode.LDC_I4_M1),
+                ".gen_state");
         si
 
-        // Emit `ldarg.0; <value_load_il>; dup; stloc <state_local_il>;
-        // stfld <state_field_ref>` — write a state value to BOTH the
-        // CLR local cached at MoveNext entry AND the state-machine
-        // frame's state field, so later `leave`s out of `.try` blocks
-        // fire finally bodies that see the correct sentinel via the
-        // local. `value_load_il` is "ldc.i4 N" for a suspend or
-        // "ldc.i4.m1" for the not-suspending sentinel.
-        _emit_state_stamp(value_load_il: string, state_local_il: string, state_field_ref: string) is
-            add("ldarg.0");
-            add(value_load_il);
-            add("dup");
-            add("stloc {state_local_il}");
-            add("stfld {state_field_ref}");
+        // Write a state value to BOTH the CLR local cached at MoveNext
+        // entry AND the state-machine frame's state field, so later
+        // `leave`s out of `.try` blocks fire finally bodies that see
+        // the correct sentinel via the local. `value` loads the state
+        // number for a suspend, or -1 for the not-suspending sentinel.
+        _emit_state_stamp(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            state_field: Semantic.Symbols.Field,
+            value: Values.Value,
+            state_local_il: string
+        ) is
+            let stamped = Values.BLOCK();
+
+            stamped.add(value);
+            stamped.add(Values.INSTRUCTION(ILOpCode.DUP));
+            stamped.add(Values.STORE_TEMP(state_local_il, _innate_symbol_lookup.get_int_type()));
+
+            add(_build_frame_field_store(frame, state_field, stamped));
         si
 
         visit(`throw: Statements.THROW) is
@@ -3955,7 +3732,7 @@ namespace Syntax.Process is
                 )
             );
 
-            add("throw");
+            add(Values.INSTRUCTION(ILOpCode.THROW));
         si
 
         // Build an AWAIT_SUSPEND for `awaited`: allocates a state
@@ -3963,7 +3740,11 @@ namespace Syntax.Process is
         // field, and records the (state, awaiter, label) triple
         // for entry-dispatch population. Returns null when the
         // awaiter type cannot be resolved.
-        _build_await_suspend(awaited: Value, awaited_type: Semantic.Types.Type) -> IR.Values.AWAIT_SUSPEND? is
+        _build_await_suspend(
+            awaited: Value,
+            awaited_type: Semantic.Types.Type,
+            declared_awaiter_field: Semantic.Symbols.Field?
+        ) -> IR.Values.AWAIT_SUSPEND? is
             let async_sm = _current_async_state_machine!;
             let frame = async_sm.frame;
 
@@ -3994,7 +3775,8 @@ namespace Syntax.Process is
             let state = async_sm.allocate_state();
             let cold_resume = IR.LABEL();
             let hot_resume = IR.LABEL();
-            let awaiter_field = frame.declare_awaiter_field(awaiter_type);
+            let awaiter_field =
+                declared_awaiter_field ?? frame.declare_awaiter_field(awaiter_type);
 
             async_sm.record_label(state, awaiter_field, cold_resume);
 
@@ -4057,7 +3839,7 @@ namespace Syntax.Process is
 
                     add(message_value!);
 
-                    add("call string string::Concat(object,object)");
+                    add(Values.CALL_STRING_CONCAT());
                 else
                     add(message_value!);
                     need_exception_wrapper = false;
@@ -4072,10 +3854,10 @@ namespace Syntax.Process is
             fi
 
             if need_exception_wrapper then
-                add("newobj instance void class ['ghul-runtime']Ghul.AssertFailedException::.ctor(class [System.Runtime]System.String)");
+                add(Values.NEW_ASSERT_FAILED_EXCEPTION());
             fi
 
-            add("throw");
+            add(Values.INSTRUCTION(ILOpCode.THROW));
 
             brancher.label(end);
         si
@@ -4171,19 +3953,27 @@ namespace Syntax.Process is
             // state machine.
             let dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
 
+            // The disposal region's own extent. A disposed local is
+            // declared outside it, so that `finally` can still reach
+            // the local after an exception has left the block.
+            let dispose_extent = Values.TRY_EXTENT();
+            let dispose_region = Values.PROTECTED_REGION(dispose_extent, null);
+
             if list.want_dispose then
                 (outer_try, return_needed, return_value) = get_exception_handler_temps();
 
                 for v in list.variables_to_dispose do
-                    let buffer = System.Text.StringBuilder();
-                    v.gen_definition_header(buffer);
+                    if !_declare_local(v) then
+                        let buffer = System.Text.StringBuilder();
+                        v.gen_definition_header(buffer);
 
-                    add(buffer.to_string());
+                        add(buffer.to_string());
+                    fi
                 od
 
                 label = _loops.enter_try(return_needed, return_value);
 
-                add(".try {{ // RAII ");
+                add(Values.TRY_START(dispose_extent));
 
                 dispatch_holder = _maybe_push_dispatch_holder();
             fi
@@ -4214,8 +4004,8 @@ namespace Syntax.Process is
 
                 brancher.leave(try_label.start);
 
-                add("}}");
-                add("finally {{");
+                add(Values.TRY_END(dispose_extent));
+                add(Values.HANDLER_START(dispose_region));
 
                 let skip_dispose_label = _open_finally_state_guard();
 
@@ -4250,8 +4040,8 @@ namespace Syntax.Process is
 
                 brancher.label(try_label.middle);
 
-                add("endfinally");
-                add("}}");
+                add(Values.INSTRUCTION(ILOpCode.ENDFINALLY));
+                add(Values.HANDLER_END(dispose_region));
 
                 _loops.leave_loop();
 
@@ -4404,9 +4194,9 @@ namespace Syntax.Process is
             // directly.
             let spiller = COMPOSITE_VALUE_SPILLER(
                 self,
+                `if,
                 `if.value,
-                _current_state_machine_frame(),
-                _contains_suspend(`if)
+                _current_state_machine_frame()
             );
 
             spiller.enter();
@@ -4526,7 +4316,7 @@ namespace Syntax.Process is
                             expected_type.is_void /\
                             !value.type!.is_void
                         then
-                            add("pop");
+                            add(Values.INSTRUCTION(ILOpCode.POP));
                         fi
                     fi
                 fi
@@ -4557,9 +4347,9 @@ namespace Syntax.Process is
             // exactly when `case.want_value` is true.
             let spiller = COMPOSITE_VALUE_SPILLER(
                 self,
+                `case,
                 `case.value,
-                _current_state_machine_frame(),
-                _contains_suspend(`case)
+                _current_state_machine_frame()
             );
 
             spiller.enter();
@@ -4688,7 +4478,7 @@ namespace Syntax.Process is
                             expected_type.is_void /\
                             !value.type!.is_void
                         then
-                            add("pop");
+                            add(Values.INSTRUCTION(ILOpCode.POP));
                         fi
                     fi
                 fi
@@ -4710,8 +4500,8 @@ namespace Syntax.Process is
                         _innate_symbol_lookup.get_string_type()
                     )
                 );
-                add("newobj instance void class ['ghul-runtime']Ghul.AssertFailedException::.ctor(class [System.Runtime]System.String)");
-                add("throw");
+                add(Values.NEW_ASSERT_FAILED_EXCEPTION());
+                add(Values.INSTRUCTION(ILOpCode.THROW));
             elif `case.want_value /\ `case.requires_default_fallthrough /\ !has_else then
                 // Open-domain case-expression with a defaultable
                 // expected type and no `else` arm — push default(T)
@@ -4783,7 +4573,7 @@ namespace Syntax.Process is
                 fi
 
                 if outer_try.is_in_finally then
-                    outer_try.return_needed!.store(Literal.NUMBER("1", _innate_symbol_lookup.get_bool_type(), "i4"));
+                    outer_try.return_needed!.store(Literal.NUMBER(1, _innate_symbol_lookup.get_bool_type()));
                     brancher.branch(outer_try.middle);
                 else
                     brancher.leave(outer_try.start);
@@ -4806,18 +4596,16 @@ namespace Syntax.Process is
                 let result_field = frame.result_field;
 
                 if return_value? /\ result_field? then
-                    add("ldarg.0");
-                    add(return_value.load());
-                    add("stfld {result_field.get_il_reference()}");
+                    add(_build_frame_field_store(frame, result_field, return_value.load()));
                 fi
 
-                add("leave {_current_async_success_label!}");
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, _current_async_success_label!));
             else
                 if return_value? then
                     add(return_value.load());
                 fi
 
-                add("ret");
+                add(Values.RET());
             fi
 
             brancher.label(label.end);
@@ -4845,15 +4633,29 @@ namespace Syntax.Process is
 
             let need_double_try = `try.catches.count > 0 /\ `try.`finally?;
 
+            // The extent each handler is attached to. With both
+            // catches and a finally the two `.try` blocks are separate
+            // extents, the finally's covering the catches; with only
+            // one kind of handler there is a single block and both
+            // names stand for it.
+            let body_extent = Values.TRY_EXTENT();
+
+            let finally_extent =
+                if need_double_try then
+                    Values.TRY_EXTENT()
+                else
+                    body_extent
+                fi;
+
             let outer_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
             let body_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
 
             if need_double_try then
-                add(".try {{");
+                add(Values.TRY_START(finally_extent));
                 outer_dispatch_holder = _maybe_push_dispatch_holder();
             fi
 
-            add(".try {{");
+            add(Values.TRY_START(body_extent));
 
             body_dispatch_holder = _maybe_push_dispatch_holder();
 
@@ -4863,15 +4665,19 @@ namespace Syntax.Process is
 
             brancher.leave(label.start);
 
-            add("}}");
+            add(Values.TRY_END(body_extent));
+
+            _try_extents.push(body_extent);
 
             for c in `try.catches do
                 c.walk(self);
             od
 
+            _try_extents.pop();
+
             if need_double_try then
                 _maybe_pop_dispatch_holder(outer_dispatch_holder);
-                add("}}");
+                add(Values.TRY_END(finally_extent));
             fi
 
             let `finally = `try.`finally;
@@ -4879,7 +4685,9 @@ namespace Syntax.Process is
             if `finally? then
                 label.is_in_finally = true;
 
-                add("finally {{");
+                let region = Values.PROTECTED_REGION(finally_extent, null);
+
+                add(Values.HANDLER_START(region));
 
                 let skip_finally_label = _open_finally_state_guard();
 
@@ -4889,8 +4697,8 @@ namespace Syntax.Process is
 
                 brancher.label(label.middle);
 
-                add("endfinally");
-                add("}}");
+                add(Values.INSTRUCTION(ILOpCode.ENDFINALLY));
+                add(Values.HANDLER_END(region));
             fi
 
             _loops.leave_loop();
@@ -4910,7 +4718,12 @@ namespace Syntax.Process is
         visit(`catch: Statements.CATCH) is
             let variable = `catch.variable!;
 
-            add("catch {variable.type_expression.type!.get_il_type()} {{");
+            let region =
+                Values.PROTECTED_REGION(
+                    _try_extents.peek(),
+                    variable.type_expression.type!);
+
+            add(Values.HANDLER_START(region));
 
             let brancher = get_brancher_for_block();
 
@@ -4930,22 +4743,29 @@ namespace Syntax.Process is
             // skipped the `.locals init` directive. Route through
             // the frame field via a temp instead.
             if let v: Semantic.Symbols.Variable = symbol, sm_field = v.state_machine_field then
-                let field_ref = sm_field.get_il_reference();
-                let exception_il = variable.type_expression.type!.get_il_type();
-                add(".locals init ({exception_il} '.catch_exc')");
-                add("stloc '.catch_exc'");
-                add("ldarg.0");
-                add("ldloc '.catch_exc'");
-                add("stfld {field_ref}");
+                let exception_type = variable.type_expression.type!;
+                let caught = ".catch_exc";
+
+                add(Values.DECLARE_LOCAL(caught, exception_type));
+                add(Values.STORE_TEMP(caught, exception_type));
+
+                add(
+                    _build_frame_field_store(
+                        cast Semantic.Symbols.STATE_MACHINE_FRAME_BASE(sm_field.owner!),
+                        sm_field,
+                        Values.Load.TEMP(caught, exception_type)));
             else
-                add("stloc {symbol!.get_il_reference()}");
+                add(
+                    Values.STORE_TEMP(
+                        symbol!.il_name,
+                        variable.type_expression.type!));
             fi
 
             `catch.body.walk(self);
 
             brancher.leave(_loops.get_current_try()!.start);
 
-            add("}}");
+            add(Values.HANDLER_END(region));
 
             super.visit(`catch);
         si
@@ -5061,34 +4881,16 @@ namespace Syntax.Process is
 
             variable.walk(self);
 
-            // Generator / async FOR: the iterator value has to
-            // survive every yield / await in the body. Allocate a
-            // frame field and route both load and store through it;
-            // the regular CLR-local TEMP path would reset on every
+            // Generator / async FOR: the iterator value has to survive
+            // every yield / await in the body, so it is read and written
+            // through the frame field compile-expressions allocated for
+            // it. The regular CLR-local TEMP path would reset on every
             // MoveNext re-entry.
-            let sm_for_function = Semantic.Symbols.state_machine_for(current_function);
-            let async_sm_for_function: Semantic.Symbols.ASYNC_STATE_MACHINE? mut = null;
-            if !sm_for_function? then
-                async_sm_for_function = Semantic.Symbols.async_state_machine_for(current_function);
-            fi
+            let iterator_field = `for.iterator_field;
+            let iterator_frame = _current_state_machine_frame();
 
-            let iterator_field: Semantic.Symbols.Field? mut = null;
-            let iterator_frame: Semantic.Symbols.Classy? mut = null;
-
-            if sm_for_function? /\ sm_for_function.frame? /\ iterator.type? then
-                let frame = sm_for_function.frame!;
-                iterator_field = frame.declare_anonymous_field("for_iterator", iterator.type!);
-                iterator_frame = frame;
-            elif async_sm_for_function? /\ async_sm_for_function.frame? /\ iterator.type? then
-                let frame = async_sm_for_function.frame!;
-                iterator_field = frame.declare_anonymous_field("for_iterator", iterator.type!);
-                iterator_frame = frame;
-            fi
-
-            if iterator_field? then
-                add("ldarg.0");
-                add(iterator);
-                add("stfld {iterator_field.get_il_reference()}");
+            if iterator_field? /\ iterator_frame? then
+                add(_build_frame_field_store(iterator_frame, iterator_field, iterator));
             fi
 
             let temp: TEMP? mut = null;
@@ -5162,12 +4964,14 @@ namespace Syntax.Process is
                     stage_delegates.add(null);
                     stage_counters.add(counter);
                 elif stage.is_inlined then
-                    add(".locals init ({stage.param_local!.type!.get_il_type()} {stage.param_local!.il_name})");
+                    add(
+                        Values.DECLARE_LOCAL(
+                            stage.param_local!.il_name, stage.param_local!.storage_type!));
                     stage_delegates.add(null);
                     stage_counters.add(null);
                 elif stage.is_index then
                     let counter = TEMP(current_block, "fused_index", _innate_symbol_lookup.get_int_type());
-                    counter.store(Literal.NUMBER("{stage.index_start}", _innate_symbol_lookup.get_int_type(), "i4"));
+                    counter.store(Literal.NUMBER(stage.index_start, _innate_symbol_lookup.get_int_type()));
                     stage_delegates.add(null);
                     stage_counters.add(counter);
                 else
@@ -5205,11 +5009,11 @@ namespace Syntax.Process is
                     // Decrement the counter for this element; once it goes
                     // negative the take limit is spent, so leave the loop.
                     // The element passes through unchanged otherwise.
-                    brancher.branch(BRANCH.LT, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER("0", int_type, "i4")), loop_end);
+                    brancher.branch(BRANCH.LT, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER(0, int_type)), loop_end);
                 elif stage.is_skip then
                     // Decrement the counter; while it stays non-negative this
                     // is a leading element to drop, so pull the next one.
-                    brancher.branch(BRANCH.GE, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER("0", int_type, "i4")), loop_start);
+                    brancher.branch(BRANCH.GE, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER(0, int_type)), loop_start);
                 else
                     let stage_result: Value mut;
 
@@ -5413,7 +5217,7 @@ namespace Syntax.Process is
 
             // Fallback setup: build the pipe chain and iterate it, exactly
             // as the normal for loop would.
-            use_fused.store(Literal.NUMBER("0", bool_type, "i4"));
+            use_fused.store(Literal.NUMBER(0, bool_type));
 
             let pipe_iterator_value =
                 if `for.read_iterator? then
@@ -5430,7 +5234,7 @@ namespace Syntax.Process is
             // pipe objects are never built.
             brancher.label(fused_setup);
 
-            use_fused.store(Literal.NUMBER("1", bool_type, "i4"));
+            use_fused.store(Literal.NUMBER(1, bool_type));
 
             let source_iterator_value =
                 if fusion.source_read_iterator? then
@@ -5591,8 +5395,8 @@ namespace Syntax.Process is
 
             let string_type = _innate_symbol_lookup.get_string_type();
 
-            let literal_length = Literal.NUMBER("{interpolation.literal_length}", _innate_symbol_lookup.get_int_type(), "i4");
-            let expression_count = Literal.NUMBER("{interpolation.expression_count}", _innate_symbol_lookup.get_int_type(), "i4");
+            let literal_length = Literal.NUMBER(interpolation.literal_length, _innate_symbol_lookup.get_int_type());
+            let expression_count = Literal.NUMBER(interpolation.expression_count, _innate_symbol_lookup.get_int_type());
 
             let interpolator = 
                 TEMP(

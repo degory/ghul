@@ -10,7 +10,7 @@ if [ "${CI}" == "" ] ; then
 
     cleanup() {
         echo "Cleaning up..."
-        dotnet tool uninstall --local ghul.compiler
+        dotnet tool uninstall --local ghul.compiler >/dev/null 2>&1 || true
         if [ -n "${PRE_BOOTSTRAP_VERSION}" ] ; then
             dotnet tool install --local ghul.compiler --version "${PRE_BOOTSTRAP_VERSION}"
         else
@@ -54,48 +54,64 @@ VERBOSITY="-verbosity:quiet"
 for PASS in 1 2 3 4 ; do
     PREVIOUS=$(dotnet ghul-compiler)
 
-    if [[ "${LOCAL}" == "" &&  ( "${PASS}" == "3" || "${PASS}" == "4" ) ]] ; then
-        VERSION="${PACKAGE_VERSION}"
+    # Every pass builds an assembly stamped with the same version, so
+    # that the last two differ only where the compiler differs. Only the
+    # package version varies: two different builds published under one
+    # package version would be served from the NuGet cache as whichever
+    # arrived first, and the second pass would silently re-test the
+    # first.
+    # The last pass's package is the build's output, so it carries the
+    # real package version; the earlier ones only have to be distinct
+    # from each other.
+    if [ "${PASS}" == "4" ] ; then
+        PASS_PACKAGE_VERSION="${PACKAGE_VERSION}"
     else
-        VERSION="${VERSION_PREFIX}-bootstrap.$(($(date +%s%N)/1000))"
+        PASS_PACKAGE_VERSION="${VERSION_PREFIX}-bootstrap.$(($(date +%s%N)/1000))"
     fi
 
     echo
-    echo "    Start pass ${PASS}: ${PREVIOUS} -> ${VERSION}..."
+    echo "    Start pass ${PASS}: ${PREVIOUS} -> ${PACKAGE_VERSION} (package ${PASS_PACKAGE_VERSION})..."
 
     rm -rf nupkg ; mkdir nupkg
 
-    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${VERSION} -p:GhulOptions="--keep-out-il" -consoleloggerparameters:NoSummary
+    dotnet pack -nologo ${VERBOSITY} -p:CI=true -p:Version=${PACKAGE_VERSION} -p:PackageVersion=${PASS_PACKAGE_VERSION} -consoleloggerparameters:NoSummary
 
-    echo "   Packed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
+    echo "   Packed pass ${PASS}"
     echo
 
-    dotnet tool uninstall --local ghul.compiler # >/dev/null 2>&1
-    dotnet tool install --local ghul.compiler --add-source nupkg --version ${VERSION} # >/dev/null 2>&1
+    dotnet tool uninstall --local ghul.compiler >/dev/null 2>&1 || true
+
+    dotnet tool install --local ghul.compiler --add-source nupkg --version ${PASS_PACKAGE_VERSION}
 
     echo
-    echo "Installed pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
+    echo "Installed pass ${PASS}"
 
     dotnet ghul-compiler
 
-    if [ "${PASS}" != "1" ] && [ "${PASS}" != "2" ] ; then
-        mv out.il stage-${PASS}.il
+    if [ "${PASS}" == "3" ] || [ "${PASS}" == "4" ] ; then
+        cp bin/Release/net10.0/ghul.dll stage-${PASS}.dll
     fi
 
     dotnet clean -nologo -verbosity:quiet
 
     echo
-    echo " Finished pass ${PASS}: ${PREVIOUS} -> ${VERSION}"
+    echo " Finished pass ${PASS}"
 done
 
 echo
-echo "Verify IL matches for last two passes..."
+echo "Verify the last two passes emitted the same assembly..."
 
-# there should be no differences between pass 3 IL and pass 4 IL except
-# for the version info, which is in a custom attribute ('.custom : ....')
-diff \
-    <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-3.il) \
-    <(grep -v "^\.custom instance void \[System.Runtime\]System.Reflection\.AssemblyInformationalVersionAttribute" stage-4.il)
+# A compiler that reproduces itself emits the same bytes, not merely an
+# equivalent program. That is only a fair test because emission is
+# deterministic - the module version id is a hash of the content and the
+# PE stamp comes from the same hash, so nothing carries the clock.
+if ! cmp stage-3.dll stage-4.dll ; then
+    echo
+    echo "pass 3 and pass 4 differ - the compiler does not reproduce itself"
+    exit 1
+fi
+
+echo "identical"
 
 echo
 

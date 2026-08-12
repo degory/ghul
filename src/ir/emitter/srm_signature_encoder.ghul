@@ -1,0 +1,681 @@
+namespace IR.Emitter is
+    use System.Reflection.Metadata.BlobBuilder;
+    use System.Reflection.Metadata.EntityHandle;
+    use System.Reflection.Metadata.SignatureCallingConvention;
+    use System.Reflection.Metadata.Ecma335.BlobEncoder;
+    use System.Reflection.Metadata.Ecma335.MethodSignatureEncoder;
+    use System.Reflection.Metadata.Ecma335.ReturnTypeEncoder;
+    use System.Reflection.Metadata.Ecma335.ParametersEncoder;
+    use System.Reflection.Metadata.Ecma335.SignatureTypeEncoder;
+
+    // Encodes a function's argument and return types as an ECMA-335
+    // signature blob.
+    //
+    // The shape mirrors Symbols.Classy.gen_type's decision tree — the
+    // il_is_primitive_type short-circuit, then a class-versus-valuetype
+    // split, then generic instantiation — with metadata handles in place
+    // of the text that path appends. Keeping the two in step matters:
+    // a methodref whose signature disagrees with the target's own
+    // declaration resolves to nothing at run time.
+    class SRM_SIGNATURE_ENCODER(_assembly: SRM_ASSEMBLY_EMITTER) is
+        // The closure to install a mapping from while a member of its
+        // frame is encoded, or null for a member that needs none.
+        //
+        // A member's signature is written in its owner's terms, and for
+        // a closure frame that does not happen on its own: the frame's
+        // type parameters are the enclosing function's symbols, which
+        // carry their own method-level position until the closure
+        // installs the frame's class-level one. A body is emitted inside
+        // that window, so its local signature comes out right unaided.
+        // These blobs are not: the structure walk builds them long after
+        // the window has closed, and a call site builds them from
+        // wherever it happens to be. Without reopening it, a field of
+        // `T` encodes as `!!0` on a type whose one parameter is `!0`.
+        //
+        // The reference the member hangs off is deliberately outside
+        // this: it names the frame at the arguments the *caller* passes,
+        // which are the caller's own parameters and are spelled where
+        // the caller stands.
+        frame_mapping(member: Semantic.Symbols.Symbol) -> Semantic.Symbols.Closure? static is
+            // The closure's own method is emitted as a member of its
+            // frame, but it is declared into the function the literal
+            // was written in, so its owner does not name the frame.
+            if let closure: Semantic.Symbols.Closure = member /\ closure.frame? then
+                return closure;
+            fi
+
+            if let frame: Semantic.Symbols.FRAME = member.owner then
+                return frame.closure;
+            fi
+
+            // The frame's own rows need it too: its type parameters are
+            // the enclosing function's symbols, so a bound naming one
+            // encodes at that symbol's method-level position unless the
+            // frame's class-level one is installed.
+            if let frame: Semantic.Symbols.FRAME = member then
+                return frame.closure;
+            fi
+
+            return null;
+        si
+
+        // A property's signature is its accessors' shape rather than its
+        // own: the calling convention says PROPERTY, and an instance
+        // property sets HASTHIS to match the getter it is read through.
+        // ghūl declares no indexed properties, so the parameter list is
+        // always empty and the signature carries only the type.
+        property_signature(property: Semantic.Symbols.Property) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .property_signature(_is_instance_property(property))
+                .parameters(0, return_type ref, parameters ref);
+
+            encode_type(return_type.`type(false), property.type!);
+
+            return builder.to_array();
+        si
+
+        _is_instance_property(property: Semantic.Symbols.Property) -> bool static =>
+            isa Semantic.Symbols.INSTANCE_PROPERTY(property);
+
+        field_signature(`field: Semantic.Symbols.Field) -> ubyte[] is
+            let closure = frame_mapping(`field);
+
+            if closure? then
+                closure.map_type_arguments();
+            fi
+
+            try
+                let builder = BlobBuilder(16);
+
+                // Same recovery as for a method signature: a field
+                // inherited from a constructed-generic base in another
+                // assembly surfaces via reflection with its type
+                // parameter substituted, and the open form is carried as
+                // unspecialized_type. Prefer it when present.
+                encode_type(
+                    BlobEncoder(builder).field_signature(),
+                    `field.unspecialized_type ?? `field.type!);
+
+                return builder.to_array();
+            finally
+                if closure? then
+                    closure.unmap_type_arguments();
+                fi
+            yrt
+        si
+
+        // The same, for a field the back end synthesises and so has no
+        // symbol to read a type off.
+        field_signature(type: Semantic.Types.Type) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            encode_type(BlobEncoder(builder).field_signature(), type);
+
+            return builder.to_array();
+        si
+
+        // A static constructor's signature: static, void, no arguments.
+        static_initializer_signature() -> ubyte[] is
+            let builder = BlobBuilder(8);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, false)
+                .parameters(0, return_type ref, parameters ref);
+
+            return_type.void();
+
+            return builder.to_array();
+        si
+
+        // An instance method taking nothing and returning the given
+        // reference type, named by handle rather than by symbol: the
+        // members that need this satisfy a framework interface no ghūl
+        // declaration mentions.
+        nullary_instance_signature(return_type: EntityHandle) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_encoder: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(0, return_encoder ref, parameters ref);
+
+            return_encoder.`type(false).`type(return_type, false);
+
+            return builder.to_array();
+        si
+
+        // The same, returning `object`, which has its own element-type
+        // code rather than a reference.
+        nullary_instance_signature_returning_object() -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_encoder: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(0, return_encoder ref, parameters ref);
+
+            return_encoder.`type(false).object();
+
+            return builder.to_array();
+        si
+
+        // A constructor's signature: an instance method returning void,
+        // taking the given argument types. Built from types rather than
+        // from a Function because the constructors that need this are
+        // the ones with no symbol to read a signature off.
+        constructor_signature(argument_types: Collections.List[Semantic.Types.Type]) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(argument_types.count, return_type ref, parameters ref);
+
+            return_type.void();
+
+            for argument in argument_types do
+                let referenced = pointee(argument);
+
+                encode_type(parameters.add_parameter().`type(referenced?), referenced ?? argument);
+            od
+
+            return builder.to_array();
+        si
+
+        // A static method's signature, built from types rather than read
+        // off a Function, for the framework members the back end reaches
+        // for by name.
+        static_signature(
+            return_type_of: Semantic.Types.Type,
+            argument_types: Collections.List[Semantic.Types.Type]
+        ) -> ubyte[] =>
+            call_signature(return_type_of, argument_types, false);
+
+        // `AsyncTaskMethodBuilder.AwaitUnsafeOnCompleted<TAwaiter,
+        // TStateMachine>(ref TAwaiter, ref TStateMachine)`. Both
+        // parameters are the method's own type parameters by reference;
+        // the two types it is called with live in the MethodSpec.
+        async_await_on_completed_signature() -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 2, true)
+                .parameters(2, return_type ref, parameters ref);
+
+            return_type.void();
+
+            for i in 0..2 do
+                parameters.add_parameter().`type(true).generic_method_type_parameter(i);
+            od
+
+            return builder.to_array();
+        si
+
+        // A parameterless instance method returning the owner's own
+        // first type parameter — an awaiter's `GetResult`, whose result
+        // is the awaited task's `T`.
+        open_result_signature() -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(0, return_type ref, parameters ref);
+
+            return_type.`type(false).generic_type_parameter(0);
+
+            return builder.to_array();
+        si
+
+        // `AsyncTaskMethodBuilder.Start<TStateMachine>(ref TStateMachine)`,
+        // whose one parameter is its own method type parameter by
+        // reference. The state machine it is called with lives in the
+        // MethodSpec, not here — the reference names the open method.
+        async_builder_start_signature() -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 1, true)
+                .parameters(1, return_type ref, parameters ref);
+
+            return_type.void();
+
+            parameters.add_parameter().`type(true).generic_method_type_parameter(0);
+
+            return builder.to_array();
+        si
+
+        // The same, for a method reached through a receiver. Built from
+        // types rather than from a Function because the members that
+        // need it are ones no symbol in the compilation declares.
+        call_signature(
+            return_type_of: Semantic.Types.Type,
+            argument_types: Collections.List[Semantic.Types.Type],
+            is_instance: bool
+        ) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, is_instance)
+                .parameters(argument_types.count, return_type ref, parameters ref);
+
+            encode_return(return_type, return_type_of);
+
+            for argument in argument_types do
+                let referenced = pointee(argument);
+
+                encode_type(parameters.add_parameter().`type(referenced?), referenced ?? argument);
+            od
+
+            return builder.to_array();
+        si
+
+        // A constructor on a constructed generic, taking one argument
+        // per type parameter. The arguments are written as indexes for
+        // the same reason Invoke's are: the reference is to the open
+        // type's constructor, and the instantiation lives in the owning
+        // TypeSpec.
+        generic_constructor_signature(argument_count: int) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(argument_count, return_type ref, parameters ref);
+
+            return_type.void();
+
+            for i in 0..argument_count do
+                parameters.add_parameter().`type(false).generic_type_parameter(i);
+            od
+
+            return builder.to_array();
+        si
+
+        // A delegate's Invoke, whose parameters and return are the
+        // delegate type's own type parameters. They are written as
+        // indexes rather than as the arguments the delegate was
+        // instantiated with: the reference is to Func`N's Invoke, and
+        // the instantiation lives in the owning TypeSpec.
+        delegate_invoke_signature(argument_count: int, is_action: bool) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            BlobEncoder(builder)
+                .method_signature(SignatureCallingConvention.DEFAULT, 0, true)
+                .parameters(argument_count, return_type ref, parameters ref);
+
+            if is_action then
+                return_type.void();
+            else
+                return_type.`type(false).generic_type_parameter(argument_count);
+            fi
+
+            for i in 0..argument_count do
+                parameters.add_parameter().`type(false).generic_type_parameter(i);
+            od
+
+            return builder.to_array();
+        si
+
+        // The blob a TypeSpec row holds: the constructed type encoded
+        // structurally, exactly as it would appear inside any other
+        // signature.
+        type_specification_signature(type: Semantic.Types.Type) -> ubyte[] is
+            let builder = BlobBuilder(16);
+
+            encode_type(BlobEncoder(builder).type_specification_signature(), type);
+
+            return builder.to_array();
+        si
+
+        method_signature(function: Semantic.Symbols.Function) -> ubyte[] is
+            let closure = frame_mapping(function);
+
+            if closure? then
+                closure.map_type_arguments();
+            fi
+
+            try
+                return _method_signature(function);
+            finally
+                if closure? then
+                    closure.unmap_type_arguments();
+                fi
+            yrt
+        si
+
+        _method_signature(function: Semantic.Symbols.Function) -> ubyte[] is
+            let builder = BlobBuilder(32);
+
+            // A method inherited from a constructed-generic base in
+            // another assembly surfaces via reflection with its type-
+            // parameter references substituted to concrete types, which
+            // the CLR will not match at the call site. The open-generic
+            // form is recovered at import time (symbol_factory) and
+            // carried as unspecialized_*; prefer it when present.
+            let arguments = function.unspecialized_arguments ?? function.arguments;
+
+            let return_type: ReturnTypeEncoder mut;
+            let parameters: ParametersEncoder mut;
+
+            // A generic method's signature declares its arity, and its
+            // own type parameters appear in it as indexes rather than
+            // as the arguments some instantiation supplied.
+            BlobEncoder(builder)
+                .method_signature(
+                    SignatureCallingConvention.DEFAULT,
+                    function.generic_arguments.count,
+                    function.is_emitted_with_receiver)
+                .parameters(arguments.count, return_type ref, parameters ref);
+
+            encode_return(return_type, function.unspecialized_return_type ?? function.return_type);
+
+            for argument in arguments do
+                let referenced = pointee(argument);
+
+                encode_type(parameters.add_parameter().`type(referenced?), referenced ?? argument);
+            od
+
+            return builder.to_array();
+        si
+
+        // What a `T ref` points at, or null when the type is not a
+        // reference.
+        //
+        // The format carries byref as a flag on the slot rather than as
+        // part of the type, so a `T ref` marks its parameter, return or
+        // local and encodes the pointee in its own place. Encoding the
+        // reference type itself instead names a value type the runtime
+        // will not accept where a managed pointer belongs.
+        pointee(type: Semantic.Types.Type?) -> Semantic.Types.Type? static =>
+            if let reference: Semantic.Types.REFERENCE = type then
+                reference.arguments[0]
+            else
+                null
+            fi;
+
+        encode_return(encoder: ReturnTypeEncoder, type: Semantic.Types.Type?) is
+            if !type? \/ is_void(type) then
+                encoder.void();
+
+                return;
+            fi
+
+            let referenced = pointee(type);
+
+            encode_type(encoder.`type(referenced?), referenced ?? type);
+        si
+
+        is_void(type: Semantic.Types.Type) -> bool static =>
+            type.symbol.il_name_override =~ "void";
+
+        encode_type(encoder: SignatureTypeEncoder, type: Semantic.Types.Type) is
+            if let array: Semantic.Types.ARRAY = type then
+                encode_type(encoder.szarray(), array.arguments[0]);
+
+                return;
+            fi
+
+            // A pointer is its own element type in the format, not a
+            // generic named `POINTER` over one. Encoding it as the
+            // latter names a class the runtime has never heard of, and
+            // the slot then holds an object reference where the code
+            // reading it expects a native integer.
+            if let pointer: Semantic.Types.POINTER = type then
+                encode_type(encoder.pointer(), pointer.arguments[0]);
+
+                return;
+            fi
+
+            let symbol = type.symbol;
+
+            if let generic_argument: Semantic.Symbols.GenericArgument = symbol then
+                // A body emitted somewhere other than where its type
+                // parameters were declared — a state machine's MoveNext,
+                // a closure's frame — reaches them at a position the
+                // lowering assigns, rather than at their own index.
+                if let position = generic_argument.emitted_position then
+                    if position.is_class_level then
+                        encoder.generic_type_parameter(position.index);
+                    else
+                        encoder.generic_method_type_parameter(position.index);
+                    fi
+                elif isa Semantic.Symbols.FUNCTION_GENERIC_ARGUMENT(generic_argument) then
+                    encoder.generic_method_type_parameter(generic_argument.index);
+                else
+                    encoder.generic_type_parameter(generic_argument.index);
+                fi
+
+                return;
+            fi
+
+            if symbol.il_is_primitive_type then
+                encode_primitive(encoder, symbol.il_name_override ?? "");
+
+                return;
+            fi
+
+            // A constructed generic's symbol is a Symbols.GENERIC, which
+            // holds the open definition rather than being one. The
+            // format wants that definition as the TypeDefOrRef, with
+            // the arguments encoded after it, so the specialization is
+            // unwrapped here rather than referenced in its own right.
+            let classy =
+                if let generic: Semantic.Symbols.GENERIC = symbol then
+                    generic.symbol
+                else
+                    cast Semantic.Symbols.Classy?(symbol)
+                fi;
+
+            if !classy? then
+                throw System.NotImplementedException(
+                    "the binary back end cannot encode the type '{type}' yet");
+            fi
+
+            // string and object have dedicated element-type codes rather
+            // than a typeref, and il_is_primitive_type does not cover
+            // them — neither is a CLR primitive. A signature spelling
+            // them as a class reference is well-formed, but no other
+            // assembly declares them that way, so a methodref built from
+            // one binds to nothing.
+            let ghul_name = classy.qualified_name;
+
+            if ghul_name =~ "Ghul.string" then
+                encoder.string();
+
+                return;
+            elif ghul_name =~ "Ghul.object" then
+                encoder.object();
+
+                return;
+            fi
+
+            let handle = _type_handle_for(classy);
+
+            let arguments = type.arguments;
+
+            if arguments.count > 0 then
+                let generic_arguments =
+                    encoder.generic_instantiation(handle, arguments.count, classy.is_value_type);
+
+                for argument in arguments do
+                    encode_type(generic_arguments.add_argument(), argument);
+                od
+
+                return;
+            fi
+
+            encoder.`type(handle, classy.is_value_type);
+        si
+
+        encode_primitive(encoder: SignatureTypeEncoder, il_name: string) static is
+            if il_name =~ "bool" then
+                encoder.boolean();
+            elif il_name =~ "char" then
+                encoder.char();
+            elif il_name =~ "int8" then
+                encoder.sbyte();
+            elif il_name =~ "unsigned int8" then
+                encoder.byte();
+            elif il_name =~ "int16" then
+                encoder.int16();
+            elif il_name =~ "unsigned int16" then
+                encoder.uint16();
+            elif il_name =~ "int32" then
+                encoder.int32();
+            elif il_name =~ "unsigned int32" then
+                encoder.uint32();
+            elif il_name =~ "int64" then
+                encoder.int64();
+            elif il_name =~ "unsigned int64" then
+                encoder.uint64();
+            elif il_name =~ "native int" then
+                encoder.int_ptr();
+            elif il_name =~ "native unsigned int" then
+                encoder.uint_ptr();
+            elif il_name =~ "float32" then
+                encoder.single();
+            elif il_name =~ "float64" then
+                encoder.double();
+            else
+                throw System.NotImplementedException(
+                    "the binary back end cannot encode the primitive type '{il_name}' yet");
+            fi
+        si
+
+        // A primitive's il_name_override is the assembler keyword, which
+        // is what a signature needs and what a reference must never
+        // carry: there is no type called `int32`. Named here so that a
+        // member reached through a primitive owner - `to_string` on an
+        // `int` - names the type the runtime knows.
+        //
+        // Written as a chain rather than a `case` because `case` over a
+        // string compares by reference, so only interned literals match
+        // and a computed name silently falls through.
+        clr_name_for_primitive(il_name: string) -> string? static =>
+            if il_name =~ "bool" then "System.Boolean";
+            elif il_name =~ "char" then "System.Char";
+            elif il_name =~ "int8" then "System.SByte";
+            elif il_name =~ "unsigned int8" then "System.Byte";
+            elif il_name =~ "int16" then "System.Int16";
+            elif il_name =~ "unsigned int16" then "System.UInt16";
+            elif il_name =~ "int32" then "System.Int32";
+            elif il_name =~ "unsigned int32" then "System.UInt32";
+            elif il_name =~ "int64" then "System.Int64";
+            elif il_name =~ "unsigned int64" then "System.UInt64";
+            elif il_name =~ "native int" then "System.IntPtr";
+            elif il_name =~ "native unsigned int" then "System.UIntPtr";
+            elif il_name =~ "float32" then "System.Single";
+            elif il_name =~ "float64" then "System.Double";
+            elif il_name =~ "void" then "System.Void";
+            else null;
+            fi;
+
+        // A type this assembly defines is named by its own TypeDef row,
+        // not by a reference; every other type resolves to a TypeRef.
+        // The TypeDef row need not exist yet — the numbering pass has
+        // already fixed which row it will be.
+        _type_handle_for(symbol: Semantic.Symbols.Classy) -> EntityHandle is
+            if let definition = _assembly.handles.type_definition(symbol) then
+                return cast EntityHandle(definition);
+            fi
+
+            return cast EntityHandle(type_reference_for(symbol));
+        si
+
+        type_reference_for(symbol: Semantic.Symbols.Classy) -> System.Reflection.Metadata.TypeReferenceHandle is
+            let assembly_name = symbol.il_assembly_name;
+
+            // An empty name is as absent as a null one, and worse to
+            // act on: it yields a reference row the runtime resolves to
+            // the assembly being built, so the type appears to be one
+            // this assembly defines and fails to load.
+            if !assembly_name? \/ assembly_name.length == 0 then
+                throw System.NotImplementedException(
+                    "the binary back end cannot yet reference '{symbol.qualified_name}', "
+                    "a type defined in the assembly being built");
+            fi
+
+            _assembly.add_assembly_reference(assembly_name, "8:0:0:0");
+
+            return reference_for_clr_name(
+                symbol,
+                assembly_name,
+                symbol.il_name_override ?? symbol.qualified_name);
+        si
+
+        // One CLR type name to one reference row, for both places that
+        // need it: a type named in a signature, and the owner a member
+        // reference hangs off. Each used to split the name itself, and
+        // only one of the two would ever have learned about nesting.
+        //
+        // A nested type is written `Outer/Inner`, and each step is a
+        // reference of its own scoped to the one before it, with only
+        // the outermost carrying a namespace. Flattened into a single
+        // row the name resolves to nothing, and the failure surfaces at
+        // load rather than at emission.
+        reference_for_clr_name(
+            symbol: Semantic.Symbols.Symbol,
+            assembly_name: string,
+            clr_type_name: string
+        ) -> System.Reflection.Metadata.TypeReferenceHandle is
+            let nested = clr_type_name.index_of('/');
+
+            if nested >= 0 then
+                let outer_name = clr_type_name.substring(0, nested);
+                let outer_dot = outer_name.last_index_of('.');
+
+                let enclosing mut =
+                    _assembly.add_type_reference_by_name(
+                        assembly_name,
+                        if outer_dot >= 0 then outer_name.substring(0, outer_dot) else "" fi,
+                        if outer_dot >= 0 then outer_name.substring(outer_dot + 1) else outer_name fi);
+
+                for step in clr_type_name.substring(nested + 1).split(['/']) do
+                    enclosing =
+                        _assembly.add_nested_type_reference(assembly_name, enclosing, step);
+                od
+
+                return enclosing;
+            fi
+
+            let dot = clr_type_name.last_index_of('.');
+
+            return _assembly.add_type_reference(
+                symbol,
+                assembly_name,
+                if dot >= 0 then clr_type_name.substring(0, dot) else "" fi,
+                if dot >= 0 then clr_type_name.substring(dot + 1) else clr_type_name fi);
+        si
+    si
+si
