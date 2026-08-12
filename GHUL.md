@@ -636,7 +636,7 @@ enum Status is
 si
 ```
 
-Enum values compare with the relational operators as well as for equality, so they order by their underlying integer. An individual member can be imported by name — `use Some.Namespace.Suit.HEARTS;` — as well as reached through the type.
+Enum values compare with the relational operators as well as for equality (`=~` and `==`), so they order by their underlying integer. `=~` over an optional enum is not supported; narrow the value first. An individual member can be imported by name — `use Some.Namespace.Suit.HEARTS;` — as well as reached through the type.
 
 ### partial and impl blocks
 
