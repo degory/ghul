@@ -944,6 +944,8 @@ A `while` condition narrows the loop body the same way an `if` condition narrows
 
 `case` branches on a scrutinee value. Each `when` carries either a value-equality expression list (literals, enum members, named constants) or a binding pattern; `else` catches the rest; the construct ends with `esac`. There is no fall-through. The body of each arm is introduced by `then`:
 
+An expression-list `when` matches a non-optional scrutinee by value: `case` resolves the scrutinee type's `=~` (falling back to `<>`) once, the same way `==` would, so a `string` scrutinee and a user type that declares `=~` both compare their labels by content rather than by identity. A `T?` scrutinee is not resolved this way — a `when null` label is a presence test, but any other label still matches by reference for a reference-type `T`, mirroring the `if let` literal-leaf caveat above ("variables").
+
 ```ghul
 case status
 when 200 then
