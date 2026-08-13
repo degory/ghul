@@ -4209,18 +4209,21 @@ namespace Syntax.Process is
 
             spiller.enter();
 
-            let temp = TEMP(current_block, "case", `case.expression.value!);
+            // The scrutinee was spilled once into a temp in
+            // compile-expressions (see CASE_STATE); emit the spill and
+            // read the temp. Reusing the single load Value across every
+            // label and pattern arm is safe - Load.TEMP.gen is an
+            // idempotent ldloc - and preserves the scrutinee's
+            // single-evaluation semantics.
+            if `case.scrutinee_spill? then
+                current_block.add(`case.scrutinee_spill!);
+            fi
+
+            let scrutinee_load = `case.scrutinee_load!;
 
             let brancher = get_brancher_for_block();
 
             let labels = _loops.enter_loop();
-
-            // Resolved once against the scrutinee's type by
-            // CASE_MATCH_OPERAND_RESOLVER (compile-expressions); see
-            // CASE_STATE. Both null falls back to the raw
-            // identity-or-value compare below, matching a bare `==`.
-            let equality_operator = `case.equality_operator;
-            let order_operator = `case.order_operator;
 
             let has_else mut = false;
             for m in `case.matches do
@@ -4233,30 +4236,54 @@ namespace Syntax.Process is
                 let next = LABEL();
 
                 if m.expressions? then
-                    if m.expressions.expressions.count == 1 then
-                        m.expressions.expressions[0].walk(self);
+                    // Per-label value-equality test Values, built in
+                    // compile-expressions (see CASE_MATCH_STATE). A
+                    // non-null test embeds its label, so it is emitted
+                    // and branched on directly; a null test means no
+                    // operator resolved (or the label is `null`), so
+                    // generate-il falls back to a raw compare.
+                    let tests = m.tests;
 
-                        let label_value = m.expressions!.expressions[0].value!;
-                        let test = gen_case_match_test(equality_operator, order_operator, temp.load(), label_value, m.location);
+                    if m.expressions.expressions.count == 1 then
+                        let test: IR.Values.Value? = if tests? then tests![0] else null fi;
 
                         if test? then
                             brancher.branch(BRANCH.Z, test, next);
                         else
-                            brancher.branch(BRANCH.NE, temp.load(), label_value, next);
+                            m.expressions.expressions[0].walk(self);
+
+                            let label_value = m.expressions!.expressions[0].value!;
+
+                            if (label_value.type?.is_null ?? false) then
+                                // `when null` is a presence test, not a
+                                // value compare: match absence. Branch
+                                // to `next` when the scrutinee is present.
+                                gen_case_null_test(scrutinee_load, `case.expression.value!.type!, next, false);
+                            else
+                                brancher.branch(BRANCH.NE, scrutinee_load, label_value, next);
+                            fi
                         fi
                     elif m.expressions.expressions.count > 1 then
                         let match = LABEL();
 
-                        for e in m.expressions! do
-                            e.walk(self);
-
-                            let label_value = e.value!;
-                            let test = gen_case_match_test(equality_operator, order_operator, temp.load(), label_value, m.location);
+                        for i in 0..m.expressions!.expressions.count do
+                            let test: IR.Values.Value? = if tests? then tests![i] else null fi;
 
                             if test? then
                                 brancher.branch(BRANCH.NZ, test, match);
                             else
-                                brancher.branch(BRANCH.EQ, temp.load(), label_value, match);
+                                let e = m.expressions!.expressions[i];
+                                e.walk(self);
+
+                                let label_value = e.value!;
+
+                                if (label_value.type?.is_null ?? false) then
+                                    // `when null` in a multi-label arm:
+                                    // branch to `match` when absent.
+                                    gen_case_null_test(scrutinee_load, `case.expression.value!.type!, match, true);
+                                else
+                                    brancher.branch(BRANCH.EQ, scrutinee_load, label_value, match);
+                                fi
                             fi
                         od
 
@@ -4278,7 +4305,7 @@ namespace Syntax.Process is
 
                     let pattern = m.pattern!;
                     let init_type: Semantic.Types.Type mut = `case.expression.value!.type!;
-                    let arm_source: IR.Values.Value mut = temp.load();
+                    let arm_source: IR.Values.Value mut = scrutinee_load;
 
                     if pattern.is_explicit_type /\ pattern.type_expression.type? then
                         init_type = pattern.type_expression.type!;
@@ -4396,41 +4423,47 @@ namespace Syntax.Process is
             spiller.leave();
         si
 
-        // Tests a `case` scrutinee against one `when` label using the
-        // operator CASE_MATCH_OPERAND_RESOLVER resolved for the whole
-        // `case` - null when neither `=~` nor `<>` resolved on the
-        // scrutinee's type, in which case the caller keeps its
-        // original identity-or-value branch.
-        gen_case_match_test(
-            equality_operator: Semantic.Symbols.Function?,
-            order_operator: Semantic.Symbols.Function?,
-            left: Values.Value,
-            right: Values.Value,
-            location: Source.LOCATION
-        ) -> Values.Value? is
-            if equality_operator? then
-                return equality_operator.call(
-                    location,
-                    left,
-                    Collections.LIST[Values.Value]([right]),
-                    _innate_symbol_lookup.get_bool_type(),
-                    _function_caller
-                );
+        // Emit a `when null` test against the case scrutinee: a presence
+        // test, not a value compare. For a value-type optional
+        // (`Nullable[T]`, `MAYBE[T]`) read `has_value`; for a reference
+        // optional the receiver itself is the presence. `branch_on_absent`
+        // selects which edge branches to `target`: a single-label `when
+        // null` arm skips to `next` when the scrutinee is present; a null
+        // label in a multi-label arm jumps to `match` when it is absent.
+        gen_case_null_test(
+            scrutinee_load: Values.Value,
+            scrutinee_type: Semantic.Types.Type,
+            target: IR.LABEL,
+            branch_on_absent: bool
+        ) is
+            let presence: Values.Value? mut =
+                if scrutinee_type.is_value_type then
+                    let has_value_member = scrutinee_type.find_member("has_value");
+
+                    if has_value_member? then
+                        has_value_member.load(LOCATION.internal, scrutinee_load, _symbol_loader);
+                    else
+                        null;
+                    fi
+                else
+                    scrutinee_load;
+                fi;
+
+            if presence? then
+                if branch_on_absent then
+                    get_brancher_for_block().branch(BRANCH.Z, presence!, target);
+                else
+                    get_brancher_for_block().branch(BRANCH.NZ, presence!, target);
+                fi
+            else
+                let null_value = IR.Values.NULL(scrutinee_type);
+
+                if branch_on_absent then
+                    get_brancher_for_block().branch(BRANCH.EQ, scrutinee_load, null_value, target);
+                else
+                    get_brancher_for_block().branch(BRANCH.NE, scrutinee_load, null_value, target);
+                fi
             fi
-
-            if order_operator? then
-                let ordered = order_operator.call(
-                    location,
-                    left,
-                    Collections.LIST[Values.Value]([right]),
-                    _innate_symbol_lookup.get_int_type(),
-                    _function_caller
-                );
-
-                return Values.COMPARE_ORDER_TO_ZERO(ordered, "==", _innate_symbol_lookup.get_bool_type());
-            fi
-
-            return null;
         si
 
         pre(match: Statements.CASE_MATCH) -> bool is

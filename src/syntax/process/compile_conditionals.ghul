@@ -30,10 +30,13 @@ namespace Syntax.Process is
         _variable_left_state: VARIABLE_LEFT_STATE_STORE;
         _pattern_checker: PATTERN_CHECKER;
         _case_scrutinee_stack: Collections.LIST[Type?];
+        // Parallel to _case_scrutinee_stack: the once-spilled scrutinee
+        // load Value for the innermost case, so each `when` label's
+        // value-equality test references the single evaluation.
+        _case_scrutinee_load_stack: Collections.LIST[IR.Values.Value?];
         _match_propagator: Semantic.MATCH_PROPAGATOR;
         _case_exhaustiveness_checker: CASE_EXHAUSTIVENESS_CHECKER;
         _arm_null_join: ARM_NULL_JOIN;
-        _case_match_operand_resolver: CASE_MATCH_OPERAND_RESOLVER;
 
         init(
             logger: Logger,
@@ -43,8 +46,7 @@ namespace Syntax.Process is
             if_flow_stack: Collections.LIST[IF_FLOW_FRAME],
             visitor: COMPILE_EXPRESSIONS,
             build_flags: Compiler.GLOBAL_BUILD_FLAGS,
-            variable_left_state: VARIABLE_LEFT_STATE_STORE,
-            overload_resolver: Semantic.OVERLOAD_RESOLVER
+            variable_left_state: VARIABLE_LEFT_STATE_STORE
         ) is
             super.init();
 
@@ -58,10 +60,10 @@ namespace Syntax.Process is
             _variable_left_state = variable_left_state;
             _pattern_checker = PATTERN_CHECKER(logger, build_flags, visitor, flow);
             _case_scrutinee_stack = Collections.LIST[Type?]();
+            _case_scrutinee_load_stack = Collections.LIST[IR.Values.Value?]();
             _match_propagator = Semantic.MATCH_PROPAGATOR(logger);
             _case_exhaustiveness_checker = CASE_EXHAUSTIVENESS_CHECKER(logger, innate_symbol_lookup);
             _arm_null_join = ARM_NULL_JOIN();
-            _case_match_operand_resolver = CASE_MATCH_OPERAND_RESOLVER(overload_resolver);
         si
 
         pre_if_branch(`if: Trees.Statements.IF_BRANCH) -> bool is
@@ -577,26 +579,40 @@ namespace Syntax.Process is
             fi
 
             // Controlled walk: walk the scrutinee first so its value
-            // type is available to each match's `pre_case_match` for
-            // binding-pattern checking, then walk every match. The
+            // is available to spill, then walk every match. The
             // scrutinee's type is held on a stack so nested `case`
             // statements still find their own scrutinee at the top.
             `case.expression.walk(_visitor);
 
-            let scrutinee_type = `case.expression.value?.type;
+            let scrutinee_value = `case.expression.value;
 
-            let (equality_operator, order_operator) =
-                _case_match_operand_resolver.resolve(scrutinee_type, `case.location);
+            // Spill the scrutinee once into a temp, so every `when`
+            // label's value-equality test (built in pre_case_match)
+            // and every pattern arm reads the single evaluation -
+            // matching the single-evaluation semantics the case
+            // scrutinee has always had. `get_temp_copier` is a no-op
+            // spill for an already-repeatable load (a local/parameter).
+            let spill_block = IR.Values.BLOCK(scrutinee_value?.type ?? Semantic.Types.ERROR());
+            let scrutinee_load =
+                if scrutinee_value? then
+                    scrutinee_value.get_temp_copier(spill_block, "case")();
+                else
+                    scrutinee_value;
+                fi;
 
-            `case.case_state.set_match_operators(equality_operator, order_operator);
+            `case.case_state.set_scrutinee(spill_block, scrutinee_load);
+
+            let scrutinee_type = scrutinee_value?.type;
 
             _case_scrutinee_stack.add(scrutinee_type);
+            _case_scrutinee_load_stack.add(scrutinee_load);
 
             for m in `case.matches do
                 m.walk(_visitor);
             od
 
             _case_scrutinee_stack.remove_at(_case_scrutinee_stack.count - 1);
+            _case_scrutinee_load_stack.remove_at(_case_scrutinee_load_stack.count - 1);
 
             return true;
         si
@@ -604,8 +620,52 @@ namespace Syntax.Process is
         pre_case_match(arm: Trees.Statements.CASE_MATCH) -> bool is
             let pattern = arm.pattern;
 
+            // Expression-list arm (`when expr, ...`): walk each label,
+            // build its value-equality test against the once-spilled
+            // scrutinee (the way `=~`, falling back to `<>`, would),
+            // and park the results on the arm for generate-il to branch
+            // on. A null test means no operator resolved (or the label
+            // is `null`); generate-il then falls back to a raw compare
+            // or a presence test. Doing this here keeps the operator
+            // resolution - and any overload-resolution failure - in the
+            // compile-expressions pass.
             if !pattern? then
-                return false;
+                if arm.expressions? then
+                    let scrutinee_load =
+                        if _case_scrutinee_load_stack.count > 0 then
+                            _case_scrutinee_load_stack[_case_scrutinee_load_stack.count - 1];
+                        else
+                            null;
+                        fi;
+
+                    let tests = Collections.LIST[IR.Values.Value?]();
+
+                    for e in arm.expressions!.expressions do
+                        e.walk(_visitor);
+
+                        let test: IR.Values.Value? mut = null;
+                        let label_value = e.value;
+
+                        // A `null` label is a presence test, not a value
+                        // comparison: skip operator resolution (a null
+                        // operand would build a null-typed temp the back
+                        // end cannot encode), leaving a null test for
+                        // generate-il to handle as match-absence.
+                        if label_value? /\ scrutinee_load? /\ !(label_value.type?.is_null ?? false) then
+                            test =
+                                _visitor.build_equality_test(scrutinee_load, label_value, "=~", arm.location) ??
+                                _visitor.build_equality_test(scrutinee_load, label_value, "<>", arm.location);
+                        fi
+
+                        tests.add(test);
+                    od
+
+                    arm.match_state.tests = tests;
+                fi
+
+                arm.statements.walk(_visitor);
+
+                return true;
             fi
 
             let scrutinee_type: Type? mut = null;
