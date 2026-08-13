@@ -955,6 +955,8 @@ else
 esac
 ```
 
+An expression-list `when` matches a non-optional scrutinee by value: `case` resolves the scrutinee type's `=~` (falling back to `<>`) once, the same way `==` would, so a `string` scrutinee and a user type that declares `=~` both compare their labels by content rather than by identity. A `T?` scrutinee is not resolved this way — a `when null` label is a presence test, but any other label still matches by reference for a reference-type `T`, mirroring the `if let` literal-leaf caveat.
+
 `case` is also an expression: the last expression of each arm body becomes the arm's value, and the `case` evaluates to whichever arm matched. An expression-position `case` needs either an `else` arm, arms that cover the scrutinee's closed domain (a union's full variant set, both bool branches, etc.), or — over an open-domain scrutinee with an expected type that has a default value (value type or `T?`) — none of the above, in which case the `case` produces `default(T)` on the no-match path and `case-needs-else` warns:
 
 ```ghul
