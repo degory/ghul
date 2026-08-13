@@ -682,6 +682,13 @@ namespace Syntax.Process is
         //
         // Answers null for anything else, leaving the operands to
         // resolve however they did before.
+        // `a =~ b` where an operand is optional. Delegates the null-safe
+        // building to _build_null_safe_equality (shared with `case`'s
+        // value-equality tests) and applies the `!~` negation the AST
+        // spelling carries. Only `=~` is null-safe here; the binary
+        // visitor's main body handles the non-optional path with its
+        // full diagnostics and retry, so this returns null unless an
+        // operand is optional.
         _try_null_safe_equality(
             binary: Trees.Expressions.BINARY,
             left_value: Value,
@@ -691,6 +698,49 @@ namespace Syntax.Process is
                 return null;
             fi
 
+            let left_type = left_value.type;
+            let right_type = right_value.type;
+
+            if
+                (!left_type? \/ !left_type.is_optional) /\
+                (!right_type? \/ !right_type.is_optional)
+            then
+                return null;
+            fi
+
+            let result = _build_null_safe_equality(left_value, right_value, binary.location);
+
+            if !result? then
+                return null;
+            fi
+
+            if binary.actual_operation =~ "!~" then
+                let negated = IR.Values.BLOCK(_innate_symbol_lookup.get_bool_type());
+                negated.add(NOT(result!));
+                negated.close();
+                return negated;
+            fi
+
+            return result;
+        si
+
+        // Build a null-safe `=~` test for two operands, at least one of
+        // which is optional. Resolves the left type's `=~` against the
+        // operands' non-optional inner types and writes the null checks
+        // around the call: an absent left operand is always answered
+        // here (no receiver to dispatch on), an absent right operand is
+        // answered here unless the operator declares its parameter
+        // optional and so could be handed one. Returns null when the
+        // gate rejects the operands or operator, or no `=~` resolves.
+        //
+        // Extracted from _try_null_safe_equality so `case` value-equality
+        // (see _try_equality_test) reuses the same lowering rather than
+        // duplicating it.
+        _build_null_safe_equality(
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value? is
             let left_type = left_value.type;
             let right_type = right_value.type;
 
@@ -712,13 +762,11 @@ namespace Syntax.Process is
             fi
 
             let overload_result =
-                _overload_resolver.resolve(
-                    binary.location,
+                _resolve_silently(
+                    location,
                     cast Semantic.Symbols.FUNCTION_GROUP(member_symbol),
                     Collections.LIST[Type]([right_inner!]),
-                    false,
-                    true,
-                    false
+                    true
                 );
 
             if !overload_result? then
@@ -766,8 +814,8 @@ namespace Syntax.Process is
                 OPTIONAL_OPERAND(IoC.CONTAINER.instance.symbol_loader, bool_type);
 
             if
-                !operand.can_split(binary.left.location, load_left()) \/
-                !operand.can_split(binary.right.location, load_right())
+                !operand.can_split(location, load_left()) \/
+                !operand.can_split(location, load_right())
             then
                 return null;
             fi
@@ -777,41 +825,226 @@ namespace Syntax.Process is
             // no absent value to hand a body in the first place.
             let guards = guards_argument \/ operand.must_be_guarded(load_right());
 
-            let left_payload = operand.payload(binary.left.location, load_left());
-            let right_payload = operand.payload(binary.right.location, load_right());
+            let left_payload = operand.payload(location, load_left());
+            let right_payload = operand.payload(location, load_right());
 
             if !left_payload? \/ !right_payload? then
                 return null;
             fi
 
-            _symbol_use_locations.add_symbol_use(binary.operation.location, function);
+            _symbol_use_locations.add_symbol_use(location, function);
 
             let call =
                 function.call(
-                    binary.location,
+                    location,
                     left_payload!,
                     Collections.LIST[Value]([right_payload!]),
                     null,
                     _function_caller
                 );
 
-            let result: Value mut =
+            let result =
                 IR.Values.NULL_SAFE_EQUALITY(
-                    operand.presence(binary.left.location, load_left()),
-                    operand.presence(binary.right.location, load_right()),
+                    operand.presence(location, load_left()),
+                    operand.presence(location, load_right()),
                     call,
                     guards,
                     bool_type
                 );
 
-            if binary.actual_operation =~ "!~" then
-                result = NOT(result);
-            fi
-
             block.add(result);
             block.close();
 
             return block;
+        si
+
+        // Build a value-equality test between two operands the way `=~`
+        // (or `<>`, compared to zero) would, for `case` `when` labels.
+        // An optional operand first tries the null-safe path
+        // (_build_null_safe_equality) for instance `=~` operators that
+        // would dereference a null receiver; when that declines - most
+        // often because the operator is a static one already null-safe
+        // by nature, like string's op_Equality - it falls through to a
+        // direct `=~` call. Returns null when no member operator
+        // resolves, leaving the caller to fall back to a raw compare.
+        // `<>` answers int and is not null-safe, so it is only handled
+        // for non-optional operands; an optional scrutinee whose inner
+        // type has only `<>` falls back.
+        _try_equality_test(
+            left_value: Value,
+            right_value: Value,
+            op_name: string,
+            location: Source.LOCATION
+        ) -> Value? is
+            let left_type = left_value.type;
+            let right_type = right_value.type;
+
+            if !left_type? \/ !right_type? then
+                return null;
+            fi
+
+            let optional = left_type.is_optional \/ right_type.is_optional;
+
+            if op_name =~ "=~" then
+                if optional then
+                    let null_safe = _build_null_safe_equality(left_value, right_value, location);
+
+                    if null_safe? then
+                        return null_safe;
+                    fi
+
+                    // An instance `=~` the gate declined (a static
+                    // operator like string's op_Equality, or one hidden
+                    // from operator resolution) reaches the free-function
+                    // `Ghul.=~`, which is null-safe over optionals - the
+                    // same call the `=~` expression makes for these types.
+                    let free = _build_free_function_test("=~", left_value, right_value, location);
+
+                    if free? then
+                        return free;
+                    fi
+
+                    return null;
+                fi
+
+                return _build_direct_operator_test(left_value, right_value, "=~", location);
+            fi
+
+            if op_name =~ "<>" then
+                if optional then
+                    return null;
+                fi
+
+                return _build_direct_operator_test(left_value, right_value, "<>", location);
+            fi
+
+            return null;
+        si
+
+        // Resolve a free-function operator (`Ghul.=~`, reachable via
+        // scope as `=~`) against both operands and build the call. This
+        // is the path the `=~` expression takes for built-in types whose
+        // member operator is hidden from operator resolution (string's
+        // op_Equality): the free function is null-safe over optionals,
+        // so it is the right call for an optional scrutinee. Returns null
+        // when no free function resolves.
+        _build_free_function_test(
+            op_name: string,
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value? is
+            let symbol = _visitor.find(op_name);
+
+            if !symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
+                return null;
+            fi
+
+            let overload_result =
+                _resolve_silently(
+                    location,
+                    cast Semantic.Symbols.FUNCTION_GROUP(symbol),
+                    Collections.LIST[Type]([left_value.type!, right_value.type!]),
+                    false
+                );
+
+            if !overload_result? then
+                return null;
+            fi
+
+            let function = overload_result.function;
+
+            _symbol_use_locations.add_symbol_use(location, function);
+
+            let call =
+                function.call(
+                    location,
+                    null,
+                    Collections.LIST[Value]([left_value, right_value]),
+                    null,
+                    _function_caller
+                );
+
+            return call;
+        si
+
+        // Resolve the left type's `=~` or `<>` member against the right
+        // operand and build the call directly (no null checks): the
+        // non-optional half of _try_equality_test. `<>`'s int result is
+        // reduced against zero. Returns null when no member resolves.
+        _build_direct_operator_test(
+            left_value: Value,
+            right_value: Value,
+            op_name: string,
+            location: Source.LOCATION
+        ) -> Value? is
+            let left_type = left_value.type;
+
+            if !left_type? then
+                return null;
+            fi
+
+            // Resolve against the non-optional inner type, matching the
+            // null-safe path: `find_member` on an optional type resolves
+            // a different (instance, optional-parameter) member than the
+            // inner type does, which would dispatch virtually and
+            // dereference a null receiver. The inner type's operator is
+            // the one `=~` resolves to for a present value.
+            let resolve_type = _non_optional(left_type!) ?? left_type!;
+
+            let member_symbol = resolve_type.find_member(op_name);
+
+            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
+                return null;
+            fi
+
+            let right_inner = _non_optional(right_value.type!) ?? right_value.type!;
+
+            let overload_result =
+                _resolve_silently(
+                    location,
+                    cast Semantic.Symbols.FUNCTION_GROUP(member_symbol),
+                    Collections.LIST[Type]([right_inner]),
+                    true
+                );
+
+            if !overload_result? then
+                return null;
+            fi
+
+            let function = overload_result.function;
+
+            _symbol_use_locations.add_symbol_use(location, function);
+
+            // Mirror the `=~` operator visitor: an instance operator
+            // takes the left operand as its receiver, a static one
+            // (string's op_Equality) takes both as arguments with no
+            // receiver. Passing a receiver for a static operator would
+            // emit a virtual call that dereferences a null receiver.
+            let call =
+                if function.is_instance then
+                    function.call(
+                        location,
+                        left_value,
+                        Collections.LIST[Value]([right_value]),
+                        null,
+                        _function_caller
+                    );
+                else
+                    function.call(
+                        location,
+                        null,
+                        Collections.LIST[Value]([left_value, right_value]),
+                        null,
+                        _function_caller
+                    );
+                fi;
+
+            if op_name =~ "<>" then
+                return COMPARE_ORDER_TO_ZERO(call, "==", _innate_symbol_lookup.get_bool_type());
+            fi
+
+            return call;
         si
 
         _non_optional(type: Type) -> Type? =>
@@ -820,6 +1053,27 @@ namespace Syntax.Process is
             else
                 type;
             fi;
+
+        // Resolve an operator overload under speculation, so a failed
+        // resolution (no matching overload) leaves no diagnostics: the
+        // `case` path treats "no operator" as "fall back to a raw
+        // compare", not an error. Mirrors the speculation
+        // _resolve_with_retry gives the `=~` expression.
+        _resolve_silently(
+            location: Source.LOCATION,
+            group: Semantic.Symbols.FUNCTION_GROUP,
+            argument_types: Collections.LIST[Type],
+            want_instance: bool
+        ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
+            let use snapshot = _logger.speculate_then_backtrack();
+
+            let result =
+                _overload_resolver.resolve(location, group, argument_types, false, want_instance, false);
+
+            snapshot.backtrack();
+
+            return result;
+        si
 
         // `a ?? b` — short-circuit null-coalesce. Result type is the
         // LUB of the left's underlying type and the right's type, with
