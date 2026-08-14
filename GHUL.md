@@ -1287,6 +1287,14 @@ Both are the same call, and both are a plain method call rather than another spe
 
 A static property or field takes `snake_case` however constant-like it reads, since only enum members become `MACRO_CASE` — `CancellationToken.None` is `System.Threading.CancellationToken.none`.
 
+An **indexer** is the one member reached only through its own syntax. .NET does not fix its name — the property carries whatever its declaring language chose, and the type nominates the real one, so `System.String` and `System.Text.StringBuilder` both call theirs `Chars` — but the name never has to be written: `[` and `]` find it whatever it is.
+
+```ghul
+let initial = name[0];
+```
+
+The accessors behind it are not members in their own right, so naming one directly is an error rather than another way in.
+
 A **nested** .NET type is not addressed through its enclosing type. It lives in the enclosing type's namespace under a name joining the segments with `_`, so `System.Environment.SpecialFolder` is written:
 
 ```ghul
