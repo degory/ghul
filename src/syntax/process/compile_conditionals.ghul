@@ -34,6 +34,13 @@ namespace Syntax.Process is
         // load Value for the innermost case, so each `when` label's
         // value-equality test references the single evaluation.
         _case_scrutinee_load_stack: Collections.LIST[IR.Values.Value?];
+        // Parallel again: the scrutinee expression node itself, so a
+        // pattern arm can narrow the scrutinee variable in its body the
+        // way `if let` narrows the tested expression.
+        _case_scrutinee_expression_stack: Collections.LIST[Trees.Expressions.Expression?];
+        // Per-case flow bookkeeping, mirroring `_if_flow_stack`: each
+        // arm records its exit environment here and visit_case joins them.
+        _case_flow_stack: Collections.LIST[CASE_FLOW_FRAME];
         _match_propagator: Semantic.MATCH_PROPAGATOR;
         _case_exhaustiveness_checker: CASE_EXHAUSTIVENESS_CHECKER;
         _arm_null_join: ARM_NULL_JOIN;
@@ -61,6 +68,8 @@ namespace Syntax.Process is
             _pattern_checker = PATTERN_CHECKER(logger, build_flags, visitor, flow);
             _case_scrutinee_stack = Collections.LIST[Type?]();
             _case_scrutinee_load_stack = Collections.LIST[IR.Values.Value?]();
+            _case_scrutinee_expression_stack = Collections.LIST[Trees.Expressions.Expression?]();
+            _case_flow_stack = Collections.LIST[CASE_FLOW_FRAME]();
             _match_propagator = Semantic.MATCH_PROPAGATOR(logger);
             _case_exhaustiveness_checker = CASE_EXHAUSTIVENESS_CHECKER(logger, innate_symbol_lookup);
             _arm_null_join = ARM_NULL_JOIN();
@@ -649,6 +658,11 @@ namespace Syntax.Process is
 
             _case_scrutinee_stack.add(scrutinee_type);
             _case_scrutinee_load_stack.add(scrutinee_load);
+            _case_scrutinee_expression_stack.add(`case.expression);
+
+            // Every arm walks from this same entry environment — the one
+            // in force once the scrutinee has been walked and spilled.
+            _case_flow_stack.add(CASE_FLOW_FRAME(_flow.current_env.copy()));
 
             for m in `case.matches do
                 m.walk(_visitor);
@@ -656,6 +670,9 @@ namespace Syntax.Process is
 
             _case_scrutinee_stack.remove_at(_case_scrutinee_stack.count - 1);
             _case_scrutinee_load_stack.remove_at(_case_scrutinee_load_stack.count - 1);
+            _case_scrutinee_expression_stack.remove_at(_case_scrutinee_expression_stack.count - 1);
+
+            _join_case_arm_exits();
 
             return true;
         si
@@ -673,6 +690,15 @@ namespace Syntax.Process is
             // resolution - and any overload-resolution failure - in the
             // compile-expressions pass.
             if !pattern? then
+                // An expression-list arm narrows nothing, but its body
+                // still walks from the shared entry environment and still
+                // has to contribute its exit to the join — a kill inside
+                // it (an assignment, a heap-mutating call) must survive
+                // the `case` just as it would from a pattern arm. A null
+                // `expressions` marks the `else` arm, which covers the
+                // no-arm-matched path.
+                _reset_to_case_entry();
+
                 if arm.expressions? then
                     let scrutinee_load =
                         if _case_scrutinee_load_stack.count > 0 then
@@ -707,6 +733,8 @@ namespace Syntax.Process is
                 fi
 
                 arm.statements.walk(_visitor);
+
+                _record_case_arm_exit(!arm.expressions?);
 
                 return true;
             fi
@@ -781,18 +809,110 @@ namespace Syntax.Process is
                 false
             );
 
+            // Arms are alternatives, so each one walks from the shared
+            // pre-case entry environment rather than from whatever the
+            // previous arm left behind.
+            let epoch = _flow.heap_epoch;
+
+            _reset_to_case_entry();
+
+            // An ascribed pattern is a runtime type test on the
+            // scrutinee, so the scrutinee itself reads at the tested
+            // type inside the arm, exactly as `if let v: T = e` narrows
+            // `e`. The scrutinee was walked and spilled once before any
+            // arm ran and no arm has run yet, so the fact holds on entry
+            // to every arm.
+            if target_type? /\ _case_scrutinee_expression_stack.count > 0 then
+                let scrutinee_expression =
+                    _case_scrutinee_expression_stack[_case_scrutinee_expression_stack.count - 1];
+
+                if scrutinee_expression? then
+                    _flow.set_env(
+                        _condition_analyzer.apply_refutable_binding_then_narrow(
+                            scrutinee_expression,
+                            target_type,
+                            _flow.current_env
+                        )
+                    );
+                fi
+            fi
+
             // Per-arm guard — walked after the pattern's names are in
             // scope, so identifiers the pattern bound resolve inside it.
+            // Run the guard through the condition analyzer and apply its
+            // then-environment to the arm body, mirroring an `if let`
+            // guard (see _check_refutable_binding_clause): a presence or
+            // `isa` test in the guard narrows within the body.
             if arm.guard? then
                 arm.guard.walk(_visitor);
+
+                let facts = _condition_analyzer.analyze_condition(arm.guard, _flow.current_env);
+
+                if _flow.heap_killed_since(epoch) then
+                    facts.then_env.drop_heap_facts();
+                fi
+
+                _flow.set_env(facts.then_env);
             fi
 
             arm.statements.walk(_visitor);
+
+            _record_case_arm_exit(false);
 
             return true;
         si
 
         visit_case_match(arm: Trees.Statements.CASE_MATCH) is
+        si
+
+        // Reset to the environment every arm starts from. Arms are
+        // alternatives, so no arm inherits what a previous arm narrowed
+        // or killed.
+        _reset_to_case_entry() is
+            if _case_flow_stack.count > 0 then
+                _flow.set_env(_case_flow_stack[_case_flow_stack.count - 1].entry.copy());
+            fi
+        si
+
+        // Record the environment an arm body exits with, so visit_case
+        // can join it with the other arms'. A body that diverges exits
+        // at the bottom environment and contributes nothing to the join.
+        _record_case_arm_exit(is_else: bool) is
+            if _case_flow_stack.count > 0 then
+                let frame = _case_flow_stack[_case_flow_stack.count - 1];
+
+                frame.branch_exits.add(_flow.current_env.copy());
+
+                if is_else then
+                    frame.has_else = true;
+                fi
+            fi
+        si
+
+        // Join the arm exits into the environment in force after the
+        // `case`. Without an `else` arm the no-arm-matched path falls
+        // through carrying the entry environment, so that joins too —
+        // and because the join is a meet over facts, anything an arm
+        // killed is correctly absent from the result.
+        _join_case_arm_exits() is
+            if _case_flow_stack.count == 0 then
+                return;
+            fi
+
+            let frame = _case_flow_stack[_case_flow_stack.count - 1];
+            _case_flow_stack.remove_at(_case_flow_stack.count - 1);
+
+            let after mut = NARROW_ENV.bottom();
+
+            for branch_exit in frame.branch_exits do
+                after = NARROW_ENV.join(after, branch_exit);
+            od
+
+            if !frame.has_else then
+                after = NARROW_ENV.join(after, frame.entry);
+            fi
+
+            _flow.set_env(after);
         si
 
         visit_case(`case: Trees.Statements.CASE) is

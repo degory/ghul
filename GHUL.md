@@ -1005,6 +1005,8 @@ esac
 
 A failing guard falls through to the next arm, exactly as if the pattern itself hadn't matched. A guarded arm never counts towards exhaustiveness — it can decline to run even when its pattern matches, so `non-exhaustive-case` still fires for a variant only ever matched by a guarded arm.
 
+An arm's narrowing works like `if let`'s: an ascribed `when v: T` narrows the scrutinee to `T` inside the arm body, and a guard's own test — a `?` presence test or an `isa` — narrows within the body too. Arm narrowing is local; nothing an arm proves reaches a sibling arm or the code after the `case`.
+
 ### val ... lav
 
 `val ... lav` is a block expression: a sequence of statements whose value is the value of the last statement. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
