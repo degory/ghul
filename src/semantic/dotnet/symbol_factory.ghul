@@ -382,14 +382,15 @@ namespace Semantic.DotNet is
         add_members(result: Symbols.Scoped, type: TYPE) is
             let properties = MAP();
             let indexers = SET();
+            let indexer_accessors = SET();
             let methods = LIST();
 
             for p in type.get_properties() do
-                add_property(result, type, properties, indexers, p);
+                add_property(result, type, properties, indexers, indexer_accessors, p);
             od
 
             for t in type.get_members(cast BindingFlags(64 + 4 + 32 + 16 + 8)) do
-                add_member(result, type, properties, indexers, methods, t);
+                add_member(result, type, properties, indexers, indexer_accessors, methods, t);
             od
 
             if methods.count > 0 then
@@ -457,10 +458,11 @@ namespace Semantic.DotNet is
         si
 
         add_member(
-            owner: Symbols.Scoped, 
-            type: TYPE, 
-            properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS], 
+            owner: Symbols.Scoped,
+            type: TYPE,
+            properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
             indexers: SET[System.Reflection.MethodInfo],
+            indexer_accessors: SET[System.Reflection.MethodInfo],
             methods: LIST[(function: Symbols.Function, method_info: MethodInfo)],
             member: MemberInfo
         ) -> Symbols.Symbol?
@@ -472,7 +474,7 @@ namespace Semantic.DotNet is
             elif member_type == MemberTypes.FIELD then
                 add_field(owner, type, cast FieldInfo?(member)!);
             elif member_type == MemberTypes.METHOD then
-                add_method(owner, type, properties, indexers, methods, cast MethodInfo?(member)!);
+                add_method(owner, type, properties, indexers, indexer_accessors, methods, cast MethodInfo?(member)!);
             fi
             return null;
         si
@@ -658,24 +660,62 @@ namespace Semantic.DotNet is
         _is_reachable_from_other_assembly(method: MethodInfo) -> bool =>
             !(method.is_private \/ method.is_assembly \/ method.is_family_and_assembly);
 
+        // The name of the type's indexer property, as named by
+        // `DefaultMemberAttribute`. A type with no marker cannot have
+        // an indexer, but the name an indexer would take is still the
+        // right answer for the accessor-naming comparison.
+        _default_member_name(type: TYPE) -> string is
+            for attr in type.get_custom_attributes_data() do
+                if attr.attribute_type.full_name =~ "System.Reflection.DefaultMemberAttribute" then
+                    for argument in attr.constructor_arguments do
+                        let name = cast string?(argument.value);
+
+                        if name? then
+                            return name;
+                        fi
+                    od
+                fi
+            od
+
+            return Symbols.INDEXER_NAMES.property_name;
+        si
+
         add_property(
-            owner: Symbols.Scoped, 
-            type: TYPE, 
+            owner: Symbols.Scoped,
+            type: TYPE,
             properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
             indexers: SET[System.Reflection.MethodInfo],
+            indexer_accessors: SET[System.Reflection.MethodInfo],
             property: PropertyInfo
         ) is
             let index_parameters = property.get_index_parameters();
 
             if index_parameters.count > 0 then
+                // An indexed property is *the* indexer when the declaring
+                // type nominates it. A type can carry others that indexing
+                // must not reach — but one already named `Item` was
+                // reachable before the nomination was consulted, so it
+                // stays reachable whether or not it is the nominated one.
+                let is_indexer =
+                    property.name =~ _default_member_name(property.declaring_type ?? type) \/
+                    property.name =~ Symbols.INDEXER_NAMES.property_name;
+
                 let getter = property.get_get_method();
                 if getter? then
                     indexers.add(getter);
+
+                    if is_indexer then
+                        indexer_accessors.add(getter);
+                    fi
                 fi
 
                 let setter = property.get_set_method();
                 if setter? then
                     indexers.add(setter);
+
+                    if is_indexer then
+                        indexer_accessors.add(setter);
+                    fi
                 fi
 
                 return;
@@ -747,10 +787,11 @@ namespace Semantic.DotNet is
             type: TYPE,
             properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
             indexers: SET[System.Reflection.MethodInfo],
+            indexer_accessors: SET[System.Reflection.MethodInfo],
             methods: LIST[(function: Symbols.Function, method_info: MethodInfo)],
             method: MethodInfo
         ) is
-            add_method(owner, type, properties, indexers, methods, method, null);
+            add_method(owner, type, properties, indexers, indexer_accessors, methods, method, null);
         si
 
         // `force_name`, when non-null, supplies the ghūl name instead of
@@ -769,6 +810,7 @@ namespace Semantic.DotNet is
             type: TYPE,
             properties: MAP[System.Reflection.MethodInfo,PROPERTY_DETAILS],
             indexers: SET[System.Reflection.MethodInfo],
+            indexer_accessors: SET[System.Reflection.MethodInfo],
             methods: LIST[(function: Symbols.Function, method_info: MethodInfo)],
             method: MethodInfo,
             force_name: string?
@@ -794,8 +836,16 @@ namespace Semantic.DotNet is
                 name = force_name!;
             elif properties.try_get_value(method, property_details ref) then
                 name = _type_name_map.get_member_name(owner.qualified_name, method.name, method.is_private, true);
-            elif method.name =~ "get_Item" \/ method.name =~ "set_Item" then
-                name = method.name;
+            elif indexer_accessors.contains(method) then
+                name = Symbols.INDEXER_NAMES.accessor(method.name);
+
+                // An indexer named anything but `Item` in metadata is
+                // reachable under both names: indexing finds it under
+                // the name declared above, and it stays callable under
+                // its own de-camelled name.
+                if !Symbols.INDEXER_NAMES.is_canonical(method.name) then
+                    alias_name = _type_name_map.get_member_name(owner.qualified_name, method.name, false, false);
+                fi
             elif method.name =~ "Equals" /\ _is_self_relational_interface_target(type, method, _equatable_open_type, _bool_type) then
                 name = "=~";
                 alias_name = _plain_member_name(owner, indexers, method);
@@ -1012,14 +1062,16 @@ namespace Semantic.DotNet is
 
             methods.add((result, method));
 
-            // `IEquatable[T].Equals` and `IComparable[T].CompareTo` are
-            // reached as the operators `=~` and `<>`, and also under the
-            // ordinary de-camelled name, so a call spelled `equals` or
-            // `compare_to` resolves as well. Both symbols carry the same
+            // Some methods are reachable under a second name:
+            // `IEquatable[T].Equals` and `IComparable[T].CompareTo` as
+            // the operators `=~` and `<>` alongside `equals` and
+            // `compare_to`, and an indexer accessor whose metadata name
+            // is not `get_Item` / `set_Item` under that name as well as
+            // the one indexing looks for. Both symbols carry the same
             // `il_name_override`, so either spelling emits a call to the
             // one underlying method.
             if alias_name? then
-                add_method(owner, type, properties, indexers, methods, method, alias_name);
+                add_method(owner, type, properties, indexers, indexer_accessors, methods, method, alias_name);
             fi
         si
 
