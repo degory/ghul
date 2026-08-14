@@ -326,6 +326,28 @@ namespace Syntax.Process is
         has_argument_awaiting_context_type(argument_expressions: Collections.List[Trees.Expressions.Expression]) -> bool static =>
             argument_expressions |> any(a => COMPILE_CALLS.is_argument_awaiting_context_type(a));
 
+        // True for an argument that is a bare reference to an
+        // overloaded function or method group and stayed a
+        // non-consumable group load on the first walk. An overloaded
+        // group only becomes a delegate once a target call shape is
+        // pushed onto it, and before the callee was resolved nothing
+        // had one to push. A single-overload group resolves on the
+        // first walk and never looks like this.
+        is_unresolved_group_argument(a: Trees.Expressions.Expression) -> bool static is
+            if let value: Value = a.value then
+                if let load: Load.SYMBOL = value then
+                    return load.symbol.is_function_group;
+                fi
+            fi
+
+            return false;
+        si
+
+        // True when the call carries at least one unresolved group
+        // reference among its arguments.
+        has_unresolved_group_argument(argument_expressions: Collections.List[Trees.Expressions.Expression]) -> bool static =>
+            argument_expressions |> any(a => COMPILE_CALLS.is_unresolved_group_argument(a));
+
         // Once overload resolution has settled on a single, unambiguous
         // `function`, retry any argument that had no type to infer
         // against on the first walk - the resolved callee's formal
@@ -333,6 +355,13 @@ namespace Syntax.Process is
         // fresh speculation level, since the roll-back below discards
         // whatever the first walk logged for the whole call, not just
         // the waiting arguments.
+        //
+        // Two argument shapes need this. A context-typed one - a bare
+        // `_`, or a `cast(v)` with the target elided - infers its type
+        // from the formal. A bare reference to an overloaded function
+        // or method group turns into a delegate only once the formal's
+        // call shape is pushed onto it, so the group picks its member
+        // the same way an explicit annotation would pick it.
         //
         // Such an argument is only ever pushed a type when the resolved
         // formal at that position is itself concrete: a generic
@@ -342,7 +371,10 @@ namespace Syntax.Process is
         // type variable free only in the waiting slot leaves the formal
         // wild and the argument is left to re-report its original
         // error - neither a `_` nor a `cast(v)` ever itself contributes
-        // to binding a type variable.
+        // to binding a type variable. A group reference is additionally
+        // gated on the formal being callable - a function type or a
+        // named .NET delegate - since nothing else gives the group a
+        // shape to resolve against.
         //
         // A resolved formal with a declared .NET default value (an
         // optional CLR parameter) takes that value rather than the
@@ -350,22 +382,45 @@ namespace Syntax.Process is
         // exactly like omitting the same parameter by name. That
         // applies to `_` alone: `cast(v)` asks for a conversion of `v`,
         // so a declared default has nothing to do with it.
+        // Returns true when a bare group argument resolved to a
+        // delegate under the pushed formal - the caller then
+        // re-resolves the call so the callee's own type variables
+        // bind from the delegate's shape rather than staying open.
         _resolve_deferred_defaults(
             function: Semantic.Symbols.Function,
             argument_expressions: Collections.List[Trees.Expressions.Expression],
             arguments: Collections.LIST[Value],
             argument_types: Collections.LIST[Type]
-        ) is
-            if !has_argument_awaiting_context_type(argument_expressions) then
-                return;
+        ) -> bool is
+            if
+                !has_argument_awaiting_context_type(argument_expressions) /\
+                !COMPILE_CALLS.has_unresolved_group_argument(argument_expressions)
+            then
+                return false;
             fi
 
             _logger.roll_back();
             _logger.speculate();
             _flow.restore();
 
+            let resolved_group mut = false;
+
             for (index, a) in argument_expressions |> index() do
                 if
+                    COMPILE_CALLS.is_unresolved_group_argument(a) /\
+                    index < function.arguments.count /\
+                    (
+                        function.arguments[index].is_function \/
+                        _delegate_shape.is_named_delegate(function.arguments[index])
+                    )
+                then
+                    a.set_expected_type(function.arguments[index], "{{0}} is not assignable to {{1}}");
+                    a.walk(_visitor);
+
+                    if !COMPILE_CALLS.is_unresolved_group_argument(a) then
+                        resolved_group = true;
+                    fi
+                elif
                     COMPILE_CALLS.is_argument_awaiting_context_type(a) /\
                     index < function.arguments.count /\
                     !function.arguments[index].is_wild
@@ -415,6 +470,8 @@ namespace Syntax.Process is
                     argument_types[index] = value.type!;
                 fi
             od
+
+            return resolved_group;
         si
 
         _compile_one_argument(
@@ -781,7 +838,7 @@ namespace Syntax.Process is
             function = _owner_constraint_specializer.specialize_from_constraint(location, function, constraint);
             function = _type_arg_placeholder_registry.specialize_with_placeholders(location, function, cache_key);
 
-            _resolve_deferred_defaults(function, argument_expressions.expressions, arguments, argument_types);
+            let _ = _resolve_deferred_defaults(function, argument_expressions.expressions, arguments, argument_types);
 
             if isa Semantic.Symbols.GENERIC(function.owner) then
                 type_symbol = cast Semantic.Symbols.Symbol(function.owner);
@@ -1086,7 +1143,8 @@ namespace Syntax.Process is
                 _under_determination_detector.any_arg_under_determined(effective_candidate, argument_types) \/
                 COMPILE_CALLS.has_function_literal_argument(argument_expressions) \/
                 COMPILE_CALLS.has_empty_array_literal_argument(argument_expressions) \/
-                _delegate_push_candidates.has_push_mismatch(effective_candidate, argument_types)
+                _delegate_push_candidates.has_push_mismatch(effective_candidate, argument_types) \/
+                COMPILE_CALLS.has_unresolved_group_argument(argument_expressions)
             ) then
                 // Sibling-arg specialisation, symmetric to
                 // the path in `resolve_constructor`: when
@@ -1422,9 +1480,19 @@ namespace Syntax.Process is
                         fi
                     fi
 
-                    let function = overload_result.function;
+                    let function mut = overload_result.function;
 
-                    _resolve_deferred_defaults(function, call.arguments.expressions, arguments, argument_types);
+                    if _resolve_deferred_defaults(function, call.arguments.expressions, arguments, argument_types) then
+                        // A bare group argument resolved to a delegate
+                        // only now that the formal was known - re-resolve
+                        // so the callee's own type variables bind from the
+                        // delegate's shape rather than staying open.
+                        let re_resolved = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict, call.expected_type);
+
+                        if re_resolved? then
+                            function = re_resolved.function;
+                        fi
+                    fi
 
                     _visitor.note_reference_arguments(call, function);
 
