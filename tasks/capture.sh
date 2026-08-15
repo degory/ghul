@@ -36,6 +36,20 @@ promote() {
     fi
 }
 
+# Matches how the runner reads the same flag, so the two cannot drift on
+# what counts as a library.
+is_library() {
+    local flag
+
+    for flag in $(cat "$CASE/ghulflags" 2>/dev/null) ; do
+        if [ "$flag" = "--library" ] ; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 if [ -d $CASE ] ; then
     if [ ! -f $CASE/failed ] ; then
         echo "expected to find failed marker in $CASE"
@@ -46,10 +60,15 @@ if [ -d $CASE ] ; then
     promote $CASE/warn.sort $CASE/warn.expected
     promote $CASE/il.out $CASE/il.expected
 
+    # A library has no entry point, so the runner never runs it and there
+    # is no run output to promote - which is not the same as the build
+    # having failed. Writing fail.expected for one makes the test demand
+    # a build failure it is not testing for, and it then reports
+    # "unexpected build success" forever after.
     if [ -f $CASE/run.out ] ; then
         promote $CASE/run.out $CASE/run.expected
         rm -f $CASE/fail.expected
-    else
+    elif ! is_library ; then
         echo >$CASE/fail.expected
     fi
 
