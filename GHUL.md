@@ -1222,6 +1222,17 @@ use System.IParsable;
 parse[T: IParsable[T]](s: string) -> T => T.parse(s, null);
 ```
 
+Some of those interfaces declare an **operator** as a static member — `IAdditionOperators[TSelf, TOther, TResult]` declares addition, and `INumber[T]` extends it. Such an operator is written as an operator rather than reached through the type parameter, but only once it has been imported by name:
+
+```ghul
+use System.Numerics.INumber;
+use System.Numerics.IAdditionOperators.`+;
+
+total[T: INumber[T]](a: T, b: T) -> T => a + b;
+```
+
+Without that `use` the operator is not in scope and `a + b` does not resolve, so nothing changes for code that does not ask for it — importing one does not displace the built-in operators either, and `3 + 4` still adds two `int`s the way it always did. The arithmetic operators `+`, `-`, `*`, `/` and `%` are the ones that can be imported this way. The comparison and equality operators cannot: a type says how it orders and compares by defining `<>` and `=~`, and those are what the operators are written in terms of.
+
 A bound can also be a **kind**: `class` for a reference type, `struct` for a value type, `optional` for one that can be absent, and `init` for a type exposing an accessible parameterless constructor. Kinds combine with each other and with a type bound, space-separated, and take no parentheses:
 
 ```ghul
