@@ -856,7 +856,23 @@ if let (Color.RED, label) = entry then
 fi
 ```
 
-Literal leaves are only allowed in refutable contexts (`if let` and `case`-when patterns); a plain `let` with a literal leaf is rejected, because the value test would be silently skipped at runtime.
+A bare name in leaf position declares a variable, so it always matches and never tests. A leading `~` says the opposite — match the source position against the value that name already holds:
+
+```ghul
+use Colour.RED;
+
+if let (~RED, label) = entry then
+    write_line("red: {label}");
+fi
+
+if let (~expected, name) = pair then
+    write_line("expected: {name}");
+fi
+```
+
+The marked value is read where the pattern is, so it need not be a constant — a local variable, a parameter, or a field all work, which is what the dotted spelling cannot express. `~` is accepted on any leaf that is a legal value to match, so it can be written on a literal or a dotted name too, where it changes nothing (`(~1, s)` and `(~Colour.RED, s)` match exactly as `(1, s)` and `(Colour.RED, s)` do). A marked leaf counts towards exhaustiveness exactly as the unmarked spelling would: marked enum members and booleans complete their closed domain, while a value from a domain too large to enumerate leaves the `case` needing an `else`.
+
+Matching leaves — literal, dotted, or marked — are only allowed in refutable contexts (`if let`, `while let` and `case`-when patterns); a plain `let` with one is rejected, because the value test would be silently skipped at runtime. For the same reason `~` is rejected on a formal argument or a lambda parameter, where a leaf can only bind, and on a whole destructure group rather than a leaf.
 
 Trailing `/\`-separated *guards* gate entry on additional conditions evaluated after the test, with the new variable in scope:
 
@@ -976,7 +992,7 @@ esac;
 A `when` arm can also carry a binding pattern instead of an equality list. The patterns mirror those accepted by `if let`:
 
 - `when v: T then` — type-test against `T`; on match, bind `v` to the narrowed value.
-- `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: CAT, d: DOG) then`); discards are `_`; literal leaves like `when (1, label) then` or `when (Color.RED, label) then` add a value-equality test at that position.
+- `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: CAT, d: DOG) then`); discards are `_`; literal leaves like `when (1, label) then` or `when (Color.RED, label) then` add a value-equality test at that position, and a `~`-marked leaf like `when (~expected, label) then` tests against the value that name holds rather than binding it.
 - `when _: T then` — type-test only, no binding.
 
 Pattern arms share `if let`'s contract on refutability — an option-shaped scrutinee binds to the unwrapped value, and an impossible value-type narrow is rejected with one error and ERROR-typed recovery on the bound names:
