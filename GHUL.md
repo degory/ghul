@@ -814,7 +814,7 @@ A variable whose type is a pure function type is trusted to hold a store-free va
 
 ### if let
 
-`cast T?(x)` views `x` as a `T`, yielding the absent value rather than throwing when `x` is not a `T` - so the result is one a presence test can ask about. Written without the `?`, the cast yields `null` into a slot whose type says it is never absent, which is what the `cast-may-throw` warning is pointing at. `if let` folds a cast and a presence test into the `if` itself — a `let` in the condition, with the then-branch running only when the value is present and the variable narrowed and in scope just there. A type on the variable makes it a type test; `elif let` chains them:
+`cast T?(x)` views `x` as a `T`, yielding the absent value rather than throwing when `x` is not a `T` - so the result is one a presence test can ask about. Written without the `?` the cast is checked: a value that is not a `T` raises `System.InvalidCastException` there rather than becoming a null in a slot whose type says it is never absent, and the `cast-may-throw` warning says so at the site. Two targets are unaffected and still yield rather than throwing: a value type, which gives that type's default, and a type parameter, which can stand for either kind and so cannot be checked at the cast - inside a generic, `cast T(x)` can still produce an absent value in a non-optional slot. `if let` folds a cast and a presence test into the `if` itself — a `let` in the condition, with the then-branch running only when the value is present and the variable narrowed and in scope just there. A type on the variable makes it a type test; `elif let` chains them:
 
 ```ghul
 if let c: CAT = a then
