@@ -1,5 +1,6 @@
 namespace Syntax.Process is
     use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
     use Semantic.Symbols.STORE_FREE_IMPORTS;
 
     // Counterfactual solvers over the same facts STORE_FREE_FIXPOINT
@@ -148,6 +149,265 @@ namespace Syntax.Process is
             od
 
             return safe;
+        si
+
+        // What each function may write, at member-symbol granularity:
+        // its own writes, plus those of everything it can dispatch to.
+        // `unbounded` names the functions for which no such set exists
+        // - the walk lost track, a callee was not walked, or an
+        // override outside the compilation could write anything.
+        //
+        // Receiver-blind, exactly as NARROWING_FLOW.on_member_store is:
+        // a write to `other.f` and one to `self.f` are the same entry,
+        // because the two receivers may alias.
+        write_sets(close_open: bool, trust_imports: bool) -> (
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) is
+            let sets = Collections.MAP[Function, Collections.SET[Symbol]]();
+            let unbounded = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let set = Collections.SET[Symbol]();
+                let record = NARROWING_STUDY.record_for(function);
+
+                if record? then
+                    for member in record.writes do
+                        set.add(member);
+                    od
+
+                    if record.writes_unbounded then
+                        unbounded.add(function);
+                    fi
+                else
+                    unbounded.add(function);
+                fi
+
+                // An override in another assembly could write anything.
+                // `close_open` drops that, which is the whole-program
+                // assumption a self-contained program like the compiler
+                // could legitimately make.
+                if !close_open /\ shadow.is_openly_dispatchable(function) then
+                    unbounded.add(function);
+                fi
+
+                sets[function] = set;
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    let set = sets[function];
+                    let before = set.count;
+                    let was_unbounded = unbounded.contains(function);
+
+                    if _absorb(function, sets, unbounded, trust_imports) then
+                        changed = true;
+                    fi
+
+                    if !was_unbounded /\ unbounded.contains(function) then
+                        changed = true;
+                    fi
+
+                    if set.count != before then
+                        changed = true;
+                    fi
+                od
+            od
+
+            return (sets = sets, unbounded = unbounded);
+        si
+
+        // Pull every dispatch target's writes into `function`'s set.
+        // Returns whether the function became unbounded.
+        _absorb(
+            function: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            let became mut = false;
+
+            for callee in _facts[function].callees do
+                if _absorb_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if _absorb_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        if !unbounded.contains(function) then
+                            unbounded.add(function);
+                            became = true;
+                        fi
+
+                        continue;
+                    fi
+
+                    if _absorb_target(function, cast Function(overrider), sets, unbounded, trust_imports) then
+                        became = true;
+                    fi
+                od
+            fi
+
+            return became;
+        si
+
+        _absorb_target(
+            function: Function,
+            target: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            if target.is_declared_pure then
+                return false;
+            fi
+
+            if !sets.contains_key(target) then
+                // not walked here: a trusted store-free import writes
+                // nothing, anything else could write anything
+                if trust_imports \/ STORE_FREE_IMPORTS.is_store_free(target) then
+                    return false;
+                fi
+
+                if unbounded.contains(function) then
+                    return false;
+                fi
+
+                unbounded.add(function);
+                return true;
+            fi
+
+            for member in sets[target] do
+                sets[function].add(member);
+            od
+
+            if unbounded.contains(target) /\ !unbounded.contains(function) then
+                unbounded.add(function);
+                return true;
+            fi
+
+            return false;
+        si
+
+        // For each function whose write set cannot be bounded, what to
+        // blame: its own give-up reason if it has one, otherwise the
+        // reason of something it can reach. Answers "what would the
+        // walk have to model for this kill to become decidable?".
+        blame(close_open: bool, trust_imports: bool) -> Collections.MutableMap[Function, string] is
+            let blamed = Collections.MAP[Function, string]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let record = NARROWING_STUDY.record_for(function);
+
+                if record? /\ !(record.unbounded_reason =~ "") then
+                    blamed[function] = record.unbounded_reason;
+                elif record? /\ record.writes_unbounded then
+                    blamed[function] = "write-target-unresolved";
+                elif !close_open /\ shadow.is_openly_dispatchable(function) then
+                    blamed[function] = "open-dispatch";
+                fi
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if blamed.contains_key(function) then
+                        continue;
+                    fi
+
+                    let reached = _blame_of(function, blamed, trust_imports);
+
+                    if reached? then
+                        blamed[function] = reached;
+                        changed = true;
+                    fi
+                od
+            od
+
+            return blamed;
+        si
+
+        _blame_of(
+            function: Function,
+            blamed: Collections.MutableMap[Function, string],
+            trust_imports: bool
+        ) -> string? is
+            for callee in _facts[function].callees do
+                let r = _blame_target(callee, blamed, trust_imports);
+
+                if r? then
+                    return r;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                let r = _blame_target(callee, blamed, trust_imports);
+
+                if r? then
+                    return r;
+                fi
+            od
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        return "overrider-not-a-function";
+                    fi
+
+                    let r = _blame_target(cast Function(overrider), blamed, trust_imports);
+
+                    if r? then
+                        return r;
+                    fi
+                od
+            fi
+
+            return null;
+        si
+
+        _blame_target(
+            target: Function,
+            blamed: Collections.MutableMap[Function, string],
+            trust_imports: bool
+        ) -> string? is
+            if target.is_declared_pure then
+                return null;
+            fi
+
+            if !_facts.contains_key(target) then
+                if trust_imports \/ STORE_FREE_IMPORTS.is_store_free(target) then
+                    return null;
+                fi
+
+                return "imported-callee";
+            fi
+
+            if blamed.contains_key(target) then
+                return blamed[target];
+            fi
+
+            return null;
         si
 
         // The exempt set for a counterfactual: property read accessors

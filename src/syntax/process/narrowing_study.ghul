@@ -38,6 +38,17 @@ namespace Syntax.Process is
         overrider_writes: bool public;
         overrider_unprovable: bool public;
 
+        // The member symbols this body writes directly, and whether it
+        // performs a write the walk could not pin to a symbol (an
+        // index, an unresolvable target) or does something unboundable
+        // that could write anything.
+        writes: Collections.SET[Symbol] public;
+        writes_unbounded: bool public;
+
+        // What the walk first gave up on in this body, or "" if it
+        // never did.
+        unbounded_reason: string public;
+
         callee_count: int public;
         overrider_count: int public;
         openly_dispatchable: bool public;
@@ -48,7 +59,30 @@ namespace Syntax.Process is
             self.owner_name = owner_name;
             self.location = location;
             self.role = role;
+            writes = Collections.SET[Symbol]();
+            unbounded_reason = "";
         si
+    si
+
+    // One killed narrowing fact, reduced to the member symbols whose
+    // being written by the callee would justify the kill.
+    class KILL_FACT(
+        location: string public,
+        callee: Function? public,
+        members: Collections.LIST[Symbol] public,
+        is_getter: bool public
+    );
+
+    // One run of the store-free analysis, and the write sets it
+    // produced under each relaxation variant. Two runs are compared:
+    // the analysis where it really sits, and the same analysis repeated
+    // after compile-expressions, which is what moving it would know.
+    class WRITE_GENERATION(
+        label: string public,
+        sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]] public,
+        unbounded: Collections.LIST[Collections.SET[Function]] public
+    ) is
+        blame: Collections.MutableMap[Function, string]?  public;
     si
 
     // Empirical study of narrowing kills and store-free classification.
@@ -168,6 +202,37 @@ namespace Syntax.Process is
             return _assumed_safe;
         si
 
+        // GHUL_STUDY_RESOLVED: after the build, repeat the store-free
+        // analysis with compile-expressions' resolved types available.
+        _resolved_pass: bool static;
+        _resolved_pass_known: bool static;
+
+        resolved_pass: bool static is
+            if !_resolved_pass_known then
+                let text = System.Environment.get_environment_variable("GHUL_STUDY_RESOLVED");
+                _resolved_pass = enabled /\ text? /\ text.length > 0;
+                _resolved_pass_known = true;
+            fi
+
+            return _resolved_pass;
+        si
+
+        // GHUL_NO_CALL_KILLS: stop calls killing heap facts at all, the
+        // unsound rule most languages with flow narrowing use. For
+        // measuring what the analysis is buying, not a supported mode.
+        _no_call_kills: bool static;
+        _no_call_kills_known: bool static;
+
+        no_call_kills: bool static is
+            if !_no_call_kills_known then
+                let text = System.Environment.get_environment_variable("GHUL_NO_CALL_KILLS");
+                _no_call_kills = text? /\ text.length > 0;
+                _no_call_kills_known = true;
+            fi
+
+            return _no_call_kills;
+        si
+
         // Whether the counterfactual exempts `function` from the
         // dispatch-shadow test. Consulted by STORE_FREE_FIXPOINT only
         // when GHUL_ASSUME_GETTERS_PURE is set, so an ordinary build
@@ -266,6 +331,95 @@ namespace Syntax.Process is
         kill_events_rescued_unprovable: int static public;
         kill_events_rescued_sound: int static public;
 
+        // ==== necessity accounting ====
+        //
+        // For each killed fact, whether the callee's write set actually
+        // contains the member the fact is about. `unknown` means the
+        // callee's writes could not be bounded, so nothing can be said.
+        facts_killed_necessary: Collections.LIST[int]? static;
+        facts_killed_unnecessary: Collections.LIST[int]? static;
+        facts_killed_unknown: Collections.LIST[int]? static;
+
+        _counts(list: Collections.LIST[int]?) -> Collections.LIST[int] static is
+            if list? then
+                return list;
+            fi
+
+            let made = Collections.LIST[int]();
+
+            for i in 0..VARIANTS do
+                made.add(0);
+            od
+
+            return made;
+        si
+
+        // The same split restricted to kills by a property read
+        // accessor.
+        getter_killed_necessary: int static public;
+        getter_killed_unnecessary: int static public;
+        getter_killed_unknown: int static public;
+
+        // Calls that did not kill because the callee is store-free, and
+        // the heap facts that survived them.
+        save_events: int static public;
+        save_facts: int static public;
+
+        // Three write-set variants, each relaxing one source of
+        // conservatism, so the report can say how much of the
+        // undecidability each source accounts for.
+        //   0  as shipped
+        //   1  whole-program: an override outside the assembly cannot exist
+        //   2  the same, plus every unannotated import trusted to write nothing
+        _write_sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]]? static;
+        _write_unbounded: Collections.LIST[Collections.SET[Function]]? static;
+
+        VARIANTS: int static => 3;
+
+        set_write_sets(
+            sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]],
+            unbounded: Collections.LIST[Collections.SET[Function]]
+        ) static is
+            _write_sets = sets;
+            _write_unbounded = unbounded;
+
+            generations.add(
+                WRITE_GENERATION(
+                    if _next_label =~ "" then "as-shipped" else _next_label fi,
+                    sets,
+                    unbounded));
+        si
+
+        // Blame counts for kills that stay undecidable under the most
+        // relaxed variant.
+        _blame: Collections.MutableMap[Function, string]? static;
+        _blame_counts: Collections.MutableMap[string, int]? static;
+
+        set_blame(blame: Collections.MutableMap[Function, string]) static is
+            _blame = blame;
+
+            if generations.count > 0 then
+                generations[generations.count - 1].blame = blame;
+            fi
+        si
+
+        blame_counts: Collections.MutableMap[string, int] static is
+            if !_blame_counts? then
+                _blame_counts = Collections.MAP[string, int]();
+            fi
+
+            return _blame_counts;
+        si
+
+        note_call_saved(callee: Function?, live: int) static is
+            if !enabled \/ live == 0 then
+                return;
+            fi
+
+            save_events = save_events + 1;
+            save_facts = save_facts + live;
+        si
+
         kill_events_heap_store: int static public;
         facts_killed_heap_store: int static public;
 
@@ -291,13 +445,27 @@ namespace Syntax.Process is
             _optimistic_clean = clean;
         si
 
-        note_call_kill(callee: Function?, killed: int) static is
+        // Sites where the most relaxed variant can still show the
+        // callee writes the very member the fact is about - the kills
+        // that would become real unsoundness if calls stopped killing.
+        necessary_sites: Collections.LIST[string]? static;
+
+        note_call_kill(
+            location: Source.LOCATION,
+            callee: Function?,
+            killed_symbols: Collections.SET[Symbol],
+            killed_paths: Collections.SET[ACCESS_PATH]
+        ) static is
             if !enabled then
                 return;
             fi
 
+            let killed = killed_symbols.count + killed_paths.count;
+
             kill_events_call = kill_events_call + 1;
             facts_killed_call = facts_killed_call + killed;
+
+            _buffer_kill(location, callee, killed_symbols, killed_paths);
 
             if !callee? then
                 kill_events_call_unattributed = kill_events_call_unattributed + 1;
@@ -362,6 +530,74 @@ namespace Syntax.Process is
             fi
         si
 
+        // One killed fact, reduced to the member symbols whose being
+        // written would justify the kill: the symbol itself for a
+        // variable fact, the root and every hop for a path fact.
+        // Buffered rather than classified on the spot, so the same
+        // kills can be re-judged against a second, better-informed run
+        // of the analysis.
+        _kills: Collections.LIST[KILL_FACT]? static;
+
+        kills: Collections.LIST[KILL_FACT] static is
+            if !_kills? then
+                _kills = Collections.LIST[KILL_FACT]();
+            fi
+
+            return _kills;
+        si
+
+        _buffer_kill(
+            location: Source.LOCATION,
+            callee: Function?,
+            killed_symbols: Collections.SET[Symbol],
+            killed_paths: Collections.SET[ACCESS_PATH]
+        ) static is
+            let record = if callee? then record_for(callee) else null fi;
+            let is_getter = record? /\ record.role =~ "get";
+            let root = if callee? then cast Function?(callee.root_specialized_from) else null fi;
+
+            for v in killed_symbols do
+                let members = Collections.LIST[Symbol]();
+
+                members.add(v.root_specialized_from);
+                kills.add(KILL_FACT("{location}", root, members, is_getter));
+            od
+
+            for p in killed_paths do
+                let members = Collections.LIST[Symbol]();
+
+                members.add(p.root.root_specialized_from);
+
+                for m in p.members do
+                    members.add(m.root_specialized_from);
+                od
+
+                kills.add(KILL_FACT("{location}", root, members, is_getter));
+            od
+        si
+
+        // ==== write-set generations ====
+
+        _generations: Collections.LIST[WRITE_GENERATION]? static;
+
+        generations: Collections.LIST[WRITE_GENERATION] static is
+            if !_generations? then
+                _generations = Collections.LIST[WRITE_GENERATION]();
+            fi
+
+            return _generations;
+        si
+
+        // Label the run whose facts the next set_write_sets carries, and
+        // clear the per-function records so the new walk's answers
+        // replace the old ones rather than being discarded as duplicates.
+        _next_label: string static;
+
+        begin_generation(label: string) static is
+            _next_label = label;
+            _records = Collections.MAP[Function, STUDY_RECORD]();
+        si
+
         note_heap_store_kill(killed: int) static is
             if !enabled then
                 return;
@@ -409,6 +645,92 @@ namespace Syntax.Process is
                     writer.write_line("kill_events_call_role_{role}\t{by_role[role]}\trescued\t{rescued}");
                 od
 
+                for variant in 0..VARIANTS do
+                    writer.write_line(
+                        "necessity_variant_{variant}\tnecessary\t{_counts(facts_killed_necessary)[variant]}"
+                        "\tunnecessary\t{_counts(facts_killed_unnecessary)[variant]}"
+                        "\tunknown\t{_counts(facts_killed_unknown)[variant]}");
+                od
+                writer.write_line("getter_killed_necessary\t{getter_killed_necessary}");
+                writer.write_line("getter_killed_unnecessary\t{getter_killed_unnecessary}");
+                writer.write_line("getter_killed_unknown\t{getter_killed_unknown}");
+                for key in blame_counts.keys do
+                    writer.write_line("blame_{key}\t{blame_counts[key]}");
+                od
+
+                for generation in generations do
+                    for variant in 0..VARIANTS do
+                        let necessary mut = 0;
+                        let unnecessary mut = 0;
+                        let unknown mut = 0;
+
+                        let blame_counts = Collections.MAP[string, int]();
+
+                        for kill in kills do
+                            let sets = generation.sets[variant];
+                            let root = kill.callee;
+
+                            let is_unbounded =
+                                !root? \/
+                                !sets.contains_key(root!) \/
+                                generation.unbounded[variant].contains(root!);
+
+                            if is_unbounded then
+                                unknown = unknown + 1;
+
+                                if variant == VARIANTS - 1 then
+                                    let blame = generation.blame;
+
+                                    _bump(
+                                        blame_counts,
+                                        if root? /\ blame? /\ blame.contains_key(root!) then
+                                            blame![root!]
+                                        else
+                                            "callee-not-walked"
+                                        fi);
+                                fi
+
+                                continue;
+                            fi
+
+                            let writes = sets[root!];
+                            let hit mut = false;
+
+                            for m in kill.members do
+                                if writes.contains(m) then
+                                    hit = true;
+                                fi
+                            od
+
+                            if hit then
+                                necessary = necessary + 1;
+
+                                if variant == VARIANTS - 1 then
+                                    writer.write_line("necessary_site\t{generation.label}\t{kill.location}");
+                                fi
+                            else
+                                unnecessary = unnecessary + 1;
+                            fi
+                        od
+
+                        writer.write_line(
+                            "necessity\t{generation.label}\tvariant{variant}"
+                            "\tnecessary\t{necessary}\tunnecessary\t{unnecessary}\tunknown\t{unknown}");
+
+                        for key in blame_counts.keys do
+                            writer.write_line("blame\t{generation.label}\t{key}\t{blame_counts[key]}");
+                        od
+                    od
+                od
+
+                if necessary_sites? then
+                    for site in necessary_sites do
+                        writer.write_line("necessary_site\t{site}");
+                    od
+                fi
+
+                writer.write_line("save_events\t{save_events}");
+                writer.write_line("save_facts\t{save_facts}");
                 writer.write_line("kill_events_rescued_sound\t{kill_events_rescued_sound}");
                 writer.write_line("kill_events_rescued_unprovable\t{kill_events_rescued_unprovable}");
                 writer.write_line("kill_events_rescued_unsound\t{kill_events_rescued_unsound}");
@@ -420,7 +742,7 @@ namespace Syntax.Process is
                 writer.write_line(
                     "# role\towner\tname\tstore_free\tdefinitely_writes\tbody_clean\tdisqualified\taliased\t"
                     "own_stores\town_unbounded\tcallees\toverriders\topenly_dispatchable\t"
-                    "declared_pure\tovr_writes\tovr_unprovable\tcontrol\topt_leaf\topt_clean\tlocation");
+                    "declared_pure\tovr_writes\tovr_unprovable\treason\tcontrol\topt_leaf\topt_clean\tlocation");
 
                 for function in records.keys do
                     let r = records[function];
@@ -433,7 +755,7 @@ namespace Syntax.Process is
                         "{r.is_disqualified}\t{r.aliased}\t"
                         "{r.own_stores}\t{r.own_unbounded}\t{r.callee_count}\t{r.overrider_count}\t"
                         "{r.openly_dispatchable}\t{r.declared_pure}\t"
-                        "{r.overrider_writes}\t{r.overrider_unprovable}\t"
+                        "{r.overrider_writes}\t{r.overrider_unprovable}\t{r.unbounded_reason}\t"
                         "{_control? /\ _control.contains(function)}\t"
                         "{_optimistic_leaf? /\ _optimistic_leaf.contains(function)}\t"
                         "{_optimistic_clean? /\ _optimistic_clean.contains(function)}\t"
