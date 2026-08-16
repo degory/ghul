@@ -407,6 +407,236 @@ namespace Syntax.Process is
             return trust_imports \/ STORE_FREE_IMPORTS.is_store_free(target);
         si
 
+        // Functions that provably never assign a possibly-absent value
+        // to anything a pre-existing presence fact could be about:
+        // their own assignments store only declared-non-optional values
+        // (constructor writes to the fresh instance excepted), and
+        // everything they can dispatch to does the same. Imports are
+        // trusted when `trust_imports` - imported code cannot assign a
+        // ghul member at all except by re-entering ghul code, which the
+        // walked side of the closure covers; delegate-invoking imports
+        // are the leak that flag papers over.
+        never_nulls(trust_imports: bool) -> Collections.SET[Function] is
+            let nulling = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let record = NARROWING_STUDY.record_for(function);
+
+                if
+                    !record? \/
+                    record.assigns_optional \/
+                    shadow.is_openly_dispatchable(function)
+                then
+                    nulling.add(function);
+                fi
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if nulling.contains(function) then
+                        continue;
+                    fi
+
+                    if !_never_nulls_dependencies_ok(function, nulling, trust_imports) then
+                        nulling.add(function);
+                        changed = true;
+                    fi
+                od
+            od
+
+            let safe = Collections.SET[Function]();
+
+            for function in _facts.keys do
+                if !nulling.contains(function) then
+                    safe.add(function);
+                fi
+            od
+
+            return safe;
+        si
+
+        _never_nulls_dependencies_ok(
+            function: Function,
+            nulling: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            for callee in _facts[function].callees do
+                if !_never_nulls_target_ok(callee, nulling, trust_imports) then
+                    return false;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if !_never_nulls_target_ok(callee, nulling, trust_imports) then
+                    return false;
+                fi
+            od
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        return false;
+                    fi
+
+                    let overrider_function = cast Function(overrider);
+
+                    if !_facts.contains_key(overrider_function) \/ nulling.contains(overrider_function) then
+                        return false;
+                    fi
+                od
+            fi
+
+            return true;
+        si
+
+        _never_nulls_target_ok(
+            target: Function,
+            nulling: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            if target.is_declared_pure then
+                return true;
+            fi
+
+            if _facts.contains_key(target) then
+                return !nulling.contains(target);
+            fi
+
+            return trust_imports \/ STORE_FREE_IMPORTS.is_store_free(target);
+        si
+
+        // The member-keyed may-null relation: which members each
+        // function (or anything it dispatches to) may assign a
+        // possibly-absent value. Imports contribute nothing - imported
+        // code cannot assign a ghul member except by re-entering ghul
+        // code, which the walked closure covers; delegate re-entry is
+        // the accepted leak. Open dispatch makes the set unboundable.
+        may_null_sets() -> (
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) is
+            let sets = Collections.MAP[Function, Collections.SET[Symbol]]();
+            let unbounded = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let set = Collections.SET[Symbol]();
+                let record = NARROWING_STUDY.record_for(function);
+
+                if record? then
+                    for m in record.nulling_writes do
+                        set.add(m);
+                    od
+
+                    if record.nulling_unbounded then
+                        unbounded.add(function);
+                    fi
+                else
+                    unbounded.add(function);
+                fi
+
+                if shadow.is_openly_dispatchable(function) then
+                    unbounded.add(function);
+                fi
+
+                sets[function] = set;
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if _absorb_nulling(function, sets, unbounded) then
+                        changed = true;
+                    fi
+                od
+            od
+
+            return (sets = sets, unbounded = unbounded);
+        si
+
+        _absorb_nulling(
+            function: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) -> bool is
+            let became mut = false;
+
+            for callee in _facts[function].callees do
+                if _absorb_nulling_target(function, callee, sets, unbounded) then
+                    became = true;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if _absorb_nulling_target(function, callee, sets, unbounded) then
+                    became = true;
+                fi
+            od
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        if !unbounded.contains(function) then
+                            unbounded.add(function);
+                            became = true;
+                        fi
+
+                        continue;
+                    fi
+
+                    if _absorb_nulling_target(function, cast Function(overrider), sets, unbounded) then
+                        became = true;
+                    fi
+                od
+            fi
+
+            return became;
+        si
+
+        _absorb_nulling_target(
+            function: Function,
+            target: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) -> bool is
+            if target.is_declared_pure then
+                return false;
+            fi
+
+            if !sets.contains_key(target) then
+                // an import: contributes no ghul-member nulling
+                return false;
+            fi
+
+            let became mut = false;
+
+            for m in sets[target] do
+                if !sets[function].contains(m) then
+                    sets[function].add(m);
+                    became = true;
+                fi
+            od
+
+            if unbounded.contains(target) /\ !unbounded.contains(function) then
+                unbounded.add(function);
+                became = true;
+            fi
+
+            return became;
+        si
+
         // For each function whose write set cannot be bounded, what to
         // blame: its own give-up reason if it has one, otherwise the
         // reason of something it can reach. Answers "what would the
