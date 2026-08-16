@@ -1,26 +1,37 @@
 namespace Syntax.Process is
     use Logging;
-    use Source.LOCATION;
 
     use Semantic.Types.Type;
-    use Semantic.Symbols.Classy;
-    use Semantic.Symbols.ENUM_STRUCT_MEMBER;
 
     // Exhaustiveness / redundancy check over a `case` statement or
     // expression. The check runs once after every arm's pattern and
     // statements have been compiled, so the scrutinee's type and each
-    // arm's classification are settled. Four warnings are emitted:
-    // `non-exhaustive-case`, `redundant-case-arm`, and
-    // `dead-case-else` are derived from a per-arm coverage walk over
-    // a small closed domain (union, closed-class root, enum, bool,
-    // and the optional-wrapped variant of each). `case-needs-else`
-    // is emitted for an open-domain scrutinee (int, string, open
-    // class hierarchies, tuples) with no fallback arm — a warning on
-    // the statement form and on an expression form with a
-    // defaultable expected type, an error otherwise.
+    // arm's classification are settled.
+    //
+    // The arms are read as rows of patterns and put to
+    // CASE_USEFULNESS, which answers both questions the construct
+    // needs: the arms are exhaustive when a row of wildcards matches
+    // nothing they leave open, and an arm is redundant when its own
+    // row matches nothing the arms before it left open. Whichever
+    // question is being asked, the answer comes back as the value
+    // shapes that escape, so a diagnostic can name them.
+    //
+    // A scrutinee whose values cannot be enumerated at all — `int`,
+    // `string`, an open class hierarchy — has no domain to cover, and
+    // takes the `case-needs-else` branch instead: a warning on the
+    // statement form and on an expression form with a defaultable
+    // expected type, an error otherwise.
     class CASE_EXHAUSTIVENESS_CHECKER is
         _logger: Logger;
-        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _classifier: CASE_DOMAIN_CLASSIFIER;
+        _builder: CASE_PATTERN_BUILDER;
+        _usefulness: CASE_USEFULNESS;
+
+        // How many missing cases a diagnostic names before it stops.
+        // A sum type lists its uncovered alternatives and there are
+        // rarely many; a product can leave a great many combinations
+        // open, and listing them all would bury the point.
+        _MAX_REPORTED_WITNESSES: int static => 8;
 
         init(
             logger: Logger,
@@ -29,7 +40,9 @@ namespace Syntax.Process is
             super.init();
 
             _logger = logger;
-            _innate_symbol_lookup = innate_symbol_lookup;
+            _classifier = CASE_DOMAIN_CLASSIFIER(innate_symbol_lookup);
+            _builder = CASE_PATTERN_BUILDER();
+            _usefulness = CASE_USEFULNESS();
         si
 
         check(`case: Trees.Statements.CASE) is
@@ -45,46 +58,19 @@ namespace Syntax.Process is
                 return;
             fi
 
-            // For the open-domain branch we treat an actual `else`, or a
-            // destructure pattern with no runtime refutability of its own,
-            // as a catch-all — `compile_conditionals.visit_case` and
-            // `pattern_arm_coverage` already treat a bare destructure as
-            // universe-covering, and `case` source commonly uses a trailing
-            // `when (x, y) then` arm as the exhaustive fallback. A pattern
-            // arm carrying its own literal/enum-member leaves (`when (true,
-            // true) then`) only matches one combination of values, so it is
-            // excluded even though it is a pattern arm.
-            let has_fallback mut = false;
-            for arm in `case.matches do
-                if arm.guard? then
-                    continue;
-                fi
-
-                if !arm.expressions? /\ !arm.pattern? then
-                    has_fallback = true;
-                elif arm.pattern? /\ !arm.pattern.left.has_intrinsic_refutability then
-                    has_fallback = true;
-                fi
-            od
-
-            let domain = _classify_domain(scrutinee_type);
+            let domain = _classifier.classify(scrutinee_type);
 
             if !domain? then
-                // Open-domain scrutinee (int, string, open class
-                // hierarchy, tuple). Without a fallback arm, emit
-                // `case-needs-else`. Severity depends on form: a
-                // statement just falls through; an expression must
-                // produce a value, but for a defaultable expected
-                // type we can warn and emit default(T) at the IL
-                // fall-through.
-                if !has_fallback then
-                    _emit_needs_else(`case, scrutinee_type);
-                fi
+                _check_open_domain(`case, scrutinee_type);
 
                 return;
             fi
 
-            let covered = CASE_COVERAGE(domain);
+            let domains = Collections.LIST[PATTERN_DOMAIN?]();
+
+            domains.add(domain);
+
+            let rows = Collections.LIST[Collections.List[CASE_PATTERN]]();
             let else_arm: Trees.Statements.CASE_MATCH? mut = null;
 
             for arm in `case.matches do
@@ -92,16 +78,21 @@ namespace Syntax.Process is
                     if !else_arm? then
                         else_arm = arm;
                     fi
+
                     continue;
                 fi
 
-                let arm_coverage = _arm_coverage(arm, domain);
+                let arm_rows = _builder.build_rows(arm, domain);
 
-                if !arm_coverage? \/ arm_coverage.is_empty then
+                // An arm whose shape could not be modelled covers
+                // nothing as far as this check is concerned, and is
+                // exempt from the redundancy report for the same
+                // reason a guarded arm is.
+                if !arm_rows? then
                     continue;
                 fi
 
-                if !arm_coverage.adds_to(covered) then
+                if !_adds_anything(rows, domains, arm_rows) then
                     _logger.warn(
                         arm.location,
                         "redundant-case-arm",
@@ -109,663 +100,159 @@ namespace Syntax.Process is
                     );
                 fi
 
-                covered.absorb(arm_coverage);
+                for row in arm_rows do
+                    rows.add(row);
+                od
             od
 
-            if covered.is_complete then
+            let witnesses =
+                _usefulness.find_witnesses(
+                    rows,
+                    domains,
+                    CASE_PATTERN_BUILDER.wildcards(1),
+                    _MAX_REPORTED_WITNESSES
+                );
+
+            let is_exhaustive = witnesses.count == 0;
+
+            if is_exhaustive then
                 `case.case_state.is_exhaustive = true;
             fi
 
             if else_arm? then
-                if covered.is_complete then
+                if is_exhaustive then
                     _logger.warn(
                         else_arm.location,
                         "dead-case-else",
                         "all cases are already covered before this else"
                     );
                 fi
-            elif !covered.is_complete then
-                // For an expression-form case, missing arms over a
-                // closed domain mean no value can be produced — that
-                // is an error. For a statement-form case it is a
-                // warning. Either way the list of missing cases is
-                // the actionable detail.
-                let message = "case is not exhaustive: missing {covered.describe_missing()}";
 
-                if `case.want_value then
-                    _logger.error(
-                        `case.location,
-                        message
-                    );
-                else
-                    _logger.warn(
-                        `case.location,
-                        "non-exhaustive-case",
-                        message
-                    );
-                fi
+                return;
+            fi
+
+            if is_exhaustive then
+                return;
+            fi
+
+            let missing = _describe(witnesses);
+
+            // A product scrutinee reports through the same branch an
+            // unenumerable one does, naming the combinations it
+            // leaves open. Covering a product has never been required
+            // of an author, so a gap in one stays a fall-through
+            // rather than the error a gap in a sum is.
+            if _is_product(domain) then
+                _emit_needs_else(`case, scrutinee_type, missing);
+
+                return;
+            fi
+
+            let message = "case is not exhaustive: missing {missing}";
+
+            if `case.want_value then
+                _logger.error(
+                    `case.location,
+                    message
+                );
+            else
+                _logger.warn(
+                    `case.location,
+                    "non-exhaustive-case",
+                    message
+                );
             fi
         si
 
-        _emit_needs_else(`case: Trees.Statements.CASE, scrutinee_type: Type) is
+        // A scrutinee with no enumerable domain is covered only by an
+        // arm that cannot fail to match.
+        _check_open_domain(`case: Trees.Statements.CASE, scrutinee_type: Type) is
+            for arm in `case.matches do
+                if arm.guard? then
+                    continue;
+                fi
+
+                if !arm.expressions? /\ !arm.pattern? then
+                    return;
+                fi
+
+                if let pattern = arm.pattern then
+                    if !pattern.is_explicit_type /\ !pattern.left.has_intrinsic_refutability then
+                        return;
+                    fi
+                fi
+            od
+
+            _emit_needs_else(`case, scrutinee_type, null);
+        si
+
+        _emit_needs_else(`case: Trees.Statements.CASE, scrutinee_type: Type, missing: string?) is
+            let detail =
+                if let m = missing then
+                    "missing {m}"
+                else
+                    "{scrutinee_type} cannot be exhaustively matched"
+                fi;
+
             if !`case.want_value then
                 _logger.warn(
                     `case.location,
                     "case-needs-else",
-                    "case without else may fall through: {scrutinee_type} cannot be exhaustively matched"
+                    "case without else may fall through: {detail}"
                 );
+
                 return;
             fi
 
             let expected_type = `case.expected_type;
+
             if expected_type? /\ _is_defaultable(expected_type) then
                 _logger.warn(
                     `case.location,
                     "case-needs-else",
-                    "case without else may return default: {scrutinee_type} cannot be exhaustively matched"
+                    "case without else may return default: {detail}"
                 );
+
                 `case.case_state.requires_default_fallthrough = true;
+
                 return;
             fi
 
             _logger.error(
                 `case.location,
-                "else required: {scrutinee_type} cannot be exhaustively matched"
+                "else required: {detail}"
             );
         si
 
-        _is_defaultable(t: Type) -> bool =>
+        // True when the arm's rows reach a value none of the rows
+        // before it do.
+        _adds_anything(
+            rows: Collections.List[Collections.List[CASE_PATTERN]],
+            domains: Collections.List[PATTERN_DOMAIN?],
+            arm_rows: Collections.List[Collections.List[CASE_PATTERN]]
+        ) -> bool is
+            for row in arm_rows do
+                if _usefulness.find_witnesses(rows, domains, row, 1).count > 0 then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        _describe(witnesses: Collections.List[Collections.List[CASE_PATTERN]]) -> string static =>
+            witnesses
+                |> Ghul.Pipes.map(w => w[0].describe())
+                |> Ghul.Pipes.join(", ");
+
+        _is_product(domain: PATTERN_DOMAIN) -> bool static =>
+            domain.constructors.count == 1 /\
+            domain.constructors[0].kind == ConstructorKind.PRODUCT;
+
+        _is_defaultable(t: Type) -> bool static =>
             t.is_value_type \/ t.is_optional;
 
-        _is_else_arm(arm: Trees.Statements.CASE_MATCH) -> bool =>
+        _is_else_arm(arm: Trees.Statements.CASE_MATCH) -> bool static =>
             !arm.expressions? /\ !arm.pattern?;
-
-        _classify_domain(scrutinee_type: Type) -> CASE_DOMAIN? is
-            let bool_type = _innate_symbol_lookup.get_bool_type();
-
-            let is_optional = scrutinee_type.is_optional;
-            let core = if is_optional then scrutinee_type.as_non_optional() else scrutinee_type fi;
-
-            if core.matches(bool_type) then
-                return CASE_DOMAIN.for_bool(is_optional);
-            fi
-
-            let one_of = cast Semantic.Types.ONE_OF?(core);
-
-            if one_of? then
-                let underlying_classy = cast Classy?(one_of.underlying_type.unspecialized_symbol);
-
-                if !underlying_classy? then
-                    return null;
-                fi
-
-                let alternatives = Collections.LIST[Classy]();
-                for v in one_of.subtypes do
-                    alternatives.add(v);
-                od
-                // ONE_OF lists the exact runtime types in the narrowed
-                // receiver, so the root only requires coverage if it
-                // is itself one of the subtypes — never separately.
-                return CASE_DOMAIN.for_closed_root(underlying_classy, alternatives, false, is_optional);
-            fi
-
-            let root_classy = _try_get_classy(core);
-
-            if root_classy? then
-                if root_classy.is_closed_root then
-                    let alternatives = Collections.LIST[Classy]();
-                    for s in root_classy.closed_alternatives do
-                        alternatives.add(s);
-                    od
-
-                    if alternatives.count == 0 then
-                        return null;
-                    fi
-
-                    // A concrete closed-class root is itself constructible
-                    // — covering every direct subclass leaves bare-root
-                    // instances unaccounted for. Mirrors the universe
-                    // construction in `condition_analysis.try_get_
-                    // complement_after_eliminated`.
-                    let requires_root = root_classy.is_class /\ !root_classy.is_abstract;
-
-                    return CASE_DOMAIN.for_closed_root(root_classy, alternatives, requires_root, is_optional);
-                fi
-
-                if _is_enum_classy(root_classy) then
-                    let members = Collections.LIST[ENUM_STRUCT_MEMBER]();
-                    for sym in root_classy.symbols do
-                        if isa ENUM_STRUCT_MEMBER(sym) then
-                            members.add(cast ENUM_STRUCT_MEMBER(sym));
-                        fi
-                    od
-
-                    if members.count == 0 then
-                        return null;
-                    fi
-
-                    return CASE_DOMAIN.for_enum(root_classy, members, is_optional);
-                fi
-            fi
-
-            return null;
-        si
-
-        _try_get_classy(type: Type) -> Classy? is
-            let named = cast Semantic.Types.NAMED?(type);
-
-            if !named? then
-                return null;
-            fi
-
-            return cast Classy?(named.symbol.unspecialized_symbol);
-        si
-
-        _is_enum_classy(classy: Classy) -> bool =>
-            classy.symbol_kind == Semantic.Symbols.SymbolKind.ENUM;
-
-        _arm_coverage(arm: Trees.Statements.CASE_MATCH, domain: CASE_DOMAIN) -> ARM_COVERAGE? is
-            // A guarded arm can fall through at runtime even when the
-            // pattern matches, so it never counts towards covering the
-            // domain — returning an empty coverage also exempts it
-            // from the redundant-case-arm check (an empty coverage is
-            // skipped by the caller before that check runs).
-            if arm.guard? then
-                return ARM_COVERAGE();
-            fi
-
-            if arm.pattern? then
-                return _pattern_arm_coverage(arm.pattern, domain);
-            elif arm.expressions? then
-                return _literal_arm_coverage(arm.expressions, domain);
-            fi
-
-            return null;
-        si
-
-        // True when the pattern tests values beneath its own top-level
-        // ascription — a literal, `null` or enum-member leaf, or a
-        // refutable `: T` on one of its elements. Such an arm matches
-        // only part of whatever its top-level ascription names, so it
-        // cannot be credited with the whole of it. The group's own
-        // ascription is deliberately not consulted: that is the test
-        // the coverage is being derived from.
-        _tests_beneath_top_level(left: Trees.Variables.VariableLeft) -> bool static is
-            if isa Trees.Variables.LITERAL_VARIABLE_LEFT(left) then
-                return true;
-            fi
-
-            let elements = left.elements;
-
-            if !elements? then
-                return false;
-            fi
-
-            for element in elements do
-                if element.has_intrinsic_refutability then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        _pattern_arm_coverage(
-            pattern: Trees.Variables.VARIABLE,
-            domain: CASE_DOMAIN
-        ) -> ARM_COVERAGE is
-            let result = ARM_COVERAGE();
-
-            // Contributes nothing, exactly as a guarded arm does: the
-            // arm can decline to match a value its top-level shape
-            // admits, so crediting it would let a gap close and leave
-            // the no-match path unreachable only in the checker's view.
-            if _tests_beneath_top_level(pattern.left) then
-                return result;
-            fi
-
-            if !pattern.is_explicit_type then
-                // A bare destructure or bare bind on a `case` arm is
-                // irrefutable on the non-null half of the scrutinee.
-                // For a non-optional scrutinee that's everything; for
-                // an optional scrutinee it leaves the null half open.
-                if domain.is_optional then
-                    result.covers_all_alternatives(domain);
-                else
-                    result.covers_universe = true;
-                fi
-
-                return result;
-            fi
-
-            let target = pattern.type_expression.type;
-
-            if !target? \/ !target.is_settled then
-                return result;
-            fi
-
-            let target_optional = target.is_optional;
-            let target_core = if target_optional then target.as_non_optional() else target fi;
-
-            if target_optional /\ domain.is_optional then
-                result.covers_null = true;
-            fi
-
-            let target_classy = _try_get_classy(target_core);
-
-            if !target_classy? then
-                return result;
-            fi
-
-            if domain.root_symbol? then
-                if target_classy =~ domain.root_symbol then
-                    result.covers_all_alternatives(domain);
-                elif domain.alternatives? /\ domain.contains_alternative(target_classy) then
-                    result.covered_alternatives.add(target_classy);
-                fi
-            fi
-
-            return result;
-        si
-
-        _literal_arm_coverage(
-            expressions: Trees.Expressions.LIST,
-            domain: CASE_DOMAIN
-        ) -> ARM_COVERAGE is
-            let result = ARM_COVERAGE();
-
-            for expr in expressions.expressions do
-                if isa Trees.Expressions.NULL(expr) then
-                    if domain.is_optional then
-                        result.covers_null = true;
-                    fi
-                elif isa Trees.Expressions.Literals.BOOLEAN(expr) then
-                    let bool_lit = cast Trees.Expressions.Literals.BOOLEAN(expr);
-
-                    if bool_lit.value_string =~ "true" then
-                        result.covers_true = true;
-                    elif bool_lit.value_string =~ "false" then
-                        result.covers_false = true;
-                    fi
-                elif domain.enum_members? then
-                    let value_string = _try_get_enum_literal_value(expr, domain);
-                    if value_string? /\ !result.contains_enum_value(value_string) then
-                        result.covered_enum_values.add(value_string);
-                    fi
-                fi
-            od
-
-            return result;
-        si
-
-        // For an enum-domain arm, recognise an expression that has
-        // been resolved to a numeric literal whose type matches the
-        // enum scrutinee. Returns the literal's value string so the
-        // checker can record coverage by enum-member value. The match
-        // tolerates `Color.RED` (member access), `cast Color(1)`, and
-        // any other shape that compile-expressions has lowered to a
-        // numeric literal — what matters is the resolved value.
-        _try_get_enum_literal_value(
-            expr: Trees.Expressions.Expression,
-            domain: CASE_DOMAIN
-        ) -> string? is
-            if !expr.value? then
-                return null;
-            fi
-
-            let number = cast IR.Values.Literal.NUMBER?(expr.value);
-
-            if !number? \/ !domain.root_symbol? then
-                return null;
-            fi
-
-            let number_classy = _try_get_classy(number.type);
-
-            if !number_classy? \/ !(number_classy =~ domain.root_symbol!) then
-                return null;
-            fi
-
-            return number.rendered;
-        si
-    si
-
-    // Closed-set classification of a `case` scrutinee's type. Four
-    // shapes qualify, each optionally wrapped: bool, union (variants
-    // are the closed set), closed class (in-assembly subclasses are
-    // the closed set), and enum (literal members are the closed set).
-    // Open scrutinees (int, string, open class hierarchies, tuples)
-    // return null and take the `case-needs-else` branch instead.
-    class CASE_DOMAIN is
-        root_symbol: Classy? public;
-        alternatives: Collections.LIST[Classy]? public;
-        enum_members: Collections.LIST[ENUM_STRUCT_MEMBER]? public;
-        is_bool: bool public;
-        // Concrete closed-class roots require explicit root coverage:
-        // their alternatives are direct subclasses, but a bare root
-        // instance is also constructible and must be matched. False
-        // for unions (root has no runtime instance), abstract closed
-        // roots, enums and bool.
-        requires_root: bool public;
-        is_optional: bool public;
-
-        init(
-            root_symbol: Classy?,
-            alternatives: Collections.LIST[Classy]?,
-            enum_members: Collections.LIST[ENUM_STRUCT_MEMBER]?,
-            is_bool: bool,
-            requires_root: bool,
-            is_optional: bool
-        ) is
-            super.init();
-
-            self.root_symbol = root_symbol;
-            self.alternatives = alternatives;
-            self.enum_members = enum_members;
-            self.is_bool = is_bool;
-            self.requires_root = requires_root;
-            self.is_optional = is_optional;
-        si
-
-        for_closed_root(symbol: Classy, alternatives: Collections.LIST[Classy], requires_root: bool, is_optional: bool) -> CASE_DOMAIN static =>
-            CASE_DOMAIN(symbol, alternatives, null, false, requires_root, is_optional);
-
-        for_enum(symbol: Classy, members: Collections.LIST[ENUM_STRUCT_MEMBER], is_optional: bool) -> CASE_DOMAIN static =>
-            CASE_DOMAIN(symbol, null, members, false, false, is_optional);
-
-        for_bool(is_optional: bool) -> CASE_DOMAIN static =>
-            CASE_DOMAIN(null, null, null, true, false, is_optional);
-
-        contains_alternative(alternative: Classy) -> bool is
-            if !alternatives? then
-                return false;
-            fi
-
-            for v in alternatives do
-                if v =~ alternative then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-    si
-
-    // Per-arm and accumulated coverage state. The same shape models
-    // an individual arm's contribution and the running union of all
-    // arms seen so far; `adds_to` and `absorb` are the merge ops.
-    class ARM_COVERAGE is
-        covered_alternatives: Collections.LIST[Classy] public;
-        covered_enum_values: Collections.LIST[string] public;
-        covers_null: bool public;
-        covers_true: bool public;
-        covers_false: bool public;
-        // True when an arm matches the closed-class root type itself
-        // (e.g. `when v: Animal then` on a closed `Animal`). Set by
-        // `covers_all_alternatives` only when the domain has
-        // `requires_root`; for unions / enums / abstract roots the
-        // flag is never set, and `is_complete` only consults it
-        // under the same gate.
-        covers_root: bool public;
-        covers_universe: bool public;
-
-        init() is
-            super.init();
-
-            covered_alternatives = Collections.LIST[Classy]();
-            covered_enum_values = Collections.LIST[string]();
-            covers_null = false;
-            covers_true = false;
-            covers_false = false;
-            covers_root = false;
-            covers_universe = false;
-        si
-
-        is_empty: bool =>
-            covered_alternatives.count == 0 /\
-            covered_enum_values.count == 0 /\
-            !covers_null /\
-            !covers_true /\
-            !covers_false /\
-            !covers_root /\
-            !covers_universe;
-
-        contains_alternative(alternative: Classy) -> bool is
-            for v in covered_alternatives do
-                if v =~ alternative then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        contains_enum_value(value: string) -> bool is
-            for v in covered_enum_values do
-                if v =~ value then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-
-        covers_all_alternatives(domain: CASE_DOMAIN) is
-            if domain.alternatives? then
-                for v in domain.alternatives do
-                    if !contains_alternative(v) then
-                        covered_alternatives.add(v);
-                    fi
-                od
-            fi
-
-            if domain.enum_members? then
-                // `emitted_value` on both sides of the comparison: an
-                // arm's coverage is recorded from the resolved literal,
-                // which is already normalised, so reading the raw source
-                // token here would never match a member written with a
-                // type suffix, digit grouping or a radix prefix.
-                for m in domain.enum_members do
-                    if !contains_enum_value(m.emitted_value) then
-                        covered_enum_values.add(m.emitted_value);
-                    fi
-                od
-            fi
-
-            if domain.requires_root then
-                covers_root = true;
-            fi
-        si
-
-        adds_to(prior: CASE_COVERAGE) -> bool is
-            if covers_universe /\ !prior.coverage.covers_universe then
-                return true;
-            fi
-
-            if covers_null /\ !prior.coverage.covers_null then
-                return true;
-            fi
-
-            if covers_true /\ !prior.coverage.covers_true then
-                return true;
-            fi
-
-            if covers_false /\ !prior.coverage.covers_false then
-                return true;
-            fi
-
-            if covers_root /\ prior.domain.requires_root /\ !prior.coverage.covers_root then
-                return true;
-            fi
-
-            for v in covered_alternatives do
-                if !prior.coverage.contains_alternative(v) then
-                    return true;
-                fi
-            od
-
-            for v in covered_enum_values do
-                if !prior.coverage.contains_enum_value(v) then
-                    return true;
-                fi
-            od
-
-            return false;
-        si
-    si
-
-    // Accumulator of arm coverage against a particular domain. Owns
-    // the `is_complete` and `describe_missing` queries the checker
-    // uses to pick the right warning at the end of the arms list.
-    class CASE_COVERAGE is
-        domain: CASE_DOMAIN public;
-        coverage: ARM_COVERAGE public;
-
-        init(domain: CASE_DOMAIN) is
-            super.init();
-
-            self.domain = domain;
-            self.coverage = ARM_COVERAGE();
-        si
-
-        absorb(arm: ARM_COVERAGE) is
-            if arm.covers_universe then
-                coverage.covers_universe = true;
-            fi
-
-            if arm.covers_null then
-                coverage.covers_null = true;
-            fi
-
-            if arm.covers_true then
-                coverage.covers_true = true;
-            fi
-
-            if arm.covers_false then
-                coverage.covers_false = true;
-            fi
-
-            if arm.covers_root then
-                coverage.covers_root = true;
-            fi
-
-            for v in arm.covered_alternatives do
-                if !coverage.contains_alternative(v) then
-                    coverage.covered_alternatives.add(v);
-                fi
-            od
-
-            for v in arm.covered_enum_values do
-                if !coverage.contains_enum_value(v) then
-                    coverage.covered_enum_values.add(v);
-                fi
-            od
-        si
-
-        is_complete: bool is
-            if coverage.covers_universe then
-                return true;
-            fi
-
-            if domain.is_bool then
-                if !coverage.covers_true \/ !coverage.covers_false then
-                    return false;
-                fi
-
-                if domain.is_optional /\ !coverage.covers_null then
-                    return false;
-                fi
-
-                return true;
-            fi
-
-            if domain.alternatives? then
-                if domain.is_optional /\ !coverage.covers_null then
-                    return false;
-                fi
-
-                if domain.requires_root /\ !coverage.covers_root then
-                    return false;
-                fi
-
-                for v in domain.alternatives do
-                    if !coverage.contains_alternative(v) then
-                        return false;
-                    fi
-                od
-
-                return true;
-            fi
-
-            if domain.enum_members? then
-                if domain.is_optional /\ !coverage.covers_null then
-                    return false;
-                fi
-
-                for m in domain.enum_members do
-                    if !coverage.contains_enum_value(m.emitted_value) then
-                        return false;
-                    fi
-                od
-
-                return true;
-            fi
-
-            return false;
-        si
-
-        describe_missing() -> string is
-            let buffer = System.Text.StringBuilder();
-            let count: int mut = 0;
-
-            if domain.is_optional /\ !coverage.covers_null /\ !coverage.covers_universe then
-                _append_with_comma(buffer, count, "null");
-                count = count + 1;
-            fi
-
-            if domain.is_bool /\ !coverage.covers_universe then
-                if !coverage.covers_false then
-                    _append_with_comma(buffer, count, "false");
-                    count = count + 1;
-                fi
-
-                if !coverage.covers_true then
-                    _append_with_comma(buffer, count, "true");
-                    count = count + 1;
-                fi
-            fi
-
-            if domain.alternatives? /\ !coverage.covers_universe then
-                if let domain.root_symbol? /\ domain.requires_root /\ !coverage.covers_root then
-                    _append_with_comma(buffer, count, root_symbol.name);
-                    count = count + 1;
-                fi
-
-                for v in domain.alternatives! do
-                    if !coverage.contains_alternative(v) then
-                        _append_with_comma(buffer, count, v.name);
-                        count = count + 1;
-                    fi
-                od
-            fi
-
-            if domain.enum_members? /\ !coverage.covers_universe then
-                for m in domain.enum_members do
-                    if !coverage.contains_enum_value(m.emitted_value) then
-                        _append_with_comma(buffer, count, m.name);
-                        count = count + 1;
-                    fi
-                od
-            fi
-
-            return buffer.to_string();
-        si
-
-        _append_with_comma(buffer: System.Text.StringBuilder, count: int, name: string) static is
-            if count > 0 then
-                buffer.append(", ");
-            fi
-
-            buffer.append(name);
-        si
     si
 si
