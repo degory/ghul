@@ -629,6 +629,12 @@ namespace Syntax.Process is
                 return;
             fi
 
+            if _is_local_target(target) then
+                // reassigning a local variable or parameter is
+                // callee-private
+                return;
+            fi
+
             if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
                 // a member, index or other compound target is a heap
                 // store
@@ -644,15 +650,6 @@ namespace Syntax.Process is
             fi
 
             let symbol = try_find(identifier);
-
-            if
-                symbol? /\
-                (isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/ isa Semantic.Symbols.LOCAL_ARGUMENT(symbol))
-            then
-                // reassigning a local variable or parameter is
-                // callee-private
-                return;
-            fi
 
             if symbol? /\ symbol.is_field /\ symbol.is_instance then
                 // a bare instance-field name resolves to the receiver's
@@ -673,6 +670,56 @@ namespace Syntax.Process is
             fi
 
             _disqualify();
+        si
+
+        // A bare name for a local variable or a parameter — the one
+        // storage location a function can write without any caller
+        // seeing it.
+        _is_local_target(target: Trees.Expressions.Expression?) -> bool is
+            if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
+                return false;
+            fi
+
+            let identifier = (cast Trees.Expressions.IDENTIFIER(target)).identifier;
+
+            if identifier.is_qualified then
+                return false;
+            fi
+
+            let symbol = try_find(identifier);
+
+            return
+                symbol? /\
+                (isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/ isa Semantic.Symbols.LOCAL_ARGUMENT(symbol));
+        si
+
+        // `x ref` hands the callee the address of a storage location
+        // rather than a value, and the callee may write through it.
+        // What the callee itself does is bounded by the enclosing
+        // call's own edges, with one exception that decides this
+        // classification: several of the imports trusted store-free
+        // write a by-ref argument by contract — `try_get_value` is the
+        // everyday one — so a write through the address is not always
+        // covered by a callee edge. The operand therefore has to carry
+        // it. The address of a local variable or parameter is
+        // callee-private, exactly as assigning one is; the address of a
+        // field, a property or an element is a possible heap store.
+        //
+        // The node's own `writes_target` flag says which direction the
+        // matched parameter takes, and is deliberately not consulted:
+        // it is set during call resolution, which runs after this pass,
+        // so every REFERENCE reaching here still reads false.
+        //
+        // The operand is walked as a child, so its own reads are
+        // classified independently of this.
+        visit(reference: Expressions.REFERENCE) is
+            if !_current? then
+                return;
+            fi
+
+            if !_is_local_target(reference.left) then
+                _disqualify();
+            fi
         si
 
         // ==== calls ====
@@ -965,6 +1012,104 @@ namespace Syntax.Process is
             fi
 
             _add_callee(_current_function);
+        si
+
+        // ==== type application ====
+
+        // `a.b[X]` where `X` reads as both a type argument and an index
+        // expression. Resolve-type-expressions settles the index
+        // reading when the type argument fails to resolve, and then the
+        // INDEX node it built is walked and classified in its own
+        // right, leaving nothing to do here.
+        visit(ambiguous: Expressions.AMBIGUOUS_EXPRESSION) is
+            if !_current? then
+                return;
+            fi
+
+            if ambiguous.result == Expressions.AmbiguousExpressionResult.INDEX then
+                return;
+            fi
+
+            _classify_type_application(ambiguous.result, ambiguous.left, ambiguous.identifier);
+        si
+
+        // `a.b[X]` where `X` can only be a type argument. Applying type
+        // arguments to a generic type or member is a read, so it
+        // classifies exactly as the same member read without them
+        // would; a call spelt this way is wrapped in a CALL node, which
+        // is classified separately and on its own terms.
+        visit(generic_application: Expressions.GENERIC_APPLICATION) is
+            if !_current? then
+                return;
+            fi
+
+            _classify_type_application(
+                generic_application.result,
+                generic_application.left,
+                generic_application.identifier
+            );
+        si
+
+        _classify_type_application(
+            result: Expressions.AmbiguousExpressionResult,
+            left: Trees.Expressions.Expression?,
+            identifier: Identifiers.Identifier
+        ) is
+            // Both node kinds walk their receiver only once a later
+            // pass has settled what the application applies to, which
+            // for every node reaching this pass means not yet. So the
+            // receiver has to be walked from here — otherwise a call or
+            // an index sitting in it would never be classified at all.
+            if result == Expressions.AmbiguousExpressionResult.UNKNOWN /\ left? then
+                left.walk(self);
+            fi
+
+            if !left? then
+                _classify_member_read(try_find(identifier));
+                return;
+            fi
+
+            // a receiver that is itself a name resolves as one
+            // qualified name — the route a namespace-qualified type or
+            // a union's variant arrives by. The joined name exists only
+            // for this lookup, so its spans are the identifier's own.
+            let left_as_identifier = left.try_copy_as_identifer();
+
+            if left_as_identifier? then
+                let symbol =
+                    try_find(
+                        Identifiers.QUALIFIED(
+                            identifier.location,
+                            left_as_identifier,
+                            identifier.name,
+                            identifier.location,
+                            identifier.right_location
+                        )
+                    );
+
+                if symbol? then
+                    _classify_member_read(symbol);
+                    return;
+                fi
+            fi
+
+            let left_type = _typer.try_type(left);
+
+            if !left_type? then
+                _disqualify();
+                return;
+            fi
+
+            let member_symbol = left_type.find_member(identifier.name);
+
+            if !member_symbol? then
+                // untyped or unresolvable member: if it turns out to be
+                // a property, its getter could run arbitrary code
+                _disqualify();
+                return;
+            fi
+
+            _classify_member_read(member_symbol);
         si
 
         // ==== local variable declarations ====
