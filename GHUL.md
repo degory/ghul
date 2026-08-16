@@ -533,6 +533,16 @@ si
 
 Inheriting two *concrete* defaults for the same member from different traits is an error rather than a silent pick, so a diamond has to be resolved by overriding the member in the implementing type.
 
+Like a class, a trait is closed to other assemblies unless it carries the postfix `open` modifier. A closed trait can be implemented, and derived from, only within the assembly it is declared in; an attempt from anywhere else is a compile error. `open` opts in to cross-assembly extension, and is the right choice when a trait exists to be implemented by downstream code:
+
+```ghul
+trait Displayable open is
+    display(state: DISPLAY_STATE);
+si
+```
+
+Nothing changes inside the declaring assembly, where a closed trait is implemented and derived from exactly as an open one is. A trait imported from an assembly built before the closure existed is treated as open.
+
 An override or trait implementation must keep the overridden member's optionality contract. It may strengthen it - a non-optional return or property where the base declares optional, an optional parameter where the base declares non-optional - but weakening it in either position is a compile error: returning `T?` where the base promises `T` would hand null to callers that use the base type, and requiring a non-optional parameter where the base accepts `T?` would receive null from them. A property with an assign accessor faces both directions at once, so its type must match the base's optionality exactly. The equality and order operators `=~` and `<>` are the one exception on the parameter side: presence is settled where the operator is used and the body is only handed present values, so an implementation may declare its parameter non-optional even where the overridden member spells it optional.
 
 ### unions
