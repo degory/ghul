@@ -45,6 +45,11 @@ namespace Syntax.Process is
         writes: Collections.SET[Symbol] public;
         writes_unbounded: bool public;
 
+        // The body stores through an indexer or to an array element -
+        // recorded apart from member writes because an element store
+        // cannot change what any field holds.
+        writes_elements: bool public;
+
         // What the walk first gave up on in this body, or "" if it
         // never did.
         unbounded_reason: string public;
@@ -279,6 +284,67 @@ namespace Syntax.Process is
             _assumed_safe = set;
         si
 
+        // ==== kill liveness ====
+        //
+        // A kill only costs anyone anything if the killed fact is
+        // consulted again afterwards. Killed facts are held pending per
+        // body; a flow query (`is_non_null`, path queries) on a pending
+        // key claims it as live, and the body-boundary reset flushes
+        // whatever was never claimed as dead.
+        _pending_symbols: Collections.SET[Symbol]? static;
+        _pending_paths: Collections.SET[ACCESS_PATH]? static;
+
+        live_kills: int static public;
+        dead_kills: int static public;
+
+        pending_symbols: Collections.SET[Symbol] static is
+            if !_pending_symbols? then
+                _pending_symbols = Collections.SET[Symbol]();
+            fi
+
+            return _pending_symbols;
+        si
+
+        pending_paths: Collections.SET[ACCESS_PATH] static is
+            if !_pending_paths? then
+                _pending_paths = Collections.SET[ACCESS_PATH]();
+            fi
+
+            return _pending_paths;
+        si
+
+        note_symbol_query(v: Symbol) static is
+            if !enabled \/ !_pending_symbols? then
+                return;
+            fi
+
+            if pending_symbols.contains(v) then
+                pending_symbols.remove(v);
+                live_kills = live_kills + 1;
+            fi
+        si
+
+        note_path_query(path: ACCESS_PATH?) static is
+            if !enabled \/ !path? \/ !_pending_paths? then
+                return;
+            fi
+
+            if pending_paths.contains(path) then
+                pending_paths.remove(path);
+                live_kills = live_kills + 1;
+            fi
+        si
+
+        flush_body() static is
+            if !enabled then
+                return;
+            fi
+
+            dead_kills = dead_kills + pending_symbols.count + pending_paths.count;
+            pending_symbols.clear();
+            pending_paths.clear();
+        si
+
         // ==== kill counters ====
 
         kill_events_call: int static public;
@@ -444,6 +510,30 @@ namespace Syntax.Process is
             return _blame_counts;
         si
 
+        // Which import blocks each closure, from a blame run with
+        // imports untrusted. Keys the import ranking below.
+        _import_blame: Collections.MutableMap[Function, string]? static;
+
+        set_import_blame(blame: Collections.MutableMap[Function, string]) static is
+            _import_blame = blame;
+        si
+
+        // Functions whose whole closure stores at most elements, under
+        // production dispatch rules; second set additionally trusts
+        // unannotated imports. A killed fact with no property in its
+        // member list survives a call to one of these under the
+        // element-rescue rule (calls behave like heap stores).
+        _element_safe: Collections.SET[Function]? static;
+        _element_safe_trusted: Collections.SET[Function]? static;
+
+        set_element_safe(
+            sound: Collections.SET[Function],
+            trusted: Collections.SET[Function]
+        ) static is
+            _element_safe = sound;
+            _element_safe_trusted = trusted;
+        si
+
         note_call_saved(callee: Function?, live: int) static is
             if !enabled \/ live == 0 then
                 return;
@@ -594,6 +684,11 @@ namespace Syntax.Process is
 
                 members.add(v.root_specialized_from);
                 kills.add(KILL_FACT("{location}", root, members, is_getter));
+                pending_symbols.add(v);
+            od
+
+            for p in killed_paths do
+                pending_paths.add(p);
             od
 
             for p in killed_paths do
@@ -690,6 +785,78 @@ namespace Syntax.Process is
                 for key in blame_counts.keys do
                     writer.write_line("blame_{key}\t{blame_counts[key]}");
                 od
+
+                writer.write_line("liveness\tlive\t{live_kills}\tdead\t{dead_kills}");
+
+                // ==== import ranking: which imported callee blocks each
+                // killed fact's closure ====
+                let import_counts = Collections.MAP[string, int]();
+
+                for kill in kills do
+                    let root = kill.callee;
+
+                    if !root? then
+                        continue;
+                    fi
+
+                    if !records.contains_key(root!) then
+                        _bump(import_counts, "direct:{root.qualified_name}");
+                    elif _import_blame? /\ _import_blame.contains_key(root!) then
+                        let key = _import_blame![root!];
+
+                        if key.starts_with("imported:") then
+                            _bump(import_counts, key);
+                        fi
+                    fi
+                od
+
+                for key in import_counts.keys do
+                    writer.write_line("import_kill\t{key}\t{import_counts[key]}");
+                od
+
+                // ==== element rescue: killed field-only facts whose
+                // callee's closure stores at most elements ====
+                let element_sound mut = 0;
+                let element_trusted mut = 0;
+                let field_only_kills mut = 0;
+
+                for kill in kills do
+                    let field_only = val
+                        let any_property mut = false;
+
+                        for m in kill.members do
+                            if isa Semantic.Symbols.Property(m) then
+                                any_property = true;
+                            fi
+                        od
+
+                        !any_property
+                    lav;
+
+                    if !field_only then
+                        continue;
+                    fi
+
+                    field_only_kills = field_only_kills + 1;
+
+                    let root = kill.callee;
+
+                    if !root? then
+                        continue;
+                    fi
+
+                    if _element_safe? /\ _element_safe.contains(root!) then
+                        element_sound = element_sound + 1;
+                    fi
+
+                    if _element_safe_trusted? /\ _element_safe_trusted.contains(root!) then
+                        element_trusted = element_trusted + 1;
+                    fi
+                od
+
+                writer.write_line(
+                    "element_rescue\tfield_only_kills\t{field_only_kills}"
+                    "\tsound\t{element_sound}\ttrusted\t{element_trusted}");
 
                 // ==== stability: members never written outside a
                 // constructor ====
