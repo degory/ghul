@@ -1,0 +1,212 @@
+namespace Syntax.Process is
+    use Collections.LIST;
+    use Collections.MAP;
+    use Collections.SET;
+
+    use Logging.Logger;
+
+    use Source.LOCATION;
+
+    use Semantic.Symbols.Symbol;
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.Function;
+
+    // What one method did, as the expression walk saw it.
+    class METHOD_SUMMARY(
+        location: LOCATION,
+        assigned: Collections.List[Symbol],
+        called: Collections.List[Symbol],
+        is_unreachable: bool
+    );
+
+    // Reports a field of non-optional reference type that a constructor
+    // leaves unassigned, which holds null in a slot whose type says it
+    // never does.
+    //
+    // A constructor is credited with what it assigns directly and with what
+    // the methods it cannot avoid calling assign, transitively. Both inputs
+    // are must-facts: the expression walk records the fields assigned, and
+    // the methods called on `self`, on every path out of a body, so a
+    // helper called from one arm of an `if` credits nothing.
+    //
+    // The closure is a least fixpoint from nothing assigned. A cycle of
+    // mutually recursive helpers therefore credits nothing rather than
+    // assuming its own conclusion, which reports where the truth is
+    // unclear instead of staying silent - the direction a check like this
+    // has to fail in.
+    //
+    // Three things are deliberately not credited, each because crediting
+    // them would hide a real null: a call on anything but `self`, which
+    // may reach another object entirely; a call to an overridable method,
+    // whose override may assign nothing; and a call reached on only some
+    // paths.
+    //
+    // A base class's fields are its own constructors' responsibility, so
+    // only the fields a class declares are checked here, and `super.init`
+    // needs no special treatment.
+    class FIELD_ASSIGNMENT_CHECKER is
+        _logger: Logger;
+
+        _summaries: MAP[Symbol, METHOD_SUMMARY];
+
+        // Constructors still to report, in the order they were walked, so
+        // the reports come out in a stable order rather than a hash order.
+        // Deduplicated: a file recompiled on demand re-walks its
+        // constructors, and each must be reported once however many times
+        // it has been seen.
+        _constructors: LIST[Function];
+        _constructors_seen: SET[Symbol];
+
+        init(logger: Logger) is
+            _logger = logger;
+            _summaries = MAP[Symbol, METHOD_SUMMARY]();
+            _constructors = LIST[Function]();
+            _constructors_seen = SET[Symbol]();
+        si
+
+        record(
+            function: Function,
+            location: LOCATION,
+            assigned: Collections.List[Symbol],
+            called: Collections.List[Symbol],
+            is_unreachable: bool
+        ) is
+            _summaries[function] = METHOD_SUMMARY(location, assigned, called, is_unreachable);
+
+            if function.name =~ "init" /\ !_constructors_seen.contains(function) then
+                _constructors_seen.add(function);
+                _constructors.add(function);
+            fi
+        si
+
+        // Called once every method that is going to be walked has been.
+        report() is
+            for constructor in _constructors do
+                _report_constructor(constructor);
+            od
+
+            // Only the pending constructors are dropped. The summaries
+            // outlive the walk that produced them, because a file
+            // recompiled on its own still has to credit a constructor
+            // with what a helper in another file assigns, and that file
+            // is not being re-walked. A re-walk overwrites its own
+            // entries, so what is kept is never stale.
+            _constructors.clear();
+            _constructors_seen.clear();
+        si
+
+        _report_constructor(constructor: Function) is
+            let summary: METHOD_SUMMARY mut;
+
+            if !_summaries.try_get_value(constructor, summary ref) then
+                return;
+            fi
+
+            // Every path out throws or returns early - there is no exit at
+            // which a field could be observed unassigned.
+            if summary.is_unreachable then
+                return;
+            fi
+
+            let owner = cast Classy?(constructor.owner);
+
+            if !owner? then
+                return;
+            fi
+
+            let assigned = _close_over_calls(constructor);
+
+            for member in owner.symbols do
+                if
+                    isa Semantic.Symbols.Field(member) /\
+                    member.is_instance /\
+                    member.owner == owner
+                then
+                    let `field = cast Semantic.Symbols.Field?(member)!;
+
+                    if _wants_assignment(`field) /\ !_covers(assigned, owner, `field) then
+                        _logger.warn(
+                            summary.location,
+                            "field-definite-assignment",
+                            "{_read_name(`field)} is not assigned on every path out of this constructor"
+                        );
+                    fi
+                fi
+            od
+        si
+
+        // The fields the constructor assigns, plus those assigned by the
+        // methods it cannot avoid reaching.
+        _close_over_calls(constructor: Function) -> SET[Symbol] is
+            let assigned = SET[Symbol]();
+            let seen = SET[Symbol]();
+            let pending = Collections.STACK[Symbol]();
+
+            pending.push(constructor);
+            seen.add(constructor);
+
+            while pending.count > 0 do
+                let current = pending.pop();
+                let summary: METHOD_SUMMARY mut;
+
+                // A callee walked in another file, or not walked at all,
+                // has no summary and so credits nothing.
+                if _summaries.try_get_value(current, summary ref) then
+                    for v in summary.assigned do
+                        assigned.add(v);
+                    od
+
+                    for callee in summary.called do
+                        if !seen.contains(callee) then
+                            seen.add(callee);
+                            pending.push(callee);
+                        fi
+                    od
+                fi
+            od
+
+            return assigned;
+        si
+
+        // A field worth checking: one whose type says it always holds a
+        // value, and which a default-initialised object leaves absent.
+        _wants_assignment(`field: Semantic.Symbols.Field) -> bool is
+            let type = `field.type;
+
+            return
+                type? /\
+                !type.is_optional /\
+                !type.is_value_type /\
+                !type.is_sentinel /\
+                !type.is_error /\
+                !type.is_inferred /\
+                !type.is_type_variable;
+        si
+
+        // An auto-property and its backing field are two symbols for one
+        // piece of state, and an assignment written `x = ...` records the
+        // property. Either standing for assigned answers for both.
+        _covers(assigned: SET[Symbol], owner: Classy, `field: Semantic.Symbols.Field) -> bool is
+            if assigned.contains(`field) then
+                return true;
+            fi
+
+            if !`field.name.starts_with('$') then
+                return false;
+            fi
+
+            let property = owner.find_member(`field.name.substring(1));
+
+            return property? /\ assigned.contains(property);
+        si
+
+        // An auto-property's backing field is named for the property with a
+        // `$` in front. The reader wrote the property, so name that.
+        _read_name(`field: Semantic.Symbols.Field) -> string =>
+            if `field.name.starts_with('$') then
+                `field.name.substring(1)
+            else
+                `field.name
+            fi;
+    si
+si
