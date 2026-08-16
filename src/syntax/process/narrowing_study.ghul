@@ -1,0 +1,458 @@
+namespace Syntax.Process is
+    use IO.Std;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Per-function record the study keeps alongside INFER_STORE_FREE's
+    // own facts. Populated during the body walk, completed at fixpoint
+    // time, dumped at the end of the compile.
+    class STUDY_RECORD is
+        name: string public;
+        owner_name: string public;
+        location: string public;
+
+        // The accessor role, derived from the synthesised accessor
+        // name: "get" for a property read accessor, "set" for its
+        // assign accessor, "index-get" / "index-set" for an indexer's,
+        // "" for an ordinary function or method.
+        role: string public;
+
+        // The body walk saw a write to something other than a local:
+        // a member, an index, a global, or the receiver's own state.
+        own_stores: bool public;
+
+        // The body walk gave up for a reason that is not a write: an
+        // unboundable callee, an unaudited node kind, an await, ...
+        own_unbounded: bool public;
+
+        // Copied from the function's STORE_FREE_FACTS at fixpoint
+        // time, so the table can be checked for records aliased
+        // between two functions.
+        is_disqualified: bool public;
+        aliased: bool public;
+
+        // Whether any override of this function definitely writes the
+        // heap, and whether any is merely unprovable. The assumption
+        // under test is exactly that the first of these is empty.
+        overrider_writes: bool public;
+        overrider_unprovable: bool public;
+
+        callee_count: int public;
+        overrider_count: int public;
+        openly_dispatchable: bool public;
+        declared_pure: bool public;
+
+        init(name: string, owner_name: string, location: string, role: string) is
+            self.name = name;
+            self.owner_name = owner_name;
+            self.location = location;
+            self.role = role;
+        si
+    si
+
+    // Empirical study of narrowing kills and store-free classification.
+    //
+    // Entirely env-gated and off by default: GHUL_NARROWING_STUDY names
+    // the file the per-function table is written to, and
+    // GHUL_ASSUME_GETTERS_PURE selects a counterfactual under which the
+    // dispatch shadow is ignored for property read accessors, so a
+    // build can be run with the assumption genuinely installed.
+    class NARROWING_STUDY is
+        _enabled: bool static;
+        _enabled_known: bool static;
+
+        // Path the table is written to, or null.
+        _path: string? static;
+
+        enabled: bool static is
+            if !_enabled_known then
+                _path = System.Environment.get_environment_variable("GHUL_NARROWING_STUDY");
+                _enabled = _path? /\ _path.length > 0;
+                _enabled_known = true;
+            fi
+
+            return _enabled;
+        si
+
+        // 0 off; 1 assume the dispatch shadow away for a *leaf* property
+        // read accessor (clean body, no bounded callees); 2 the same for
+        // any property read accessor whose own body is clean.
+        _assume_mode: int static;
+        _assume_mode_known: bool static;
+
+        assume_mode: int static is
+            if !_assume_mode_known then
+                let text = System.Environment.get_environment_variable("GHUL_ASSUME_GETTERS_PURE");
+
+                if text? then
+                    if text =~ "1" then
+                        _assume_mode = 1;
+                    elif text =~ "2" then
+                        _assume_mode = 2;
+                    fi
+                fi
+
+                _assume_mode_known = true;
+            fi
+
+            return _assume_mode;
+        si
+
+        _records: Collections.MutableMap[Function, STUDY_RECORD]? static;
+
+        records: Collections.MutableMap[Function, STUDY_RECORD] static is
+            if !_records? then
+                _records = Collections.MAP[Function, STUDY_RECORD]();
+            fi
+
+            return _records;
+        si
+
+        record_for(function: Function?) -> STUDY_RECORD? static is
+            if !function? then
+                return null;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return null;
+            fi
+
+            if records.contains_key(root) then
+                return records[root];
+            fi
+
+            return null;
+        si
+
+        note_function(
+            function: Function?,
+            name: string,
+            owner_name: string,
+            location: string,
+            role: string
+        ) static is
+            if !enabled /\ assume_mode == 0 then
+                return;
+            fi
+
+            if !function? then
+                return;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return;
+            fi
+
+            if records.contains_key(root) then
+                records[root].aliased = true;
+                return;
+            fi
+
+            records[root] = STUDY_RECORD(name, owner_name, location, role);
+        si
+
+        // ==== the assumed-safe set ====
+
+        _assumed_safe: Collections.SET[Function]? static;
+
+        assumed_safe: Collections.SET[Function] static is
+            if !_assumed_safe? then
+                _assumed_safe = Collections.SET[Function]();
+            fi
+
+            return _assumed_safe;
+        si
+
+        // Whether the counterfactual exempts `function` from the
+        // dispatch-shadow test. Consulted by STORE_FREE_FIXPOINT only
+        // when GHUL_ASSUME_GETTERS_PURE is set, so an ordinary build
+        // never reaches it.
+        is_assumed_safe(function: Function) -> bool static =>
+            assume_mode != 0 /\ assumed_safe.contains(function);
+
+        // Rebuild the assumed-safe set from this run's facts. Called at
+        // the top of the fixpoint, before any solving.
+        prepare(facts: Collections.MutableMap[Function, STORE_FREE_FACTS]) static is
+            if assume_mode == 0 then
+                return;
+            fi
+
+            let set = Collections.SET[Function]();
+
+            for function in facts.keys do
+                let record = record_for(function);
+
+                if !record? \/ !(record.role =~ "get") then
+                    continue;
+                fi
+
+                let f = facts[function];
+
+                if f.is_disqualified then
+                    continue;
+                fi
+
+                if assume_mode == 1 /\ f.callees.count > 0 then
+                    continue;
+                fi
+
+                set.add(function);
+            od
+
+            _assumed_safe = set;
+        si
+
+        // ==== kill counters ====
+
+        kill_events_call: int static public;
+        facts_killed_call: int static public;
+
+        // Of the above, those whose killing callee is store-free once
+        // the dispatch shadow is assumed away — the kills the
+        // hypothesis would prevent.
+        kill_events_call_preventable_leaf: int static public;
+        facts_killed_call_preventable_leaf: int static public;
+        kill_events_call_preventable_clean: int static public;
+        facts_killed_call_preventable_clean: int static public;
+
+        // Kills whose callee is a property read accessor at all,
+        // whatever the reason it was not store-free.
+        kill_events_call_by_getter: int static public;
+        facts_killed_call_by_getter: int static public;
+
+        // Call kills the study could not attribute to a single callee
+        // (a closure invocation, an interpolation, a pure-slot check).
+        kill_events_call_unattributed: int static public;
+        facts_killed_call_unattributed: int static public;
+
+        // Call kills bucketed by the role of the callee, and by
+        // whether the counterfactual rescues them.
+        _by_role: Collections.MutableMap[string, int]? static;
+        _by_role_preventable: Collections.MutableMap[string, int]? static;
+
+        by_role: Collections.MutableMap[string, int] static is
+            if !_by_role? then
+                _by_role = Collections.MAP[string, int]();
+            fi
+
+            return _by_role;
+        si
+
+        by_role_preventable: Collections.MutableMap[string, int] static is
+            if !_by_role_preventable? then
+                _by_role_preventable = Collections.MAP[string, int]();
+            fi
+
+            return _by_role_preventable;
+        si
+
+        _bump(map: Collections.MutableMap[string, int], key: string) static is
+            if map.contains_key(key) then
+                map[key] = map[key] + 1;
+            else
+                map[key] = 1;
+            fi
+        si
+
+        // Rescued kills whose callee has an override that definitely
+        // writes: the subset of the gain the assumption only buys by
+        // being wrong.
+        kill_events_rescued_unsound: int static public;
+        kill_events_rescued_unprovable: int static public;
+        kill_events_rescued_sound: int static public;
+
+        kill_events_heap_store: int static public;
+        facts_killed_heap_store: int static public;
+
+        kill_events_member_store: int static public;
+        facts_killed_member_store: int static public;
+
+        // Whether `function` would be store-free under counterfactual
+        // `mode`, computed by the analysis pass and cached here.
+        // The same solver with an empty exempt set: must reproduce the
+        // shipped classification exactly, and is dumped as the report's
+        // control column.
+        _control: Collections.SET[Function]? static;
+
+        _optimistic_leaf: Collections.SET[Function]? static;
+        _optimistic_clean: Collections.SET[Function]? static;
+
+        set_control(control: Collections.SET[Function]) static is
+            _control = control;
+        si
+
+        set_optimistic(leaf: Collections.SET[Function], clean: Collections.SET[Function]) static is
+            _optimistic_leaf = leaf;
+            _optimistic_clean = clean;
+        si
+
+        note_call_kill(callee: Function?, killed: int) static is
+            if !enabled then
+                return;
+            fi
+
+            kill_events_call = kill_events_call + 1;
+            facts_killed_call = facts_killed_call + killed;
+
+            if !callee? then
+                kill_events_call_unattributed = kill_events_call_unattributed + 1;
+                facts_killed_call_unattributed = facts_killed_call_unattributed + killed;
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if !root? then
+                kill_events_call_unattributed = kill_events_call_unattributed + 1;
+                facts_killed_call_unattributed = facts_killed_call_unattributed + killed;
+                return;
+            fi
+
+            let record = record_for(root);
+
+            let role =
+                if !record? then
+                    "not-walked"
+                elif record.role =~ "" then
+                    "ordinary"
+                else
+                    record.role
+                fi;
+
+            _bump(by_role, role);
+
+            if
+                (_optimistic_leaf? /\ _optimistic_leaf.contains(root)) \/
+                (_optimistic_clean? /\ _optimistic_clean.contains(root))
+            then
+                _bump(by_role_preventable, role);
+            fi
+
+            if
+                (_optimistic_leaf? /\ _optimistic_leaf.contains(root)) \/
+                (_optimistic_clean? /\ _optimistic_clean.contains(root))
+            then
+                if record? /\ record.overrider_writes then
+                    kill_events_rescued_unsound = kill_events_rescued_unsound + 1;
+                elif record? /\ record.overrider_unprovable then
+                    kill_events_rescued_unprovable = kill_events_rescued_unprovable + 1;
+                else
+                    kill_events_rescued_sound = kill_events_rescued_sound + 1;
+                fi
+            fi
+
+            if record? /\ record.role =~ "get" then
+                kill_events_call_by_getter = kill_events_call_by_getter + 1;
+                facts_killed_call_by_getter = facts_killed_call_by_getter + killed;
+            fi
+
+            if _optimistic_leaf? /\ _optimistic_leaf.contains(root) then
+                kill_events_call_preventable_leaf = kill_events_call_preventable_leaf + 1;
+                facts_killed_call_preventable_leaf = facts_killed_call_preventable_leaf + killed;
+            fi
+
+            if _optimistic_clean? /\ _optimistic_clean.contains(root) then
+                kill_events_call_preventable_clean = kill_events_call_preventable_clean + 1;
+                facts_killed_call_preventable_clean = facts_killed_call_preventable_clean + killed;
+            fi
+        si
+
+        note_heap_store_kill(killed: int) static is
+            if !enabled then
+                return;
+            fi
+
+            kill_events_heap_store = kill_events_heap_store + 1;
+            facts_killed_heap_store = facts_killed_heap_store + killed;
+        si
+
+        note_member_store_kill(killed: int) static is
+            if !enabled then
+                return;
+            fi
+
+            kill_events_member_store = kill_events_member_store + 1;
+            facts_killed_member_store = facts_killed_member_store + killed;
+        si
+
+        // ==== the per-function table ====
+
+        // Written once, at the end of the compile. Two sections: a
+        // header of counter lines, then one tab-separated row per
+        // function the compilation walked.
+        report() static is
+            if !enabled \/ !_path? then
+                return;
+            fi
+
+            try
+                let writer = IO.StreamWriter(_path!);
+
+                writer.write_line("# counters");
+                writer.write_line("kill_events_call\t{kill_events_call}");
+                writer.write_line("facts_killed_call\t{facts_killed_call}");
+                writer.write_line("kill_events_call_by_getter\t{kill_events_call_by_getter}");
+                writer.write_line("facts_killed_call_by_getter\t{facts_killed_call_by_getter}");
+                writer.write_line("kill_events_call_preventable_leaf\t{kill_events_call_preventable_leaf}");
+                writer.write_line("facts_killed_call_preventable_leaf\t{facts_killed_call_preventable_leaf}");
+                writer.write_line("kill_events_call_preventable_clean\t{kill_events_call_preventable_clean}");
+                writer.write_line("facts_killed_call_preventable_clean\t{facts_killed_call_preventable_clean}");
+                writer.write_line("kill_events_call_unattributed\t{kill_events_call_unattributed}");
+                writer.write_line("facts_killed_call_unattributed\t{facts_killed_call_unattributed}");
+                for role in by_role.keys do
+                    let rescued = if by_role_preventable.contains_key(role) then by_role_preventable[role] else 0 fi;
+                    writer.write_line("kill_events_call_role_{role}\t{by_role[role]}\trescued\t{rescued}");
+                od
+
+                writer.write_line("kill_events_rescued_sound\t{kill_events_rescued_sound}");
+                writer.write_line("kill_events_rescued_unprovable\t{kill_events_rescued_unprovable}");
+                writer.write_line("kill_events_rescued_unsound\t{kill_events_rescued_unsound}");
+                writer.write_line("kill_events_heap_store\t{kill_events_heap_store}");
+                writer.write_line("facts_killed_heap_store\t{facts_killed_heap_store}");
+                writer.write_line("kill_events_member_store\t{kill_events_member_store}");
+                writer.write_line("facts_killed_member_store\t{facts_killed_member_store}");
+
+                writer.write_line(
+                    "# role\towner\tname\tstore_free\tdefinitely_writes\tbody_clean\tdisqualified\taliased\t"
+                    "own_stores\town_unbounded\tcallees\toverriders\topenly_dispatchable\t"
+                    "declared_pure\tovr_writes\tovr_unprovable\tcontrol\topt_leaf\topt_clean\tlocation");
+
+                for function in records.keys do
+                    let r = records[function];
+
+                    writer.write_line(
+                        "{r.role}\t{r.owner_name}\t{r.name}\t"
+                        "{function.is_store_free}\t"
+                        "{_definitely_writes? /\ _definitely_writes.contains(function)}\t"
+                        "{_body_clean? /\ _body_clean.contains(function)}\t"
+                        "{r.is_disqualified}\t{r.aliased}\t"
+                        "{r.own_stores}\t{r.own_unbounded}\t{r.callee_count}\t{r.overrider_count}\t"
+                        "{r.openly_dispatchable}\t{r.declared_pure}\t"
+                        "{r.overrider_writes}\t{r.overrider_unprovable}\t"
+                        "{_control? /\ _control.contains(function)}\t"
+                        "{_optimistic_leaf? /\ _optimistic_leaf.contains(function)}\t"
+                        "{_optimistic_clean? /\ _optimistic_clean.contains(function)}\t"
+                        "{r.location}");
+                od
+
+                writer.flush();
+                writer.close();
+            catch ex: System.Exception
+                Std.error.write_line("narrowing study: could not write {_path}: {ex.message}");
+            yrt
+        si
+
+        _definitely_writes: Collections.SET[Function]? static;
+        _body_clean: Collections.SET[Function]? static;
+
+        set_ground_truth(writes: Collections.SET[Function], clean: Collections.SET[Function]) static is
+            _definitely_writes = writes;
+            _body_clean = clean;
+        si
+    si
+si

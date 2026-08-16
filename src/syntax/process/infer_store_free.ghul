@@ -96,6 +96,10 @@ namespace Syntax.Process is
         _current: STORE_FREE_FACTS?;
         _current_function: Function?;
 
+        // The study's record for the function being walked, or null
+        // when the study is off. See NARROWING_STUDY.
+        _current_record: STUDY_RECORD?;
+
         // Whether the most recent finish_run moved any function's
         // store-free bit. Only meaningful between finish_run and the
         // next start_run.
@@ -201,6 +205,7 @@ namespace Syntax.Process is
 
             _current = null;
             _current_function = null;
+            _current_record = null;
         si
 
         // Whether the most recent apply abandoned its walk on an
@@ -218,10 +223,14 @@ namespace Syntax.Process is
             try
                 let fixpoint = STORE_FREE_FIXPOINT();
 
+                NARROWING_STUDY.prepare(_facts);
+
                 _last_run_changed = fixpoint.mark(_facts);
                 _last_flipped = fixpoint.flipped;
 
                 _trust_value_optional_accessors();
+
+                _run_study();
             catch ex: Exception
                 // a broken fixpoint must not leave optimistic bits
                 // from a partial write-back behind; treat the run as
@@ -236,6 +245,86 @@ namespace Syntax.Process is
             yrt
 
             start_run();
+        si
+
+        // Complete each study record from the solved graph, and run the
+        // counterfactual solvers the report compares against.
+        _run_study() is
+            if !NARROWING_STUDY.enabled then
+                return;
+            fi
+
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let record = NARROWING_STUDY.record_for(function);
+
+                if !record? then
+                    continue;
+                fi
+
+                record.is_disqualified = _facts[function].is_disqualified;
+                record.callee_count = _facts[function].callees.count;
+                record.openly_dispatchable = shadow.is_openly_dispatchable(function);
+                record.declared_pure = function.is_declared_pure;
+
+                let overriders = function.overriders;
+
+                let overrider_count mut = 0;
+
+                if overriders? then
+                    for overrider in overriders do
+                        overrider_count = overrider_count + 1;
+                    od
+                fi
+
+                record.overrider_count = overrider_count;
+            od
+
+            let study = STORE_FREE_STUDY(_facts);
+
+            let writes = study.definitely_writes();
+            let clean = study.body_clean();
+
+            NARROWING_STUDY.set_ground_truth(writes, clean);
+
+            // Classify each function's override closure against the
+            // ground truth, so the report can say whether the
+            // assumption is contradicted anywhere in this codebase.
+            for function in _facts.keys do
+                let record = NARROWING_STUDY.record_for(function);
+
+                if !record? then
+                    continue;
+                fi
+
+                let overriders = function.overriders;
+
+                if !overriders? then
+                    continue;
+                fi
+
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        record.overrider_unprovable = true;
+                        continue;
+                    fi
+
+                    let overrider_function = cast Function(overrider);
+
+                    if writes.contains(overrider_function) then
+                        record.overrider_writes = true;
+                    elif !clean.contains(overrider_function) then
+                        record.overrider_unprovable = true;
+                    fi
+                od
+            od
+
+            NARROWING_STUDY.set_control(study.solve(Collections.SET[Function]()));
+
+            NARROWING_STUDY.set_optimistic(
+                study.solve(study.exempt_getters(true)),
+                study.solve(study.exempt_getters(false)));
         si
 
         // The value-type optional carriers' accessors get the bit
@@ -271,6 +360,42 @@ namespace Syntax.Process is
             od
         si
 
+        // Open a study record for the function about to be walked, and
+        // classify its accessor role from the name add-accessors-for-
+        // properties synthesised.
+        _note_study_function(function: Definitions.FUNCTION, symbol: Function) is
+            _current_record = null;
+
+            if !NARROWING_STUDY.enabled /\ NARROWING_STUDY.assume_mode == 0 then
+                return;
+            fi
+
+            let raw_name = if function.name? then function.name.name else "" fi;
+
+            let role mut = "";
+
+            if function.for_property? \/ function.for_indexer? then
+                let is_indexer = function.for_indexer?;
+
+                if raw_name.starts_with("$get_") \/ raw_name.starts_with("get_") then
+                    role = if is_indexer then "index-get" else "get" fi;
+                elif raw_name.starts_with("$set_") \/ raw_name.starts_with("set_") then
+                    role = if is_indexer then "index-set" else "set" fi;
+                fi
+            fi
+
+            let owner = symbol.owner;
+
+            NARROWING_STUDY.note_function(
+                symbol,
+                raw_name,
+                if owner? then owner.name else "" fi,
+                "{function.location}",
+                role);
+
+            _current_record = NARROWING_STUDY.record_for(symbol);
+        si
+
         // ==== default: any node kind without an explicit override ====
 
         visit_default(node: Trees.Node) is
@@ -278,9 +403,32 @@ namespace Syntax.Process is
         si
 
         _disqualify() is
-            if _current? then
-                _current.is_disqualified = true;
-                _current.is_construction_disqualified = true;
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_unbounded = true;
+            fi
+        si
+
+        // The subset of `_disqualify` where the walk saw a write to a
+        // pre-existing heap slot rather than merely failing to bound
+        // something. Behaves identically; only the study distinguishes
+        // them.
+        _disqualify_store() is
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
             fi
         si
 
@@ -288,8 +436,14 @@ namespace Syntax.Process is
         // not: writing the receiver's own instance state touches only
         // the fresh object a `NEW` is building.
         _disqualify_strict_only() is
-            if _current? then
-                _current.is_disqualified = true;
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
             fi
         si
 
@@ -552,9 +706,12 @@ namespace Syntax.Process is
 
                 _current = facts;
                 _current_function = symbol;
+
+                _note_study_function(function, symbol);
             else
                 _current = null;
                 _current_function = null;
+                _current_record = null;
             fi
 
             return false;
@@ -638,14 +795,14 @@ namespace Syntax.Process is
             if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
                 // a member, index or other compound target is a heap
                 // store
-                _disqualify();
+                _disqualify_store();
                 return;
             fi
 
             let identifier = (cast Trees.Expressions.IDENTIFIER(target)).identifier;
 
             if identifier.is_qualified then
-                _disqualify();
+                _disqualify_store();
                 return;
             fi
 
@@ -669,7 +826,9 @@ namespace Syntax.Process is
                 return;
             fi
 
-            _disqualify();
+            // a global variable, or a target the walk could not
+            // resolve: either way the write is not to a local
+            _disqualify_store();
         si
 
         // A bare name for a local variable or a parameter — the one
