@@ -1,0 +1,432 @@
+namespace Syntax.Process is
+    use Semantic.Types.Type;
+    use Semantic.Symbols.Classy;
+
+    // A pattern occupying one column: a wildcard, which matches every
+    // value of that column, or a constructor with one sub-pattern per
+    // field.
+    class CASE_PATTERN is
+        constructor: PATTERN_CONSTRUCTOR?;
+        fields: Collections.List[CASE_PATTERN];
+
+        is_wildcard: bool => !constructor?;
+
+        init() is
+            super.init();
+
+            fields = Collections.LIST[CASE_PATTERN]();
+        si
+
+        init(constructor: PATTERN_CONSTRUCTOR, fields: Collections.List[CASE_PATTERN]) is
+            super.init();
+
+            self.constructor = constructor;
+            self.fields = fields;
+        si
+
+        // How a missing case reads in a diagnostic. A constructor
+        // whose fields are all wildcards is named on its own, so a
+        // union variant reads as `WHOLE` rather than `WHOLE(_)`
+        // unless a field is what distinguishes the missing case.
+        describe() -> string is
+            if let c = constructor then
+                if c.kind == ConstructorKind.PRODUCT then
+                    return "({_describe_fields()})";
+                fi
+
+                if fields.count == 0 \/ (fields |> Ghul.Pipes.all(f => f.is_wildcard)) then
+                    return c.name;
+                fi
+
+                return "{c.name}({_describe_fields()})";
+            fi
+
+            return "_";
+        si
+
+        _describe_fields() -> string =>
+            fields |> Ghul.Pipes.map(f => f.describe()) |> Ghul.Pipes.join(", ");
+    si
+
+    // Builds the pattern rows a `case`'s arms contribute.
+    //
+    // An arm whose shape cannot be modelled contributes no rows at
+    // all rather than an approximation. Dropping a row can only leave
+    // the domain looking less covered than it is, which costs a
+    // warning; crediting one that does not match would let a gap
+    // close and leave the no-match path unreachable in the checker's
+    // view alone.
+    class CASE_PATTERN_BUILDER is
+        init() is
+            super.init();
+        si
+
+        // The rows this arm contributes, or null when its shape
+        // cannot be modelled. An arm carrying several labels, or an
+        // optional ascription, contributes one row each.
+        build_rows(
+            arm: Trees.Statements.CASE_MATCH,
+            domain: PATTERN_DOMAIN?
+        ) -> Collections.List[Collections.List[CASE_PATTERN]]? is
+            // A guarded arm can decline to match a value its pattern
+            // admits, so it never covers anything.
+            if arm.guard? then
+                return null;
+            fi
+
+            let rows = Collections.LIST[Collections.List[CASE_PATTERN]]();
+
+            if let expressions = arm.expressions then
+                for expression in expressions.expressions do
+                    let pattern = _from_expression(expression, domain);
+
+                    if !pattern? then
+                        return null;
+                    fi
+
+                    rows.add(_row(pattern));
+                od
+
+                return rows;
+            fi
+
+            if let pattern = arm.pattern then
+                let patterns = _from_variable(pattern, domain);
+
+                if !patterns? then
+                    return null;
+                fi
+
+                for p in patterns do
+                    rows.add(_row(p));
+                od
+
+                return rows;
+            fi
+
+            rows.add(_row(CASE_PATTERN()));
+
+            return rows;
+        si
+
+        _row(pattern: CASE_PATTERN) -> Collections.List[CASE_PATTERN] is
+            let row = Collections.LIST[CASE_PATTERN]();
+
+            row.add(pattern);
+
+            return row;
+        si
+
+        _from_variable(
+            pattern: Trees.Variables.VARIABLE,
+            domain: PATTERN_DOMAIN?
+        ) -> Collections.List[CASE_PATTERN]? is
+            if !pattern.is_explicit_type then
+                let single = _from_left(pattern.left, domain);
+
+                if !single? then
+                    return null;
+                fi
+
+                let result = Collections.LIST[CASE_PATTERN]();
+
+                result.add(single);
+
+                return result;
+            fi
+
+            return _from_ascription(
+                pattern.type_expression.type,
+                _elements_of(pattern.left),
+                domain
+            );
+        si
+
+        // An ascribed pattern selects the alternative its target
+        // names. An optional target additionally admits absence, so
+        // it contributes a second row rather than being approximated
+        // by either half alone.
+        _from_ascription(
+            target: Type?,
+            elements: Collections.List[Trees.Variables.VariableLeft]?,
+            domain: PATTERN_DOMAIN?
+        ) -> Collections.List[CASE_PATTERN]? is
+            if !target? \/ !target.is_settled \/ !domain? then
+                return null;
+            fi
+
+            let target_optional = target.is_optional;
+            let core = if target_optional then target.as_non_optional() else target fi;
+
+            let constructor = _find_classy_constructor(domain, core);
+
+            if !constructor? then
+                return null;
+            fi
+
+            let fields = _fields(elements, constructor);
+
+            if !fields? then
+                return null;
+            fi
+
+            let result = Collections.LIST[CASE_PATTERN]();
+
+            result.add(CASE_PATTERN(constructor, fields));
+
+            if target_optional then
+                let null_constructor = _find_kind(domain, ConstructorKind.NULL);
+
+                if !null_constructor? then
+                    return null;
+                fi
+
+                result.add(CASE_PATTERN(null_constructor, Collections.LIST[CASE_PATTERN]()));
+            fi
+
+            return result;
+        si
+
+        _from_left(
+            left: Trees.Variables.VariableLeft,
+            domain: PATTERN_DOMAIN?
+        ) -> CASE_PATTERN? is
+            // A pattern with no runtime test of its own matches every
+            // value it is given, whatever shape it destructures into.
+            if !left.has_intrinsic_refutability then
+                return CASE_PATTERN();
+            fi
+
+            if let literal: Trees.Variables.LITERAL_VARIABLE_LEFT = left then
+                return _from_expression(literal.expression, domain);
+            fi
+
+            let elements = _elements_of(left);
+
+            if elements? /\ _has_named_group(elements) then
+                return null;
+            fi
+
+            if let ascription = left.type_expression then
+                let patterns = _from_ascription(ascription.type, elements, domain);
+
+                // An optional ascription below the top level would
+                // need the column to hold two shapes at once, which a
+                // single row cannot say.
+                if !patterns? \/ patterns.count != 1 then
+                    return null;
+                fi
+
+                return patterns[0];
+            fi
+
+            if !elements? \/ !domain? then
+                return null;
+            fi
+
+            let constructor = _find_kind(domain, ConstructorKind.PRODUCT);
+
+            if !constructor? then
+                return null;
+            fi
+
+            let fields = _fields(elements, constructor);
+
+            if !fields? then
+                return null;
+            fi
+
+            return CASE_PATTERN(constructor, fields);
+        si
+
+        _from_expression(
+            expression: Trees.Expressions.Expression,
+            domain: PATTERN_DOMAIN?
+        ) -> CASE_PATTERN? is
+            if isa Trees.Expressions.NULL(expression) then
+                return _leaf(domain, ConstructorKind.NULL);
+            fi
+
+            if let boolean: Trees.Expressions.Literals.BOOLEAN = expression then
+                if boolean.value_string =~ "true" then
+                    return _leaf(domain, ConstructorKind.TRUE);
+                fi
+
+                if boolean.value_string =~ "false" then
+                    return _leaf(domain, ConstructorKind.FALSE);
+                fi
+
+                return null;
+            fi
+
+            let enum_constructor = _try_get_enum_constructor(expression, domain);
+
+            if enum_constructor? then
+                return CASE_PATTERN(enum_constructor, Collections.LIST[CASE_PATTERN]());
+            fi
+
+            // A value drawn from a domain too large to enumerate. It
+            // is distinct from every other alternative, including any
+            // other literal, so it can never complete a domain.
+            return CASE_PATTERN(
+                PATTERN_CONSTRUCTOR(ConstructorKind.OPAQUE, "_", Collections.LIST[PATTERN_DOMAIN?]()),
+                Collections.LIST[CASE_PATTERN]()
+            );
+        si
+
+        _leaf(domain: PATTERN_DOMAIN?, kind: ConstructorKind) -> CASE_PATTERN? is
+            if !domain? then
+                return null;
+            fi
+
+            let constructor = _find_kind(domain, kind);
+
+            if !constructor? then
+                return null;
+            fi
+
+            return CASE_PATTERN(constructor, Collections.LIST[CASE_PATTERN]());
+        si
+
+        // Recognises an expression compile-expressions has resolved to
+        // a numeric literal of the scrutinee's own enum type, and
+        // returns the member it names. The value is matched by value —
+        // that is what distinguishes one member from another — and the
+        // member symbol is what the resulting pattern is keyed on.
+        _try_get_enum_constructor(
+            expression: Trees.Expressions.Expression,
+            domain: PATTERN_DOMAIN?
+        ) -> PATTERN_CONSTRUCTOR? is
+            if !domain? \/ !domain.enum_root? then
+                return null;
+            fi
+
+            if !expression.value? then
+                return null;
+            fi
+
+            let number = cast IR.Values.Literal.NUMBER?(expression.value);
+
+            if !number? then
+                return null;
+            fi
+
+            let number_classy = _classy_of(number.type);
+
+            if !number_classy? \/ !(number_classy =~ domain.enum_root!) then
+                return null;
+            fi
+
+            for constructor in domain.constructors do
+                if let member = constructor.enum_member then
+                    if member.emitted_value =~ number.rendered then
+                        return constructor;
+                    fi
+                fi
+            od
+
+            return null;
+        si
+
+        _classy_of(type: Type?) -> Classy? is
+            if !type? then
+                return null;
+            fi
+
+            if let named = cast Semantic.Types.NAMED?(type) then
+                return cast Classy?(named.symbol.unspecialized_symbol);
+            fi
+
+            return null;
+        si
+
+        _find_classy_constructor(domain: PATTERN_DOMAIN, core: Type) -> PATTERN_CONSTRUCTOR? is
+            let target = _classy_of(core);
+
+            if !target? then
+                return null;
+            fi
+
+            for constructor in domain.constructors do
+                if let classy = constructor.classy then
+                    if classy =~ target then
+                        return constructor;
+                    fi
+                fi
+            od
+
+            return null;
+        si
+
+        _find_kind(domain: PATTERN_DOMAIN, kind: ConstructorKind) -> PATTERN_CONSTRUCTOR? is
+            for constructor in domain.constructors do
+                if constructor.kind == kind then
+                    return constructor;
+                fi
+            od
+
+            return null;
+        si
+
+        // One sub-pattern per field of `constructor`. A pattern that
+        // writes no elements binds the whole alternative and so
+        // matches every field; one whose element count disagrees with
+        // the alternative's shape cannot be modelled.
+        _fields(
+            elements: Collections.List[Trees.Variables.VariableLeft]?,
+            constructor: PATTERN_CONSTRUCTOR
+        ) -> Collections.List[CASE_PATTERN]? is
+            let field_domains = constructor.field_domains;
+
+            if !elements? then
+                return wildcards(field_domains.count);
+            fi
+
+            if elements.count != field_domains.count then
+                return null;
+            fi
+
+            let result = Collections.LIST[CASE_PATTERN]();
+
+            for i in 0..elements.count do
+                let element = _from_left(elements[i], field_domains[i]);
+
+                if !element? then
+                    return null;
+                fi
+
+                result.add(element);
+            od
+
+            return result;
+        si
+
+        _elements_of(left: Trees.Variables.VariableLeft) -> Collections.List[Trees.Variables.VariableLeft]? is
+            if isa Trees.Variables.DESTRUCTURING_VARIABLE_LEFT(left) then
+                return left.elements;
+            fi
+
+            return null;
+        si
+
+        _has_named_group(elements: Collections.List[Trees.Variables.VariableLeft]) -> bool static is
+            for element in elements do
+                if element.source_field_name? then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        wildcards(count: int) -> Collections.List[CASE_PATTERN] static is
+            let result = Collections.LIST[CASE_PATTERN]();
+
+            for i in 0..count do
+                result.add(CASE_PATTERN());
+            od
+
+            return result;
+        si
+    si
+si
