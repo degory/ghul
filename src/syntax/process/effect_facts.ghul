@@ -1,0 +1,265 @@
+namespace Syntax.Process is
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Per-function facts the resolved-mode walk of the infer-effects
+    // pass collects — member writes, nulling writes, member reads,
+    // element access, effect-polymorphism markers — consumed by the
+    // EFFECT_SOLVERS closures and, through them, the reliance judge.
+    // The narrowing study reads the same records for its
+    // measurements.
+    class FUNCTION_EFFECT_FACTS is
+        name: string public;
+        owner_name: string public;
+        location: string public;
+
+        // The accessor role, derived from the synthesised accessor
+        // name: "get" for a property read accessor, "set" for its
+        // assign accessor, "index-get" / "index-set" for an indexer's,
+        // "" for an ordinary function or method.
+        role: string public;
+
+        // The body walk saw a write to something other than a local:
+        // a member, an index, a global, or the receiver's own state.
+        own_stores: bool public;
+
+        // The body walk gave up for a reason that is not a write: an
+        // unboundable callee, an unaudited node kind, an await, ...
+        own_unbounded: bool public;
+
+        // Copied from the function's STORE_FREE_FACTS at fixpoint
+        // time, so the table can be checked for records aliased
+        // between two functions.
+        is_disqualified: bool public;
+        aliased: bool public;
+
+        // Whether any override of this function definitely writes the
+        // heap, and whether any is merely unprovable. The assumption
+        // under test is exactly that the first of these is empty.
+        overrider_writes: bool public;
+        overrider_unprovable: bool public;
+
+        // The member symbols this body writes directly, and whether it
+        // performs a write the walk could not pin to a symbol (an
+        // index, an unresolvable target) or does something unboundable
+        // that could write anything.
+        writes: Collections.SET[Symbol] public;
+        writes_unbounded: bool public;
+
+        // The body assigns an optional-typed (or untypeable) value to
+        // something that is, or could be, a member - excluding a
+        // constructor's writes to its own fresh instance. The seed of
+        // the never-nulls classification.
+        assigns_optional: bool public;
+
+        // The member symbols the possibly-null assignments target, and
+        // whether any such assignment's target could not be resolved
+        // (in which case any member could have been nulled).
+        nulling_writes: Collections.SET[Symbol] public;
+        nulling_unbounded: bool public;
+
+        // The body stores through an indexer or to an array element -
+        // recorded apart from member writes because an element store
+        // cannot change what any field holds.
+        writes_elements: bool public;
+
+        // The member symbols this body reads, and whether it performs
+        // a read the walk cannot pin down (an element read, an
+        // unaudited construct). The seed of the getter read-closure
+        // the reliance judge intersects with a crossing callee's
+        // write set.
+        reads: Collections.SET[Symbol] public;
+        reads_elements: bool public;
+
+        // What the walk first gave up on in this body, or "" if it
+        // never did.
+        unbounded_reason: string public;
+
+        // Set on a property accessor's record when the owning property
+        // is an auto-property: its getter reads only the hidden backing
+        // field, so the property's value can only change through an
+        // assignment to the property itself. A hand-written getter can
+        // read anything, so it is never stability-eligible.
+        for_auto_property: bool public;
+
+        callee_count: int public;
+        overrider_count: int public;
+        openly_dispatchable: bool public;
+        declared_pure: bool public;
+
+        // The body invokes a function-typed parameter. The write-set
+        // closure then absorbs the write sets of every function value
+        // passed to this function at any call site the walk saw,
+        // instead of treating the invocation as unboundable.
+        invokes_function_param: bool public;
+
+        // Known callees this body forwards one of its own
+        // function-typed parameters to: if any of them invokes its
+        // parameter, this body invokes-by-proxy, and the values are
+        // still accounted at this body's own call sites.
+        forwards_param_to: Collections.SET[Function] public;
+
+        init(name: string, owner_name: string, location: string, role: string) is
+            self.name = name;
+            self.owner_name = owner_name;
+            self.location = location;
+            self.role = role;
+            writes = Collections.SET[Symbol]();
+            nulling_writes = Collections.SET[Symbol]();
+            reads = Collections.SET[Symbol]();
+            forwards_param_to = Collections.SET[Function]();
+            unbounded_reason = "";
+        si
+    si
+
+    // The registry those facts live in, plus the function values the
+    // walk saw flowing into function-typed parameters. Keyed on root
+    // symbols. Populated while `collecting` (set by the infer-effects
+    // pass) or while the measurement study's environment gates are
+    // on.
+    class EFFECT_FACTS is
+
+        // The production switch: on while the infer-effects pass is
+        // re-walking bodies with resolved types, so the per-function
+        // records collect member-granular write and nulling facts for
+        // the reliance judge. Independent of the study's environment
+        // gates, which remain measurement-only.
+        collecting: bool public static;
+
+        _records: Collections.MutableMap[Function, FUNCTION_EFFECT_FACTS]? static;
+
+        records: Collections.MutableMap[Function, FUNCTION_EFFECT_FACTS] static is
+            if !_records? then
+                _records = Collections.MAP[Function, FUNCTION_EFFECT_FACTS]();
+            fi
+
+            return _records;
+        si
+
+        record_for(function: Function?) -> FUNCTION_EFFECT_FACTS? static is
+            if !function? then
+                return null;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return null;
+            fi
+
+            if records.contains_key(root) then
+                return records[root];
+            fi
+
+            return null;
+        si
+
+        note_function(
+            function: Function?,
+            name: string,
+            owner_name: string,
+            location: string,
+            role: string
+        ) static is
+            if !collecting /\ !NARROWING_STUDY.enabled /\ NARROWING_STUDY.assume_mode == 0 then
+                return;
+            fi
+
+            if !function? then
+                return;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return;
+            fi
+
+            if records.contains_key(root) then
+                records[root].aliased = true;
+                return;
+            fi
+
+            records[root] = FUNCTION_EFFECT_FACTS(name, owner_name, location, role);
+        si
+
+        // clear the per-function records so the new walk's answers
+        // replace the old ones rather than being discarded as duplicates.
+        _next_label: string static;
+
+        generation_label: string static => _next_label;
+
+        begin_generation(label: string) static is
+            _next_label = label;
+            _records = Collections.MAP[Function, FUNCTION_EFFECT_FACTS]();
+            _passed_functions = Collections.MAP[Function, Collections.SET[Function]]();
+            _passed_opaque = Collections.SET[Function]();
+        si
+
+        // ==== function values flowing into parameters ====
+
+        // For each callee, the function values known to flow into its
+        // function-typed parameters across every call site the walk
+        // saw; and the callees handed a function value the walk could
+        // not name. Keyed on root symbols.
+        _passed_functions: Collections.MutableMap[Function, Collections.SET[Function]]? static;
+        _passed_opaque: Collections.SET[Function]? static;
+
+        passed_opaque: Collections.SET[Function] static is
+            if !_passed_opaque? then
+                _passed_opaque = Collections.SET[Function]();
+            fi
+
+            return _passed_opaque!;
+        si
+
+        passed_functions_for(callee: Function?) -> Collections.SET[Function]? static is
+            if !callee? \/ !_passed_functions? then
+                return null;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if root? /\ _passed_functions.contains_key(root!) then
+                return _passed_functions![root!];
+            fi
+
+            return null;
+        si
+
+        note_passed_function(callee: Function?, value: Function?) static is
+            if !callee? \/ !value? then
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+            let value_root = cast Function?(value.root_specialized_from);
+
+            if !root? \/ !value_root? then
+                return;
+            fi
+
+            if !_passed_functions? then
+                _passed_functions = Collections.MAP[Function, Collections.SET[Function]]();
+            fi
+
+            if !_passed_functions.contains_key(root!) then
+                _passed_functions![root!] = Collections.SET[Function]();
+            fi
+
+            _passed_functions![root!].add(value_root!);
+        si
+
+        note_passed_opaque(callee: Function?) static is
+            if !callee? then
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if root? then
+                passed_opaque.add(root!);
+            fi
+        si
+    si
+si
