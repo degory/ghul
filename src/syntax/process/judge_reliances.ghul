@@ -1,0 +1,278 @@
+namespace Syntax.Process is
+    use Logging;
+    use Trees;
+
+    use Symbol = Semantic.Symbols.Symbol;
+    use Function = Semantic.Symbols.Function;
+    use Type = Semantic.Types.Type;
+    use Value = IR.Values.Value;
+
+    // The consumption judge. Runs after infer-effects has solved the
+    // effect relations, walking each body's compiled values: for
+    // every consumption of a value stamped with reliance provenance,
+    // it first asks whether the consumption leans on the fact at all
+    // — a use the un-narrowed type already satisfies asks nothing of
+    // it — and only then whether every crossing is discharged by the
+    // solved relations and every getter the fact reads through is
+    // proven store-free. A value that reaches its consumption through
+    // `!`, `?.`, `??`, an `isa` test or a checked cast carries no
+    // provenance, because those re-check at runtime.
+    //
+    // The consumptions judged are the ones the emitted code would get
+    // wrong if the fact were false: an argument or stored value whose
+    // slot only the narrowed type satisfies, a return the declared
+    // return type would reject wide, and a dispatch or field access
+    // through a receiver that could be null again or of a type that
+    // no longer declares the member.
+    class JUDGE_RELIANCES: DefaultVisitor is
+        // Declared return type of each enclosing function body, for
+        // judging `return` expressions. Null entries stand for
+        // lambda bodies, whose returns are not judged yet.
+        _return_type_stack: Collections.LIST[Type?];
+
+        // One error per stamped load, however many consumptions it
+        // flows into.
+        _reported: Collections.SET[RELIANCE_PROVENANCE];
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES
+        ) is
+            super.init(logger, symbol_table, namespaces);
+
+            _return_type_stack = Collections.LIST[Type?]();
+            _reported = Collections.SET[RELIANCE_PROVENANCE]();
+        si
+
+        apply(root: Trees.Node) is
+            try
+                root.walk(self);
+            catch ex: System.Exception
+                // judging is best-effort over whatever compiled;
+                // broken code is diagnosed by the earlier passes
+            yrt
+        si
+
+        visit_default(node: Trees.Node) is
+            if isa Trees.Expressions.Expression(node) then
+                let value = (cast Trees.Expressions.Expression(node)).value;
+
+                if value? then
+                    _judge_shallow(value);
+                fi
+            fi
+        si
+
+        pre(function: Definitions.FUNCTION) -> bool is
+            let symbol = function_for(function);
+
+            _return_type_stack.add(if symbol? then symbol.return_type else null fi);
+
+            return false;
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            if _return_type_stack.count > 0 then
+                _return_type_stack.remove_at(_return_type_stack.count - 1);
+            fi
+        si
+
+        pre(function: Expressions.FUNCTION) -> bool is
+            _return_type_stack.add(null);
+
+            return false;
+        si
+
+        visit(function: Expressions.FUNCTION) is
+            if _return_type_stack.count > 0 then
+                _return_type_stack.remove_at(_return_type_stack.count - 1);
+            fi
+        si
+
+        visit(r: Statements.RETURN) is
+            if r.expression? /\ r.expression.value? /\ _return_type_stack.count > 0 then
+                _judge_slot(r.expression.value!, _return_type_stack[_return_type_stack.count - 1]);
+            fi
+        si
+
+        _judge_shallow(value: Value) is
+            if let call: IR.Values.Call.INSTANCE = value then
+                _judge_receiver(call.from, call.function);
+                _judge_arguments(call.function, call.arguments);
+            elif let call: IR.Values.Call.STRUCT = value then
+                _judge_receiver(call.from, call.function);
+                _judge_arguments(call.function, call.arguments);
+            elif let call: IR.Values.Call.STATIC = value then
+                _judge_arguments(call.function, call.arguments);
+            elif let call: IR.Values.Call.GLOBAL = value then
+                _judge_arguments(call.function, call.arguments);
+            elif let new_value: IR.Values.NEW = value then
+                _judge_arguments(new_value.constructor, new_value.arguments);
+            elif let store: IR.Values.Store.SYMBOL = value then
+                _judge_slot(store.value, _symbol_type(store.symbol));
+            elif let load: IR.Values.Load.INSTANCE_FIELD = value then
+                if load.from? then
+                    _judge_member_receiver(load.from!, load.symbol);
+                fi
+            fi
+        si
+
+        _symbol_type(symbol: Symbol?) -> Type? is
+            if !symbol? \/ !isa Semantic.Types.Typed(symbol) then
+                return null;
+            fi
+
+            return (cast Semantic.Types.Typed(symbol)).type;
+        si
+
+        _judge_arguments(function: Function, arguments: Collections.List[Value]) is
+            let formals = function.arguments;
+
+            for i in 0..arguments.count do
+                if i < formals.count then
+                    _judge_slot(arguments[i], formals[i]);
+                fi
+            od
+        si
+
+        // A value flowing into a typed slot: relies on its facts only
+        // when the slot rejects the un-narrowed type.
+        _judge_slot(value: Value, formal: Type?) is
+            let provenance = value.reliance_provenance;
+
+            if !provenance? \/ !formal? \/ _reported.contains(provenance!) then
+                return;
+            fi
+
+            let wide = provenance.wide_type;
+
+            if formal.is_assignable_from(wide) then
+                return;
+            fi
+
+            let needs_presence = wide.is_optional;
+            let needs_narrow =
+                !formal.is_assignable_from(
+                    if wide.is_optional then wide.as_non_optional() else wide fi);
+
+            _judge_reliance(provenance!, needs_presence, needs_narrow, false);
+        si
+
+        // Dispatch through a receiver: a null receiver fails whatever
+        // the member is, so presence is always leaned on; the member
+        // itself is only leaned on when the un-narrowed type does not
+        // declare it — a replacement value of the wide type still
+        // carries any member declared at or above it.
+        _judge_receiver(receiver: Value, function: Function) is
+            _judge_receiver_against(receiver, _owner_type(function.owner));
+        si
+
+        _judge_member_receiver(receiver: Value, member: Symbol?) is
+            if !member? then
+                return;
+            fi
+
+            _judge_receiver_against(receiver, _owner_type(member.owner));
+        si
+
+        _judge_receiver_against(receiver: Value, owner_type: Type?) is
+            let provenance = receiver.reliance_provenance;
+
+            if !provenance? \/ _reported.contains(provenance!) then
+                return;
+            fi
+
+            let wide = provenance.wide_type;
+
+            let needs_presence = wide.is_optional;
+
+            let wide_inner =
+                if wide.is_optional then wide.as_non_optional() else wide fi;
+
+            let needs_narrow =
+                !owner_type? \/ !owner_type.is_assignable_from(wide_inner);
+
+            if !needs_presence /\ !needs_narrow then
+                return;
+            fi
+
+            // dereferencing a possibly-null receiver is the same
+            // hazard the null-deref warning already covers, so a
+            // presence-only receiver reliance warns rather than
+            // errors; a type reliance is type confusion and stays an
+            // error
+            _judge_reliance(provenance!, needs_presence, needs_narrow, !needs_narrow);
+        si
+
+        _owner_type(owner: Semantic.Scope?) -> Type? is
+            if !owner? \/ !isa Semantic.Symbols.Classy(owner) then
+                return null;
+            fi
+
+            return (cast Semantic.Symbols.Classy(owner)).type;
+        si
+
+        _judge_reliance(provenance: RELIANCE_PROVENANCE, needs_presence: bool, needs_narrow: bool, warn_only: bool) is
+            // leaning on the fact at all requires every getter it
+            // reads through to be provably store-free
+            if provenance.getter_unproven then
+                let unproven = RELIANCES.first_unproven_getter(provenance.target, provenance.path);
+
+                if unproven? then
+                    _report(
+                        provenance,
+                        warn_only,
+                        "the getter of '{unproven.name}' is not provably store-free, so it can answer differently on every read; copy the value into a local variable instead");
+
+                    return;
+                fi
+            fi
+
+            if needs_presence /\ provenance.presence_crossings? then
+                if _report_first_undischarged(provenance, provenance.presence_crossings!, true, warn_only) then
+                    return;
+                fi
+            fi
+
+            if needs_narrow /\ provenance.narrow_crossings? then
+                _report_first_undischarged(provenance, provenance.narrow_crossings!, false, false);
+            fi
+        si
+
+        _report_first_undischarged(
+            provenance: RELIANCE_PROVENANCE,
+            crossings: Collections.LIST[CROSSING],
+            is_presence: bool,
+            warn_only: bool
+        ) -> bool is
+            for crossing in crossings do
+                if !RELIANCES.crossing_discharged(crossing, provenance.target, provenance.path, is_presence) then
+                    _report(
+                        provenance,
+                        warn_only,
+                        "the call at line {crossing.location.start_line} can change it; test '{provenance.name}' again, or copy it into a local variable before the call");
+
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        _report(provenance: RELIANCE_PROVENANCE, warn_only: bool, detail: string) is
+            _reported.add(provenance);
+
+            if warn_only then
+                _logger.warn(
+                    provenance.location,
+                    "null-deref",
+                    "{provenance.name} may not hold a value here: {detail}");
+            else
+                _logger.error(
+                    provenance.location,
+                    "cannot rely on the narrowing of '{provenance.name}' here: {detail}");
+            fi
+        si
+    si
+si

@@ -98,6 +98,7 @@ namespace Syntax.Process is
         // A stack because a block expression inside an assert's
         // condition or message can contain another assert.
         _assert_condition_killed_stack: Collections.LIST[bool];
+        _assert_condition_marks_stack: Collections.LIST[(from_mark: int, to_mark: int)];
 
         // Stack of per-`try` frames, one per `try` currently being
         // walked. pre(TRY) pushes; visit(TRY) pops. The
@@ -242,6 +243,7 @@ namespace Syntax.Process is
             _if_flow_stack = Collections.LIST[IF_FLOW_FRAME]();
             _loop_kept_stack = Collections.LIST[NARROW_ENV]();
             _assert_condition_killed_stack = Collections.LIST[bool]();
+            _assert_condition_marks_stack = Collections.LIST[(from_mark: int, to_mark: int)]();
             _try_flow_stack = Collections.LIST[TRY_FLOW_FRAME]();
             _val_block_stack = Collections.LIST[Trees.Expressions.VAL_BLOCK?]();
 
@@ -479,7 +481,12 @@ namespace Syntax.Process is
             if isa Semantic.Symbols.Property(symbol) then
                 let property = cast Semantic.Symbols.Property(symbol);
 
-                if property.read_function? /\ property.read_function.is_store_free then
+                // Optimistic: any readable property narrows. Whether
+                // its getter is really store-free is judged where a
+                // consumption leans on a fact read through it - see
+                // JUDGE_RELIANCES; a consumption the un-narrowed type
+                // already satisfies asks nothing of the getter.
+                if property.read_function? then
                     return property;
                 fi
             fi
@@ -566,7 +573,10 @@ namespace Syntax.Process is
             if !hop.is_field then
                 let property = cast Semantic.Symbols.Property?(hop);
 
-                if !property? \/ !property.read_function? \/ !property.read_function.is_store_free then
+                // as in try_get_narrowing_target: any readable
+                // property is an eligible hop, judged where a
+                // consumption leans on the fact
+                if !property? \/ !property.read_function? then
                     return null;
                 fi
             fi
@@ -804,6 +814,7 @@ namespace Syntax.Process is
             _loop_kept_stack.clear();
             _try_flow_stack.clear();
             _assert_condition_killed_stack.clear();
+            _assert_condition_marks_stack.clear();
         si
 
         // Flushed by the build loop once the compile-expressions pass has
@@ -1765,16 +1776,20 @@ namespace Syntax.Process is
                 // writes survive the loop.
                 let kept = _loops.loop_kept_env(`for);
                 let epoch = _flow.heap_epoch;
+                let mark = _flow.crossing_mark;
 
                 _flow.set_env(kept);
                 body.walk(self);
 
                 // The assignment kill-set covers direct writes but
-                // not calls or member stores inside the body, so a
-                // kill during the walk drops the kept environment's
-                // heap facts before restoration.
+                // not member stores inside the body, so a store
+                // during the walk drops the kept environment's heap
+                // facts before restoration; the body's calls attach
+                // as crossings.
                 if _flow.heap_killed_since(epoch) then
                     kept.drop_heap_facts();
+                else
+                    _flow.adopt_crossings_since(kept, mark);
                 fi
 
                 _flow.set_env(kept);
@@ -1920,15 +1935,18 @@ namespace Syntax.Process is
             super.pre(assert_in);
 
             let epoch = _flow.heap_epoch;
+            let mark = _flow.crossing_mark;
 
             assert_in.condition.walk(self);
 
-            // A kill during the condition's own walk means its
+            // A store during the condition's own walk means its
             // derived heap facts cannot be kept (`assert _f? /\
-            // mutate() in …`). The message's walk is outside the
-            // span: it only runs on the failure path, so its kills
-            // don't invalidate what the passing condition proves.
+            // mutate() in …`); its calls attach as crossings. The
+            // message's walk is outside the span: it only runs on
+            // the failure path, so its effects don't invalidate what
+            // the passing condition proves.
             let condition_killed = _flow.heap_killed_since(epoch);
+            let condition_mark_end = _flow.crossing_mark;
 
             // Walk the message *before* installing the condition-holds
             // narrowing, because the message expression is only
@@ -1944,6 +1962,8 @@ namespace Syntax.Process is
 
                 if condition_killed then
                     facts.then_env.drop_heap_facts();
+                else
+                    _flow.adopt_crossings_between(facts.then_env, mark, condition_mark_end);
                 fi
 
                 _flow.set_env(facts.then_env);
@@ -2260,6 +2280,7 @@ namespace Syntax.Process is
             // the message only runs on the failure path, so its kills
             // don't invalidate what the passing condition proves.
             let epoch = _flow.heap_epoch;
+            let mark = _flow.crossing_mark;
 
             _access.assert_condition_depth = _access.assert_condition_depth + 1;
 
@@ -2268,6 +2289,7 @@ namespace Syntax.Process is
             _access.assert_condition_depth = _access.assert_condition_depth - 1;
 
             _assert_condition_killed_stack.add(_flow.heap_killed_since(epoch));
+            _assert_condition_marks_stack.add((from_mark = mark, to_mark = _flow.crossing_mark));
 
             if `assert.message? then
                 `assert.message.walk(self);
@@ -2281,6 +2303,9 @@ namespace Syntax.Process is
 
             let condition_killed = _assert_condition_killed_stack[_assert_condition_killed_stack.count - 1];
             _assert_condition_killed_stack.remove_at(_assert_condition_killed_stack.count - 1);
+
+            let condition_marks = _assert_condition_marks_stack[_assert_condition_marks_stack.count - 1];
+            _assert_condition_marks_stack.remove_at(_assert_condition_marks_stack.count - 1);
 
             // `assert false` always throws — control does not
             // continue past it.
@@ -2305,6 +2330,8 @@ namespace Syntax.Process is
 
             if condition_killed then
                 facts.then_env.drop_heap_facts();
+            else
+                _flow.adopt_crossings_between(facts.then_env, condition_marks.from_mark, condition_marks.to_mark);
             fi
 
             _flow.set_env(facts.then_env);
