@@ -111,6 +111,13 @@ namespace Syntax.Process is
         unbounded: Collections.LIST[Collections.SET[Function]] public
     ) is
         blame: Collections.MutableMap[Function, string]?  public;
+
+        // The nulling refinement of `sets`, one per variant: what each
+        // function may write an absent value to. Same closure, seeded
+        // from the possibly-null assignments alone; imports contribute
+        // nothing, since imported code cannot assign a ghūl member.
+        nulling_sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]]? public;
+        nulling_unbounded: Collections.LIST[Collections.SET[Function]]? public;
     si
 
     // Empirical study of narrowing kills and store-free classification.
@@ -545,6 +552,16 @@ namespace Syntax.Process is
         // relaxed variant.
         _blame: Collections.MutableMap[Function, string]? static;
         _blame_counts: Collections.MutableMap[string, int]? static;
+
+        set_nulling_sets(
+            sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]],
+            unbounded: Collections.LIST[Collections.SET[Function]]
+        ) static is
+            if generations.count > 0 then
+                generations[generations.count - 1].nulling_sets = sets;
+                generations[generations.count - 1].nulling_unbounded = unbounded;
+            fi
+        si
 
         set_blame(blame: Collections.MutableMap[Function, string]) static is
             _blame = blame;
@@ -1112,6 +1129,18 @@ namespace Syntax.Process is
                         let unnecessary mut = 0;
                         let unknown mut = 0;
 
+                        // The presence-aware re-judgement: a
+                        // presence-only fact over storage members dies
+                        // only when the callee may write an absent
+                        // value to the fact's member, or may re-point
+                        // a path prefix it reads through. Facts with a
+                        // computed member fall back to the full write
+                        // set, counted separately.
+                        let presence_necessary mut = 0;
+                        let presence_unnecessary mut = 0;
+                        let presence_unknown mut = 0;
+                        let presence_fallback mut = 0;
+
                         let blame_counts = Collections.MAP[string, int]();
 
                         let fail_ineligible mut = 0;
@@ -1158,8 +1187,127 @@ namespace Syntax.Process is
                                 !sets.contains_key(root!) \/
                                 generation.unbounded[variant].contains(root!);
 
+                            // The refined judgement, under the model
+                            // the improved post-compile-expressions
+                            // pass would implement: a fact whose every
+                            // member is storage (a field or an
+                            // auto-property; a local root cannot be
+                            // written by any callee) cannot be changed
+                            // by imported code, which has no way to
+                            // name a ghūl member - delegate re-entry
+                            // is the known hole, unmeasured here. A
+                            // presence-only storage fact additionally
+                            // dies only to the nulling subset of the
+                            // callee's writes (a path also to a write
+                            // that re-points a prefix hop). Facts with
+                            // a computed member take the plain verdict,
+                            // counted as fallback.
+                            //   0 unknown, 1 necessary, 2 unnecessary
+                            let refined mut = -1;
+
+                            let all_storage = val
+                                let ok mut = true;
+
+                                for m in kill.members do
+                                    if
+                                        isa Semantic.Symbols.LOCAL_VARIABLE(m) \/
+                                        isa Semantic.Symbols.LOCAL_ARGUMENT(m)
+                                    then
+                                        continue;
+                                    fi
+
+                                    if !_is_eligible_member(m) then
+                                        ok = false;
+                                    fi
+                                od
+
+                                ok
+                            lav;
+
+                            if !all_storage \/ !generation.nulling_sets? then
+                                presence_fallback = presence_fallback + 1;
+                            elif !root? then
+                                // no single bounded callee: a closure
+                                // invocation or the like could run any
+                                // code, ghūl code included
+                                refined = 0;
+                            elif !sets.contains_key(root!) then
+                                // a direct import: writes no ghūl member
+                                refined = 2;
+                            else
+                                let full_writes = sets[root!];
+                                let full_unbounded = generation.unbounded[variant].contains(root!);
+
+                                let presence_only = kill.has_presence /\ !kill.has_narrow;
+
+                                let judge_writes =
+                                    if presence_only then
+                                        generation.nulling_sets![variant][root!]
+                                    else
+                                        full_writes
+                                    fi;
+
+                                let judge_unbounded =
+                                    if presence_only then
+                                        generation.nulling_unbounded![variant].contains(root!)
+                                    else
+                                        full_unbounded
+                                    fi;
+
+                                if judge_unbounded then
+                                    refined = 0;
+                                else
+                                    let hit_refined mut = false;
+
+                                    if kill.is_path then
+                                        // final member: judged writes;
+                                        // prefix hops: any write
+                                        // re-points what the tail reads
+                                        for i in 0..kill.members.count do
+                                            let m = kill.members[i];
+
+                                            if i == kill.members.count - 1 then
+                                                if judge_writes.contains(m) then
+                                                    hit_refined = true;
+                                                fi
+                                            elif !full_unbounded /\ full_writes.contains(m) then
+                                                hit_refined = true;
+                                            elif full_unbounded then
+                                                refined = 0;
+                                            fi
+                                        od
+                                    else
+                                        for m in kill.members do
+                                            if judge_writes.contains(m) then
+                                                hit_refined = true;
+                                            fi
+                                        od
+                                    fi
+
+                                    if refined != 0 then
+                                        refined = if hit_refined then 1 else 2 fi;
+                                    fi
+                                fi
+                            fi
+
+                            if refined == 0 then
+                                presence_unknown = presence_unknown + 1;
+                            elif refined == 1 then
+                                presence_necessary = presence_necessary + 1;
+
+                                if variant == VARIANTS - 1 then
+                                    writer.write_line("refined_necessary_site\t{generation.label}\t{kill.location}");
+                                fi
+                            elif refined == 2 then
+                                presence_unnecessary = presence_unnecessary + 1;
+                            fi
+
                             if is_unbounded then
                                 unknown = unknown + 1;
+
+                                if refined == -1 then
+                                    presence_unknown = presence_unknown + 1;
+                                fi
 
                                 if stable_exempt /\ variant == VARIANTS - 1 then
                                     exempt_unknown = exempt_unknown + 1;
@@ -1192,6 +1340,10 @@ namespace Syntax.Process is
                             if hit then
                                 necessary = necessary + 1;
 
+                                if refined == -1 then
+                                    presence_necessary = presence_necessary + 1;
+                                fi
+
                                 if stable_exempt /\ variant == VARIANTS - 1 then
                                     exempt_necessary = exempt_necessary + 1;
                                 fi
@@ -1201,6 +1353,10 @@ namespace Syntax.Process is
                                 fi
                             else
                                 unnecessary = unnecessary + 1;
+
+                                if refined == -1 then
+                                    presence_unnecessary = presence_unnecessary + 1;
+                                fi
 
                                 if stable_exempt /\ variant == VARIANTS - 1 then
                                     exempt_unnecessary = exempt_unnecessary + 1;
@@ -1222,6 +1378,13 @@ namespace Syntax.Process is
                         writer.write_line(
                             "necessity\t{generation.label}\tvariant{variant}"
                             "\tnecessary\t{necessary}\tunnecessary\t{unnecessary}\tunknown\t{unknown}");
+
+                        writer.write_line(
+                            "necessity_refined\t{generation.label}\tvariant{variant}"
+                            "\tnecessary\t{presence_necessary}"
+                            "\tunnecessary\t{presence_unnecessary}"
+                            "\tunknown\t{presence_unknown}"
+                            "\tfallback\t{presence_fallback}");
 
                         for key in blame_counts.keys do
                             writer.write_line("blame\t{generation.label}\t{key}\t{blame_counts[key]}");
