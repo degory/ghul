@@ -557,32 +557,136 @@ namespace Syntax.Process is
 
             if let call: IR.Values.Call.INSTANCE = value then
                 _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
                 return true;
             fi
 
             if let call: IR.Values.Call.STATIC = value then
                 _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
                 return true;
             fi
 
             if let call: IR.Values.Call.GLOBAL = value then
                 _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
                 return true;
             fi
 
             if let call: IR.Values.Call.STRUCT = value then
                 _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
                 return true;
             fi
 
             if let construction: IR.Values.NEW = value then
                 _add_construction_callee(construction.constructor);
+                _study_note_call_arguments(construction.constructor, construction.arguments);
                 return true;
+            fi
+
+            // Invoking a function value: bounded when the value names
+            // its function, effect-polymorphic when it is one of the
+            // enclosing function's own parameters, unboundable
+            // otherwise.
+            if let call: IR.Values.Call.CLOSURE = value then
+                if !call.is_state_changing_call then
+                    return true;
+                fi
+
+                let fn = _function_value_of(call.from);
+
+                if fn? then
+                    _add_callee(fn);
+                    _study_note_call_arguments(fn, call.arguments);
+                    return true;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(call.from) then
+                    if _current_record? then
+                        _current_record.invokes_function_param = true;
+                    fi
+
+                    return true;
+                fi
+
+                return false;
             fi
 
             // not a call at all: reading a value writes nothing, and any
             // sub-expression is classified as the walk reaches it
             return !value.is_state_changing_call;
+        si
+
+        // The function a value denotes, when the value's shape names
+        // one: a lambda literal compiled to a closure, a delegate
+        // constructed from a named function, a function pointer.
+        _function_value_of(value: IR.Values.Value?) -> Function? is
+            if !value? then
+                return null;
+            fi
+
+            if let view: IR.Values.NARROW_VIEW = value then
+                return _function_value_of(view.underlying);
+            fi
+
+            if let load: IR.Values.Load.INSTANCE_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            if let load: IR.Values.Load.STATIC_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            if let load: IR.Values.Load.GLOBAL_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            return value.referenced_function;
+        si
+
+        // Record which function values flow into a callee's
+        // function-typed parameters. A named value joins the callee's
+        // passed set; the caller's own parameter forwarded onward is
+        // accounted at the caller's own call sites instead; anything
+        // else function-typed makes the callee's parameter values
+        // unknowable - unless its type is pure, which admits only
+        // store-free values whoever invokes it.
+        _study_note_call_arguments(callee: Function?, arguments: Collections.List[IR.Values.Value]) is
+            if !callee? then
+                return;
+            fi
+
+            for argument in arguments do
+                let fn = _function_value_of(argument);
+
+                if fn? then
+                    NARROWING_STUDY.note_passed_function(callee, fn);
+                    continue;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(argument) then
+                    let argument_type = argument.type;
+
+                    if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                        if _current_record? then
+                            let root = cast Function?(callee.root_specialized_from);
+
+                            if root? then
+                                _current_record.forwards_param_to.add(root!);
+                            fi
+                        fi
+                    fi
+
+                    continue;
+                fi
+
+                let argument_type = argument.type;
+
+                if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                    NARROWING_STUDY.note_passed_opaque(callee);
+                fi
+            od
         si
 
         // `_disqualify` with the reason recorded for the study, so the
@@ -773,6 +877,16 @@ namespace Syntax.Process is
                 od
             elif isa Function(symbol) then
                 _add_callee(cast Function(symbol));
+            elif
+                _resolved_mode /\
+                isa Semantic.Symbols.LOCAL_ARGUMENT(symbol) /\
+                symbol.type? /\ symbol.type.is_function
+            then
+                // invoking a function-typed parameter: bounded by the
+                // values the enclosing function's own callers pass
+                if _current_record? then
+                    _current_record.invokes_function_param = true;
+                fi
             elif _is_store_free_construction(symbol) then
                 // constructing a fresh exception writes only that new
                 // object, never a pre-existing heap slot, so it cannot
@@ -935,8 +1049,55 @@ namespace Syntax.Process is
         // merely creates the closure; any invocation happens through
         // a delegate-typed value, which is never a bounded callee.
         // Closure symbols are never marked store-free.
-        pre(function: Expressions.FUNCTION) -> bool => true;
+        //
+        // In resolved mode the body is walked anyway, under the
+        // closure's own function symbol, so the effect-polymorphic
+        // absorption has a write set for every function value it can
+        // trace to a literal.
+        pre(function: Expressions.FUNCTION) -> bool is
+            if _resolved_mode then
+                _study_walk_lambda(function);
+            fi
+
+            return true;
+        si
+
         visit(function: Expressions.FUNCTION) is si
+
+        _study_walk_lambda(function: Expressions.FUNCTION) is
+            let symbol = _function_value_of(function.value);
+
+            if !symbol? then
+                return;
+            fi
+
+            let root = cast Function?(symbol.root_specialized_from);
+
+            if !root? \/ _facts.contains_key(root!) then
+                return;
+            fi
+
+            let saved_facts = _current;
+            let saved_function = _current_function;
+            let saved_record = _current_record;
+
+            let facts = STORE_FREE_FACTS();
+
+            _facts[root!] = facts;
+            _current = facts;
+            _current_function = root;
+
+            NARROWING_STUDY.note_function(root, root.name, "", "{function.location}", "lambda");
+            _current_record = NARROWING_STUDY.record_for(root);
+
+            enter_scope(function);
+            function.body.walk(self);
+            leave_scope(function);
+
+            _current = saved_facts;
+            _current_function = saved_function;
+            _current_record = saved_record;
+        si
 
         // ==== stores ====
 
