@@ -66,11 +66,16 @@ namespace Syntax.Process is
         // True if the body, or some catch handler, can complete
         // normally and so reach the end of the try statement.
         can_complete: bool public;
+        // True if the finally body cannot complete normally, in
+        // which case control never falls through the try however
+        // the body and handlers fared.
+        finally_diverges: bool public;
 
         init(entry: NARROW_ENV) is
             self.entry = entry;
         si
     si
+
 
     // The flow-sensitive narrowing orchestrator. Holds the narrowing
     // environment in force at the current walk point and keeps each
@@ -119,8 +124,18 @@ namespace Syntax.Process is
         // re-walk's diagnostics are scrubbed.
         _speculation: Collections.STACK[NARROW_ENV];
 
+
+        // Every call crossing this body walk has noted, in order —
+        // the source adopt_crossings_* copies from. Grows for the
+        // body's duration and clears at reset(). A rolled-back
+        // speculative walk's entries stay in the log; adopting them
+        // is conservative (an extra crossing can only add an
+        // obligation), and the retry re-walks the same calls anyway.
+        _crossing_log: Collections.LIST[CROSSING];
+
         init(logger: Logger) is
             _logger = logger;
+            _crossing_log = Collections.LIST[CROSSING]();
             _current_env = NARROW_ENV();
             _declared = Collections.MAP[Symbol, Type]();
             _tracked = Collections.SET[Symbol]();
@@ -250,6 +265,8 @@ namespace Syntax.Process is
                 _literal_impure_stack.clear();
             fi
 
+            _crossing_log.clear();
+
             // Speculation baselines are balanced by the `speculate_then_*`
             // disposables, but an aborted walk can leak one; drop any
             // leftovers at the body boundary (inert env copies — nothing
@@ -319,6 +336,10 @@ namespace Syntax.Process is
                     fi
                 od
             fi
+
+            // the set_* establishment calls above cleared the records
+            // a branch entry must carry forward
+            applied.adopt_crossings_from(target);
 
             _current_env = applied;
         si
@@ -551,44 +572,55 @@ namespace Syntax.Process is
             return false;
         si
 
-        // Call transfer: a field is plain storage a callee can reach
-        // through `this` and reassign, so a narrow or presence fact
-        // proven before a call cannot be trusted after it, and a
-        // property's getter reads arbitrary heap the callee may have
-        // written. Locals are unreachable to the callee, so their
-        // facts survive. Fires once a call expression has been
-        // compiled — its receiver has already been read, so the
-        // call's own narrowed access is unaffected.
+        // Call transfer. Narrowing is optimistic: a call drops no
+        // heap fact. Instead the call is recorded as a crossing
+        // against every heap fact live over it, and each later use of
+        // such a fact is judged against its crossings — a crossing
+        // whose callee provably left the fact alone is discharged,
+        // and relying on a fact with an undischarged crossing is a
+        // compile error at the use site. Locals are unreachable to
+        // the callee and take no crossings. Fires once a call
+        // expression has been compiled — its receiver has already
+        // been read, so the call's own narrowed access is unaffected.
         on_call(location: LOCATION) is
-            _heap_epoch = _heap_epoch + 1;
+            on_call_of(location, null);
+        si
+
+        // The call transfer, told which function is being called.
+        // `callee` is null where the site has no single bounded
+        // callee — a closure invocation, an interpolation — which no
+        // judgement can discharge. A call does not bump the heap
+        // epoch: facts survive it optimistically, carrying the
+        // crossing, and the epoch is what direct stores use to make
+        // snapshot-derived environments drop. The crossing is also
+        // logged so controlled walks can attach it to environments
+        // derived from snapshots taken before the call ran.
+        on_call_of(location: LOCATION, callee: Semantic.Symbols.Function?) is
             _mark_literal_impure();
 
-            let stale = Collections.SET[Symbol]();
+            let crossing = CROSSING(location, callee);
 
-            for v in _current_env.variables do
-                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
-                    stale.add(v);
-                fi
+            _current_env.note_crossing(crossing);
+            _crossing_log.add(crossing);
+        si
+
+        // Position marker into the call-crossing log, paired with the
+        // adopt_crossings_* methods below: an environment derived
+        // from a snapshot never saw the calls walked after the
+        // snapshot was taken, so their crossings are attached to its
+        // heap facts before it comes into force. This replaces the
+        // epoch drop for calls; direct stores still bump the epoch,
+        // and snapshot consumers still drop everything on it.
+        crossing_mark: int => _crossing_log.count;
+
+        adopt_crossings_since(env: NARROW_ENV, mark: int) is
+            adopt_crossings_between(env, mark, _crossing_log.count);
+        si
+
+        adopt_crossings_between(env: NARROW_ENV, from_mark: int, to_mark: int) is
+            for i in from_mark..to_mark do
+                env.note_crossing(_crossing_log[i]);
             od
-
-            for v in _current_env.non_null_variables do
-                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
-                    stale.add(v);
-                fi
-            od
-
-            for v in stale do
-                if !_shield.mark_if_shielded(v) then
-                    _report_kill(v, location, "a call here may change it");
-                    forget(v);
-                fi
-            od
-
-            // Every path fact dies here: a hop's own getter is
-            // store-free by construction, but the callee may have
-            // stored to anything the path reads through.
-            _report_dropped_paths(location, "a call here may change it", false);
-            _current_env.drop_all_paths();
         si
 
         // Emit a kill hint for each tracked path about to be dropped,
@@ -631,16 +663,224 @@ namespace Syntax.Process is
             _drop_property_facts(location, "a store here may change it");
         si
 
-        // Receiver-interior call transfer: the callee writes its own
-        // receiver's internal state and reaches no user code. That
-        // state is a BCL type's private storage, which is not
-        // addressable as a ghūl member, so no field fact can be about
-        // it and every field fact survives. A getter can read the
-        // receiver, so property facts and getter-bearing paths die
-        // exactly as they do for a direct store.
-        on_receiver_interior_call(location: LOCATION) is
-            _drop_property_facts(location, "a call here may change what a getter reads");
+        // ==== reliance judgement ====
+        //
+        // A use that leans on a heap fact — a load compiled at the
+        // narrowed type, or an optional read compiled as present — is
+        // checked against the fact's crossings. Every crossing must
+        // be discharged: the callee provably left the fact alone.
+        // Anything less is an error at the use site: the value may
+        // have changed since the fact was proven, and the emitted
+        // code would trust a stale view. The remedy at the use site is
+        // to re-establish — test again, unwrap with `!`, or copy to a
+        // local before the call.
+
+        // A crossing is discharged when the callee provably left the
+        // fact alone: a store-free callee writes nothing at all; a
+        // receiver-interior callee writes only its own receiver's
+        // BCL-internal state, which no field is, so it leaves field
+        // facts alone but can change what a getter reads.
+        _crossing_discharged(crossing: CROSSING, reads_through_getter: bool) -> bool is
+            let callee = crossing.callee;
+
+            return
+                callee? /\
+                (callee.is_store_free \/
+                    (!reads_through_getter /\ callee.writes_only_receiver_interior));
         si
+
+        _first_undischarged(
+            crossings: Collections.LIST[CROSSING]?,
+            reads_through_getter: bool
+        ) -> CROSSING? is
+            if !crossings? then
+                return null;
+            fi
+
+            for c in crossings do
+                if !_crossing_discharged(c, reads_through_getter) then
+                    return c;
+                fi
+            od
+
+            return null;
+        si
+
+        // The crossings the inline filter cannot discharge, snapshot
+        // so later mutation of the fact's own list cannot reach a
+        // pending event. Null when every crossing is discharged.
+        _undischarged_crossings(
+            crossings: Collections.LIST[CROSSING]?,
+            reads_through_getter: bool
+        ) -> Collections.LIST[CROSSING]? is
+            if !crossings? then
+                return null;
+            fi
+
+            let kept: Collections.LIST[CROSSING]? mut = null;
+
+            for c in crossings do
+                if !_crossing_discharged(c, reads_through_getter) then
+                    if !kept? then
+                        kept = Collections.LIST[CROSSING]();
+                    fi
+
+                    kept.add(c);
+                fi
+            od
+
+            return kept;
+        si
+
+        // Provenance for a load of `v`'s in-force facts, or null when
+        // no fact carries a crossing the inline tiers cannot
+        // discharge. `wide_type` is the value's un-narrowed type, so
+        // the consumption judge can tell a use the wide type already
+        // satisfies from one that leans on the fact.
+        provenance_for_symbol(location: LOCATION, v: Symbol, wide_type: Type?) -> RELIANCE_PROVENANCE? is
+            if !wide_type? then
+                return null;
+            fi
+
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) then
+                return null;
+            fi
+
+            RELIANCES.loads_consulted = RELIANCES.loads_consulted + 1;
+
+            let getter = isa Semantic.Symbols.Property(v);
+            let narrow_in_force = _current_env.contains(v);
+            let presence_in_force = _current_env.is_non_null(v);
+
+            if !narrow_in_force /\ !presence_in_force then
+                return null;
+            fi
+
+            let narrow_crossings =
+                if narrow_in_force then
+                    _undischarged_crossings(_current_env.narrow_crossings_of(v), getter)
+                else
+                    null
+                fi;
+
+            let presence_crossings =
+                if presence_in_force then
+                    _undischarged_crossings(_current_env.non_null_crossings_of(v), getter)
+                else
+                    null
+                fi;
+
+            let getter_unproven = !_getter_proven_inline(v);
+
+            if !narrow_crossings? /\ !presence_crossings? /\ !getter_unproven then
+                return null;
+            fi
+
+            RELIANCES.loads_stamped = RELIANCES.loads_stamped + 1;
+
+            return RELIANCE_PROVENANCE(location, v.name, v, null, wide_type!, narrow_in_force, presence_in_force, narrow_crossings, presence_crossings, getter_unproven);
+        si
+
+        provenance_for_path(location: LOCATION, path: ACCESS_PATH, wide_type: Type?) -> RELIANCE_PROVENANCE? is
+            if !wide_type? then
+                return null;
+            fi
+
+            RELIANCES.loads_consulted = RELIANCES.loads_consulted + 1;
+
+            let getter = path.has_getter_hop;
+            let narrow_in_force = _current_env.narrowed_type_of_path(path)?;
+            let presence_in_force = _current_env.is_non_null_path(path);
+
+            if !narrow_in_force /\ !presence_in_force then
+                return null;
+            fi
+
+            let narrow_crossings =
+                if narrow_in_force then
+                    _undischarged_crossings(_current_env.path_narrow_crossings_of(path), getter)
+                else
+                    null
+                fi;
+
+            let presence_crossings =
+                if presence_in_force then
+                    _undischarged_crossings(_current_env.path_presence_crossings_of(path), getter)
+                else
+                    null
+                fi;
+
+            let getter_unproven = !_path_getters_proven_inline(path);
+
+            if !narrow_crossings? /\ !presence_crossings? /\ !getter_unproven then
+                return null;
+            fi
+
+            RELIANCES.loads_stamped = RELIANCES.loads_stamped + 1;
+
+            return RELIANCE_PROVENANCE(location, "{path}", null, path, wide_type!, narrow_in_force, presence_in_force, narrow_crossings, presence_crossings, getter_unproven);
+        si
+
+
+        // Whether the fact-formation tier proves the getter a fact
+        // reads through - the same Property.narrowable_getter rule
+        // the formation gates apply, so with the gates in place this
+        // never fails. It is kept as a safety net: should a fact ever
+        // arrive through a getter the tier no longer proves (a stale
+        // incremental state, a future gate change), the use records
+        // an obligation for the deferred judge instead of silently
+        // leaning on the getter.
+        _getter_proven_inline(m: Symbol) -> bool is
+            if !isa Semantic.Symbols.Property(m) then
+                return true;
+            fi
+
+            return (cast Semantic.Symbols.Property(m)).narrowable_getter;
+        si
+
+        _path_getters_proven_inline(path: ACCESS_PATH) -> bool is
+            if !_getter_proven_inline(path.root) then
+                return false;
+            fi
+
+            for m in path.members do
+                if !_getter_proven_inline(m) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+
+
+
+
+
+
+
+        // Whether every crossing recorded against `v`'s facts is
+        // discharged. Gates the redundancy warnings: an `!` or a
+        // re-test after an undischarged crossing is load-bearing —
+        // it is the remedy the reliance error asks for — and must not
+        // be reported redundant.
+        symbol_fact_validated(v: Symbol) -> bool is
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) then
+                return true;
+            fi
+
+            let getter = isa Semantic.Symbols.Property(v);
+
+            return
+                _getter_proven_inline(v) /\
+                !_first_undischarged(_current_env.non_null_crossings_of(v), getter)? /\
+                !_first_undischarged(_current_env.narrow_crossings_of(v), getter)?;
+        si
+
+        path_fact_validated(path: ACCESS_PATH) -> bool =>
+            _path_getters_proven_inline(path) /\
+            !_first_undischarged(_current_env.path_presence_crossings_of(path), path.has_getter_hop)? /\
+            !_first_undischarged(_current_env.path_narrow_crossings_of(path), path.has_getter_hop)?;
 
         _drop_property_facts(location: LOCATION, reason: string) is
             _heap_epoch = _heap_epoch + 1;

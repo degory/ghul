@@ -1,0 +1,651 @@
+namespace Syntax.Process is
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+    use Semantic.Symbols.STORE_FREE_IMPORTS;
+
+    // Solves the whole-program effect relations the reliance judge
+    // reads, over the same per-function facts STORE_FREE_FIXPOINT
+    // consumes: member-granular may-write and may-write-null sets, the
+    // store-free set, and member read closures. Nothing here writes a
+    // store-free bit; the solved sets are installed into EFFECTS.
+    class EFFECT_SOLVERS is
+        _facts: Collections.MutableMap[Function, STORE_FREE_FACTS];
+
+        // Functions that invoke a function-typed parameter, directly
+        // or by forwarding one to something that does. Their write
+        // sets absorb the write sets of every function value passed
+        // to them at any recorded call site.
+        _param_invokers: Collections.SET[Function]?;
+
+        init(facts: Collections.MutableMap[Function, STORE_FREE_FACTS]) is
+            _facts = facts;
+        si
+
+        param_invokers: Collections.SET[Function] is
+            if _param_invokers? then
+                return _param_invokers!;
+            fi
+
+            let invokers = Collections.SET[Function]();
+
+            for function in _facts.keys do
+                let record = EFFECT_FACTS.record_for(function);
+
+                if record? /\ record.invokes_function_param then
+                    invokers.add(function);
+                fi
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if invokers.contains(function) then
+                        continue;
+                    fi
+
+                    let record = EFFECT_FACTS.record_for(function);
+
+                    if !record? then
+                        continue;
+                    fi
+
+                    for target in record.forwards_param_to do
+                        if invokers.contains(target) then
+                            invokers.add(function);
+                            changed = true;
+                        fi
+                    od
+                od
+            od
+
+            _param_invokers = invokers;
+
+            return invokers;
+        si
+
+        // The store-free relation, solved by STORE_FREE_FIXPOINT
+        // itself so the two can never drift apart.
+        solve() -> Collections.SET[Function] is
+            let unsafe = STORE_FREE_FIXPOINT().solve(_facts).unsafe;
+
+            let safe = Collections.SET[Function]();
+
+            for function in _facts.keys do
+                if !unsafe.contains(function) then
+                    safe.add(function);
+                fi
+            od
+
+            return safe;
+        si
+
+        // What each function may write, at member-symbol granularity:
+        // its own writes, plus those of everything it can dispatch to.
+        // `unbounded` names the functions for which no such set exists
+        // - the walk lost track, a callee was not walked, or an
+        // override outside the compilation could write anything.
+        //
+        // Receiver-blind, exactly as NARROWING_FLOW.on_member_store is:
+        // a write to `other.f` and one to `self.f` are the same entry,
+        // because the two receivers may alias.
+        write_sets(close_open: bool, trust_imports: bool) -> (
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) is
+            let sets = Collections.MAP[Function, Collections.SET[Symbol]]();
+            let unbounded = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let set = Collections.SET[Symbol]();
+                let record = EFFECT_FACTS.record_for(function);
+
+                if record? then
+                    for member in record.writes do
+                        set.add(member);
+                    od
+
+                    if record.writes_unbounded then
+                        unbounded.add(function);
+                    fi
+                else
+                    unbounded.add(function);
+                fi
+
+                // An override in another assembly could write anything.
+                // `close_open` drops that, which is the whole-program
+                // assumption a self-contained program like the compiler
+                // could legitimately make.
+                if !close_open /\ shadow.is_openly_dispatchable(function) then
+                    unbounded.add(function);
+                fi
+
+                sets[function] = set;
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    let set = sets[function];
+                    let before = set.count;
+                    let was_unbounded = unbounded.contains(function);
+
+                    if _absorb(function, sets, unbounded, trust_imports) then
+                        changed = true;
+                    fi
+
+                    if !was_unbounded /\ unbounded.contains(function) then
+                        changed = true;
+                    fi
+
+                    if set.count != before then
+                        changed = true;
+                    fi
+                od
+            od
+
+            return (sets = sets, unbounded = unbounded);
+        si
+
+        // Pull every dispatch target's writes into `function`'s set.
+        // Returns whether the function became unbounded.
+        _absorb(
+            function: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            // Once unbounded, nothing more can change: queries answer
+            // conservatively without reading the member set, and
+            // callers read only the unbounded flag.
+            if unbounded.contains(function) then
+                return false;
+            fi
+
+            let became mut = false;
+
+            for callee in _facts[function].callees do
+                if _absorb_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if _absorb_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            // Effect-polymorphic absorption: an invoked function-typed
+            // parameter is bounded by the values recorded flowing in
+            // at the function's call sites; a value nothing could name
+            // makes the invocation unboundable after all.
+            if param_invokers.contains(function) then
+                if EFFECT_FACTS.passed_opaque.contains(function) then
+                    if !unbounded.contains(function) then
+                        unbounded.add(function);
+                        became = true;
+                    fi
+                else
+                    let passed = EFFECT_FACTS.passed_functions_for(function);
+
+                    if passed? then
+                        for value in passed do
+                            if _absorb_target(function, value, sets, unbounded, trust_imports) then
+                                became = true;
+                            fi
+                        od
+                    fi
+                fi
+            fi
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        if !unbounded.contains(function) then
+                            unbounded.add(function);
+                            became = true;
+                        fi
+
+                        continue;
+                    fi
+
+                    if _absorb_target(function, cast Function(overrider), sets, unbounded, trust_imports) then
+                        became = true;
+                    fi
+                od
+            fi
+
+            return became;
+        si
+
+        _absorb_target(
+            function: Function,
+            target: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            if target.is_declared_pure then
+                return false;
+            fi
+
+            if !sets.contains_key(target) then
+                // not walked here: a trusted store-free import writes
+                // nothing, a receiver-interior mutator writes only its
+                // own receiver's internal state - never a ghul member -
+                // and anything else could write anything
+                if
+                    trust_imports \/
+                    STORE_FREE_IMPORTS.is_store_free(target) \/
+                    target.writes_only_receiver_interior
+                then
+                    return false;
+                fi
+
+                unbounded.add(function);
+                return true;
+            fi
+
+            if unbounded.contains(target) then
+                // the caller's members no longer matter either, so
+                // skip the union
+                unbounded.add(function);
+                return true;
+            fi
+
+            let function_set = sets[function];
+
+            for member in sets[target] do
+                function_set.add(member);
+            od
+
+            return false;
+        si
+
+        // The member-keyed may-null relation: which members each
+        // function (or anything it dispatches to) may assign a
+        // possibly-absent value. Open dispatch makes the set
+        // unboundable.
+        //
+        // `trust_imports` selects the import model. Trusted, an
+        // unwalked callee contributes nothing, on the argument that
+        // imported code cannot assign a ghul member except by
+        // re-entering ghul code - an argument with a known leak
+        // (delegate re-entry), so it is a measurement configuration
+        // only. Untrusted - the production setting - an unwalked
+        // callee that is not declared pure and not on the curated
+        // store-free whitelist makes the caller unboundable.
+        may_null_sets(close_open: bool, trust_imports: bool) -> (
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) is
+            let sets = Collections.MAP[Function, Collections.SET[Symbol]]();
+            let unbounded = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let set = Collections.SET[Symbol]();
+                let record = EFFECT_FACTS.record_for(function);
+
+                if record? then
+                    for m in record.nulling_writes do
+                        set.add(m);
+                    od
+
+                    // an unbounded write could write null just as well
+                    // as it could write anything else, so the nulling
+                    // set is only a bound where the write set is
+                    if record.nulling_unbounded \/ record.writes_unbounded then
+                        unbounded.add(function);
+                    fi
+                else
+                    unbounded.add(function);
+                fi
+
+                if !close_open /\ shadow.is_openly_dispatchable(function) then
+                    unbounded.add(function);
+                fi
+
+                sets[function] = set;
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if _absorb_nulling(function, sets, unbounded, trust_imports) then
+                        changed = true;
+                    fi
+                od
+            od
+
+            return (sets = sets, unbounded = unbounded);
+        si
+
+        _absorb_nulling(
+            function: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            // Once unbounded, nothing more can change - see _absorb.
+            if unbounded.contains(function) then
+                return false;
+            fi
+
+            let became mut = false;
+
+            for callee in _facts[function].callees do
+                if _absorb_nulling_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if _absorb_nulling_target(function, callee, sets, unbounded, trust_imports) then
+                    became = true;
+                fi
+            od
+
+            if param_invokers.contains(function) then
+                if EFFECT_FACTS.passed_opaque.contains(function) then
+                    if !unbounded.contains(function) then
+                        unbounded.add(function);
+                        became = true;
+                    fi
+                else
+                    let passed = EFFECT_FACTS.passed_functions_for(function);
+
+                    if passed? then
+                        for value in passed do
+                            if _absorb_nulling_target(function, value, sets, unbounded, trust_imports) then
+                                became = true;
+                            fi
+                        od
+                    fi
+                fi
+            fi
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        if !unbounded.contains(function) then
+                            unbounded.add(function);
+                            became = true;
+                        fi
+
+                        continue;
+                    fi
+
+                    if _absorb_nulling_target(function, cast Function(overrider), sets, unbounded, trust_imports) then
+                        became = true;
+                    fi
+                od
+            fi
+
+            return became;
+        si
+
+        _absorb_nulling_target(
+            function: Function,
+            target: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            trust_imports: bool
+        ) -> bool is
+            if target.is_declared_pure then
+                return false;
+            fi
+
+            if !sets.contains_key(target) then
+                // Same tiers as _absorb_target; a receiver-interior
+                // mutator cannot assign a ghul member at all, null or
+                // otherwise.
+                if
+                    trust_imports \/
+                    STORE_FREE_IMPORTS.is_store_free(target) \/
+                    target.writes_only_receiver_interior
+                then
+                    return false;
+                fi
+
+                unbounded.add(function);
+                return true;
+            fi
+
+            if unbounded.contains(target) then
+                // the caller's members no longer matter either, so
+                // skip the union
+                unbounded.add(function);
+                return true;
+            fi
+
+            let became mut = false;
+            let function_set = sets[function];
+
+            for m in sets[target] do
+                if !function_set.contains(m) then
+                    function_set.add(m);
+                    became = true;
+                fi
+            od
+
+            return became;
+        si
+
+        // The member read closure: which members each function - or
+        // anything it can dispatch to or invoke - may read, plus
+        // whether it may read or write collection/array elements.
+        // Consumed by the reliance judge for facts read through a
+        // getter: a crossing callee whose write set is disjoint from
+        // the getter's read closure provably leaves the getter's
+        // answer alone. An unwalked callee makes the reads
+        // unboundable, except the curated import tiers: a store-free
+        // import reads only its receiver's interior, and a
+        // receiver-interior mutator additionally writes it.
+        read_sets() -> (
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            reads_elements: Collections.SET[Function],
+            writes_elements: Collections.SET[Function]
+        ) is
+            let sets = Collections.MAP[Function, Collections.SET[Symbol]]();
+            let unbounded = Collections.SET[Function]();
+            let reads_elements = Collections.SET[Function]();
+            let writes_elements = Collections.SET[Function]();
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let set = Collections.SET[Symbol]();
+                let record = EFFECT_FACTS.record_for(function);
+
+                if record? then
+                    for m in record.reads do
+                        set.add(m);
+                    od
+
+                    if record.reads_elements then
+                        reads_elements.add(function);
+                    fi
+
+                    if record.writes_elements then
+                        writes_elements.add(function);
+                    fi
+
+                    if record.own_unbounded \/ record.writes_unbounded then
+                        unbounded.add(function);
+                    fi
+                else
+                    unbounded.add(function);
+                fi
+
+                if shadow.is_openly_dispatchable(function) then
+                    unbounded.add(function);
+                    writes_elements.add(function);
+                fi
+
+                sets[function] = set;
+            od
+
+            let changed mut = true;
+
+            while changed do
+                changed = false;
+
+                for function in _facts.keys do
+                    if _absorb_reads(function, sets, unbounded, reads_elements, writes_elements) then
+                        changed = true;
+                    fi
+                od
+            od
+
+            return (sets = sets, unbounded = unbounded, reads_elements = reads_elements, writes_elements = writes_elements);
+        si
+
+        _absorb_reads(
+            function: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            reads_elements: Collections.SET[Function],
+            writes_elements: Collections.SET[Function]
+        ) -> bool is
+            let became mut = false;
+
+            for callee in _facts[function].callees do
+                if _absorb_reads_target(function, callee, sets, unbounded, reads_elements, writes_elements) then
+                    became = true;
+                fi
+            od
+
+            for callee in _facts[function].construction_callees do
+                if _absorb_reads_target(function, callee, sets, unbounded, reads_elements, writes_elements) then
+                    became = true;
+                fi
+            od
+
+            if param_invokers.contains(function) then
+                if EFFECT_FACTS.passed_opaque.contains(function) then
+                    became = _add_once(unbounded, function) \/ became;
+                    became = _add_once(writes_elements, function) \/ became;
+                else
+                    let passed = EFFECT_FACTS.passed_functions_for(function);
+
+                    if passed? then
+                        for value in passed do
+                            if _absorb_reads_target(function, value, sets, unbounded, reads_elements, writes_elements) then
+                                became = true;
+                            fi
+                        od
+                    fi
+                fi
+            fi
+
+            let overriders = function.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Function(overrider) then
+                        became = _add_once(unbounded, function) \/ became;
+                        became = _add_once(writes_elements, function) \/ became;
+
+                        continue;
+                    fi
+
+                    if _absorb_reads_target(function, cast Function(overrider), sets, unbounded, reads_elements, writes_elements) then
+                        became = true;
+                    fi
+                od
+            fi
+
+            return became;
+        si
+
+        _absorb_reads_target(
+            function: Function,
+            target: Function,
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function],
+            reads_elements: Collections.SET[Function],
+            writes_elements: Collections.SET[Function]
+        ) -> bool is
+            let became mut = false;
+
+            if !sets.contains_key(target) then
+                // not walked here. A curated store-free import reads
+                // only its receiver's interior; a receiver-interior
+                // mutator also writes it. A declared-pure import
+                // stores nothing but can read anything; everything
+                // else could do either.
+                // Declared purity is checked before the
+                // receiver-interior tier: `pure` implies the
+                // store-free bit, which the receiver-interior test
+                // accepts, but a pure function promises nothing
+                // about what it reads.
+                if STORE_FREE_IMPORTS.is_store_free(target) then
+                    became = _add_once(reads_elements, function);
+                elif target.is_declared_pure then
+                    became = _add_once(unbounded, function);
+                elif target.writes_only_receiver_interior then
+                    became = _add_once(reads_elements, function) \/ became;
+                    became = _add_once(writes_elements, function) \/ became;
+                else
+                    became = _add_once(unbounded, function) \/ became;
+                    became = _add_once(writes_elements, function) \/ became;
+                fi
+
+                return became;
+            fi
+
+            if unbounded.contains(target) then
+                became = _add_once(unbounded, function) \/ became;
+            elif !unbounded.contains(function) then
+                // the member union matters only while both closures
+                // are still bounded - an unbounded closure answers
+                // null whatever its set holds. The element flags
+                // below still propagate regardless, because
+                // may_write_elements consults them independently of
+                // the read closure.
+                let function_set = sets[function];
+
+                for m in sets[target] do
+                    if !function_set.contains(m) then
+                        function_set.add(m);
+                        became = true;
+                    fi
+                od
+            fi
+
+            if reads_elements.contains(target) then
+                became = _add_once(reads_elements, function) \/ became;
+            fi
+
+            if writes_elements.contains(target) then
+                became = _add_once(writes_elements, function) \/ became;
+            fi
+
+            return became;
+        si
+
+        _add_once(set: Collections.SET[Function], function: Function) -> bool static is
+            if set.contains(function) then
+                return false;
+            fi
+
+            set.add(function);
+            return true;
+        si
+    si
+si

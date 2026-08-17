@@ -1,0 +1,253 @@
+namespace Syntax.Process is
+    use Logging.Logger;
+    use LOCATION = Source.LOCATION;
+    use Symbol = Semantic.Symbols.Symbol;
+    use Function = Semantic.Symbols.Function;
+
+    // Provenance stamped on a compiled value that was loaded through
+    // a flow-narrowing fact while the fact still had call crossings
+    // the inline tiers could not discharge. The crossing lists are
+    // snapshot at load time — a call walked after the load cannot
+    // change a value already loaded, so the snapshot is exact.
+    // Nothing is reported at the load: whether the fact was *relied
+    // on* is a property of each consumption of the value, judged by
+    // JUDGE_RELIANCES after the effect relations are solved. A null
+    // crossing list means that fact kind either was not applied to
+    // the load or had every crossing inline-discharged.
+    class RELIANCE_PROVENANCE(
+        location: LOCATION,
+        name: string,
+        target: Symbol?,
+        path: ACCESS_PATH?,
+        wide_type: Semantic.Types.Type,
+        // which fact kinds were in force at the load - a consumption
+        // can only lean on a fact that was actually applied
+        narrows_type: bool,
+        asserts_presence: bool,
+        narrow_crossings: Collections.LIST[CROSSING]?,
+        presence_crossings: Collections.LIST[CROSSING]?,
+        // some getter the fact reads through is not proven store-free
+        // by the symbol-local tier; a relying consumption must get the
+        // proof from the solved effect relations or be an error
+        getter_unproven: bool
+    );
+
+
+    // The discharge rules the consumption judge (JUDGE_RELIANCES)
+    // asks of a stamped value's crossings and getters, plus the
+    // volume counters the study summary reports: how many heap-fact
+    // loads were consulted for provenance, how many actually got
+    // stamped, and how many consumptions were reported.
+    class RELIANCES is
+        loads_consulted: int public static;
+        loads_stamped: int public static;
+        consumptions_reported: int public static;
+
+        reset_counters() static is
+            loads_consulted = 0;
+            loads_stamped = 0;
+            consumptions_reported = 0;
+        si
+
+
+
+        // The first property a provenance's fact reads through whose
+        // getter neither the symbol-local tier nor the solved effect
+        // relations prove store-free, or null when all are proven.
+        first_unproven_getter(target: Symbol?, path: ACCESS_PATH?) -> Symbol? static is
+            if target? then
+                if !_getter_proven(target) then
+                    return target;
+                fi
+
+                return null;
+            fi
+
+            if path? then
+                if !_getter_proven(path.root) then
+                    return path.root;
+                fi
+
+                for m in path.members do
+                    if !_getter_proven(m) then
+                        return m;
+                    fi
+                od
+            fi
+
+            return null;
+        si
+
+        // A fact read through a getter survives a crossing when the
+        // callee provably writes nothing the getters read: the
+        // callee's write set is disjoint from the union of the fact's
+        // hop symbols and every getter hop's read closure, elements
+        // included. Anything unboundable on either side declines.
+        _getter_fact_discharged(callee: Function, target: Symbol?, path: ACCESS_PATH?) -> bool static is
+            let reads = Collections.SET[Symbol]();
+            let reads_elements mut = false;
+
+            if target? then
+                if !_collect_hop_reads(target, reads) then
+                    return false;
+                fi
+
+                reads_elements = _hop_reads_elements(target);
+            fi
+
+            if path? then
+                if !_collect_hop_reads(path.root, reads) then
+                    return false;
+                fi
+
+                reads_elements = reads_elements \/ _hop_reads_elements(path.root);
+
+                for m in path.members do
+                    if !_collect_hop_reads(m, reads) then
+                        return false;
+                    fi
+
+                    reads_elements = reads_elements \/ _hop_reads_elements(m);
+                od
+            fi
+
+            if reads_elements /\ EFFECTS.may_write_elements(callee) then
+                return false;
+            fi
+
+            for m in reads do
+                if EFFECTS.may_write(callee, m) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        // Add the hop symbol itself, and - when it is a property -
+        // its getter's read closure. False when the closure cannot be
+        // bounded.
+        _collect_hop_reads(m: Symbol, reads: Collections.SET[Symbol]) -> bool static is
+            reads.add(m.root_specialized_from);
+
+            if !isa Semantic.Symbols.Property(m) then
+                return true;
+            fi
+
+            let getter = (cast Semantic.Symbols.Property(m)).read_function;
+
+            if !getter? then
+                return false;
+            fi
+
+            let closure = EFFECTS.getter_read_closure(getter);
+
+            if !closure? then
+                return false;
+            fi
+
+            for r in closure do
+                reads.add(r);
+            od
+
+            return true;
+        si
+
+        _hop_reads_elements(m: Symbol) -> bool static is
+            if !isa Semantic.Symbols.Property(m) then
+                return false;
+            fi
+
+            return EFFECTS.getter_reads_elements((cast Semantic.Symbols.Property(m)).read_function);
+        si
+
+        _getter_proven(m: Symbol) -> bool static is
+            if !isa Semantic.Symbols.Property(m) then
+                return true;
+            fi
+
+            let property = cast Semantic.Symbols.Property(m);
+
+            if property.narrowable_getter then
+                return true;
+            fi
+
+            let read_function = property.read_function;
+
+            return read_function? /\ EFFECTS.is_store_free(read_function);
+        si
+
+
+        // Whether `crossing`'s callee provably left the fact alone.
+        // A fact read through a getter — a property target, or a path
+        // with a getter hop — needs a callee that stores nothing at
+        // all, since a getter can read anything a store changed. A
+        // fields-only fact needs less: a presence fact survives any
+        // callee that cannot assign a possibly-absent value to its
+        // member, and a type narrow survives any callee that cannot
+        // store to it; for a path, every hop below the last is held
+        // to may-write, since rewriting a prefix redirects the path
+        // to a different object entirely.
+
+        // Shared by the deferred judge above and the consumption judge
+        // (JUDGE_RELIANCES): whether the crossing's callee provably
+        // left the identified fact alone.
+        crossing_discharged(crossing: CROSSING, target: Symbol?, path: ACCESS_PATH?, is_presence: bool) -> bool static is
+            let callee = crossing.callee;
+
+            if !callee? then
+                return false;
+            fi
+
+            let getter =
+                (target? /\ isa Semantic.Symbols.Property(target)) \/
+                (path? /\ path.has_getter_hop);
+
+            if callee.is_store_free \/ EFFECTS.is_store_free(callee) then
+                return true;
+            fi
+
+            if getter then
+                return _getter_fact_discharged(callee, target, path);
+            fi
+
+            if callee.writes_only_receiver_interior then
+                return true;
+            fi
+
+            if target? then
+                if is_presence then
+                    return !EFFECTS.may_null(callee, target);
+                fi
+
+                return !EFFECTS.may_write(callee, target);
+            fi
+
+            if path? then
+                if isa Semantic.Symbols.Field(path.root) /\ EFFECTS.may_write(callee, path.root) then
+                    return false;
+                fi
+
+                let members = path.members;
+
+                for i in 0..members.count do
+                    let hop = members[i];
+
+                    if i < members.count - 1 then
+                        if EFFECTS.may_write(callee, hop) then
+                            return false;
+                        fi
+                    elif is_presence then
+                        return !EFFECTS.may_null(callee, hop);
+                    else
+                        return !EFFECTS.may_write(callee, hop);
+                    fi
+                od
+
+                return true;
+            fi
+
+            return false;
+        si
+    si
+si

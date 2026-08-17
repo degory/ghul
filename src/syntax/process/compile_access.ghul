@@ -94,6 +94,13 @@ namespace Syntax.Process is
                     _visitor.check_receiver_present(member.left);
                 fi
 
+                // A coalescing access re-checks the receiver at run
+                // time, so the guarded access inside it never leans on
+                // a presence fact - same rule as the unwrap.
+                if member.is_coalesce then
+                    left_value.reliance_provenance = null;
+                fi
+
                 // TODO we could loop here to handle multiple levels of dereferencing
                 if type.is_ref then
                     need_deref = true;
@@ -331,6 +338,16 @@ namespace Syntax.Process is
                         fi;
 
                     if path? \/ self_target? then
+                        // The un-narrowed view of this load, for the
+                        // consumption judge: a use the wide type
+                        // already satisfies does not lean on the fact.
+                        let wide_type =
+                            if path? then
+                                member.value!.type
+                            else
+                                _flow.declared_type_of(self_target!)
+                            fi;
+
                         // Step 1: type narrow (isa T on x.y). Wraps the
                         // loaded value at the recorded static subtype
                         // when the composition is sound. Path-keyed
@@ -383,9 +400,53 @@ namespace Syntax.Process is
                                 fi
                             fi
                         fi
+
+                        // Stamp the load with its facts' undischarged
+                        // crossings; each consumption that leans on a
+                        // fact is judged against them post-CE.
+                        let provenance =
+                            if path? then
+                                _flow.provenance_for_path(member.location, path!, wide_type)
+                            else
+                                _flow.provenance_for_symbol(member.location, self_target!, wide_type)
+                            fi;
+
+                        // A NARROW_PROJECT is stamped like any other
+                        // narrowed load: its `.value` projection throws
+                        // cleanly where the reference lowering would
+                        // smuggle a null, but which lowering backs a
+                        // `T?` is not allowed to show in diagnostics.
+                        if provenance? /\ member.value? then
+                            member.value.reliance_provenance = provenance;
+                        fi
                     fi
                 fi
             fi
+        si
+
+        // Whether the fact behind an `!` operand has every crossing
+        // discharged. When it does not, the unwrap is the remedy the
+        // reliance error asks for, and must not be warned redundant.
+        _unwrap_fact_validated(operand: Trees.Expressions.Expression?) -> bool is
+            if !operand? then
+                return true;
+            fi
+
+            let target = _visitor.try_get_narrowing_target(operand);
+
+            if target? then
+                return _flow.symbol_fact_validated(target!);
+            fi
+
+            if let member: Trees.Expressions.MEMBER = operand then
+                let path = _visitor.try_build_access_path(member);
+
+                if path? then
+                    return _flow.path_fact_validated(path!);
+                fi
+            fi
+
+            return true;
         si
 
         // True iff any receiver in `expr`'s member-access chain has
@@ -683,6 +744,19 @@ namespace Syntax.Process is
                             fi
                         fi
 
+                        // Stamp the load with its facts' undischarged
+                        // crossings; each consumption that leans on a
+                        // fact is judged against them post-CE. Locals
+                        // are filtered inside the builder.
+                        if identifier.value? then
+                            let provenance = _flow.provenance_for_symbol(
+                                identifier.location, symbol, _flow.declared_type_of(symbol));
+
+                            if provenance? then
+                                identifier.value.reliance_provenance = provenance;
+                            fi
+                        fi
+
                         // HOVER reads a narrowed local's type off
                         // this use-site node, not the symbol — the
                         // symbol's `type` is restored after the walk.
@@ -787,6 +861,7 @@ namespace Syntax.Process is
             return callable;
         si
 
+
         visit_has_value(has_value: Trees.Expressions.HAS_VALUE) is
 
             if !has_value.left.value? then
@@ -860,13 +935,14 @@ namespace Syntax.Process is
                 fi
             fi
 
+
             let target = _visitor.try_get_narrowing_target(has_value.left);
 
             if left_value.type!.is_optional then
                 // the test that itself proves presence is not
                 // redundant; one on an operand already proven to
                 // hold a value is
-                if target? /\ _flow.is_non_null(target) then
+                if target? /\ _flow.is_non_null(target) /\ _flow.symbol_fact_validated(target!) then
                     _logger.warn(
                         has_value.location,
                         "redundant-presence-test",
@@ -883,21 +959,38 @@ namespace Syntax.Process is
                 let declared = if target? then _flow.declared_type_of(target) else null fi;
 
                 if declared? /\ declared.is_optional then
-                    _logger.warn(
-                        has_value.location,
-                        "redundant-presence-test",
-                        "'?' is redundant here"
-                    );
+                    if !target? \/ _flow.symbol_fact_validated(target!) then
+                        _logger.warn(
+                            has_value.location,
+                            "redundant-presence-test",
+                            "'?' is redundant here"
+                        );
+                    fi
                 elif left_value.type!.is_value_type then
                     _logger.error(has_value.left.location, "not optional");
                     has_value.compile_expressions_state.value = DUMMY(bool_type, has_value.location);
                     return;
                 elif assert_condition_depth == 0 then
-                    _logger.warn(
-                        has_value.location,
-                        "presence-test-non-optional",
-                        "'?' is redundant"
-                    );
+                    // A member path reads as non-optional here when a
+                    // presence fact is applied to the view; a re-test
+                    // of one whose getters are unproven or whose
+                    // crossings are undischarged is the very
+                    // re-establishment the reliance judge asks for,
+                    // never redundant.
+                    let operand_path =
+                        if isa Trees.Expressions.MEMBER(has_value.left) then
+                            _visitor.try_build_access_path(cast Trees.Expressions.MEMBER(has_value.left))
+                        else
+                            null
+                        fi;
+
+                    if !operand_path? \/ _flow.path_fact_validated(operand_path!) then
+                        _logger.warn(
+                            has_value.location,
+                            "presence-test-non-optional",
+                            "'?' is redundant"
+                        );
+                    fi
                 fi
             fi
 
@@ -924,6 +1017,7 @@ namespace Syntax.Process is
         si
 
         visit_unwrap(unwrap: Trees.Expressions.UNWRAP) is
+
             let need_store = unwrap.value? /\ isa Need.STORE(unwrap.value);
 
             // Peel a flow-narrowing projection back to its wrapper so
@@ -1017,13 +1111,22 @@ namespace Syntax.Process is
                         // declared receiver type.
                         if declared? /\ declared.is_optional \/ isa IR.Values.NARROW_VIEW(left_value) \/ _has_narrowed_receiver(unwrap.left) then
                             // non-optional only because flow analysis
-                            // has narrowed it at this point
-                            if !_build_flags.no_warn_redundant_unwrap then
+                            // has narrowed it at this point; an `!`
+                            // covering an undischarged crossing is
+                            // load-bearing, not redundant
+                            if !_build_flags.no_warn_redundant_unwrap /\ _unwrap_fact_validated(unwrap.left) then
                                 _logger.warn(
                                     unwrap.location,
                                     "redundant-unwrap",
                                     "'!' is redundant here"
                                 );
+                            elif NARROWING_STUDY.enabled then
+                                // Study output: an `!` kept quiet
+                                // because its fact has an undischarged
+                                // crossing. The set of these is the
+                                // ceremony the analysis still requires;
+                                // grep the tag when measuring it.
+                                IO.Std.error.write_line("LOAD-BEARING-UNWRAP {unwrap.location}");
                             fi
 
                             unwrap.compile_expressions_state.value = left_value;
@@ -1043,7 +1146,7 @@ namespace Syntax.Process is
                 then
                     let unwrap_target = _visitor.try_get_narrowing_target(unwrap.left);
 
-                    if unwrap_target? /\ _flow.is_non_null(unwrap_target) then
+                    if unwrap_target? /\ _flow.is_non_null(unwrap_target) /\ _flow.symbol_fact_validated(unwrap_target!) then
                         _logger.warn(
                             unwrap.location,
                             "redundant-unwrap",
@@ -1075,6 +1178,14 @@ namespace Syntax.Process is
                     "►",
                     INLAY_TYPE.render(target_type.as_non_optional())
                 );
+            fi
+
+            // The unwrap checked the value at runtime, which is the
+            // re-establishment any reliance would ask for — including
+            // when the result value reuses the operand's own load, so
+            // the stamp must not travel through.
+            if unwrap.value? then
+                unwrap.value.reliance_provenance = null;
             fi
 
             // TODO, we could handle ref and ptr here as well
@@ -1402,15 +1513,18 @@ namespace Syntax.Process is
             // widened to the optional shape the user asked for with
             // `?.`.
             if !receiver_type.is_optional then
+
                 let target = _visitor.try_get_narrowing_target(member.left);
                 let declared = if target? then _flow.declared_type_of(target) else null fi;
 
                 if declared? /\ declared.is_optional then
-                    _logger.warn(
-                        member.location,
-                        "redundant-coalesce",
-                        "'?.' is redundant here"
-                    );
+                    if !target? \/ _flow.symbol_fact_validated(target!) then
+                        _logger.warn(
+                            member.location,
+                            "redundant-coalesce",
+                            "'?.' is redundant here"
+                        );
+                    fi
                 elif receiver_type.is_value_type then
                     _logger.error(member.left.location, "receiver is not optional");
                     return null;

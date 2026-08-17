@@ -96,6 +96,10 @@ namespace Syntax.Process is
         _current: STORE_FREE_FACTS?;
         _current_function: Function?;
 
+        // The study's record for the function being walked, or null
+        // when the study is off. See NARROWING_STUDY.
+        _current_record: FUNCTION_EFFECT_FACTS?;
+
         // Whether the most recent finish_run moved any function's
         // store-free bit. Only meaningful between finish_run and the
         // next start_run.
@@ -163,6 +167,7 @@ namespace Syntax.Process is
 
             _typer = TRIVIAL_EXPRESSION_TYPER(symbol_table, innate_symbol_lookup);
             _innate_symbol_lookup = innate_symbol_lookup;
+            _local_function_values = Collections.MAP[Symbol, Function]();
 
             start_run();
         si
@@ -193,7 +198,7 @@ namespace Syntax.Process is
             try
                 root.walk(self);
             catch ex: Exception
-                _disqualify();
+                _disqualify_because("walk-aborted");
                 release_scope_stack(mark);
 
                 _last_walk_failed = true;
@@ -201,6 +206,7 @@ namespace Syntax.Process is
 
             _current = null;
             _current_function = null;
+            _current_record = null;
         si
 
         // Whether the most recent apply abandoned its walk on an
@@ -209,6 +215,16 @@ namespace Syntax.Process is
         // from every later run's union instead of getting a fresh walk.
         _last_walk_failed: bool;
         last_walk_failed: bool => _last_walk_failed;
+
+        // Study-only: repeat the walk reading the types
+        // compile-expressions resolved, rather than the declared-types-
+        // only approximation available when the pass really runs.
+        set_resolved_mode(on: bool) is
+            _typer.use_resolved = on;
+            _resolved_mode = on;
+        si
+
+        _resolved_mode: bool;
 
         // Facts in, bits out — the graph solving lives in
         // STORE_FREE_FIXPOINT.
@@ -236,6 +252,89 @@ namespace Syntax.Process is
             yrt
 
             start_run();
+        si
+
+        // Solve the effect relations over this run's facts and install
+        // them for the reliance judge. Called by the infer-effects
+        // pass's finish hook, after the resolved-mode walk of every
+        // file. A failure leaves the registry cleared, which every
+        // query answers conservatively.
+        solve_effects() is
+            _last_run_walked_files = _walked_files;
+
+            try
+                let study = EFFECT_SOLVERS(_facts);
+
+                let sw = System.Diagnostics.Stopwatch.start_new();
+                let writes = study.write_sets(false, false);
+                let t_w = sw.elapsed_milliseconds;
+                let nulls = study.may_null_sets(false, false);
+                let t_n = sw.elapsed_milliseconds;
+                let store_free = study.solve();
+                let t_s = sw.elapsed_milliseconds;
+                let reads = study.read_sets();
+                let t_r = sw.elapsed_milliseconds;
+
+                if NARROWING_STUDY.enabled then
+                    IO.Std.error.write_line("solve phases: writes {t_w} nulls {t_n - t_w} store-free {t_s - t_n} reads {t_r - t_s}");
+                fi
+
+                EFFECTS.install(
+                    writes.sets, writes.unbounded,
+                    nulls.sets, nulls.unbounded,
+                    store_free,
+                    reads.sets, reads.unbounded, reads.reads_elements, reads.writes_elements);
+
+                if NARROWING_STUDY.enabled then
+                    IO.Std.error.write_line(
+                        "effects: {writes.sets.count} walked, "
+                        "{writes.unbounded.count} write-unbounded, "
+                        "{nulls.unbounded.count} null-unbounded, "
+                        "{store_free.count} store-free");
+
+                    _complete_records();
+                    NARROWING_STUDY.report();
+                fi
+            catch ex: Exception
+                EFFECTS.clear();
+
+                if NARROWING_STUDY.enabled then
+                    IO.Std.error.write_line("effects: solve failed: {ex}");
+                fi
+            yrt
+
+            start_run();
+        si
+
+        // Complete each effect record with the solve-side facts the
+        // report prints - reporting only, nothing reads these back.
+        _complete_records() is
+            let shadow = STORE_FREE_FIXPOINT();
+
+            for function in _facts.keys do
+                let record = EFFECT_FACTS.record_for(function);
+
+                if !record? then
+                    continue;
+                fi
+
+                record.is_disqualified = _facts[function].is_disqualified;
+                record.callee_count = _facts[function].callees.count;
+                record.openly_dispatchable = shadow.is_openly_dispatchable(function);
+                record.declared_pure = function.is_declared_pure;
+
+                let overriders = function.overriders;
+
+                let overrider_count mut = 0;
+
+                if overriders? then
+                    for overrider in overriders do
+                        overrider_count = overrider_count + 1;
+                    od
+                fi
+
+                record.overrider_count = overrider_count;
+            od
         si
 
         // The value-type optional carriers' accessors get the bit
@@ -271,16 +370,364 @@ namespace Syntax.Process is
             od
         si
 
+        // Open an effect record for the function about to be walked,
+        // classifying its accessor role from the structural links the
+        // accessor synthesiser stamped.
+        _note_study_function(function: Definitions.FUNCTION, symbol: Function) is
+            _current_record = null;
+
+            if !EFFECT_FACTS.collecting /\ !NARROWING_STUDY.enabled then
+                return;
+            fi
+
+            let raw_name = if function.name? then function.name.name else "" fi;
+
+            // The role is structural: the accessor synthesiser links
+            // each accessor to its property or indexer and stamps
+            // which half it is, so nothing is inferred back from the
+            // accessor's name.
+            let role =
+                if function.for_indexer? then
+                    if function.is_assign_accessor then "index-set" else "index-get" fi
+                elif function.for_property? then
+                    if function.is_assign_accessor then "set" else "get" fi
+                else
+                    ""
+                fi;
+
+            let owner = symbol.owner;
+
+            EFFECT_FACTS.note_function(
+                symbol,
+                raw_name,
+                if owner? then owner.name else "" fi,
+                "{function.location}",
+                role);
+
+            _current_record = EFFECT_FACTS.record_for(symbol);
+
+            if _current_record? /\ function.for_property? then
+                _current_record.for_auto_property = function.for_property.is_auto_property;
+            fi
+        si
+
         // ==== default: any node kind without an explicit override ====
 
         visit_default(node: Trees.Node) is
+            if _resolved_mode /\ _classify_resolved(node) then
+                return;
+            fi
+
+            _disqualify_because("unaudited-node:{node.get_type().full_name}");
+        si
+
+        // Study-only. Once compile-expressions has run, the node kinds
+        // this walk never modelled carry enough resolved state to be
+        // classified: a `for` names the three iterator members it calls,
+        // and every other expression carries the value it compiled to,
+        // whose callee is a bounded edge like any other. Returns whether
+        // the node was classified; false falls through to disqualifying
+        // it as before.
+        _classify_resolved(node: Trees.Node) -> bool is
+            // an element read cannot be pinned to a member symbol;
+            // the read-closure records it as its own dimension
+            if _current_record? then
+                if isa Trees.Expressions.INDEX(node) then
+                    _current_record.reads_elements = true;
+                elif isa Trees.Expressions.AMBIGUOUS_EXPRESSION(node) then
+                    if (cast Trees.Expressions.AMBIGUOUS_EXPRESSION(node)).result == Trees.Expressions.AmbiguousExpressionResult.INDEX then
+                        _current_record.reads_elements = true;
+                    fi
+                fi
+            fi
+
+            if let `for: Statements.FOR = node then
+                if `for.fusion? then
+                    return _classify_fused_for(`for.fusion);
+                fi
+
+                // read_iterator is legitimately null when the loop
+                // expression is already an iterator - the emitter
+                // drives move_next/current on the value directly
+                let move_next = `for.move_next;
+                let read_current = `for.read_current;
+
+                if !move_next? \/ !read_current? then
+                    let expression = `for.expression;
+
+                    let detail =
+                        if !expression? then
+                            "no-expression"
+                        elif !expression.value? then
+                            "no-value"
+                        elif !expression.value.type? then
+                            "no-type"
+                        else
+                            "{expression.value.type}"
+                        fi;
+
+                    _disqualify_because("for-unresolved:{detail}");
+                    return true;
+                fi
+
+                if `for.read_iterator? then
+                    _add_callee(`for.read_iterator);
+                fi
+
+                _add_callee(move_next);
+                _add_callee(read_current);
+
+                return true;
+            fi
+
+            if let expression: Trees.Expressions.Expression = node then
+                let value = expression.value;
+
+                if !value? then
+                    return false;
+                fi
+
+                return _classify_resolved_value(value);
+            fi
+
+            return false;
+        si
+
+        // A fused loop never builds the pipe objects: it iterates the
+        // pinned built-in source directly and runs each map/filter
+        // stage's lambda body inline, so the loop's effects are the
+        // stage bodies' effects. The lambda literals were skipped by
+        // the ordinary walk (creating a closure is effect-free), so
+        // they are walked here, attributed to the enclosing function
+        // exactly as the fused lowering executes them. A stage fed an
+        // arbitrary delegate value rather than a literal is invoked
+        // per element with no bounded callee, so it stays unbounded
+        // unless the value's type is a pure function type.
+        _classify_fused_for(fusion: PIPE_FUSION) -> bool is
+            for stage in fusion.stages_outermost_first do
+                if stage.is_countdown \/ stage.is_index then
+                    continue;
+                fi
+
+                let argument = stage.argument;
+
+                if !argument? then
+                    continue;
+                fi
+
+                if let literal: Trees.Expressions.FUNCTION = argument then
+                    literal.body.walk(self);
+                elif !(argument.value? /\ argument.value.type? /\ argument.value.type.is_pure_function) then
+                    _disqualify_because("fused-stage-delegate");
+                    return true;
+                fi
+            od
+
+            return true;
+        si
+
+        _classify_resolved_value(value: IR.Values.Value) -> bool is
+            if let view: IR.Values.NARROW_VIEW = value then
+                return _classify_resolved_value(view.underlying);
+            fi
+
+            if let call: IR.Values.Call.INSTANCE = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.STATIC = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.GLOBAL = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.STRUCT = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let construction: IR.Values.NEW = value then
+                _add_construction_callee(construction.constructor);
+                _study_note_call_arguments(construction.constructor, construction.arguments);
+                return true;
+            fi
+
+            // Invoking a function value: bounded when the value names
+            // its function, effect-polymorphic when it is one of the
+            // enclosing function's own parameters, unboundable
+            // otherwise.
+            if let call: IR.Values.Call.CLOSURE = value then
+                if !call.is_state_changing_call then
+                    return true;
+                fi
+
+                let fn = _function_value_of(call.from);
+
+                if fn? then
+                    _add_callee(fn);
+                    _study_note_call_arguments(fn, call.arguments);
+                    return true;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(call.from) then
+                    if _current_record? then
+                        _current_record.invokes_function_param = true;
+                    fi
+
+                    return true;
+                fi
+
+                return false;
+            fi
+
+            // not a call at all: reading a value writes nothing, and any
+            // sub-expression is classified as the walk reaches it
+            return !value.is_state_changing_call;
+        si
+
+        // The function a value denotes, when the value's shape names
+        // one: a lambda literal compiled to a closure, a delegate
+        // constructed from a named function, a function pointer.
+        _function_value_of(value: IR.Values.Value?) -> Function? is
+            if !value? then
+                return null;
+            fi
+
+            if let view: IR.Values.NARROW_VIEW = value then
+                return _function_value_of(view.underlying);
+            fi
+
+            if let wrapper: IR.Values.WRAPPER = value then
+                return _function_value_of(wrapper.value);
+            fi
+
+            if let load: IR.Values.Load.INSTANCE_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            if let load: IR.Values.Load.STATIC_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            if let load: IR.Values.Load.GLOBAL_ANONYMOUS_FUNCTION = value then
+                return cast Function?(load.symbol);
+            fi
+
+            // an immutable local can only ever hold its initializer's
+            // value, so a load of one denotes whatever function that
+            // named
+            if let load: IR.Values.Load.LOCAL_VARIABLE = value then
+                if _local_function_values.contains_key(load.symbol) then
+                    return _local_function_values[load.symbol];
+                fi
+
+                return null;
+            fi
+
+            return value.referenced_function;
+        si
+
+        // Immutable locals whose initializer named a function value.
+        // Keyed on the local's own symbol, which is unique across the
+        // compilation, so the map never needs clearing.
+        _local_function_values: Collections.MutableMap[Symbol, Function];
+
+        // Record which function values flow into a callee's
+        // function-typed parameters. A named value joins the callee's
+        // passed set; the caller's own parameter forwarded onward is
+        // accounted at the caller's own call sites instead; anything
+        // else function-typed makes the callee's parameter values
+        // unknowable - unless its type is pure, which admits only
+        // store-free values whoever invokes it.
+        _study_note_call_arguments(callee: Function?, arguments: Collections.List[IR.Values.Value]) is
+            if !callee? then
+                return;
+            fi
+
+            for argument in arguments do
+                let fn = _function_value_of(argument);
+
+                if fn? then
+                    EFFECT_FACTS.note_passed_function(callee, fn);
+                    continue;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(argument) then
+                    let argument_type = argument.type;
+
+                    if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                        if _current_record? then
+                            let root = cast Function?(callee.root_specialized_from);
+
+                            if root? then
+                                _current_record.forwards_param_to.add(root!);
+                            fi
+                        fi
+                    fi
+
+                    continue;
+                fi
+
+                let argument_type = argument.type;
+
+                if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                    EFFECT_FACTS.note_passed_opaque(callee);
+                    NARROWING_STUDY.note_opaque_shape("{argument.get_type().name} -> {callee.name}");
+                fi
+            od
+        si
+
+        // `_disqualify` with the reason recorded for the study, so the
+        // report can say what the walk actually gives up on. First
+        // reason wins: it is the one that made the function unbounded.
+        _disqualify_because(reason: string) is
+            if _current? /\ _current_record? /\ _current_record.unbounded_reason =~ "" then
+                _current_record.unbounded_reason = reason;
+            fi
+
             _disqualify();
         si
 
         _disqualify() is
-            if _current? then
-                _current.is_disqualified = true;
-                _current.is_construction_disqualified = true;
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_unbounded = true;
+
+                // whatever the walk could not bound could write
+                // anything, so the write set stops being a bound too
+                _current_record.writes_unbounded = true;
+            fi
+        si
+
+        // The subset of `_disqualify` where the walk saw a write to a
+        // pre-existing heap slot rather than merely failing to bound
+        // something. Behaves identically; only the study distinguishes
+        // them.
+        _disqualify_store() is
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
             fi
         si
 
@@ -288,8 +735,14 @@ namespace Syntax.Process is
         // not: writing the receiver's own instance state touches only
         // the fresh object a `NEW` is building.
         _disqualify_strict_only() is
-            if _current? then
-                _current.is_disqualified = true;
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
             fi
         si
 
@@ -371,14 +824,14 @@ namespace Syntax.Process is
             fi
 
             if !callee? then
-                _disqualify();
+                _disqualify_because("callee-null");
                 return;
             fi
 
             let root = cast Function?(callee.root_specialized_from);
 
             if !root? then
-                _disqualify();
+                _disqualify_because("callee-no-root");
                 return;
             fi
 
@@ -391,14 +844,14 @@ namespace Syntax.Process is
             fi
 
             if !callee? then
-                _disqualify();
+                _disqualify_because("ctor-callee-null");
                 return;
             fi
 
             let root = cast Function?(callee.root_specialized_from);
 
             if !root? then
-                _disqualify();
+                _disqualify_because("ctor-callee-no-root");
                 return;
             fi
 
@@ -411,7 +864,7 @@ namespace Syntax.Process is
             fi
 
             if !symbol? then
-                _disqualify();
+                _disqualify_because("callee-symbol-null");
                 return;
             fi
 
@@ -421,6 +874,16 @@ namespace Syntax.Process is
                 od
             elif isa Function(symbol) then
                 _add_callee(cast Function(symbol));
+            elif
+                _resolved_mode /\
+                isa Semantic.Symbols.LOCAL_ARGUMENT(symbol) /\
+                symbol.type? /\ symbol.type.is_function
+            then
+                // invoking a function-typed parameter: bounded by the
+                // values the enclosing function's own callers pass
+                if _current_record? then
+                    _current_record.invokes_function_param = true;
+                fi
             elif _is_store_free_construction(symbol) then
                 // constructing a fresh exception writes only that new
                 // object, never a pre-existing heap slot, so it cannot
@@ -431,7 +894,7 @@ namespace Syntax.Process is
                 // a delegate-typed value, an imported constructor, or
                 // something stranger: the call's effect cannot be
                 // bounded
-                _disqualify();
+                _disqualify_because("callee-not-a-function:{symbol.get_type().name}");
             fi
         si
 
@@ -456,7 +919,7 @@ namespace Syntax.Process is
                 return;
             fi
 
-            _disqualify();
+            _disqualify_because("constructor-unresolved");
         si
 
         // Constructing an imported exception type is store-free for
@@ -490,7 +953,7 @@ namespace Syntax.Process is
             fi
 
             if !property.read_function? then
-                _disqualify();
+                _disqualify_because("property-no-getter");
                 return;
             fi
 
@@ -506,7 +969,7 @@ namespace Syntax.Process is
                 if isa Semantic.Symbols.Property(overrider) then
                     _add_property_read_edges(cast Semantic.Symbols.Property(overrider));
                 else
-                    _disqualify();
+                    _disqualify_because("overrider-not-a-property");
                 fi
             od
         si
@@ -523,6 +986,13 @@ namespace Syntax.Process is
             // fields, locals, parameters, function groups (a bare
             // function reference only creates a delegate), types and
             // namespaces are harmless reads
+
+            if
+                _current_record? /\
+                (isa Semantic.Symbols.Field(symbol) \/ isa Semantic.Symbols.Property(symbol))
+            then
+                _current_record.reads.add(symbol.root_specialized_from);
+            fi
         si
 
         // ==== function context ====
@@ -552,9 +1022,12 @@ namespace Syntax.Process is
 
                 _current = facts;
                 _current_function = symbol;
+
+                _note_study_function(function, symbol);
             else
                 _current = null;
                 _current_function = null;
+                _current_record = null;
             fi
 
             return false;
@@ -580,22 +1053,178 @@ namespace Syntax.Process is
         // merely creates the closure; any invocation happens through
         // a delegate-typed value, which is never a bounded callee.
         // Closure symbols are never marked store-free.
-        pre(function: Expressions.FUNCTION) -> bool => true;
+        //
+        // In resolved mode the body is walked anyway, under the
+        // closure's own function symbol, so the effect-polymorphic
+        // absorption has a write set for every function value it can
+        // trace to a literal.
+        pre(function: Expressions.FUNCTION) -> bool is
+            if _resolved_mode then
+                _study_walk_lambda(function);
+            fi
+
+            return true;
+        si
+
         visit(function: Expressions.FUNCTION) is si
 
+        _study_walk_lambda(function: Expressions.FUNCTION) is
+            let symbol = _function_value_of(function.value);
+
+            if !symbol? then
+                return;
+            fi
+
+            let root = cast Function?(symbol.root_specialized_from);
+
+            if !root? \/ _facts.contains_key(root!) then
+                return;
+            fi
+
+            let saved_facts = _current;
+            let saved_function = _current_function;
+            let saved_record = _current_record;
+
+            let facts = STORE_FREE_FACTS();
+
+            _facts[root!] = facts;
+            _current = facts;
+            _current_function = root;
+
+            EFFECT_FACTS.note_function(root, root.name, "", "{function.location}", "lambda");
+            _current_record = EFFECT_FACTS.record_for(root);
+
+            enter_scope(function);
+            function.body.walk(self);
+            leave_scope(function);
+
+            _current = saved_facts;
+            _current_function = saved_function;
+            _current_record = saved_record;
+        si
+
         // ==== stores ====
+
+        // The target of a store is written, not read: walking it
+        // generically would classify the member as a read as well,
+        // adding its getter's edges - and disqualifying outright when
+        // the property is assign-only and has no getter. So the
+        // children are driven by hand: the value and every receiver
+        // and index expression inside the target are walked, the
+        // target member itself is not.
+        pre(assign: Statements.ASSIGNMENT) -> bool is
+            assign.right.walk(self);
+
+            _walk_assignment_target_operands(assign.left);
+
+            return true;
+        si
+
+        _walk_assignment_target_operands(left: Trees.Expressions.AssignmentLeftExpression?) is
+            if !left? then
+                return;
+            fi
+
+            if isa Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left) then
+                _walk_store_target_operands((cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left)).expression);
+            elif isa Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left) then
+                for element in (cast Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left)).elements do
+                    _walk_assignment_target_operands(element);
+                od
+            fi
+        si
+
+        _walk_store_target_operands(target: Trees.Expressions.Expression?) is
+            if !target? then
+                return;
+            fi
+
+            if let member: Trees.Expressions.MEMBER = target then
+                if !isa Trees.Expressions.SELF(member.left) then
+                    member.left.walk(self);
+                fi
+
+                return;
+            fi
+
+            if let index: Trees.Expressions.INDEX = target then
+                index.left.walk(self);
+                index.index.walk(self);
+                return;
+            fi
+
+            if let ambiguous: Trees.Expressions.AMBIGUOUS_EXPRESSION = target then
+                if ambiguous.result == Trees.Expressions.AmbiguousExpressionResult.INDEX then
+                    _walk_store_target_operands(ambiguous.index);
+                elif ambiguous.left? then
+                    ambiguous.left.walk(self);
+                fi
+
+                return;
+            fi
+
+            // a bare identifier target: nothing inside it to read
+        si
 
         visit(assign: Statements.ASSIGNMENT) is
             if !_current? then
                 return;
             fi
 
+            // Study-only: whether this assignment's value could be
+            // absent. An RHS of declared non-optional type cannot be
+            // null under the language's own rules; anything optional or
+            // untypeable counts as possibly-null.
+            let rhs_type = _typer.try_type(assign.right);
+
+            _study_rhs_nulling = !rhs_type? \/ rhs_type.is_optional;
+
             _classify_assignment_target(assign.left);
+
+            _study_rhs_nulling = false;
+        si
+
+        _study_rhs_nulling: bool;
+
+        // Flag the current function as assigning a possibly-absent
+        // value to member-or-wider storage. A constructor's writes to
+        // its own fresh instance cannot make any pre-existing member
+        // absent, so they are excluded.
+        _study_note_nulling(own_instance: bool) is
+            if !_current_record? \/ !_study_rhs_nulling then
+                return;
+            fi
+
+            if _in_constructor /\ own_instance then
+                return;
+            fi
+
+            _current_record.assigns_optional = true;
+        si
+
+        // The member-keyed refinement of the above: record which member
+        // the possibly-null assignment targets, or that it could not be
+        // resolved. Unlike the coarse flag, a constructor's writes to
+        // its own instance are NOT excluded: the fresh-instance
+        // argument only holds at a construction site, and the solved
+        // sets answer for plain calls too - a constructor reached by
+        // delegation, or invoked directly on an existing receiver,
+        // nulls a pre-existing member like any other method would.
+        _study_note_nulling_member(symbol: Symbol?, own_instance: bool) is
+            if !_current_record? \/ !_study_rhs_nulling then
+                return;
+            fi
+
+            if symbol? then
+                _current_record.nulling_writes.add(symbol.root_specialized_from);
+            else
+                _current_record.nulling_unbounded = true;
+            fi
         si
 
         _classify_assignment_target(left: Trees.Expressions.AssignmentLeftExpression?) is
             if !left? then
-                _disqualify();
+                _disqualify_because("assign-target-null");
                 return;
             fi
 
@@ -606,11 +1235,13 @@ namespace Syntax.Process is
                     _classify_assignment_target(element);
                 od
             else
-                _disqualify();
+                _disqualify_because("assign-target-shape");
             fi
         si
 
         _classify_simple_store(target: Trees.Expressions.Expression?) is
+            _study_note_store(target);
+
             if _writes_own_instance_field_member(target) then
                 // `self.field = …` writes only the receiver's own
                 // state: disqualifies the strict bit but not
@@ -638,14 +1269,14 @@ namespace Syntax.Process is
             if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
                 // a member, index or other compound target is a heap
                 // store
-                _disqualify();
+                _disqualify_store();
                 return;
             fi
 
             let identifier = (cast Trees.Expressions.IDENTIFIER(target)).identifier;
 
             if identifier.is_qualified then
-                _disqualify();
+                _disqualify_store();
                 return;
             fi
 
@@ -669,7 +1300,9 @@ namespace Syntax.Process is
                 return;
             fi
 
-            _disqualify();
+            // a global variable, or a target the walk could not
+            // resolve: either way the write is not to a local
+            _disqualify_store();
         si
 
         // A bare name for a local variable or a parameter — the one
@@ -722,11 +1355,147 @@ namespace Syntax.Process is
             fi
         si
 
+        // Record, for the study, which member symbol a store targets.
+        // Mirrors the classification below without affecting it: a
+        // local target records nothing, a resolvable member records
+        // that symbol, anything else marks the writes unboundable.
+        _study_note_store(target: Trees.Expressions.Expression?) is
+            if !_current_record? then
+                return;
+            fi
+
+            if !target? then
+                _current_record.writes_unbounded = true;
+                return;
+            fi
+
+            if isa Trees.Expressions.IDENTIFIER(target) then
+                let symbol = try_find((cast Trees.Expressions.IDENTIFIER(target)).identifier);
+
+                if
+                    symbol? /\
+                    (isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/ isa Semantic.Symbols.LOCAL_ARGUMENT(symbol))
+                then
+                    return;
+                fi
+
+                _study_note_nulling(symbol? /\ symbol.is_instance);
+                _study_note_nulling_member(symbol, symbol? /\ symbol.is_instance);
+                _study_add_write(symbol);
+                return;
+            fi
+
+            if isa Trees.Expressions.MEMBER(target) then
+                let member = cast Trees.Expressions.MEMBER(target);
+
+                if isa Trees.Expressions.SELF(member.left) then
+                    let context = current_instance_context;
+
+                    if context? then
+                        _study_note_nulling(true);
+                        _study_note_nulling_member(context.find_member(member.identifier.name), true);
+                        _study_add_write(context.find_member(member.identifier.name));
+                        return;
+                    fi
+                fi
+
+                let left_type = _typer.try_type(member.left);
+
+                if !left_type? then
+                    _study_note_nulling(false);
+                    _study_note_nulling_member(null, false);
+                    _study_unbounded_store("store-receiver-untyped");
+                    return;
+                fi
+
+                let member_symbol = left_type.find_member(member.identifier.name);
+
+                if !member_symbol? then
+                    _study_note_nulling(false);
+                    _study_note_nulling_member(null, false);
+                    _study_unbounded_store("store-member-not-found");
+                    return;
+                fi
+
+                _study_note_nulling(false);
+                _study_note_nulling_member(member_symbol, false);
+                _study_add_write(member_symbol);
+                return;
+            fi
+
+            if isa Trees.Expressions.INDEX(target) then
+                // an element store: cannot change what any field holds,
+                // so it is recorded apart from member writes - the
+                // element-rescue measurement keys on the distinction
+                _current_record.writes_elements = true;
+                return;
+            fi
+
+            // `xs[i] = v` parses as an ambiguous expression; once
+            // compile-expressions has settled which shape it is, an
+            // index store is an element store like any other
+            if let ambiguous: Trees.Expressions.AMBIGUOUS_EXPRESSION = target then
+                if ambiguous.result == Trees.Expressions.AmbiguousExpressionResult.INDEX then
+                    _current_record.writes_elements = true;
+                    return;
+                fi
+
+                _study_note_nulling(false);
+                _study_note_nulling_member(null, false);
+                _study_unbounded_store("store-ambiguous-unresolved");
+                return;
+            fi
+
+            // a target shape the walk does not model
+            _study_note_nulling(false);
+            _study_note_nulling_member(null, false);
+            _study_unbounded_store("store-target-shape:{target.get_type().name}");
+        si
+
+        // Mark the current record's write set unboundable, naming why,
+        // so the blame table can split the catch-all
+        // "write-target-unresolved" bucket by cause.
+        _study_unbounded_store(reason: string) is
+            if !_current_record? then
+                return;
+            fi
+
+            _current_record.writes_unbounded = true;
+
+            if _current_record.unbounded_reason =~ "" then
+                _current_record.unbounded_reason = reason;
+            fi
+        si
+
+        _study_add_write(symbol: Symbol?) is
+            if !_current_record? then
+                return;
+            fi
+
+            if !symbol? then
+                _current_record.writes_unbounded = true;
+                return;
+            fi
+
+            _current_record.writes.add(symbol.root_specialized_from);
+        si
+
         // ==== calls ====
 
         visit(call: Expressions.CALL) is
             if !_current? then
                 return;
+            fi
+
+            // Study-only: after compile-expressions the call carries the
+            // value it compiled to, which names the callee directly
+            // whatever shape the target expression has.
+            if _resolved_mode then
+                let value = call.value;
+
+                if value? /\ _classify_resolved_value(value) then
+                    return;
+                fi
             fi
 
             _add_call_target_edges(call.function);
@@ -744,12 +1513,12 @@ namespace Syntax.Process is
         _is_pure_function_valued(symbol: Semantic.Symbols.Symbol?) -> bool =>
             symbol? /\
             isa Semantic.Symbols.Variable(symbol) /\
-            !isa Semantic.Symbols.LOCAL_VARIABLE(symbol) /\
+            (_resolved_mode \/ !isa Semantic.Symbols.LOCAL_VARIABLE(symbol)) /\
             symbol.type? /\ symbol.type.is_pure_function;
 
         _add_call_target_edges(target: Trees.Expressions.Expression?) is
             if !target? then
-                _disqualify();
+                _disqualify_because("call-target-null");
                 return;
             fi
 
@@ -781,7 +1550,7 @@ namespace Syntax.Process is
                     let receiver_type = _typer.try_type(member.left);
 
                     if !receiver_type? then
-                        _disqualify();
+                        _disqualify_because("ctor-chain-receiver-untyped");
                         return;
                     fi
 
@@ -807,7 +1576,7 @@ namespace Syntax.Process is
                 let left_type = _typer.try_type(member.left);
 
                 if !left_type? then
-                    _disqualify();
+                    _disqualify_because("call-receiver-untyped");
                     return;
                 fi
 
@@ -831,7 +1600,7 @@ namespace Syntax.Process is
                 return;
             fi
 
-            _disqualify();
+            _disqualify_because("call-target-shape");
         si
 
         // ==== operators ====
@@ -858,7 +1627,7 @@ namespace Syntax.Process is
             right: Trees.Expressions.Expression?
         ) is
             if !operation? then
-                _disqualify();
+                _disqualify_because("operator-unresolved");
                 return;
             fi
 
@@ -913,7 +1682,7 @@ namespace Syntax.Process is
                 // in, and answered the same way. The free and innate
                 // operators are already bounded through the operator
                 // group above.
-                _disqualify();
+                _disqualify_because("member-operator-unresolved");
 
                 return;
             fi
@@ -980,7 +1749,7 @@ namespace Syntax.Process is
 
             // untyped receiver: if this member turns out to be a
             // property, its getter could run arbitrary code
-            _disqualify();
+            _disqualify_because("member-receiver-untyped");
         si
 
         visit(index: Expressions.INDEX) is
@@ -991,7 +1760,7 @@ namespace Syntax.Process is
             let left_type = _typer.try_type(index.left);
 
             if !left_type? then
-                _disqualify();
+                _disqualify_because("index-receiver-untyped");
                 return;
             fi
 
@@ -1120,9 +1889,30 @@ namespace Syntax.Process is
             fi
 
             if variable.want_dispose then
-                // `let use` runs dispose() at scope exit
-                _disqualify();
-                return;
+                // `let use` runs dispose() at scope exit. Before
+                // compile-expressions the value's type is unknown, so
+                // the disposal cannot be bounded; after it, the
+                // dispose member resolves like any other callee.
+                if !_resolved_mode then
+                    _disqualify_because("let-use-dispose");
+                    return;
+                fi
+
+                let disposed_type = _typer.try_type(variable.initializer);
+
+                if !disposed_type? then
+                    _disqualify_because("let-use-dispose-untyped");
+                    return;
+                fi
+
+                let dispose = disposed_type.find_member("dispose");
+
+                if !dispose? then
+                    _disqualify_because("let-use-dispose-unresolved");
+                    return;
+                fi
+
+                _add_callee_edges(dispose);
             fi
 
             if variable.is_argument then
@@ -1142,6 +1932,15 @@ namespace Syntax.Process is
 
             if !symbol? \/ !isa Semantic.Symbols.LOCAL_VARIABLE(symbol) then
                 return;
+            fi
+
+            if _resolved_mode /\ !(cast Semantic.Symbols.LOCAL_VARIABLE(symbol)).is_mutable_marked then
+                let fn = _function_value_of(
+                    if variable.initializer? then variable.initializer.value else null fi);
+
+                if fn? then
+                    _local_function_values[symbol] = fn;
+                fi
             fi
 
             // An explicitly-declared local carries its type on the
@@ -1191,14 +1990,14 @@ namespace Syntax.Process is
             for fragment in interpolation.values do
                 if fragment.is_expression then
                     if fragment.format? then
-                        _disqualify();
+                        _disqualify_because("interpolation-format");
                         return;
                     fi
 
                     let fragment_type = _typer.try_type(fragment.expression);
 
                     if !fragment_type? then
-                        _disqualify();
+                        _disqualify_because("interpolation-fragment-untyped");
                         return;
                     fi
 
@@ -1215,7 +2014,7 @@ namespace Syntax.Process is
             fi
 
             if !STORE_FREE_INNATES.is_store_free(block.name) then
-                _disqualify();
+                _disqualify_because("innate-not-store-free");
             fi
         si
 
@@ -1276,9 +2075,13 @@ namespace Syntax.Process is
         visit(block: Expressions.VAL_BLOCK) is si
         visit(member: Expressions.EXPLICIT_SPECIALIZATION) is si
 
+        // In resolved mode the disposal is bounded per variable, from
+        // the initializer's compiled type - see the want_dispose case
+        // in visit(variable) - so the statement-level catch-alls only
+        // fire when the type was unknowable.
         visit(statement: Expressions.LET_IN) is
-            if statement.want_dispose then
-                _disqualify();
+            if statement.want_dispose /\ !_resolved_mode then
+                _disqualify_because("let-in-dispose");
             fi
 
             leave_scope(statement);
@@ -1302,8 +2105,8 @@ namespace Syntax.Process is
         visit(rb: Statements.REFUTABLE_BINDING) is si
 
         visit(l: Statements.LET) is
-            if l.want_dispose then
-                _disqualify();
+            if l.want_dispose /\ !_resolved_mode then
+                _disqualify_because("let-dispose");
             fi
         si
 
