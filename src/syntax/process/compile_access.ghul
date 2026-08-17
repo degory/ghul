@@ -331,6 +331,13 @@ namespace Syntax.Process is
                         fi;
 
                     if path? \/ self_target? then
+                        // A symbol-keyed type narrow reaches this load
+                        // through the narrowed symbol's own type; the
+                        // reliance is judged here, where the use is.
+                        if self_target? then
+                            _flow.note_symbol_narrow_reliance(member.location, self_target!);
+                        fi
+
                         // Step 1: type narrow (isa T on x.y). Wraps the
                         // loaded value at the recorded static subtype
                         // when the composition is sound. Path-keyed
@@ -344,6 +351,7 @@ namespace Syntax.Process is
                                 if let composed = _flow.compose_path_narrow(loaded.type, recorded) then
                                     member.compile_expressions_state.value = IR.Values.NARROW_VIEW(loaded, composed);
                                     _symbol_use_locations.replace_with_variable_use(member.identifier.right_location, symbol, member.value!);
+                                    _flow.note_path_narrow_reliance(member.location, path!);
                                 fi
                             fi
                         fi
@@ -361,6 +369,12 @@ namespace Syntax.Process is
                             fi;
 
                         if loaded.type? /\ loaded.type!.is_optional /\ is_present then
+                            if path? then
+                                _flow.note_path_presence_reliance(member.location, path!);
+                            else
+                                _flow.note_symbol_presence_reliance(member.location, self_target!);
+                            fi
+
                             let loaded_type = loaded.type!;
                             let narrowed = loaded_type.as_non_optional();
 
@@ -386,6 +400,31 @@ namespace Syntax.Process is
                     fi
                 fi
             fi
+        si
+
+        // Whether the fact behind an `!` operand has every crossing
+        // discharged. When it does not, the unwrap is the fix the
+        // reliance error asks for, and must not be warned redundant.
+        _unwrap_fact_validated(operand: Trees.Expressions.Expression?) -> bool is
+            if !operand? then
+                return true;
+            fi
+
+            let target = _visitor.try_get_narrowing_target(operand);
+
+            if target? then
+                return _flow.symbol_fact_validated(target!);
+            fi
+
+            if let member: Trees.Expressions.MEMBER = operand then
+                let path = _visitor.try_build_access_path(member);
+
+                if path? then
+                    return _flow.path_fact_validated(path!);
+                fi
+            fi
+
+            return true;
         si
 
         // True iff any receiver in `expr`'s member-access chain has
@@ -623,6 +662,12 @@ namespace Syntax.Process is
                         // underlying wrapper for their own IR.
                         let loaded = identifier.value;
 
+                        // A heap symbol's type narrow reaches this load
+                        // through the mutated symbol type; judge the
+                        // reliance here, where the use is. Locals are
+                        // filtered inside.
+                        _flow.note_symbol_narrow_reliance(identifier.location, symbol);
+
                         // the load's snapshot type is null for an inference placeholder
                         @suppress("presence-test-non-optional")
                         if
@@ -634,6 +679,8 @@ namespace Syntax.Process is
                             let variable = symbol;
 
                             if _flow.is_non_null(variable) then
+                                _flow.note_symbol_presence_reliance(identifier.location, variable);
+
                                 let loaded_type = loaded.type;
                                 let narrowed = loaded_type.as_non_optional();
 
@@ -667,6 +714,8 @@ namespace Syntax.Process is
                             // narrowing target, so this reads the fact
                             // exactly where the target rule recorded
                             // one.
+                            _flow.note_symbol_presence_reliance(identifier.location, symbol);
+
                             let loaded_type = loaded.type;
                             let narrowed = loaded_type.as_non_optional();
 
@@ -787,6 +836,27 @@ namespace Syntax.Process is
             return callable;
         si
 
+        // A re-observation of a narrowed target — a presence test,
+        // an unwrap, a coalescing access, an isa test — checks the
+        // value at runtime, so any reliance its own operand load
+        // recorded is moot. See PENDING_RELIANCE.
+        absolve_reobservation(expression: Trees.Expressions.Expression?) is
+            if !expression? then
+                return;
+            fi
+
+            let target = _visitor.try_get_narrowing_target(expression);
+
+            let path =
+                if let member: Trees.Expressions.MEMBER = expression then
+                    _visitor.try_build_access_path(member)
+                else
+                    null
+                fi;
+
+            _flow.absolve_reliances_for(target, path);
+        si
+
         visit_has_value(has_value: Trees.Expressions.HAS_VALUE) is
 
             if !has_value.left.value? then
@@ -860,13 +930,15 @@ namespace Syntax.Process is
                 fi
             fi
 
+            absolve_reobservation(has_value.left);
+
             let target = _visitor.try_get_narrowing_target(has_value.left);
 
             if left_value.type!.is_optional then
                 // the test that itself proves presence is not
                 // redundant; one on an operand already proven to
                 // hold a value is
-                if target? /\ _flow.is_non_null(target) then
+                if target? /\ _flow.is_non_null(target) /\ _flow.symbol_fact_validated(target!) then
                     _logger.warn(
                         has_value.location,
                         "redundant-presence-test",
@@ -883,11 +955,13 @@ namespace Syntax.Process is
                 let declared = if target? then _flow.declared_type_of(target) else null fi;
 
                 if declared? /\ declared.is_optional then
-                    _logger.warn(
-                        has_value.location,
-                        "redundant-presence-test",
-                        "'?' is redundant here"
-                    );
+                    if !target? \/ _flow.symbol_fact_validated(target!) then
+                        _logger.warn(
+                            has_value.location,
+                            "redundant-presence-test",
+                            "'?' is redundant here"
+                        );
+                    fi
                 elif left_value.type!.is_value_type then
                     _logger.error(has_value.left.location, "not optional");
                     has_value.compile_expressions_state.value = DUMMY(bool_type, has_value.location);
@@ -924,6 +998,8 @@ namespace Syntax.Process is
         si
 
         visit_unwrap(unwrap: Trees.Expressions.UNWRAP) is
+            absolve_reobservation(unwrap.left);
+
             let need_store = unwrap.value? /\ isa Need.STORE(unwrap.value);
 
             // Peel a flow-narrowing projection back to its wrapper so
@@ -1017,8 +1093,10 @@ namespace Syntax.Process is
                         // declared receiver type.
                         if declared? /\ declared.is_optional \/ isa IR.Values.NARROW_VIEW(left_value) \/ _has_narrowed_receiver(unwrap.left) then
                             // non-optional only because flow analysis
-                            // has narrowed it at this point
-                            if !_build_flags.no_warn_redundant_unwrap then
+                            // has narrowed it at this point; an `!`
+                            // covering an undischarged crossing is
+                            // load-bearing, not redundant
+                            if !_build_flags.no_warn_redundant_unwrap /\ _unwrap_fact_validated(unwrap.left) then
                                 _logger.warn(
                                     unwrap.location,
                                     "redundant-unwrap",
@@ -1043,7 +1121,7 @@ namespace Syntax.Process is
                 then
                     let unwrap_target = _visitor.try_get_narrowing_target(unwrap.left);
 
-                    if unwrap_target? /\ _flow.is_non_null(unwrap_target) then
+                    if unwrap_target? /\ _flow.is_non_null(unwrap_target) /\ _flow.symbol_fact_validated(unwrap_target!) then
                         _logger.warn(
                             unwrap.location,
                             "redundant-unwrap",
@@ -1402,15 +1480,19 @@ namespace Syntax.Process is
             // widened to the optional shape the user asked for with
             // `?.`.
             if !receiver_type.is_optional then
+                absolve_reobservation(member.left);
+
                 let target = _visitor.try_get_narrowing_target(member.left);
                 let declared = if target? then _flow.declared_type_of(target) else null fi;
 
                 if declared? /\ declared.is_optional then
-                    _logger.warn(
-                        member.location,
-                        "redundant-coalesce",
-                        "'?.' is redundant here"
-                    );
+                    if !target? \/ _flow.symbol_fact_validated(target!) then
+                        _logger.warn(
+                            member.location,
+                            "redundant-coalesce",
+                            "'?.' is redundant here"
+                        );
+                    fi
                 elif receiver_type.is_value_type then
                     _logger.error(member.left.location, "receiver is not optional");
                     return null;

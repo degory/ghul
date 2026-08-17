@@ -72,6 +72,20 @@ namespace Syntax.Process is
         si
     si
 
+    // A use that leaned on a heap fact with an undischarged
+    // crossing, held until the enclosing expression is known. A
+    // re-observation of the same target — a presence test, an
+    // unwrap, a coalescing access, an isa test — absolves it: the
+    // test is the re-establishment the error would ask for. Whatever
+    // is not absolved by the next transfer is a reliance error.
+    class PENDING_RELIANCE(
+        location: LOCATION,
+        name: string,
+        crossing: CROSSING,
+        target: Symbol?,
+        path: ACCESS_PATH?
+    );
+
     // The flow-sensitive narrowing orchestrator. Holds the narrowing
     // environment in force at the current walk point and keeps each
     // narrowed variable's `Symbol.type` reconciled to it, so the
@@ -119,8 +133,13 @@ namespace Syntax.Process is
         // re-walk's diagnostics are scrubbed.
         _speculation: Collections.STACK[NARROW_ENV];
 
+        // Reliance events awaiting the end of their expression —
+        // see PENDING_RELIANCE.
+        _pending_reliances: Collections.LIST[PENDING_RELIANCE];
+
         init(logger: Logger) is
             _logger = logger;
+            _pending_reliances = Collections.LIST[PENDING_RELIANCE]();
             _current_env = NARROW_ENV();
             _declared = Collections.MAP[Symbol, Type]();
             _tracked = Collections.SET[Symbol]();
@@ -238,6 +257,7 @@ namespace Syntax.Process is
         // type, empty the environment, and forget declared types.
         // Called at each method-body boundary.
         reset() is
+            flush_reliances();
             restore_all();
             _current_env = NARROW_ENV();
             _declared.clear();
@@ -286,6 +306,7 @@ namespace Syntax.Process is
         // reconciling `Symbol.type` to match. `_current_env`
         // becomes the actually-applied subset of `target`.
         set_env(target: NARROW_ENV) is
+            flush_reliances();
             restore_all();
 
             let applied = NARROW_ENV();
@@ -320,6 +341,10 @@ namespace Syntax.Process is
                 od
             fi
 
+            // the set_* establishment calls above cleared the records
+            // a branch entry must carry forward
+            applied.adopt_crossings_from(target);
+
             _current_env = applied;
         si
 
@@ -353,6 +378,9 @@ namespace Syntax.Process is
         // discarding the speculative walk's narrowing facts.
         roll_back() is
             assert _speculation.count >= 1 else "flow roll_back with no active speculation";
+
+            // the abandoned walk's reliance events go with it
+            _pending_reliances.clear();
 
             set_env(_speculation.pop());
         si
@@ -551,44 +579,31 @@ namespace Syntax.Process is
             return false;
         si
 
-        // Call transfer: a field is plain storage a callee can reach
-        // through `this` and reassign, so a narrow or presence fact
-        // proven before a call cannot be trusted after it, and a
-        // property's getter reads arbitrary heap the callee may have
-        // written. Locals are unreachable to the callee, so their
-        // facts survive. Fires once a call expression has been
-        // compiled — its receiver has already been read, so the
-        // call's own narrowed access is unaffected.
+        // Call transfer. Narrowing is optimistic: a call drops no
+        // heap fact. Instead the call is recorded as a crossing
+        // against every heap fact live over it, and each later use of
+        // such a fact is judged against its crossings — a crossing
+        // whose callee provably left the fact alone is discharged,
+        // and relying on a fact with an undischarged crossing is a
+        // compile error at the use site. Locals are unreachable to
+        // the callee and take no crossings. Fires once a call
+        // expression has been compiled — its receiver has already
+        // been read, so the call's own narrowed access is unaffected.
         on_call(location: LOCATION) is
+            on_call_of(location, null);
+        si
+
+        // The call transfer, told which function is being called.
+        // `callee` is null where the site has no single bounded
+        // callee — a closure invocation, an interpolation — which no
+        // judgement can discharge.
+        on_call_of(location: LOCATION, callee: Semantic.Symbols.Function?) is
+            flush_reliances();
+
             _heap_epoch = _heap_epoch + 1;
             _mark_literal_impure();
 
-            let stale = Collections.SET[Symbol]();
-
-            for v in _current_env.variables do
-                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
-                    stale.add(v);
-                fi
-            od
-
-            for v in _current_env.non_null_variables do
-                if isa Semantic.Symbols.Field(v) \/ isa Semantic.Symbols.Property(v) then
-                    stale.add(v);
-                fi
-            od
-
-            for v in stale do
-                if !_shield.mark_if_shielded(v) then
-                    _report_kill(v, location, "a call here may change it");
-                    forget(v);
-                fi
-            od
-
-            // Every path fact dies here: a hop's own getter is
-            // store-free by construction, but the callee may have
-            // stored to anything the path reads through.
-            _report_dropped_paths(location, "a call here may change it", false);
-            _current_env.drop_all_paths();
+            _current_env.note_crossing(CROSSING(location, callee));
         si
 
         // Emit a kill hint for each tracked path about to be dropped,
@@ -631,18 +646,180 @@ namespace Syntax.Process is
             _drop_property_facts(location, "a store here may change it");
         si
 
-        // Receiver-interior call transfer: the callee writes its own
-        // receiver's internal state and reaches no user code. That
-        // state is a BCL type's private storage, which is not
-        // addressable as a ghūl member, so no field fact can be about
-        // it and every field fact survives. A getter can read the
-        // receiver, so property facts and getter-bearing paths die
-        // exactly as they do for a direct store.
-        on_receiver_interior_call(location: LOCATION) is
-            _drop_property_facts(location, "a call here may change what a getter reads");
+        // ==== reliance judgement ====
+        //
+        // A use that leans on a heap fact — a load compiled at the
+        // narrowed type, or an optional read compiled as present — is
+        // checked against the fact's crossings. Every crossing must
+        // be discharged: the callee provably left the fact alone.
+        // Anything less is an error at the use site: the value may
+        // have changed since the fact was proven, and the emitted
+        // code would trust a stale view. The fix at the use site is
+        // to re-establish — test again, unwrap with `!`, or copy to a
+        // local before the call.
+
+        // A crossing is discharged when the callee provably left the
+        // fact alone: a store-free callee writes nothing at all; a
+        // receiver-interior callee writes only its own receiver's
+        // BCL-internal state, which no field is, so it leaves field
+        // facts alone but can change what a getter reads.
+        _crossing_discharged(crossing: CROSSING, reads_through_getter: bool) -> bool =>
+            crossing.callee? /\
+            (crossing.callee.is_store_free \/
+                (!reads_through_getter /\ crossing.callee.writes_only_receiver_interior));
+
+        _first_undischarged(
+            crossings: Collections.LIST[CROSSING]?,
+            reads_through_getter: bool
+        ) -> CROSSING? is
+            if !crossings? then
+                return null;
+            fi
+
+            for c in crossings do
+                if !_crossing_discharged(c, reads_through_getter) then
+                    return c;
+                fi
+            od
+
+            return null;
         si
 
+        _pend_reliance(location: LOCATION, name: string, crossing: CROSSING, target: Symbol?, path: ACCESS_PATH?) is
+            _pending_reliances.add(PENDING_RELIANCE(location, name, crossing, target, path));
+        si
+
+        // A re-observation of `target` or `path` — a presence test,
+        // an unwrap, a coalescing access, an isa test — makes any
+        // pending reliance on it moot: the observation checks the
+        // value at runtime, which is exactly what the error would
+        // have asked for.
+        absolve_reliances_for(target: Symbol?, path: ACCESS_PATH?) is
+            if _pending_reliances.count == 0 then
+                return;
+            fi
+
+            let kept = Collections.LIST[PENDING_RELIANCE]();
+
+            for pending in _pending_reliances do
+                let absolved =
+                    (target? /\ pending.target? /\ pending.target == target) \/
+                    (path? /\ pending.path? /\ pending.path.equals(path));
+
+                if !absolved then
+                    kept.add(pending);
+                fi
+            od
+
+            _pending_reliances = kept;
+        si
+
+        // Report every reliance that survived to a transfer or a
+        // body boundary without being absolved.
+        flush_reliances() is
+            if _pending_reliances.count == 0 then
+                return;
+            fi
+
+            for pending in _pending_reliances do
+                _logger.error(
+                    pending.location,
+                    "cannot rely on the narrowing of '{pending.name}' here: the call at line {pending.crossing.location.start_line} can change it; test '{pending.name}' again, or copy it into a local variable before the call");
+            od
+
+            _pending_reliances.clear();
+        si
+
+        note_symbol_presence_reliance(location: LOCATION, v: Symbol) is
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) then
+                return;
+            fi
+
+            // a dropped fact can leave a stale crossing record behind;
+            // only a fact actually in force is judged
+            if !_current_env.is_non_null(v) then
+                return;
+            fi
+
+            let undischarged = _first_undischarged(
+                _current_env.non_null_crossings_of(v),
+                isa Semantic.Symbols.Property(v));
+
+            if undischarged? then
+                _pend_reliance(location, v.name, undischarged, v, null);
+            fi
+        si
+
+        note_symbol_narrow_reliance(location: LOCATION, v: Symbol) is
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) then
+                return;
+            fi
+
+            if !_current_env.contains(v) then
+                return;
+            fi
+
+            let undischarged = _first_undischarged(
+                _current_env.narrow_crossings_of(v),
+                isa Semantic.Symbols.Property(v));
+
+            if undischarged? then
+                _pend_reliance(location, v.name, undischarged, v, null);
+            fi
+        si
+
+        note_path_presence_reliance(location: LOCATION, path: ACCESS_PATH) is
+            if !_current_env.is_non_null_path(path) then
+                return;
+            fi
+
+            let undischarged = _first_undischarged(
+                _current_env.path_presence_crossings_of(path),
+                path.has_getter_hop);
+
+            if undischarged? then
+                _pend_reliance(location, "{path}", undischarged, null, path);
+            fi
+        si
+
+        note_path_narrow_reliance(location: LOCATION, path: ACCESS_PATH) is
+            if !_current_env.narrowed_type_of_path(path)? then
+                return;
+            fi
+
+            let undischarged = _first_undischarged(
+                _current_env.path_narrow_crossings_of(path),
+                path.has_getter_hop);
+
+            if undischarged? then
+                _pend_reliance(location, "{path}", undischarged, null, path);
+            fi
+        si
+
+        // Whether every crossing recorded against `v`'s facts is
+        // discharged. Gates the redundancy warnings: an `!` or a
+        // re-test after an undischarged crossing is load-bearing —
+        // it is the fix the reliance error asks for — and must not
+        // be reported redundant.
+        symbol_fact_validated(v: Symbol) -> bool is
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) then
+                return true;
+            fi
+
+            let getter = isa Semantic.Symbols.Property(v);
+
+            return
+                !_first_undischarged(_current_env.non_null_crossings_of(v), getter)? /\
+                !_first_undischarged(_current_env.narrow_crossings_of(v), getter)?;
+        si
+
+        path_fact_validated(path: ACCESS_PATH) -> bool =>
+            !_first_undischarged(_current_env.path_presence_crossings_of(path), path.has_getter_hop)? /\
+            !_first_undischarged(_current_env.path_narrow_crossings_of(path), path.has_getter_hop)?;
+
         _drop_property_facts(location: LOCATION, reason: string) is
+            flush_reliances();
+
             _heap_epoch = _heap_epoch + 1;
             _mark_literal_impure();
 
@@ -679,6 +856,8 @@ namespace Syntax.Process is
             if !member? then
                 return;
             fi
+
+            flush_reliances();
 
             _heap_epoch = _heap_epoch + 1;
             _mark_literal_impure();
