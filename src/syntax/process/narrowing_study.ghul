@@ -1,0 +1,1656 @@
+namespace Syntax.Process is
+    use IO.Std;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Per-function record the study keeps alongside INFER_STORE_FREE's
+    // own facts. Populated during the body walk, completed at fixpoint
+    // time, dumped at the end of the compile.
+    class STUDY_RECORD is
+        name: string public;
+        owner_name: string public;
+        location: string public;
+
+        // The accessor role, derived from the synthesised accessor
+        // name: "get" for a property read accessor, "set" for its
+        // assign accessor, "index-get" / "index-set" for an indexer's,
+        // "" for an ordinary function or method.
+        role: string public;
+
+        // The body walk saw a write to something other than a local:
+        // a member, an index, a global, or the receiver's own state.
+        own_stores: bool public;
+
+        // The body walk gave up for a reason that is not a write: an
+        // unboundable callee, an unaudited node kind, an await, ...
+        own_unbounded: bool public;
+
+        // Copied from the function's STORE_FREE_FACTS at fixpoint
+        // time, so the table can be checked for records aliased
+        // between two functions.
+        is_disqualified: bool public;
+        aliased: bool public;
+
+        // Whether any override of this function definitely writes the
+        // heap, and whether any is merely unprovable. The assumption
+        // under test is exactly that the first of these is empty.
+        overrider_writes: bool public;
+        overrider_unprovable: bool public;
+
+        // The member symbols this body writes directly, and whether it
+        // performs a write the walk could not pin to a symbol (an
+        // index, an unresolvable target) or does something unboundable
+        // that could write anything.
+        writes: Collections.SET[Symbol] public;
+        writes_unbounded: bool public;
+
+        // The body assigns an optional-typed (or untypeable) value to
+        // something that is, or could be, a member - excluding a
+        // constructor's writes to its own fresh instance. The seed of
+        // the never-nulls classification.
+        assigns_optional: bool public;
+
+        // The member symbols the possibly-null assignments target, and
+        // whether any such assignment's target could not be resolved
+        // (in which case any member could have been nulled).
+        nulling_writes: Collections.SET[Symbol] public;
+        nulling_unbounded: bool public;
+
+        // The body stores through an indexer or to an array element -
+        // recorded apart from member writes because an element store
+        // cannot change what any field holds.
+        writes_elements: bool public;
+
+        // What the walk first gave up on in this body, or "" if it
+        // never did.
+        unbounded_reason: string public;
+
+        // Set on a property accessor's record when the owning property
+        // is an auto-property: its getter reads only the hidden backing
+        // field, so the property's value can only change through an
+        // assignment to the property itself. A hand-written getter can
+        // read anything, so it is never stability-eligible.
+        for_auto_property: bool public;
+
+        callee_count: int public;
+        overrider_count: int public;
+        openly_dispatchable: bool public;
+        declared_pure: bool public;
+
+        // The body invokes a function-typed parameter. The write-set
+        // closure then absorbs the write sets of every function value
+        // passed to this function at any call site the walk saw,
+        // instead of treating the invocation as unboundable.
+        invokes_function_param: bool public;
+
+        // Known callees this body forwards one of its own
+        // function-typed parameters to: if any of them invokes its
+        // parameter, this body invokes-by-proxy, and the values are
+        // still accounted at this body's own call sites.
+        forwards_param_to: Collections.SET[Function] public;
+
+        init(name: string, owner_name: string, location: string, role: string) is
+            self.name = name;
+            self.owner_name = owner_name;
+            self.location = location;
+            self.role = role;
+            writes = Collections.SET[Symbol]();
+            nulling_writes = Collections.SET[Symbol]();
+            forwards_param_to = Collections.SET[Function]();
+            unbounded_reason = "";
+        si
+    si
+
+    // One killed narrowing fact, reduced to the member symbols whose
+    // being written by the callee would justify the kill.
+    class KILL_FACT(
+        location: string public,
+        callee: Function? public,
+        members: Collections.LIST[Symbol] public,
+        is_getter: bool public,
+        is_path: bool public,
+        has_presence: bool public,
+        has_narrow: bool public
+    ) is
+        // Liveness, joined per fact: the fact was consulted by a flow
+        // query after the kill, or its member merely loaded again; the
+        // first mention's location names the use site an unsafe-
+        // reliance error would land on.
+        consulted: bool public;
+        mentioned: bool public;
+        use_location: string? public;
+    si
+
+    // One run of the store-free analysis, and the write sets it
+    // produced under each relaxation variant. Two runs are compared:
+    // the analysis where it really sits, and the same analysis repeated
+    // after compile-expressions, which is what moving it would know.
+    class WRITE_GENERATION(
+        label: string public,
+        sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]] public,
+        unbounded: Collections.LIST[Collections.SET[Function]] public
+    ) is
+        blame: Collections.MutableMap[Function, string]?  public;
+
+        // The nulling refinement of `sets`, one per variant: what each
+        // function may write an absent value to. Same closure, seeded
+        // from the possibly-null assignments alone; imports contribute
+        // nothing, since imported code cannot assign a ghūl member.
+        nulling_sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]]? public;
+        nulling_unbounded: Collections.LIST[Collections.SET[Function]]? public;
+    si
+
+    // Empirical study of narrowing kills and store-free classification.
+    //
+    // Entirely env-gated and off by default: GHUL_NARROWING_STUDY names
+    // the file the per-function table is written to, and
+    // GHUL_ASSUME_GETTERS_PURE selects a counterfactual under which the
+    // dispatch shadow is ignored for property read accessors, so a
+    // build can be run with the assumption genuinely installed.
+    class NARROWING_STUDY is
+        // The production switch: on while the infer-effects pass is
+        // re-walking bodies with resolved types, so the per-function
+        // records collect member-granular write and nulling facts for
+        // the reliance judge. Independent of the study's environment
+        // gates, which remain measurement-only.
+        collecting: bool public static;
+
+        _enabled: bool static;
+        _enabled_known: bool static;
+
+        // Path the table is written to, or null.
+        _path: string? static;
+
+        enabled: bool static is
+            if !_enabled_known then
+                _path = System.Environment.get_environment_variable("GHUL_NARROWING_STUDY");
+                _enabled = _path? /\ _path.length > 0;
+                _enabled_known = true;
+            fi
+
+            return _enabled;
+        si
+
+        // 0 off; 1 assume the dispatch shadow away for a *leaf* property
+        // read accessor (clean body, no bounded callees); 2 the same for
+        // any property read accessor whose own body is clean.
+        _assume_mode: int static;
+        _assume_mode_known: bool static;
+
+        assume_mode: int static is
+            if !_assume_mode_known then
+                let text = System.Environment.get_environment_variable("GHUL_ASSUME_GETTERS_PURE");
+
+                if text? then
+                    if text =~ "1" then
+                        _assume_mode = 1;
+                    elif text =~ "2" then
+                        _assume_mode = 2;
+                    fi
+                fi
+
+                _assume_mode_known = true;
+            fi
+
+            return _assume_mode;
+        si
+
+        _records: Collections.MutableMap[Function, STUDY_RECORD]? static;
+
+        records: Collections.MutableMap[Function, STUDY_RECORD] static is
+            if !_records? then
+                _records = Collections.MAP[Function, STUDY_RECORD]();
+            fi
+
+            return _records;
+        si
+
+        record_for(function: Function?) -> STUDY_RECORD? static is
+            if !function? then
+                return null;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return null;
+            fi
+
+            if records.contains_key(root) then
+                return records[root];
+            fi
+
+            return null;
+        si
+
+        note_function(
+            function: Function?,
+            name: string,
+            owner_name: string,
+            location: string,
+            role: string
+        ) static is
+            if !collecting /\ !enabled /\ assume_mode == 0 then
+                return;
+            fi
+
+            if !function? then
+                return;
+            fi
+
+            let root = cast Function?(function.root_specialized_from);
+
+            if !root? then
+                return;
+            fi
+
+            if records.contains_key(root) then
+                records[root].aliased = true;
+                return;
+            fi
+
+            records[root] = STUDY_RECORD(name, owner_name, location, role);
+        si
+
+        // ==== the assumed-safe set ====
+
+        _assumed_safe: Collections.SET[Function]? static;
+
+        assumed_safe: Collections.SET[Function] static is
+            if !_assumed_safe? then
+                _assumed_safe = Collections.SET[Function]();
+            fi
+
+            return _assumed_safe;
+        si
+
+        // GHUL_STUDY_RESOLVED: after the build, repeat the store-free
+        // analysis with compile-expressions' resolved types available.
+        _resolved_pass: bool static;
+        _resolved_pass_known: bool static;
+
+        resolved_pass: bool static is
+            if !_resolved_pass_known then
+                let text = System.Environment.get_environment_variable("GHUL_STUDY_RESOLVED");
+                _resolved_pass = enabled /\ text? /\ text.length > 0;
+                _resolved_pass_known = true;
+            fi
+
+            return _resolved_pass;
+        si
+
+        // GHUL_NO_CALL_KILLS: stop calls killing heap facts at all, the
+        // unsound rule most languages with flow narrowing use. For
+        // measuring what the analysis is buying, not a supported mode.
+        _no_call_kills: bool static;
+        _no_call_kills_known: bool static;
+
+        no_call_kills: bool static is
+            if !_no_call_kills_known then
+                let text = System.Environment.get_environment_variable("GHUL_NO_CALL_KILLS");
+                _no_call_kills = text? /\ text.length > 0;
+                _no_call_kills_known = true;
+            fi
+
+            return _no_call_kills;
+        si
+
+        // GHUL_OPTIMISTIC_HOPS: let member-access paths narrow through
+        // any getter, proven store-free or not - the hop-eligibility
+        // half of the optimistic-narrowing design. Combined with
+        // GHUL_NO_CALL_KILLS this is the design's full configuration.
+        // For measurement, not a supported mode.
+        _optimistic_hops: bool static;
+        _optimistic_hops_known: bool static;
+
+        optimistic_hops: bool static is
+            if !_optimistic_hops_known then
+                let text = System.Environment.get_environment_variable("GHUL_OPTIMISTIC_HOPS");
+                _optimistic_hops = text? /\ text.length > 0;
+                _optimistic_hops_known = true;
+            fi
+
+            return _optimistic_hops;
+        si
+
+        // Whether the counterfactual exempts `function` from the
+        // dispatch-shadow test. Consulted by STORE_FREE_FIXPOINT only
+        // when GHUL_ASSUME_GETTERS_PURE is set, so an ordinary build
+        // never reaches it.
+        is_assumed_safe(function: Function) -> bool static =>
+            assume_mode != 0 /\ assumed_safe.contains(function);
+
+        // Rebuild the assumed-safe set from this run's facts. Called at
+        // the top of the fixpoint, before any solving.
+        prepare(facts: Collections.MutableMap[Function, STORE_FREE_FACTS]) static is
+            if assume_mode == 0 then
+                return;
+            fi
+
+            let set = Collections.SET[Function]();
+
+            for function in facts.keys do
+                let record = record_for(function);
+
+                if !record? \/ !(record.role =~ "get") then
+                    continue;
+                fi
+
+                let f = facts[function];
+
+                if f.is_disqualified then
+                    continue;
+                fi
+
+                if assume_mode == 1 /\ f.callees.count > 0 then
+                    continue;
+                fi
+
+                set.add(function);
+            od
+
+            _assumed_safe = set;
+        si
+
+        // ==== kill liveness ====
+        //
+        // A kill only costs anyone anything if the killed fact is
+        // consulted again afterwards. Killed facts are held pending per
+        // body; a flow query (`is_non_null`, path queries) on a pending
+        // key claims it as live, and the body-boundary reset flushes
+        // whatever was never claimed as dead.
+        _pending_symbols: Collections.MutableMap[Symbol, KILL_FACT]? static;
+        _pending_paths: Collections.MutableMap[ACCESS_PATH, KILL_FACT]? static;
+
+        live_kills: int static public;
+        dead_kills: int static public;
+
+        pending_symbols: Collections.MutableMap[Symbol, KILL_FACT] static is
+            if !_pending_symbols? then
+                _pending_symbols = Collections.MAP[Symbol, KILL_FACT]();
+            fi
+
+            return _pending_symbols;
+        si
+
+        pending_paths: Collections.MutableMap[ACCESS_PATH, KILL_FACT] static is
+            if !_pending_paths? then
+                _pending_paths = Collections.MAP[ACCESS_PATH, KILL_FACT]();
+            fi
+
+            return _pending_paths;
+        si
+
+        note_symbol_query(v: Symbol) static is
+            if !enabled \/ !_pending_symbols? then
+                return;
+            fi
+
+            if pending_symbols.contains_key(v) then
+                pending_symbols[v].consulted = true;
+                pending_symbols.remove(v);
+                live_kills = live_kills + 1;
+            fi
+
+        si
+
+        // A weaker liveness signal than a flow query: the member is
+        // loaded again at all after the kill. Catches the compensated
+        // idioms - an unwrap, a re-test, a warned dereference - that a
+        // strict consultation count can misfile as "dead". Keyed on
+        // canonical symbols because load sites see per-specialization
+        // Symbol objects. The load's location names the use site an
+        // unsafe-reliance error would land on.
+        _pending_mention_symbols: Collections.MutableMap[Symbol, KILL_FACT]? static;
+
+        mention_live_kills: int static public;
+
+        note_mention(location: Source.LOCATION, symbol: Semantic.Symbols.Symbol?) static is
+            let pending = _pending_mention_symbols;
+
+            if !enabled \/ !symbol? \/ !pending? then
+                return;
+            fi
+
+            let canonical = symbol.root_specialized_from;
+
+            if pending.contains_key(canonical) then
+                let fact = pending[canonical];
+
+                fact.mentioned = true;
+
+                if !fact.use_location? then
+                    fact.use_location = "{location}";
+                fi
+
+                pending.remove(canonical);
+                mention_live_kills = mention_live_kills + 1;
+            fi
+        si
+
+        note_path_query(path: ACCESS_PATH?) static is
+            if !enabled \/ !path? \/ !_pending_paths? then
+                return;
+            fi
+
+            if pending_paths.contains_key(path) then
+                pending_paths[path].consulted = true;
+                pending_paths.remove(path);
+                live_kills = live_kills + 1;
+            fi
+        si
+
+        pending_mention_symbols: Collections.MutableMap[Symbol, KILL_FACT] static is
+            if !_pending_mention_symbols? then
+                _pending_mention_symbols = Collections.MAP[Symbol, KILL_FACT]();
+            fi
+
+            return _pending_mention_symbols;
+        si
+
+        flush_body() static is
+            if !enabled then
+                return;
+            fi
+
+            dead_kills = dead_kills + pending_symbols.count + pending_paths.count;
+            pending_symbols.clear();
+            pending_paths.clear();
+
+            if _pending_mention_symbols? then
+                _pending_mention_symbols.clear();
+            fi
+        si
+
+        // ==== kill counters ====
+
+        kill_events_call: int static public;
+        facts_killed_call: int static public;
+
+        // Of the above, those whose killing callee is store-free once
+        // the dispatch shadow is assumed away — the kills the
+        // hypothesis would prevent.
+        kill_events_call_preventable_leaf: int static public;
+        facts_killed_call_preventable_leaf: int static public;
+        kill_events_call_preventable_clean: int static public;
+        facts_killed_call_preventable_clean: int static public;
+
+        // Kills whose callee is a property read accessor at all,
+        // whatever the reason it was not store-free.
+        kill_events_call_by_getter: int static public;
+        facts_killed_call_by_getter: int static public;
+
+        // Call kills the study could not attribute to a single callee
+        // (a closure invocation, an interpolation, a pure-slot check).
+        kill_events_call_unattributed: int static public;
+        facts_killed_call_unattributed: int static public;
+
+        // Call kills bucketed by the role of the callee, and by
+        // whether the counterfactual rescues them.
+        _by_role: Collections.MutableMap[string, int]? static;
+        _by_role_preventable: Collections.MutableMap[string, int]? static;
+
+        by_role: Collections.MutableMap[string, int] static is
+            if !_by_role? then
+                _by_role = Collections.MAP[string, int]();
+            fi
+
+            return _by_role;
+        si
+
+        by_role_preventable: Collections.MutableMap[string, int] static is
+            if !_by_role_preventable? then
+                _by_role_preventable = Collections.MAP[string, int]();
+            fi
+
+            return _by_role_preventable;
+        si
+
+        // A member is stability-eligible when its value is exactly its
+        // storage: a field, or an auto-property. It is stable when it is
+        // eligible and never written outside a constructor.
+        _is_stable_member(m: Symbol, written: Collections.SET[Symbol]) -> bool static =>
+            _is_eligible_member(m) /\ !written.contains(m);
+
+        _is_eligible_member(m: Symbol) -> bool static is
+            if m.is_field then
+                return true;
+            fi
+
+            if let property: Semantic.Symbols.Property = m then
+                let read_function = property.read_function;
+
+                if !read_function? then
+                    return false;
+                fi
+
+                let record = record_for(read_function);
+
+                return record? /\ record.for_auto_property;
+            fi
+
+            return false;
+        si
+
+        _bump(map: Collections.MutableMap[string, int], key: string) static is
+            if map.contains_key(key) then
+                map[key] = map[key] + 1;
+            else
+                map[key] = 1;
+            fi
+        si
+
+        // Rescued kills whose callee has an override that definitely
+        // writes: the subset of the gain the assumption only buys by
+        // being wrong.
+        kill_events_rescued_unsound: int static public;
+        kill_events_rescued_unprovable: int static public;
+        kill_events_rescued_sound: int static public;
+
+        // ==== necessity accounting ====
+        //
+        // For each killed fact, whether the callee's write set actually
+        // contains the member the fact is about. `unknown` means the
+        // callee's writes could not be bounded, so nothing can be said.
+        facts_killed_necessary: Collections.LIST[int]? static;
+        facts_killed_unnecessary: Collections.LIST[int]? static;
+        facts_killed_unknown: Collections.LIST[int]? static;
+
+        _counts(list: Collections.LIST[int]?) -> Collections.LIST[int] static is
+            if list? then
+                return list;
+            fi
+
+            let made = Collections.LIST[int]();
+
+            for i in 0..VARIANTS do
+                made.add(0);
+            od
+
+            return made;
+        si
+
+        // The same split restricted to kills by a property read
+        // accessor.
+        getter_killed_necessary: int static public;
+        getter_killed_unnecessary: int static public;
+        getter_killed_unknown: int static public;
+
+        // Calls that did not kill because the callee is store-free, and
+        // the heap facts that survived them.
+        save_events: int static public;
+        save_facts: int static public;
+
+        // Three write-set variants, each relaxing one source of
+        // conservatism, so the report can say how much of the
+        // undecidability each source accounts for.
+        //   0  as shipped
+        //   1  whole-program: an override outside the assembly cannot exist
+        //   2  the same, plus every unannotated import trusted to write nothing
+        _write_sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]]? static;
+        _write_unbounded: Collections.LIST[Collections.SET[Function]]? static;
+
+        VARIANTS: int static => 3;
+
+        set_write_sets(
+            sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]],
+            unbounded: Collections.LIST[Collections.SET[Function]]
+        ) static is
+            _write_sets = sets;
+            _write_unbounded = unbounded;
+
+            generations.add(
+                WRITE_GENERATION(
+                    if _next_label =~ "" then "as-shipped" else _next_label fi,
+                    sets,
+                    unbounded));
+        si
+
+        // Blame counts for kills that stay undecidable under the most
+        // relaxed variant.
+        _blame: Collections.MutableMap[Function, string]? static;
+        _blame_counts: Collections.MutableMap[string, int]? static;
+
+        set_nulling_sets(
+            sets: Collections.LIST[Collections.MutableMap[Function, Collections.SET[Symbol]]],
+            unbounded: Collections.LIST[Collections.SET[Function]]
+        ) static is
+            if generations.count > 0 then
+                generations[generations.count - 1].nulling_sets = sets;
+                generations[generations.count - 1].nulling_unbounded = unbounded;
+            fi
+        si
+
+        set_blame(blame: Collections.MutableMap[Function, string]) static is
+            _blame = blame;
+
+            if generations.count > 0 then
+                generations[generations.count - 1].blame = blame;
+            fi
+        si
+
+        blame_counts: Collections.MutableMap[string, int] static is
+            if !_blame_counts? then
+                _blame_counts = Collections.MAP[string, int]();
+            fi
+
+            return _blame_counts;
+        si
+
+        // Which import blocks each closure, from a blame run with
+        // imports untrusted. Keys the import ranking below.
+        _import_blame: Collections.MutableMap[Function, string]? static;
+
+        set_import_blame(blame: Collections.MutableMap[Function, string]) static is
+            _import_blame = blame;
+        si
+
+        // Functions whose whole closure stores at most elements, under
+        // production dispatch rules; second set additionally trusts
+        // unannotated imports. A killed fact with no property in its
+        // member list survives a call to one of these under the
+        // element-rescue rule (calls behave like heap stores).
+        _element_safe: Collections.SET[Function]? static;
+        _element_safe_trusted: Collections.SET[Function]? static;
+
+        _never_nulls: Collections.SET[Function]? static;
+        _never_nulls_untrusted: Collections.SET[Function]? static;
+
+        _may_null_sets: Collections.MutableMap[Function, Collections.SET[Symbol]]? static;
+        _may_null_unbounded: Collections.SET[Function]? static;
+
+        set_may_null(
+            sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) static is
+            _may_null_sets = sets;
+            _may_null_unbounded = unbounded;
+        si
+
+        set_never_nulls(
+            trusted: Collections.SET[Function],
+            untrusted: Collections.SET[Function]
+        ) static is
+            _never_nulls = trusted;
+            _never_nulls_untrusted = untrusted;
+        si
+
+        set_element_safe(
+            sound: Collections.SET[Function],
+            trusted: Collections.SET[Function]
+        ) static is
+            _element_safe = sound;
+            _element_safe_trusted = trusted;
+        si
+
+        note_call_saved(callee: Function?, live: int) static is
+            if !enabled \/ live == 0 then
+                return;
+            fi
+
+            save_events = save_events + 1;
+            save_facts = save_facts + live;
+        si
+
+        kill_events_heap_store: int static public;
+        facts_killed_heap_store: int static public;
+
+        kill_events_member_store: int static public;
+        facts_killed_member_store: int static public;
+
+        // Whether `function` would be store-free under counterfactual
+        // `mode`, computed by the analysis pass and cached here.
+        // The same solver with an empty exempt set: must reproduce the
+        // shipped classification exactly, and is dumped as the report's
+        // control column.
+        _control: Collections.SET[Function]? static;
+
+        _optimistic_leaf: Collections.SET[Function]? static;
+        _optimistic_clean: Collections.SET[Function]? static;
+
+        set_control(control: Collections.SET[Function]) static is
+            _control = control;
+        si
+
+        set_optimistic(leaf: Collections.SET[Function], clean: Collections.SET[Function]) static is
+            _optimistic_leaf = leaf;
+            _optimistic_clean = clean;
+        si
+
+        // Sites where the most relaxed variant can still show the
+        // callee writes the very member the fact is about - the kills
+        // that would become real unsoundness if calls stopped killing.
+        necessary_sites: Collections.LIST[string]? static;
+
+        note_call_kill(
+            location: Source.LOCATION,
+            callee: Function?,
+            killed_symbols: Collections.SET[Symbol],
+            killed_paths: Collections.SET[ACCESS_PATH],
+            presence_symbols: Collections.SET[Symbol],
+            narrow_symbols: Collections.SET[Symbol],
+            presence_paths: Collections.SET[ACCESS_PATH]
+        ) static is
+            if !enabled then
+                return;
+            fi
+
+            let killed = killed_symbols.count + killed_paths.count;
+
+            kill_events_call = kill_events_call + 1;
+            facts_killed_call = facts_killed_call + killed;
+
+            _buffer_kill(
+                location, callee, killed_symbols, killed_paths,
+                presence_symbols, narrow_symbols, presence_paths);
+
+            if !callee? then
+                kill_events_call_unattributed = kill_events_call_unattributed + 1;
+                facts_killed_call_unattributed = facts_killed_call_unattributed + killed;
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if !root? then
+                kill_events_call_unattributed = kill_events_call_unattributed + 1;
+                facts_killed_call_unattributed = facts_killed_call_unattributed + killed;
+                return;
+            fi
+
+            let record = record_for(root);
+
+            let role =
+                if !record? then
+                    "not-walked"
+                elif record.role =~ "" then
+                    "ordinary"
+                else
+                    record.role
+                fi;
+
+            _bump(by_role, role);
+
+            if
+                (_optimistic_leaf? /\ _optimistic_leaf.contains(root)) \/
+                (_optimistic_clean? /\ _optimistic_clean.contains(root))
+            then
+                _bump(by_role_preventable, role);
+            fi
+
+            if
+                (_optimistic_leaf? /\ _optimistic_leaf.contains(root)) \/
+                (_optimistic_clean? /\ _optimistic_clean.contains(root))
+            then
+                if record? /\ record.overrider_writes then
+                    kill_events_rescued_unsound = kill_events_rescued_unsound + 1;
+                elif record? /\ record.overrider_unprovable then
+                    kill_events_rescued_unprovable = kill_events_rescued_unprovable + 1;
+                else
+                    kill_events_rescued_sound = kill_events_rescued_sound + 1;
+                fi
+            fi
+
+            if record? /\ record.role =~ "get" then
+                kill_events_call_by_getter = kill_events_call_by_getter + 1;
+                facts_killed_call_by_getter = facts_killed_call_by_getter + killed;
+            fi
+
+            if _optimistic_leaf? /\ _optimistic_leaf.contains(root) then
+                kill_events_call_preventable_leaf = kill_events_call_preventable_leaf + 1;
+                facts_killed_call_preventable_leaf = facts_killed_call_preventable_leaf + killed;
+            fi
+
+            if _optimistic_clean? /\ _optimistic_clean.contains(root) then
+                kill_events_call_preventable_clean = kill_events_call_preventable_clean + 1;
+                facts_killed_call_preventable_clean = facts_killed_call_preventable_clean + killed;
+            fi
+        si
+
+        // One killed fact, reduced to the member symbols whose being
+        // written would justify the kill: the symbol itself for a
+        // variable fact, the root and every hop for a path fact.
+        // Buffered rather than classified on the spot, so the same
+        // kills can be re-judged against a second, better-informed run
+        // of the analysis.
+        _kills: Collections.LIST[KILL_FACT]? static;
+
+        kills: Collections.LIST[KILL_FACT] static is
+            if !_kills? then
+                _kills = Collections.LIST[KILL_FACT]();
+            fi
+
+            return _kills;
+        si
+
+        _buffer_kill(
+            location: Source.LOCATION,
+            callee: Function?,
+            killed_symbols: Collections.SET[Symbol],
+            killed_paths: Collections.SET[ACCESS_PATH],
+            presence_symbols: Collections.SET[Symbol],
+            narrow_symbols: Collections.SET[Symbol],
+            presence_paths: Collections.SET[ACCESS_PATH]
+        ) static is
+            let record = if callee? then record_for(callee) else null fi;
+            let is_getter = record? /\ record.role =~ "get";
+            let root = if callee? then cast Function?(callee.root_specialized_from) else null fi;
+
+            for v in killed_symbols do
+                let members = Collections.LIST[Symbol]();
+
+                members.add(v.root_specialized_from);
+
+                let fact = KILL_FACT(
+                    "{location}", root, members, is_getter, false,
+                    presence_symbols.contains(v), narrow_symbols.contains(v));
+
+                kills.add(fact);
+                pending_symbols[v] = fact;
+                pending_mention_symbols[v.root_specialized_from] = fact;
+            od
+
+            for p in killed_paths do
+                let members = Collections.LIST[Symbol]();
+
+                members.add(p.root.root_specialized_from);
+
+                for m in p.members do
+                    members.add(m.root_specialized_from);
+                od
+
+                let fact = KILL_FACT(
+                    "{location}", root, members, is_getter, true,
+                    presence_paths.contains(p), !presence_paths.contains(p));
+
+                kills.add(fact);
+                pending_paths[p] = fact;
+
+                // proxy: the path's final member being loaded again
+                // counts as a mention of the path
+                pending_mention_symbols[p.members[p.members.count - 1].root_specialized_from] = fact;
+            od
+        si
+
+        // ==== write-set generations ====
+
+        _generations: Collections.LIST[WRITE_GENERATION]? static;
+
+        generations: Collections.LIST[WRITE_GENERATION] static is
+            if !_generations? then
+                _generations = Collections.LIST[WRITE_GENERATION]();
+            fi
+
+            return _generations;
+        si
+
+        // Label the run whose facts the next set_write_sets carries, and
+        // clear the per-function records so the new walk's answers
+        // replace the old ones rather than being discarded as duplicates.
+        _next_label: string static;
+
+        begin_generation(label: string) static is
+            _next_label = label;
+            _records = Collections.MAP[Function, STUDY_RECORD]();
+            _passed_functions = Collections.MAP[Function, Collections.SET[Function]]();
+            _passed_opaque = Collections.SET[Function]();
+        si
+
+        // ==== function values flowing into parameters ====
+
+        // For each callee, the function values known to flow into its
+        // function-typed parameters across every call site the walk
+        // saw; and the callees handed a function value the walk could
+        // not name. Keyed on root symbols.
+        _passed_functions: Collections.MutableMap[Function, Collections.SET[Function]]? static;
+        _passed_opaque: Collections.SET[Function]? static;
+
+        passed_opaque: Collections.SET[Function] static is
+            if !_passed_opaque? then
+                _passed_opaque = Collections.SET[Function]();
+            fi
+
+            return _passed_opaque!;
+        si
+
+        passed_functions_for(callee: Function?) -> Collections.SET[Function]? static is
+            if !callee? \/ !_passed_functions? then
+                return null;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if root? /\ _passed_functions.contains_key(root!) then
+                return _passed_functions![root!];
+            fi
+
+            return null;
+        si
+
+        note_passed_function(callee: Function?, value: Function?) static is
+            if !callee? \/ !value? then
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+            let value_root = cast Function?(value.root_specialized_from);
+
+            if !root? \/ !value_root? then
+                return;
+            fi
+
+            if !_passed_functions? then
+                _passed_functions = Collections.MAP[Function, Collections.SET[Function]]();
+            fi
+
+            if !_passed_functions.contains_key(root!) then
+                _passed_functions![root!] = Collections.SET[Function]();
+            fi
+
+            _passed_functions![root!].add(value_root!);
+        si
+
+        // What shape of value each opaque function argument had, and
+        // which callee it went to - names the provenance work that
+        // would bound the remaining param invocations.
+        _opaque_shapes: Collections.MutableMap[string, int]? static;
+
+        opaque_shapes: Collections.MutableMap[string, int] static is
+            if !_opaque_shapes? then
+                _opaque_shapes = Collections.MAP[string, int]();
+            fi
+
+            return _opaque_shapes!;
+        si
+
+        note_opaque_shape(key: string) static is
+            _bump(opaque_shapes, key);
+        si
+
+        note_passed_opaque(callee: Function?) static is
+            if !callee? then
+                return;
+            fi
+
+            let root = cast Function?(callee.root_specialized_from);
+
+            if root? then
+                passed_opaque.add(root!);
+            fi
+        si
+
+        note_heap_store_kill(killed: int) static is
+            if !enabled then
+                return;
+            fi
+
+            kill_events_heap_store = kill_events_heap_store + 1;
+            facts_killed_heap_store = facts_killed_heap_store + killed;
+        si
+
+        note_member_store_kill(killed: int) static is
+            if !enabled then
+                return;
+            fi
+
+            kill_events_member_store = kill_events_member_store + 1;
+            facts_killed_member_store = facts_killed_member_store + killed;
+        si
+
+        // ==== the per-function table ====
+
+        // Written once, at the end of the compile. Two sections: a
+        // header of counter lines, then one tab-separated row per
+        // function the compilation walked.
+        report() static is
+            if !enabled \/ !_path? then
+                return;
+            fi
+
+            try
+                let writer = IO.StreamWriter(_path!);
+
+                writer.write_line("# counters");
+                writer.write_line("kill_events_call\t{kill_events_call}");
+                writer.write_line("facts_killed_call\t{facts_killed_call}");
+                writer.write_line("kill_events_call_by_getter\t{kill_events_call_by_getter}");
+                writer.write_line("facts_killed_call_by_getter\t{facts_killed_call_by_getter}");
+                writer.write_line("kill_events_call_preventable_leaf\t{kill_events_call_preventable_leaf}");
+                writer.write_line("facts_killed_call_preventable_leaf\t{facts_killed_call_preventable_leaf}");
+                writer.write_line("kill_events_call_preventable_clean\t{kill_events_call_preventable_clean}");
+                writer.write_line("facts_killed_call_preventable_clean\t{facts_killed_call_preventable_clean}");
+                writer.write_line("kill_events_call_unattributed\t{kill_events_call_unattributed}");
+                writer.write_line("facts_killed_call_unattributed\t{facts_killed_call_unattributed}");
+                for role in by_role.keys do
+                    let rescued = if by_role_preventable.contains_key(role) then by_role_preventable[role] else 0 fi;
+                    writer.write_line("kill_events_call_role_{role}\t{by_role[role]}\trescued\t{rescued}");
+                od
+
+                for variant in 0..VARIANTS do
+                    writer.write_line(
+                        "necessity_variant_{variant}\tnecessary\t{_counts(facts_killed_necessary)[variant]}"
+                        "\tunnecessary\t{_counts(facts_killed_unnecessary)[variant]}"
+                        "\tunknown\t{_counts(facts_killed_unknown)[variant]}");
+                od
+                writer.write_line("getter_killed_necessary\t{getter_killed_necessary}");
+                writer.write_line("getter_killed_unnecessary\t{getter_killed_unnecessary}");
+                writer.write_line("getter_killed_unknown\t{getter_killed_unknown}");
+                for key in blame_counts.keys do
+                    writer.write_line("blame_{key}\t{blame_counts[key]}");
+                od
+
+                for key in opaque_shapes.keys do
+                    writer.write_line("opaque_shape\t{key}\t{opaque_shapes[key]}");
+                od
+
+                writer.write_line(
+                    "liveness\tconsulted\t{live_kills}"
+                    "\tmentioned\t{mention_live_kills}"
+                    "\tdead\t{dead_kills}");
+
+                // ==== import ranking: which imported callee blocks each
+                // killed fact's closure ====
+                let import_counts = Collections.MAP[string, int]();
+
+                for kill in kills do
+                    let root = kill.callee;
+
+                    if !root? then
+                        continue;
+                    fi
+
+                    if !records.contains_key(root!) then
+                        _bump(import_counts, "direct:{root.qualified_name}");
+                    elif _import_blame? /\ _import_blame.contains_key(root!) then
+                        let key = _import_blame![root!];
+
+                        if key.starts_with("imported:") then
+                            _bump(import_counts, key);
+                        fi
+                    fi
+                od
+
+                for key in import_counts.keys do
+                    writer.write_line("import_kill\t{key}\t{import_counts[key]}");
+                od
+
+                // ==== fact kinds, and the never-nulls rescue bound ====
+                //
+                // A callee that never assigns null (or an optional-typed
+                // value) to anything cannot make a *storage* member
+                // absent, so a presence fact on a field or auto-property
+                // survives it even though it stores. A computed
+                // property's presence can flip from non-null stores, and
+                // a path re-reads through whatever a hop store put
+                // there, so neither is rescuable by that bit alone.
+                let single_presence mut = 0;
+                let single_narrow mut = 0;
+                let single_both mut = 0;
+                let path_presence mut = 0;
+                let path_narrow mut = 0;
+                let rescuable_presence mut = 0;
+                let rescuable_partial mut = 0;
+
+                for kill in kills do
+                    if kill.is_path then
+                        if kill.has_presence then
+                            path_presence = path_presence + 1;
+                        else
+                            path_narrow = path_narrow + 1;
+                        fi
+
+                        continue;
+                    fi
+
+                    if kill.has_presence /\ kill.has_narrow then
+                        single_both = single_both + 1;
+                    elif kill.has_presence then
+                        single_presence = single_presence + 1;
+                    else
+                        single_narrow = single_narrow + 1;
+                    fi
+
+                    if kill.has_presence /\ _is_eligible_member(kill.members[0]) then
+                        if kill.has_narrow then
+                            rescuable_partial = rescuable_partial + 1;
+                        else
+                            rescuable_presence = rescuable_presence + 1;
+                        fi
+                    fi
+                od
+
+                writer.write_line(
+                    "fact_kinds\tsingle_presence\t{single_presence}"
+                    "\tsingle_narrow\t{single_narrow}\tsingle_both\t{single_both}"
+                    "\tpath_presence\t{path_presence}\tpath_narrow\t{path_narrow}");
+                let rescued_trusted mut = 0;
+                let rescued_untrusted mut = 0;
+
+                for kill in kills do
+                    if
+                        kill.is_path \/
+                        !kill.has_presence \/
+                        kill.has_narrow \/
+                        !_is_eligible_member(kill.members[0]) \/
+                        !kill.callee?
+                    then
+                        continue;
+                    fi
+
+                    if _never_nulls? /\ _never_nulls.contains(kill.callee!) then
+                        rescued_trusted = rescued_trusted + 1;
+                    fi
+
+                    if _never_nulls_untrusted? /\ _never_nulls_untrusted.contains(kill.callee!) then
+                        rescued_untrusted = rescued_untrusted + 1;
+                    fi
+                od
+
+                let fused_rescued mut = 0;
+
+                for kill in kills do
+                    if
+                        kill.is_path \/
+                        !kill.has_presence \/
+                        kill.has_narrow \/
+                        !_is_eligible_member(kill.members[0]) \/
+                        !kill.callee?
+                    then
+                        continue;
+                    fi
+
+                    let root = kill.callee!;
+
+                    if
+                        _may_null_sets? /\
+                        _may_null_sets.contains_key(root) /\
+                        !(_may_null_unbounded? /\ _may_null_unbounded.contains(root)) /\
+                        !_may_null_sets[root].contains(kill.members[0])
+                    then
+                        fused_rescued = fused_rescued + 1;
+                    fi
+                od
+
+                writer.write_line("never_null_fused\trescued\t{fused_rescued}");
+
+                writer.write_line(
+                    "never_null_rescue\tfull\t{rescuable_presence}"
+                    "\tpartial\t{rescuable_partial}"
+                    "\trescued_trusted_imports\t{rescued_trusted}"
+                    "\trescued_untrusted\t{rescued_untrusted}");
+
+                let nulling_records mut = 0;
+                let record_count mut = 0;
+
+                for function in records.keys do
+                    record_count = record_count + 1;
+
+                    if records[function].assigns_optional then
+                        nulling_records = nulling_records + 1;
+                    fi
+                od
+
+                writer.write_line(
+                    "never_null_diag\tfunctions\t{record_count}"
+                    "\tassigns_optional\t{nulling_records}"
+                    "\tnever_nulls_trusted\t{if _never_nulls? then _never_nulls.count else 0 fi}"
+                    "\tnever_nulls_untrusted\t{if _never_nulls_untrusted? then _never_nulls_untrusted.count else 0 fi}");
+
+                // ==== element rescue: killed field-only facts whose
+                // callee's closure stores at most elements ====
+                let element_sound mut = 0;
+                let element_trusted mut = 0;
+                let field_only_kills mut = 0;
+
+                for kill in kills do
+                    let field_only = val
+                        let any_property mut = false;
+
+                        for m in kill.members do
+                            if isa Semantic.Symbols.Property(m) then
+                                any_property = true;
+                            fi
+                        od
+
+                        !any_property
+                    lav;
+
+                    if !field_only then
+                        continue;
+                    fi
+
+                    field_only_kills = field_only_kills + 1;
+
+                    let root = kill.callee;
+
+                    if !root? then
+                        continue;
+                    fi
+
+                    if _element_safe? /\ _element_safe.contains(root!) then
+                        element_sound = element_sound + 1;
+                    fi
+
+                    if _element_safe_trusted? /\ _element_safe_trusted.contains(root!) then
+                        element_trusted = element_trusted + 1;
+                    fi
+                od
+
+                writer.write_line(
+                    "element_rescue\tfield_only_kills\t{field_only_kills}"
+                    "\tsound\t{element_sound}\ttrusted\t{element_trusted}");
+
+                // ==== stability: members never written outside a
+                // constructor ====
+                //
+                // The written-member union, over every non-constructor
+                // function's direct writes. A member outside it, if it
+                // is a field or an auto-property, cannot change after
+                // construction, so no call can invalidate a fact on it.
+                // Writes made by constructors are excluded wholesale -
+                // strictly that over-excludes a constructor writing
+                // *another* object's member, but the pattern is rare.
+                let written = Collections.SET[Symbol]();
+                let write_wildcards mut = 0;
+
+                for function in records.keys do
+                    if function.is_constructor then
+                        continue;
+                    fi
+
+                    let r = records[function];
+
+                    for m in r.writes do
+                        written.add(m);
+                    od
+
+                    if r.writes_unbounded then
+                        write_wildcards = write_wildcards + 1;
+                    fi
+                od
+
+                writer.write_line("stability_written_members\t{written.count}");
+                writer.write_line("stability_write_wildcards\t{write_wildcards}");
+
+                for generation in generations do
+                    for variant in 0..VARIANTS do
+                        let necessary mut = 0;
+                        let unnecessary mut = 0;
+                        let unknown mut = 0;
+
+                        // The presence-aware re-judgement: a
+                        // presence-only fact over storage members dies
+                        // only when the callee may write an absent
+                        // value to the fact's member, or may re-point
+                        // a path prefix it reads through. Facts with a
+                        // computed member fall back to the full write
+                        // set, counted separately.
+                        let presence_necessary mut = 0;
+                        let presence_unnecessary mut = 0;
+                        let presence_unknown mut = 0;
+                        let presence_fallback mut = 0;
+
+                        // The necessity × liveness join, computed for the
+                        // post-compile-expressions generation's most
+                        // relaxed variant only: under the optimistic-
+                        // narrowing design, the compile-error burden is
+                        // the (necessary ∪ unknown) ∩ live cell.
+                        let join_necessary_live mut = 0;
+                        let join_necessary_dead mut = 0;
+                        let join_unknown_live mut = 0;
+                        let join_unknown_dead mut = 0;
+                        let join_unnecessary_live mut = 0;
+                        let join_unnecessary_dead mut = 0;
+
+                        let blame_counts = Collections.MAP[string, int]();
+
+                        let fail_ineligible mut = 0;
+                        let fail_written mut = 0;
+
+                        let exempt_necessary mut = 0;
+                        let exempt_unnecessary mut = 0;
+                        let exempt_unknown mut = 0;
+                        let exempt_total mut = 0;
+
+                        for kill in kills do
+                            let stable_exempt = val
+                                let any_ineligible mut = false;
+                                let any_written mut = false;
+
+                                for m in kill.members do
+                                    if !_is_eligible_member(m) then
+                                        any_ineligible = true;
+                                    elif written.contains(m) then
+                                        any_written = true;
+                                    fi
+                                od
+
+                                if variant == VARIANTS - 1 then
+                                    if any_ineligible then
+                                        fail_ineligible = fail_ineligible + 1;
+                                    elif any_written then
+                                        fail_written = fail_written + 1;
+                                    fi
+                                fi
+
+                                !any_ineligible /\ !any_written
+                            lav;
+
+                            if stable_exempt /\ variant == VARIANTS - 1 then
+                                exempt_total = exempt_total + 1;
+                            fi
+
+                            let sets = generation.sets[variant];
+                            let root = kill.callee;
+
+                            let is_unbounded =
+                                !root? \/
+                                !sets.contains_key(root!) \/
+                                generation.unbounded[variant].contains(root!);
+
+                            // The refined judgement, under the model
+                            // the improved post-compile-expressions
+                            // pass would implement: a fact whose every
+                            // member is storage (a field or an
+                            // auto-property; a local root cannot be
+                            // written by any callee) cannot be changed
+                            // by imported code, which has no way to
+                            // name a ghūl member - delegate re-entry
+                            // is the known hole, unmeasured here. A
+                            // presence-only storage fact additionally
+                            // dies only to the nulling subset of the
+                            // callee's writes (a path also to a write
+                            // that re-points a prefix hop). Facts with
+                            // a computed member take the plain verdict,
+                            // counted as fallback.
+                            //   0 unknown, 1 necessary, 2 unnecessary
+                            let refined mut = -1;
+
+                            let all_storage = val
+                                let ok mut = true;
+
+                                for m in kill.members do
+                                    if
+                                        isa Semantic.Symbols.LOCAL_VARIABLE(m) \/
+                                        isa Semantic.Symbols.LOCAL_ARGUMENT(m)
+                                    then
+                                        continue;
+                                    fi
+
+                                    if !_is_eligible_member(m) then
+                                        ok = false;
+                                    fi
+                                od
+
+                                ok
+                            lav;
+
+                            if !all_storage \/ !generation.nulling_sets? then
+                                presence_fallback = presence_fallback + 1;
+                            elif !root? then
+                                // no single bounded callee: a closure
+                                // invocation or the like could run any
+                                // code, ghūl code included
+                                refined = 0;
+                            elif !sets.contains_key(root!) then
+                                // a direct import: writes no ghūl member
+                                refined = 2;
+                            else
+                                let full_writes = sets[root!];
+                                let full_unbounded = generation.unbounded[variant].contains(root!);
+
+                                let presence_only = kill.has_presence /\ !kill.has_narrow;
+
+                                let judge_writes =
+                                    if presence_only then
+                                        generation.nulling_sets![variant][root!]
+                                    else
+                                        full_writes
+                                    fi;
+
+                                let judge_unbounded =
+                                    if presence_only then
+                                        generation.nulling_unbounded![variant].contains(root!)
+                                    else
+                                        full_unbounded
+                                    fi;
+
+                                if judge_unbounded then
+                                    refined = 0;
+                                else
+                                    let hit_refined mut = false;
+
+                                    if kill.is_path then
+                                        // final member: judged writes;
+                                        // prefix hops: any write
+                                        // re-points what the tail reads
+                                        for i in 0..kill.members.count do
+                                            let m = kill.members[i];
+
+                                            if i == kill.members.count - 1 then
+                                                if judge_writes.contains(m) then
+                                                    hit_refined = true;
+                                                fi
+                                            elif !full_unbounded /\ full_writes.contains(m) then
+                                                hit_refined = true;
+                                            elif full_unbounded then
+                                                refined = 0;
+                                            fi
+                                        od
+                                    else
+                                        for m in kill.members do
+                                            if judge_writes.contains(m) then
+                                                hit_refined = true;
+                                            fi
+                                        od
+                                    fi
+
+                                    if refined != 0 then
+                                        refined = if hit_refined then 1 else 2 fi;
+                                    fi
+                                fi
+                            fi
+
+                            if refined == 0 then
+                                presence_unknown = presence_unknown + 1;
+                            elif refined == 1 then
+                                presence_necessary = presence_necessary + 1;
+
+                                if variant == VARIANTS - 1 then
+                                    writer.write_line("refined_necessary_site\t{generation.label}\t{kill.location}");
+                                fi
+                            elif refined == 2 then
+                                presence_unnecessary = presence_unnecessary + 1;
+                            fi
+
+                            if is_unbounded then
+                                unknown = unknown + 1;
+
+                                if refined == -1 then
+                                    presence_unknown = presence_unknown + 1;
+                                fi
+
+                                if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                                    let verdict = if refined == -1 then 0 else refined fi;
+                                    let live = kill.consulted \/ kill.mentioned;
+
+                                    if verdict == 1 then
+                                        if live then join_necessary_live = join_necessary_live + 1; else join_necessary_dead = join_necessary_dead + 1; fi
+                                    elif verdict == 0 then
+                                        if live then join_unknown_live = join_unknown_live + 1; else join_unknown_dead = join_unknown_dead + 1; fi
+                                    else
+                                        if live then join_unnecessary_live = join_unnecessary_live + 1; else join_unnecessary_dead = join_unnecessary_dead + 1; fi
+                                    fi
+
+                                    if live /\ verdict != 2 then
+                                        writer.write_line("flagged_site\t{if verdict == 1 then "necessary" else "unknown" fi}\t{kill.location}\t{kill.use_location ?? ""}");
+                                    fi
+                                fi
+
+                                if stable_exempt /\ variant == VARIANTS - 1 then
+                                    exempt_unknown = exempt_unknown + 1;
+                                fi
+
+                                if variant == VARIANTS - 1 then
+                                    let blame = generation.blame;
+
+                                    _bump(
+                                        blame_counts,
+                                        if root? /\ blame? /\ blame.contains_key(root!) then
+                                            blame![root!]
+                                        else
+                                            "callee-not-walked"
+                                        fi);
+                                fi
+
+                                continue;
+                            fi
+
+                            let writes = sets[root!];
+                            let hit mut = false;
+
+                            for m in kill.members do
+                                if writes.contains(m) then
+                                    hit = true;
+                                fi
+                            od
+
+                            if hit then
+                                necessary = necessary + 1;
+
+                                if refined == -1 then
+                                    presence_necessary = presence_necessary + 1;
+                                fi
+
+                                if stable_exempt /\ variant == VARIANTS - 1 then
+                                    exempt_necessary = exempt_necessary + 1;
+                                fi
+
+                                if variant == VARIANTS - 1 then
+                                    writer.write_line("necessary_site\t{generation.label}\t{kill.location}");
+                                fi
+                            else
+                                unnecessary = unnecessary + 1;
+
+                                if refined == -1 then
+                                    presence_unnecessary = presence_unnecessary + 1;
+                                fi
+
+                                if stable_exempt /\ variant == VARIANTS - 1 then
+                                    exempt_unnecessary = exempt_unnecessary + 1;
+                                fi
+                            fi
+
+                            if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                                let verdict = if refined != -1 then refined elif hit then 1 else 2 fi;
+                                let live = kill.consulted \/ kill.mentioned;
+
+                                if verdict == 1 then
+                                    if live then join_necessary_live = join_necessary_live + 1; else join_necessary_dead = join_necessary_dead + 1; fi
+                                elif verdict == 0 then
+                                    if live then join_unknown_live = join_unknown_live + 1; else join_unknown_dead = join_unknown_dead + 1; fi
+                                else
+                                    if live then join_unnecessary_live = join_unnecessary_live + 1; else join_unnecessary_dead = join_unnecessary_dead + 1; fi
+                                fi
+
+                                if live /\ verdict != 2 then
+                                    writer.write_line("flagged_site\t{if verdict == 1 then "necessary" else "unknown" fi}\t{kill.location}\t{kill.use_location ?? ""}");
+                                fi
+                            fi
+                        od
+
+                        if variant == VARIANTS - 1 then
+                            writer.write_line(
+                                "stability\t{generation.label}"
+                                "\texempt_total\t{exempt_total}"
+                                "\texempt_necessary\t{exempt_necessary}"
+                                "\texempt_unnecessary\t{exempt_unnecessary}"
+                                "\texempt_unknown\t{exempt_unknown}"
+                                "\tfail_ineligible\t{fail_ineligible}"
+                                "\tfail_written\t{fail_written}");
+                        fi
+
+                        writer.write_line(
+                            "necessity\t{generation.label}\tvariant{variant}"
+                            "\tnecessary\t{necessary}\tunnecessary\t{unnecessary}\tunknown\t{unknown}");
+
+                        writer.write_line(
+                            "necessity_refined\t{generation.label}\tvariant{variant}"
+                            "\tnecessary\t{presence_necessary}"
+                            "\tunnecessary\t{presence_unnecessary}"
+                            "\tunknown\t{presence_unknown}"
+                            "\tfallback\t{presence_fallback}");
+
+                        if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                            writer.write_line(
+                                "necessity_liveness"
+                                "\tnecessary_live\t{join_necessary_live}"
+                                "\tnecessary_dead\t{join_necessary_dead}"
+                                "\tunknown_live\t{join_unknown_live}"
+                                "\tunknown_dead\t{join_unknown_dead}"
+                                "\tunnecessary_live\t{join_unnecessary_live}"
+                                "\tunnecessary_dead\t{join_unnecessary_dead}");
+                        fi
+
+                        for key in blame_counts.keys do
+                            writer.write_line("blame\t{generation.label}\t{key}\t{blame_counts[key]}");
+                        od
+                    od
+                od
+
+                if necessary_sites? then
+                    for site in necessary_sites do
+                        writer.write_line("necessary_site\t{site}");
+                    od
+                fi
+
+                writer.write_line("save_events\t{save_events}");
+                writer.write_line("save_facts\t{save_facts}");
+                writer.write_line("kill_events_rescued_sound\t{kill_events_rescued_sound}");
+                writer.write_line("kill_events_rescued_unprovable\t{kill_events_rescued_unprovable}");
+                writer.write_line("kill_events_rescued_unsound\t{kill_events_rescued_unsound}");
+                writer.write_line("kill_events_heap_store\t{kill_events_heap_store}");
+                writer.write_line("facts_killed_heap_store\t{facts_killed_heap_store}");
+                writer.write_line("kill_events_member_store\t{kill_events_member_store}");
+                writer.write_line("facts_killed_member_store\t{facts_killed_member_store}");
+
+                writer.write_line(
+                    "# role\towner\tname\tstore_free\tdefinitely_writes\tbody_clean\tdisqualified\taliased\t"
+                    "own_stores\town_unbounded\tcallees\toverriders\topenly_dispatchable\t"
+                    "declared_pure\tovr_writes\tovr_unprovable\treason\tcontrol\topt_leaf\topt_clean\tlocation");
+
+                for function in records.keys do
+                    let r = records[function];
+
+                    writer.write_line(
+                        "{r.role}\t{r.owner_name}\t{r.name}\t"
+                        "{function.is_store_free}\t"
+                        "{_definitely_writes? /\ _definitely_writes.contains(function)}\t"
+                        "{_body_clean? /\ _body_clean.contains(function)}\t"
+                        "{r.is_disqualified}\t{r.aliased}\t"
+                        "{r.own_stores}\t{r.own_unbounded}\t{r.callee_count}\t{r.overrider_count}\t"
+                        "{r.openly_dispatchable}\t{r.declared_pure}\t"
+                        "{r.overrider_writes}\t{r.overrider_unprovable}\t{r.unbounded_reason}\t"
+                        "{_control? /\ _control.contains(function)}\t"
+                        "{_optimistic_leaf? /\ _optimistic_leaf.contains(function)}\t"
+                        "{_optimistic_clean? /\ _optimistic_clean.contains(function)}\t"
+                        "{r.location}");
+                od
+
+                writer.flush();
+                writer.close();
+            catch ex: System.Exception
+                Std.error.write_line("narrowing study: could not write {_path}: {ex.message}");
+            yrt
+        si
+
+        _definitely_writes: Collections.SET[Function]? static;
+        _body_clean: Collections.SET[Function]? static;
+
+        set_ground_truth(writes: Collections.SET[Function], clean: Collections.SET[Function]) static is
+            _definitely_writes = writes;
+            _body_clean = clean;
+        si
+    si
+si
