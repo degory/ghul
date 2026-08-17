@@ -112,7 +112,15 @@ namespace Syntax.Process is
         is_path: bool public,
         has_presence: bool public,
         has_narrow: bool public
-    );
+    ) is
+        // Liveness, joined per fact: the fact was consulted by a flow
+        // query after the kill, or its member merely loaded again; the
+        // first mention's location names the use site an unsafe-
+        // reliance error would land on.
+        consulted: bool public;
+        mentioned: bool public;
+        use_location: string? public;
+    si
 
     // One run of the store-free analysis, and the write sets it
     // produced under each relaxation variant. Two runs are compared:
@@ -281,6 +289,24 @@ namespace Syntax.Process is
             return _no_call_kills;
         si
 
+        // GHUL_OPTIMISTIC_HOPS: let member-access paths narrow through
+        // any getter, proven store-free or not - the hop-eligibility
+        // half of the optimistic-narrowing design. Combined with
+        // GHUL_NO_CALL_KILLS this is the design's full configuration.
+        // For measurement, not a supported mode.
+        _optimistic_hops: bool static;
+        _optimistic_hops_known: bool static;
+
+        optimistic_hops: bool static is
+            if !_optimistic_hops_known then
+                let text = System.Environment.get_environment_variable("GHUL_OPTIMISTIC_HOPS");
+                _optimistic_hops = text? /\ text.length > 0;
+                _optimistic_hops_known = true;
+            fi
+
+            return _optimistic_hops;
+        si
+
         // Whether the counterfactual exempts `function` from the
         // dispatch-shadow test. Consulted by STORE_FREE_FIXPOINT only
         // when GHUL_ASSUME_GETTERS_PURE is set, so an ordinary build
@@ -327,23 +353,23 @@ namespace Syntax.Process is
         // body; a flow query (`is_non_null`, path queries) on a pending
         // key claims it as live, and the body-boundary reset flushes
         // whatever was never claimed as dead.
-        _pending_symbols: Collections.SET[Symbol]? static;
-        _pending_paths: Collections.SET[ACCESS_PATH]? static;
+        _pending_symbols: Collections.MutableMap[Symbol, KILL_FACT]? static;
+        _pending_paths: Collections.MutableMap[ACCESS_PATH, KILL_FACT]? static;
 
         live_kills: int static public;
         dead_kills: int static public;
 
-        pending_symbols: Collections.SET[Symbol] static is
+        pending_symbols: Collections.MutableMap[Symbol, KILL_FACT] static is
             if !_pending_symbols? then
-                _pending_symbols = Collections.SET[Symbol]();
+                _pending_symbols = Collections.MAP[Symbol, KILL_FACT]();
             fi
 
             return _pending_symbols;
         si
 
-        pending_paths: Collections.SET[ACCESS_PATH] static is
+        pending_paths: Collections.MutableMap[ACCESS_PATH, KILL_FACT] static is
             if !_pending_paths? then
-                _pending_paths = Collections.SET[ACCESS_PATH]();
+                _pending_paths = Collections.MAP[ACCESS_PATH, KILL_FACT]();
             fi
 
             return _pending_paths;
@@ -354,7 +380,8 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if pending_symbols.contains(v) then
+            if pending_symbols.contains_key(v) then
+                pending_symbols[v].consulted = true;
                 pending_symbols.remove(v);
                 live_kills = live_kills + 1;
             fi
@@ -366,19 +393,28 @@ namespace Syntax.Process is
         // idioms - an unwrap, a re-test, a warned dereference - that a
         // strict consultation count can misfile as "dead". Keyed on
         // canonical symbols because load sites see per-specialization
-        // Symbol objects.
-        _pending_mention_symbols: Collections.SET[Symbol]? static;
+        // Symbol objects. The load's location names the use site an
+        // unsafe-reliance error would land on.
+        _pending_mention_symbols: Collections.MutableMap[Symbol, KILL_FACT]? static;
 
         mention_live_kills: int static public;
 
-        note_mention(symbol: Semantic.Symbols.Symbol?) static is
+        note_mention(location: Source.LOCATION, symbol: Semantic.Symbols.Symbol?) static is
             if !enabled \/ !symbol? \/ !_pending_mention_symbols? then
                 return;
             fi
 
             let canonical = symbol.root_specialized_from;
 
-            if _pending_mention_symbols.contains(canonical) then
+            if _pending_mention_symbols.contains_key(canonical) then
+                let fact = _pending_mention_symbols![canonical];
+
+                fact.mentioned = true;
+
+                if !fact.use_location? then
+                    fact.use_location = "{location}";
+                fi
+
                 _pending_mention_symbols.remove(canonical);
                 mention_live_kills = mention_live_kills + 1;
             fi
@@ -389,15 +425,16 @@ namespace Syntax.Process is
                 return;
             fi
 
-            if pending_paths.contains(path) then
+            if pending_paths.contains_key(path) then
+                pending_paths[path].consulted = true;
                 pending_paths.remove(path);
                 live_kills = live_kills + 1;
             fi
         si
 
-        pending_mention_symbols: Collections.SET[Symbol] static is
+        pending_mention_symbols: Collections.MutableMap[Symbol, KILL_FACT] static is
             if !_pending_mention_symbols? then
-                _pending_mention_symbols = Collections.SET[Symbol]();
+                _pending_mention_symbols = Collections.MAP[Symbol, KILL_FACT]();
             fi
 
             return _pending_mention_symbols;
@@ -795,19 +832,14 @@ namespace Syntax.Process is
                 let members = Collections.LIST[Symbol]();
 
                 members.add(v.root_specialized_from);
-                kills.add(KILL_FACT(
+
+                let fact = KILL_FACT(
                     "{location}", root, members, is_getter, false,
-                    presence_symbols.contains(v), narrow_symbols.contains(v)));
-                pending_symbols.add(v);
-                pending_mention_symbols.add(v.root_specialized_from);
-            od
+                    presence_symbols.contains(v), narrow_symbols.contains(v));
 
-            for p in killed_paths do
-                pending_paths.add(p);
-
-                // proxy: the path's final member being loaded again
-                // counts as a mention of the path
-                pending_mention_symbols.add(p.members[p.members.count - 1].root_specialized_from);
+                kills.add(fact);
+                pending_symbols[v] = fact;
+                pending_mention_symbols[v.root_specialized_from] = fact;
             od
 
             for p in killed_paths do
@@ -819,9 +851,16 @@ namespace Syntax.Process is
                     members.add(m.root_specialized_from);
                 od
 
-                kills.add(KILL_FACT(
+                let fact = KILL_FACT(
                     "{location}", root, members, is_getter, true,
-                    presence_paths.contains(p), !presence_paths.contains(p)));
+                    presence_paths.contains(p), !presence_paths.contains(p));
+
+                kills.add(fact);
+                pending_paths[p] = fact;
+
+                // proxy: the path's final member being loaded again
+                // counts as a mention of the path
+                pending_mention_symbols[p.members[p.members.count - 1].root_specialized_from] = fact;
             od
         si
 
@@ -1243,6 +1282,18 @@ namespace Syntax.Process is
                         let presence_unknown mut = 0;
                         let presence_fallback mut = 0;
 
+                        // The necessity × liveness join, computed for the
+                        // post-compile-expressions generation's most
+                        // relaxed variant only: under the optimistic-
+                        // narrowing design, the compile-error burden is
+                        // the (necessary ∪ unknown) ∩ live cell.
+                        let join_necessary_live mut = 0;
+                        let join_necessary_dead mut = 0;
+                        let join_unknown_live mut = 0;
+                        let join_unknown_dead mut = 0;
+                        let join_unnecessary_live mut = 0;
+                        let join_unnecessary_dead mut = 0;
+
                         let blame_counts = Collections.MAP[string, int]();
 
                         let fail_ineligible mut = 0;
@@ -1411,6 +1462,23 @@ namespace Syntax.Process is
                                     presence_unknown = presence_unknown + 1;
                                 fi
 
+                                if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                                    let verdict = if refined == -1 then 0 else refined fi;
+                                    let live = kill.consulted \/ kill.mentioned;
+
+                                    if verdict == 1 then
+                                        if live then join_necessary_live = join_necessary_live + 1; else join_necessary_dead = join_necessary_dead + 1; fi
+                                    elif verdict == 0 then
+                                        if live then join_unknown_live = join_unknown_live + 1; else join_unknown_dead = join_unknown_dead + 1; fi
+                                    else
+                                        if live then join_unnecessary_live = join_unnecessary_live + 1; else join_unnecessary_dead = join_unnecessary_dead + 1; fi
+                                    fi
+
+                                    if live /\ verdict != 2 then
+                                        writer.write_line("flagged_site\t{if verdict == 1 then "necessary" else "unknown" fi}\t{kill.location}\t{kill.use_location ?? ""}");
+                                    fi
+                                fi
+
                                 if stable_exempt /\ variant == VARIANTS - 1 then
                                     exempt_unknown = exempt_unknown + 1;
                                 fi
@@ -1464,6 +1532,23 @@ namespace Syntax.Process is
                                     exempt_unnecessary = exempt_unnecessary + 1;
                                 fi
                             fi
+
+                            if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                                let verdict = if refined != -1 then refined elif hit then 1 else 2 fi;
+                                let live = kill.consulted \/ kill.mentioned;
+
+                                if verdict == 1 then
+                                    if live then join_necessary_live = join_necessary_live + 1; else join_necessary_dead = join_necessary_dead + 1; fi
+                                elif verdict == 0 then
+                                    if live then join_unknown_live = join_unknown_live + 1; else join_unknown_dead = join_unknown_dead + 1; fi
+                                else
+                                    if live then join_unnecessary_live = join_unnecessary_live + 1; else join_unnecessary_dead = join_unnecessary_dead + 1; fi
+                                fi
+
+                                if live /\ verdict != 2 then
+                                    writer.write_line("flagged_site\t{if verdict == 1 then "necessary" else "unknown" fi}\t{kill.location}\t{kill.use_location ?? ""}");
+                                fi
+                            fi
                         od
 
                         if variant == VARIANTS - 1 then
@@ -1487,6 +1572,17 @@ namespace Syntax.Process is
                             "\tunnecessary\t{presence_unnecessary}"
                             "\tunknown\t{presence_unknown}"
                             "\tfallback\t{presence_fallback}");
+
+                        if variant == VARIANTS - 1 /\ generation.label =~ "after-compile-expressions" then
+                            writer.write_line(
+                                "necessity_liveness"
+                                "\tnecessary_live\t{join_necessary_live}"
+                                "\tnecessary_dead\t{join_necessary_dead}"
+                                "\tunknown_live\t{join_unknown_live}"
+                                "\tunknown_dead\t{join_unknown_dead}"
+                                "\tunnecessary_live\t{join_unnecessary_live}"
+                                "\tunnecessary_dead\t{join_unnecessary_dead}");
+                        fi
 
                         for key in blame_counts.keys do
                             writer.write_line("blame\t{generation.label}\t{key}\t{blame_counts[key]}");
