@@ -72,18 +72,21 @@ namespace Syntax.Process is
         si
     si
 
-    // A use that leaned on a heap fact with an undischarged
-    // crossing, held until the enclosing expression is known. A
-    // re-observation of the same target — a presence test, an
-    // unwrap, a coalescing access, an isa test — absolves it: the
-    // test is the re-establishment the error would ask for. Whatever
-    // is not absolved by the next transfer is a reliance error.
+    // A use that leaned on a heap fact with a crossing the inline
+    // filter could not discharge, held until the enclosing expression
+    // is known. A re-observation of the same target — a presence
+    // test, an unwrap, a coalescing access, an isa test — absolves
+    // it: the test is the re-establishment the error would ask for.
+    // Whatever is not absolved by the next transfer is recorded for
+    // the deferred judge (see RELIANCES), which asks the solved
+    // member-granular effect relations before reporting.
     class PENDING_RELIANCE(
         location: LOCATION,
         name: string,
-        crossing: CROSSING,
+        crossings: Collections.LIST[CROSSING],
         target: Symbol?,
-        path: ACCESS_PATH?
+        path: ACCESS_PATH?,
+        is_presence: bool
     );
 
     // The flow-sensitive narrowing orchestrator. Holds the narrowing
@@ -277,6 +280,7 @@ namespace Syntax.Process is
             fi
 
             _pending_marks.clear();
+            RELIANCES.clear_marks();
 
             // Speculation baselines are balanced by the `speculate_then_*`
             // disposables, but an aborted walk can leak one; drop any
@@ -362,6 +366,7 @@ namespace Syntax.Process is
         speculate() is
             _speculation.push(_current_env.copy());
             _pending_marks.push(_pending_reliances.count);
+            RELIANCES.mark();
         si
 
         // Reset the current env to the active baseline without dropping
@@ -393,6 +398,8 @@ namespace Syntax.Process is
             if _pending_marks.count > 0 then
                 _pending_marks.pop();
             fi
+
+            RELIANCES.keep_mark();
         si
 
         // Drop the active baseline and restore the current env to it,
@@ -409,6 +416,8 @@ namespace Syntax.Process is
                     _pending_reliances.remove_at(_pending_reliances.count - 1);
                 od
             fi
+
+            RELIANCES.drop_to_mark();
 
             set_env(_speculation.pop());
         si
@@ -713,8 +722,34 @@ namespace Syntax.Process is
             return null;
         si
 
-        _pend_reliance(location: LOCATION, name: string, crossing: CROSSING, target: Symbol?, path: ACCESS_PATH?) is
-            _pending_reliances.add(PENDING_RELIANCE(location, name, crossing, target, path));
+        // The crossings the inline filter cannot discharge, snapshot
+        // so later mutation of the fact's own list cannot reach a
+        // pending event. Null when every crossing is discharged.
+        _undischarged_crossings(
+            crossings: Collections.LIST[CROSSING]?,
+            reads_through_getter: bool
+        ) -> Collections.LIST[CROSSING]? is
+            if !crossings? then
+                return null;
+            fi
+
+            let kept: Collections.LIST[CROSSING]? mut = null;
+
+            for c in crossings do
+                if !_crossing_discharged(c, reads_through_getter) then
+                    if !kept? then
+                        kept = Collections.LIST[CROSSING]();
+                    fi
+
+                    kept.add(c);
+                fi
+            od
+
+            return kept;
+        si
+
+        _pend_reliance(location: LOCATION, name: string, crossings: Collections.LIST[CROSSING], target: Symbol?, path: ACCESS_PATH?, is_presence: bool) is
+            _pending_reliances.add(PENDING_RELIANCE(location, name, crossings, target, path, is_presence));
         si
 
         // Whether any reliance is pending. Absolution call sites
@@ -748,17 +783,25 @@ namespace Syntax.Process is
             _pending_reliances = kept;
         si
 
-        // Report every reliance that survived to a transfer or a
-        // body boundary without being absolved.
+        // Hand every reliance that survived to a transfer or a body
+        // boundary without being absolved to the deferred judge. No
+        // error is reported here: whether the callee could really
+        // have changed the fact is answered member-granularly by
+        // RELIANCES.judge once infer-effects has solved the effect
+        // relations.
         flush_reliances() is
             if _pending_reliances.count == 0 then
                 return;
             fi
 
             for pending in _pending_reliances do
-                _logger.error(
+                RELIANCES.record(RECORDED_RELIANCE(
                     pending.location,
-                    "cannot rely on the narrowing of '{pending.name}' here: the call at line {pending.crossing.location.start_line} can change it; test '{pending.name}' again, or copy it into a local variable before the call");
+                    pending.name,
+                    pending.crossings,
+                    pending.target,
+                    pending.path,
+                    pending.is_presence));
             od
 
             _pending_reliances.clear();
@@ -775,12 +818,12 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let undischarged = _first_undischarged(
+            let undischarged = _undischarged_crossings(
                 _current_env.non_null_crossings_of(v),
                 isa Semantic.Symbols.Property(v));
 
             if undischarged? then
-                _pend_reliance(location, v.name, undischarged, v, null);
+                _pend_reliance(location, v.name, undischarged, v, null, true);
             fi
         si
 
@@ -793,12 +836,12 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let undischarged = _first_undischarged(
+            let undischarged = _undischarged_crossings(
                 _current_env.narrow_crossings_of(v),
                 isa Semantic.Symbols.Property(v));
 
             if undischarged? then
-                _pend_reliance(location, v.name, undischarged, v, null);
+                _pend_reliance(location, v.name, undischarged, v, null, false);
             fi
         si
 
@@ -807,12 +850,12 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let undischarged = _first_undischarged(
+            let undischarged = _undischarged_crossings(
                 _current_env.path_presence_crossings_of(path),
                 path.has_getter_hop);
 
             if undischarged? then
-                _pend_reliance(location, "{path}", undischarged, null, path);
+                _pend_reliance(location, "{path}", undischarged, null, path, true);
             fi
         si
 
@@ -821,12 +864,12 @@ namespace Syntax.Process is
                 return;
             fi
 
-            let undischarged = _first_undischarged(
+            let undischarged = _undischarged_crossings(
                 _current_env.path_narrow_crossings_of(path),
                 path.has_getter_hop);
 
             if undischarged? then
-                _pend_reliance(location, "{path}", undischarged, null, path);
+                _pend_reliance(location, "{path}", undischarged, null, path, false);
             fi
         si
 

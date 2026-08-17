@@ -1,0 +1,211 @@
+namespace Syntax.Process is
+    use Logging.Logger;
+    use LOCATION = Source.LOCATION;
+    use Symbol = Semantic.Symbols.Symbol;
+    use Function = Semantic.Symbols.Function;
+
+    // A use that leaned on a heap fact whose crossings the inline
+    // filter could not discharge, held for judgement once the
+    // infer-effects pass has solved the member-granular effect
+    // relations. Carries every crossing the fact was still exposed to
+    // at the use, and enough of the fact's identity — the member
+    // symbol or access path, and whether the fact is a presence or a
+    // type narrow — for the judge to ask the precise question.
+    class RECORDED_RELIANCE(
+        location: LOCATION,
+        name: string,
+        crossings: Collections.LIST[CROSSING],
+        target: Symbol?,
+        path: ACCESS_PATH?,
+        is_presence: bool
+    );
+
+    // Reliance events that survived flow-local absolution, recorded
+    // during compile-expressions and judged after infer-effects has
+    // installed the EFFECTS relations. Judgement is deferred because
+    // the precise facts do not exist while expressions are still
+    // being compiled; nothing semantic depends on the verdict — facts
+    // survive optimistically either way — so the judge is purely a
+    // diagnostic pass over this list.
+    //
+    // Records made inside a speculative walk are framed by the same
+    // marks the flow's pending list uses: kept on commit, dropped on
+    // roll-back, so an abandoned walk's events never surface as
+    // errors — mirroring how the logger scrubs a rolled-back walk's
+    // diagnostics.
+    class RELIANCES is
+        _recorded: Collections.LIST[RECORDED_RELIANCE]? static;
+        _marks: Collections.STACK[int]? static;
+
+        _recorded_list: Collections.LIST[RECORDED_RELIANCE] static is
+            if !_recorded? then
+                _recorded = Collections.LIST[RECORDED_RELIANCE]();
+            fi
+
+            return _recorded!;
+        si
+
+        _marks_stack: Collections.STACK[int] static is
+            if !_marks? then
+                _marks = Collections.STACK[int]();
+            fi
+
+            return _marks!;
+        si
+
+        count: int static =>
+            if _recorded? then _recorded.count else 0 fi;
+
+        record(reliance: RECORDED_RELIANCE) static is
+            _recorded_list.add(reliance);
+        si
+
+        mark() static is
+            _marks_stack.push(_recorded_list.count);
+        si
+
+        keep_mark() static is
+            if _marks_stack.count > 0 then
+                _marks_stack.pop();
+            fi
+        si
+
+        drop_to_mark() static is
+            if _marks_stack.count == 0 then
+                return;
+            fi
+
+            let mark = _marks_stack.pop();
+            let recorded = _recorded_list;
+
+            while recorded.count > mark do
+                recorded.remove_at(recorded.count - 1);
+            od
+        si
+
+        clear_marks() static is
+            if _marks? then
+                _marks.clear();
+            fi
+        si
+
+        clear() static is
+            if _recorded? then
+                _recorded.clear();
+            fi
+
+            clear_marks();
+        si
+
+        // Report every recorded reliance some crossing of which the
+        // solved effect relations cannot discharge, then clear. Never
+        // reports anything the inline filter's tiers would have
+        // discharged, so the deferred judge only ever removes errors
+        // relative to judging inline.
+        judge(logger: Logger) static is
+            if !_recorded? then
+                return;
+            fi
+
+            for reliance in _recorded do
+                if NARROWING_STUDY.enabled then
+                    let kind = if reliance.target? then reliance.target.get_type().name else "-" fi;
+
+                    IO.Std.error.write_line("judge: {reliance.name} at {reliance.location} crossings {reliance.crossings.count} target {reliance.target} kind {kind} path {reliance.path}");
+
+                    for c in reliance.crossings do
+                        IO.Std.error.write_line("  crossing {c.callee} bits-sf {c.callee? /\ c.callee.is_store_free} eff-sf {EFFECTS.is_store_free(c.callee)} discharged {_discharged(reliance, c)}");
+                    od
+                fi
+
+                let undischarged = _first_undischarged(reliance);
+
+                if undischarged? then
+                    logger.error(
+                        reliance.location,
+                        "cannot rely on the narrowing of '{reliance.name}' here: the call at line {undischarged.location.start_line} can change it; test '{reliance.name}' again, or copy it into a local variable before the call");
+                fi
+            od
+
+            clear();
+        si
+
+        _first_undischarged(reliance: RECORDED_RELIANCE) -> CROSSING? static is
+            for crossing in reliance.crossings do
+                if !_discharged(reliance, crossing) then
+                    return crossing;
+                fi
+            od
+
+            return null;
+        si
+
+        // Whether `crossing`'s callee provably left the fact alone.
+        // A fact read through a getter — a property target, or a path
+        // with a getter hop — needs a callee that stores nothing at
+        // all, since a getter can read anything a store changed. A
+        // fields-only fact needs less: a presence fact survives any
+        // callee that cannot assign a possibly-absent value to its
+        // member, and a type narrow survives any callee that cannot
+        // store to it; for a path, every hop below the last is held
+        // to may-write, since rewriting a prefix redirects the path
+        // to a different object entirely.
+        _discharged(reliance: RECORDED_RELIANCE, crossing: CROSSING) -> bool static is
+            let callee = crossing.callee;
+
+            if !callee? then
+                return false;
+            fi
+
+            let getter =
+                (reliance.target? /\ isa Semantic.Symbols.Property(reliance.target)) \/
+                (reliance.path? /\ reliance.path.has_getter_hop);
+
+            if callee.is_store_free \/ EFFECTS.is_store_free(callee) then
+                return true;
+            fi
+
+            if getter then
+                return false;
+            fi
+
+            if callee.writes_only_receiver_interior then
+                return true;
+            fi
+
+            if let target = reliance.target then
+                if reliance.is_presence then
+                    return !EFFECTS.may_null(callee, target);
+                fi
+
+                return !EFFECTS.may_write(callee, target);
+            fi
+
+            if let path = reliance.path then
+                if isa Semantic.Symbols.Field(path.root) /\ EFFECTS.may_write(callee, path.root) then
+                    return false;
+                fi
+
+                let members = path.members;
+
+                for i in 0..members.count do
+                    let hop = members[i];
+
+                    if i < members.count - 1 then
+                        if EFFECTS.may_write(callee, hop) then
+                            return false;
+                        fi
+                    elif reliance.is_presence then
+                        return !EFFECTS.may_null(callee, hop);
+                    else
+                        return !EFFECTS.may_write(callee, hop);
+                    fi
+                od
+
+                return true;
+            fi
+
+            return false;
+        si
+    si
+si
