@@ -707,6 +707,10 @@ namespace Syntax.Process is
                 return null;
             fi
 
+            return _type_parameter_equality(left_value, right_value);
+        si
+
+        _type_parameter_equality(left_value: Value, right_value: Value) -> Value? is
             let left_type = left_value.type;
             let right_type = right_value.type;
 
@@ -733,6 +737,222 @@ namespace Syntax.Process is
                 right_value,
                 comparer_type,
                 _innate_symbol_lookup.get_bool_type());
+        si
+
+        // A field comparison in a synthesized union `=~`. The operands
+        // are plain member loads compiled by the ordinary walk; what is
+        // decided here is which comparison they run, which depends on
+        // the field's static type and so was not knowable when the body
+        // was built.
+        visit_field_equals(field_equals: Trees.Expressions.FIELD_EQUALS) is
+            field_equals.compile_expressions_state.value = null;
+
+            let left_value = field_equals.left.value;
+            let right_value = field_equals.right.value;
+
+            if !left_value? \/ !right_value? then
+                field_equals.compile_expressions_state.value =
+                    DUMMY(Semantic.Types.ERROR(), field_equals.location);
+
+                return;
+            fi
+
+            field_equals.compile_expressions_state.value =
+                _compile_field_equals(left_value, right_value, field_equals.location);
+        si
+
+        // The field type's own `=~` where one resolves — a member
+        // operator on the type, or a global innate (scalars, strings) —
+        // the runtime comparer for a bare type parameter, and, when
+        // neither answers, the default equality comparer with a warning
+        // at the field's declaration: the union's structural equality
+        // compares that field with .NET's `Equals` rather than an
+        // operator the type declared.
+        _compile_field_equals(
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value is
+            let left_type = left_value.type;
+            let right_type = right_value.type;
+
+            if !left_type? \/ !right_type? then
+                return DUMMY(Semantic.Types.ERROR(), location);
+            fi
+
+            let type_parameter_comparison = _type_parameter_equality(left_value, right_value);
+
+            if type_parameter_comparison? then
+                return type_parameter_comparison;
+            fi
+
+            if left_type.is_optional \/ right_type.is_optional then
+                // The global innates declare their own optional
+                // parameters, so an optional string field is answered
+                // by the operator itself, exactly as a written
+                // `a =~ b` over the same operands would be.
+                let global_value = _try_global_equals_operator(left_value, right_value, location);
+
+                if global_value? then
+                    return global_value;
+                fi
+
+                let null_safe = _build_null_safe_equality(left_value, right_value, location);
+
+                if null_safe? then
+                    return null_safe;
+                fi
+            else
+                let member_value = _try_member_equals_operator(left_value, right_value, location);
+
+                if member_value? then
+                    return member_value;
+                fi
+
+                let global_value = _try_global_equals_operator(left_value, right_value, location);
+
+                if global_value? then
+                    return global_value;
+                fi
+            fi
+
+            let comparer_type = _innate_symbol_lookup.get_equality_comparer_type(left_type);
+
+            if !comparer_type? then
+                _logger.error(location, "cannot compare values of type {left_type}");
+
+                return DUMMY(Semantic.Types.ERROR(), location);
+            fi
+
+            // Reported only where the author could act: a type declared
+            // in ghūl source could declare `=~` and does not. Imported
+            // types, tuples, arrays, collection instantiations and
+            // function types cannot declare one, so for those the
+            // fallback is the only semantics available and a report
+            // would have no remedy to point at.
+            let inner = _non_optional(left_type) ?? left_type;
+
+            if
+                isa Semantic.Symbols.Classy(inner.symbol) /\
+                !inner.symbol.is_reflected
+            then
+                _logger.warn(
+                    location,
+                    "synthesized-equality-fallback",
+                    "{left_type} defines no =~, so this field compares with the default equality comparer");
+            fi
+
+            return EQUALITY_COMPARISON(
+                left_value,
+                right_value,
+                comparer_type,
+                _innate_symbol_lookup.get_bool_type());
+        si
+
+        // A `=~` operator declared as a member of the field's type —
+        // a user-written operator, a nested union's synthesized one, or
+        // an operator an imported type gains through `Ghul.Equatable`.
+        // Returns null when the type declares no such operator or the
+        // declaration rejects these operands.
+        _try_member_equals_operator(
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value? is
+            let member_symbol = left_value.type!.find_member("=~");
+
+            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
+                return null;
+            fi
+
+            let group = cast Semantic.Symbols.FUNCTION_GROUP(member_symbol);
+
+            if HIDDEN_OPERATOR_MEMBERS.is_hidden(group) then
+                return null;
+            fi
+
+            let overload_result =
+                _resolve_silently(
+                    location,
+                    group,
+                    Collections.LIST[Type]([right_value.type!]),
+                    left_value.is_consumable);
+
+            if !overload_result? then
+                return null;
+            fi
+
+            let function = overload_result.function;
+
+            if function.is_hidden_from_operator_resolution then
+                return null;
+            fi
+
+            _symbol_use_locations.add_symbol_use(location, function);
+
+            if function.is_instance then
+                return function.call(
+                    location,
+                    left_value,
+                    Collections.LIST[Value]([right_value]),
+                    null,
+                    _function_caller);
+            fi
+
+            return function.call(
+                location,
+                null,
+                Collections.LIST[Value]([left_value, right_value]),
+                null,
+                _function_caller);
+        si
+
+        // A `=~` operator in scope as a global — the scalar and string
+        // innates. Returns null when nothing in scope answers for these
+        // operand types.
+        _try_global_equals_operator(
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value? is
+            let global_symbol = _visitor.find(Trees.Identifiers.Identifier(location, "=~"));
+
+            if !global_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(global_symbol) then
+                return null;
+            fi
+
+            let overload_result =
+                _resolve_silently(
+                    location,
+                    cast Semantic.Symbols.FUNCTION_GROUP(global_symbol),
+                    Collections.LIST[Type]([left_value.type!, right_value.type!]),
+                    false);
+
+            if !overload_result? then
+                return null;
+            fi
+
+            let function = overload_result.function;
+
+            _symbol_use_locations.add_symbol_use(location, function);
+
+            let value =
+                function.call(
+                    location,
+                    null,
+                    Collections.LIST[Value]([left_value, right_value]),
+                    null,
+                    _function_caller);
+
+            if isa Call.INNATE(value) then
+                let innate_value = value;
+
+                innate_value.actual_operation = "=~";
+
+                return innate_value.lower();
+            fi
+
+            return value;
         si
 
         // `a =~ b` where an operand is optional. Resolve against the
