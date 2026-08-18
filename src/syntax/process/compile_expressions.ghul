@@ -269,7 +269,7 @@ namespace Syntax.Process is
                 _loop_kept_stack
             );
 
-            _pure_slots = PURE_SLOT_CHECK(logger, _flow, _build_flags);
+            _pure_slots = PURE_SLOT_CHECK(_flow, _build_flags);
 
             _bindings = COMPILE_BINDINGS(
                 logger,
@@ -605,9 +605,18 @@ namespace Syntax.Process is
         _note_call(location: LOCATION, value: IR.Values.Value?) is
             _note_self_call(value);
 
-            if value? /\ value.is_state_changing_call then
-                _flow.on_call_of(location, _called_function_of(value));
+            if !value? \/ !value.is_state_changing_call then
+                // not a call at all, or a call whose callee is
+                // structurally store-free — declared pure, a
+                // whitelisted import, a synthesized backing read, a
+                // pure function-typed invocation. Only the structural
+                // tiers gate here: the proven answer does not exist
+                // until after the solve, and a crossing skipped on a
+                // stale proof could never be judged.
+                return;
             fi
+
+            _flow.on_call_of(location, _called_function_of(value));
         si
 
         // The single bounded callee behind a state-changing value, or
@@ -3189,32 +3198,10 @@ namespace Syntax.Process is
                 // must be re-derived rather than kept.
                 let current_type = typed_symbol.type;
 
-                // A recursive literal's retry walk can re-derive its
-                // own self-reference at the pure shape once the body
-                // is proven store-free (see COMPILE_LAMBDAS), after
-                // this local already settled at the impure shape on
-                // an earlier walk. Without this, `is_settled` alone
-                // would keep the stale impure type and the local
-                // would never pick up the improved one. Scoped to a
-                // bare inferred `let` (no explicit type) with a
-                // same-shape right-hand value — an explicitly-typed
-                // local's assignability is checked by a sibling
-                // branch that only runs when `needs_set` is false,
-                // and this must never short-circuit that check by
-                // coincidentally matching on an unrelated pure
-                // function value of a different shape.
-                let right_value = left_state.right_value;
-                let upgrades_to_pure_function =
-                    !left_state.explicit_type? /\
-                    current_type? /\ current_type.is_function /\ !current_type.is_pure_function /\
-                    right_value? /\ right_value.type? /\ right_value.type.is_pure_function /\
-                    current_type.compare(right_value.type) == Semantic.Types.MATCH.SAME;
-
                 let needs_set mut =
                     !current_type? \/
                     !current_type.is_settled \/
-                    current_type.has_function_generic_argument_foreign_to(current_function) \/
-                    upgrades_to_pure_function;
+                    current_type.has_function_generic_argument_foreign_to(current_function);
 
                 if
                     !needs_set /\
@@ -4063,75 +4050,71 @@ namespace Syntax.Process is
         visit(interpolation: Trees.Expressions.STRING_INTERPOLATION) is
             _literals.visit_interpolation(interpolation);
 
-            // Interpolation formats each fragment through to_string
-            // at run time, but those calls are synthesised at
-            // emission and never surface as call values here — so
-            // the call transfer must fire now unless every
-            // fragment's to_string dispatch is provably store-free.
-            if !_all_fragments_format_store_free(interpolation) then
-                _flow.on_call(interpolation.location);
-            fi
+            // Interpolation formats each fragment through to_string at
+            // run time, but those calls are synthesised at emission and
+            // never surface as call values here, so the call transfer
+            // has to fire for them. Each fragment is recorded against
+            // the to_string it will dispatch to, so the judge can
+            // discharge it like any other call; a fragment whose target
+            // cannot be named records an unbounded crossing instead.
+            _note_interpolation_calls(interpolation);
         si
 
-        _all_fragments_format_store_free(interpolation: Trees.Expressions.STRING_INTERPOLATION) -> bool is
+        _note_interpolation_calls(interpolation: Trees.Expressions.STRING_INTERPOLATION) is
             for fragment in interpolation.values do
-                if fragment.is_expression then
-                    if fragment.format? then
-                        // a format specifier selects a different,
-                        // culture-aware formatting path
-                        return false;
-                    fi
-
-                    let expression = fragment.expression;
-
-                    if !expression.value? then
-                        return false;
-                    fi
-
-                    let fragment_type = expression.value.type;
-
-                    if !fragment_type? then
-                        return false;
-                    fi
-
-                    let member = fragment_type.find_member("to_string");
-
-                    if !_is_store_free_to_string(member) then
-                        return false;
-                    fi
+                if !fragment.is_expression then
+                    continue;
                 fi
-            od
 
-            return true;
+                // a format specifier selects a different, culture-aware
+                // formatting path
+                if fragment.format? then
+                    _flow.on_call(interpolation.location);
+                    return;
+                fi
+
+                let fragment_type = fragment.expression.value?.type;
+
+                if !fragment_type? then
+                    _flow.on_call(interpolation.location);
+                    return;
+                fi
+
+                let to_string = _zero_argument_to_string(fragment_type.find_member("to_string"));
+
+                if !to_string? then
+                    _flow.on_call(interpolation.location);
+                    return;
+                fi
+
+                // same structural gate as _note_call
+                if to_string.is_store_free then
+                    continue;
+                fi
+
+                _flow.on_call_of(interpolation.location, to_string);
+            od
         si
 
-        // True when the zero-argument to_string a fragment formats
-        // through — including every override a call could dispatch
-        // to — is proven store-free.
-        _is_store_free_to_string(member: Semantic.Symbols.Symbol?) -> bool is
-            if !member? then
-                return false;
-            fi
-
-            if isa Semantic.Symbols.FUNCTION_GROUP(member) then
-                for function in (cast Semantic.Symbols.FUNCTION_GROUP(member)).functions do
+        // The zero-argument to_string a fragment formats through.
+        _zero_argument_to_string(member: Semantic.Symbols.Symbol?) -> Semantic.Symbols.Function? is
+            if let group: Semantic.Symbols.FUNCTION_GROUP = member then
+                for function in group.functions do
                     if !function.are_arguments_declared \/ function.arguments.count == 0 then
-                        return function.is_store_free;
+                        return function;
                     fi
                 od
 
-                return false;
+                return null;
             fi
 
-            if isa Semantic.Symbols.Function(member) then
-                let function = cast Semantic.Symbols.Function(member);
-
+            if let function: Semantic.Symbols.Function = member then
                 if !function.are_arguments_declared \/ function.arguments.count == 0 then
-                    return function.is_store_free;
+                    return function;
                 fi
             fi
 
-            return false;
+            return null;
         si
 
         visit(`string: Trees.Expressions.Literals.STRING) is

@@ -52,16 +52,16 @@ namespace Semantic.Symbols is
         _overriders: Collections.MutableList[Symbol]?;
         _overridees: Collections.MutableList[Symbol]?;
 
-        // Set by infer-store-free: a call to this function provably
-        // cannot store to any pre-existing heap location — no field,
-        // property, global, indexer or array-element assignment,
-        // directly or through anything the call could dispatch to,
-        // including every override. False means "not proven", not
-        // "known to store". The bit is read and written through the
-        // unspecialized function so specializations created at any
-        // point see it, and stored in STORE_FREE_BITS keyed by the
-        // function's id so it survives an incremental edit re-creating
-        // the symbol when the replacement adopts the predecessor's id.
+        // Whether a call to this function is trusted not to store to
+        // any pre-existing heap location, without the body being seen:
+        // declared `pure` — including on a body-less trait member the
+        // analysis never walks — a curated store-free import, or a
+        // synthesized backing-field read. Answerable at any point in
+        // the build, and never stale, because every contributor is
+        // settled by declaration shape rather than inferred from a
+        // body. What was actually proven is EFFECTS.is_store_free,
+        // which is only answerable once expressions are compiled, and
+        // which takes the union with this.
         is_store_free: bool is
             let rsf = root_specialized_from;
 
@@ -69,10 +69,95 @@ namespace Semantic.Symbols is
                 return (cast Function?(rsf)!).is_store_free;
             fi
 
-            // declared `pure` is trusted without proof — including on
-            // body-less trait members, which the analysis never sees
-            return STORE_FREE_BITS.is_store_free(id) \/ _is_declared_pure \/ _is_trusted_import;
+            return _is_declared_pure \/ _is_trusted_import \/ _is_trusted_backing_read;
         si
+
+        // Set when this function was synthesized as the read accessor
+        // of an auto property: its body is a read of the backing
+        // field, by construction, so it stores nothing without any
+        // analysis being needed.
+        _is_backing_read: bool;
+
+        mark_backing_read() is
+            let rsf = root_specialized_from;
+
+            if rsf != self then
+                (cast Function?(rsf)!).mark_backing_read();
+                return;
+            fi
+
+            _is_backing_read = true;
+        si
+
+        // A backing read is only trusted at a call site when the call
+        // is bound to reach it: an in-assembly overrider, or a
+        // possible override outside the assembly behind an open
+        // class, could stand behind the call and store.
+        _is_trusted_backing_read: bool =>
+            _is_backing_read /\ has_no_overriders /\ !_is_openly_dispatchable;
+
+        // Whether an override outside this compilation could stand
+        // behind a call to this function: an instance method of
+        // anything but a closed class. Mirrors the dispatch-shadow
+        // rule the store-free solvers apply.
+        _is_openly_dispatchable: bool is
+            if isa STRUCT_METHOD(self) then
+                return false;
+            fi
+
+            if !isa INSTANCE_METHOD(self) then
+                return false;
+            fi
+
+            let owner = self.owner;
+
+            if !owner? \/ !isa Classy(owner) then
+                return true;
+            fi
+
+            return (cast Classy(owner)).is_open;
+        si
+
+        // Written back by the store-free solve once expressions have
+        // compiled: the body, and everything it can reach, was proven
+        // to store nothing. Read where the answer is surfaced rather
+        // than relied on — hover's pure prefix and the pure
+        // function-type shape — so a stale answer in analysis mode
+        // costs a momentarily wrong display, never a wrong judgement;
+        // the reliance and pure-slot judges read EFFECTS instead,
+        // inside the round that solved it. Kept in the id-keyed
+        // STORE_FREE_BITS so it survives an incremental edit that
+        // replaces the symbol object under an adopted id.
+        is_proven_store_free: bool is
+            let rsf = root_specialized_from;
+
+            if rsf != self then
+                return (cast Function?(rsf)!).is_proven_store_free;
+            fi
+
+            return is_store_free \/ STORE_FREE_BITS.is_proven_store_free(id);
+        si
+
+        set_proven_store_free(value: bool) is
+            let rsf = root_specialized_from;
+
+            if rsf != self then
+                (cast Function?(rsf)!).set_proven_store_free(value);
+                return;
+            fi
+
+            STORE_FREE_BITS.set_proven_store_free(id, value);
+        si
+
+        // Set while a literal's body compiles if it performed any
+        // heap-visible operation — a crossing-recording call, a heap
+        // store, or any local reassignment (a reassigned local can be
+        // a captured one, which is a frame-field store; own-local
+        // reassignment is conservatively included). Consulted where
+        // the compiled literal takes its value's type: a clean body
+        // surfaces at the pure shape. Meaningless for named
+        // functions — the store-free solve covers those.
+        literal_body_impure: bool public;
 
         // A curated store-free import is trusted at query time, not
         // only when a named body's fixpoint happens to reach it as a
@@ -133,17 +218,6 @@ namespace Semantic.Symbols is
             return _receiver_interior_import_cache;
         si
 
-        set_store_free(value: bool) is
-            let rsf = root_specialized_from;
-
-            if rsf != self then
-                (cast Function?(rsf)!).set_store_free(value);
-                return;
-            fi
-
-            STORE_FREE_BITS.set_store_free(id, value);
-        si
-
         // Whether this function is a constructor. Overridden on the
         // method that carries the `.ctor` IL name; false everywhere
         // else, so callers can ask any function without a cast.
@@ -151,10 +225,10 @@ namespace Semantic.Symbols is
 
         // A constructor is trusted to write no pre-existing heap slot
         // *given its receiver is fresh* — the case a `NEW` presents.
-        // Store-free constructors qualify directly; a constructor that
-        // only writes its own instance fields qualifies through the
-        // fixpoint's construction pass. The strict store-free bit stays
-        // the answer for every non-construction call site.
+        // Only the structural tiers answer here; a constructor that
+        // writes its own instance fields is proven harmless by the
+        // solve instead, and the crossing its construction records is
+        // discharged against EFFECTS.constructs_store_free.
         constructs_store_free: bool is
             let rsf = root_specialized_from;
 
@@ -162,18 +236,7 @@ namespace Semantic.Symbols is
                 return (cast Function?(rsf)!).constructs_store_free;
             fi
 
-            return is_store_free \/ STORE_FREE_BITS.constructs_store_free(id);
-        si
-
-        set_constructs_store_free(value: bool) is
-            let rsf = root_specialized_from;
-
-            if rsf != self then
-                (cast Function?(rsf)!).set_constructs_store_free(value);
-                return;
-            fi
-
-            STORE_FREE_BITS.set_constructs_store_free(id, value);
+            return is_store_free;
         si
 
         // Declared `pure` in source: the function is trusted
@@ -203,16 +266,6 @@ namespace Semantic.Symbols is
 
             _is_declared_pure = true;
         si
-
-        // Recorded while compile-expressions walks a function
-        // literal's body: true when the body performed a possibly
-        // heap-visible operation — a possibly-storing call, a heap
-        // store, or any local reassignment (a reassigned local can be
-        // a captured one, which is a frame-field store; own-local
-        // reassignment is conservatively included). Consulted where
-        // the literal meets a pure function-typed slot. Meaningless
-        // for named functions — infer-store-free covers those.
-        literal_body_impure: bool public;
 
         // The operation named by an `INTRINSIC_ATTRIBUTE` on this
         // declaration, or null. Set for a source declaration only: the
@@ -403,7 +456,7 @@ namespace Semantic.Symbols is
         // function is proven store-free — diagnostic surfacing only,
         // deliberately inside the comment so it does not read as
         // source syntax.
-        pure_prefix: string => if is_store_free then "pure " else "" fi;
+        pure_prefix: string => if is_proven_store_free then "pure " else "" fi;
         
         argument_descriptions: string =>
             (0..arguments.count) |> map(i => get_argument_description(i)) |> join() ?? "";
@@ -996,7 +1049,7 @@ namespace Semantic.Symbols is
             // A store-free function referred to as a value is a value
             // of the pure shape of its type — the property belongs to
             // the function, not to the slot it is being read into.
-            return innate_symbol_lookup.get_function_type(types, is_store_free);
+            return innate_symbol_lookup.get_function_type(types, is_proven_store_free);
         si
 
         try_override(into: Classy, function: Function, logger: Logger) is
