@@ -6,6 +6,12 @@ public enum Level
     High = 7,
 }
 
+public enum Wide : long
+{
+    Small = 3,
+    Huge = 0x1_0000_0000,
+}
+
 // The constant shapes the base class library does not offer: a string, a
 // bool, one typed by an enum, and the only constant of a reference type
 // metadata can describe, which is null.
@@ -16,6 +22,7 @@ public static class Constants
     public const bool Yes = true;
     public const bool No = false;
     public const Level Threshold = Level.High;
+    public const Wide Reach = Wide.Huge;
     public const char Separator = ';';
     public const long Big = 9_000_000_000L;
 
