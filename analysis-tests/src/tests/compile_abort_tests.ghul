@@ -1,0 +1,221 @@
+namespace Analysis.Tests is
+    use Collections.Iterable;
+    use Collections.LIST;
+
+    use System.Text.StringBuilder;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // An edit that arrives while a compile is running cuts that compile
+    // short: the rest of its walk would compute diagnostics the edit has
+    // already made stale.
+    //
+    // Only the expressions-only walk can be abandoned. Stopping part-way
+    // through it leaves the remaining files at up-to-expressions with no
+    // use-map entries, which is the state a single-file edit's rebuild
+    // leaves anyway; the whole-project rebuild has no such halfway state
+    // and runs to completion.
+    class COMPILE_ABORT_TESTS is
+        @test()
+
+        init() is si
+
+        // Enough files, each with enough methods, that the walk takes long
+        // enough for an edit written straight behind the compile request to
+        // be queued before the walk reaches its second file.
+        file_count: int static => 6;
+        method_count: int static => 150;
+
+        path_of(index: int) -> string static => "compile_abort_{index}.ghul";
+
+        source_of(index: int) -> string static =>
+            source_of(index, false);
+
+        // `with_extra` appends a method, which changes the file's interface
+        // and so leaves every other file needing its expressions walked
+        // again - the state the compile under test is in.
+        source_of(index: int, with_extra: bool) -> string static is
+            let source = StringBuilder();
+
+            source.append("namespace CompileAbort is\n");
+            source.append("    class HOLDER_{index} is\n");
+            source.append("        init() is si\n");
+
+            for i in 0..method_count do
+                source.append("\n");
+                source.append("        method_{i}(a: int, b: int) -> int is\n");
+                source.append("            let total = a + b + {i};\n");
+                source.append("            return total * 2;\n");
+                source.append("        si\n");
+            od
+
+            if with_extra then
+                source.append("\n");
+                source.append("        extra() -> int => {index};\n");
+            fi
+
+            source.append("    si\n");
+            source.append("si\n");
+
+            return source.to_string();
+        si
+
+        edit_files() -> Iterable[EDIT_FILE] static is
+            let files = LIST[EDIT_FILE]();
+
+            for i in 0..file_count do
+                files.add(EDIT_FILE(path_of(i), source_of(i)));
+            od
+
+            return files;
+        si
+
+        read_diagnostics(analyser: ANALYSER_PROCESS, what: string) -> Response.DIAGNOSTICS static is
+            let response = analyser.read_response();
+
+            assert isa Response.DIAGNOSTICS(response) else
+                "expected a diagnostics response {what}, got {response.get_type().name}\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
+
+            return cast Response.DIAGNOSTICS(response);
+        si
+
+        an_edit_written_during_a_compile_cuts_that_compile_short() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            assert analyser.supports("compile-abort") else
+                "analyser should advertise the compile-abort capability\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
+
+            analyser.send_edit_files(edit_files());
+
+            read_diagnostics(analyser, "for the initial edit");
+
+            // Interface-affecting, so every other file needs its
+            // expressions walked again and the compile below has work to
+            // be interrupted in the middle of.
+            analyser.send_edit(path_of(0), source_of(0, true));
+
+            let after_edit = read_diagnostics(analyser, "for the interface-affecting edit");
+
+            Assert.is_true(
+                after_edit.compile_needed,
+                "an interface-affecting edit should leave a compile needed\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let before = analyser.stat_counts();
+
+            analyser.send_compile();
+            analyser.send_edit(path_of(1), source_of(1, true));
+
+            let compile = read_diagnostics(analyser, "for the compile");
+
+            Assert.are_equal(
+                "full",
+                compile.phase,
+                "expected the compile's own response first\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.is_true(
+                compile.compile_needed,
+                "an abandoned compile should say a compile is still needed\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // Files the walk never reached have had their expression
+            // diagnostics cleared and not recomputed, so reporting the
+            // paths it did check would clear their squiggles until the
+            // next compile puts them back. It reports none.
+            Assert.are_equal(
+                0,
+                compile.checked_paths.count,
+                "an abandoned compile should report no checked paths\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let edit = read_diagnostics(analyser, "for the superseding edit");
+
+            Assert.are_equal(
+                "partial",
+                edit.phase,
+                "expected the superseding edit's response second\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let after = analyser.stat_counts();
+
+            Assert.are_equal(
+                1,
+                _delta(before, after, "compile-superseded"),
+                "the analyser did not record abandoning the compile\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // Nothing waiting means nothing to defer to: the compile runs to
+        // completion, reports every path it checked and clears the flag.
+        a_compile_with_nothing_waiting_runs_to_completion() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files(edit_files());
+
+            read_diagnostics(analyser, "for the initial edit");
+
+            analyser.send_edit(path_of(0), source_of(0, true));
+
+            read_diagnostics(analyser, "for the interface-affecting edit");
+
+            let before = analyser.stat_counts();
+
+            analyser.send_compile();
+
+            let compile = read_diagnostics(analyser, "for the compile");
+
+            Assert.is_false(
+                compile.compile_needed,
+                "a compile that ran to completion should not ask for another\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.is_true(
+                compile.checked_paths.count >= file_count,
+                "a compile that ran to completion should report every path it checked\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let after = analyser.stat_counts();
+
+            Assert.are_equal(
+                0,
+                _delta(before, after, "compile-superseded"),
+                "nothing was waiting, so nothing should have been abandoned\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        _delta(
+            before: Collections.MutableMap[string,int],
+            after: Collections.MutableMap[string,int],
+            name: string
+        ) -> int static =>
+            _count(after, name) - _count(before, name);
+
+        _count(counts: Collections.MutableMap[string,int], name: string) -> int static is
+            if counts.contains_key(name) then
+                return counts[name];
+            fi
+
+            return 0;
+        si
+    si
+si
