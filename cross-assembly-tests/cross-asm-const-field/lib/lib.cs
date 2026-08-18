@@ -19,6 +19,10 @@ public static class Constants
 {
     public const string Greeting = "hello";
     public const string Absent = null;
+
+    // The word the argument-default channel uses for "no value", which a
+    // library author is free to choose as an actual value.
+    public const string Mode = "default";
     public const bool Yes = true;
     public const bool No = false;
     public const Level Threshold = Level.High;
