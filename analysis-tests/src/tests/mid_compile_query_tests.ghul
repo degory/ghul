@@ -1,0 +1,171 @@
+namespace Analysis.Tests is
+    use Collections.Iterable;
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.EDIT_FILE;
+    use Analysis.Protocol.Response;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+
+    // A query that arrives while a compile is running is answered during
+    // it, at the next per-file boundary of the compile-expressions walk,
+    // rather than after the whole compile.
+    //
+    // These drive it by writing the query straight after the request that
+    // starts the compile, without reading in between - which is what a
+    // client that pipelines its requests does.
+    class MID_COMPILE_QUERY_TESTS is
+        @test()
+
+        init() is si
+
+        // Enough files that the compile-expressions walk has boundaries to
+        // stop at, and enough work before it - parsing, declaring and
+        // resolving every file, and loading the referenced assemblies -
+        // that the queries are certainly queued by the time it starts.
+        file_count: int static => 8;
+
+        path_of(index: int) -> string static => "mid_compile_{index}.ghul";
+
+        source_of(index: int) -> string static =>
+            "namespace MidCompile is\n"
+            "    class HOLDER_{index} is\n"
+            "        init() is si\n"
+            "\n"
+            "        alpha() -> int is\n"
+            "            return {index};\n"
+            "        si\n"
+            "\n"
+            "        beta() -> int is\n"
+            "            return alpha() + 1;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        edit_files() -> Iterable[EDIT_FILE] static is
+            let files = LIST[EDIT_FILE]();
+
+            for i in 0..file_count do
+                files.add(EDIT_FILE(path_of(i), source_of(i)));
+            od
+
+            return files;
+        si
+
+        // Position of the `alpha` call inside `beta` - a use, so the
+        // hover exists once that file's expressions are walked. The
+        // assertions below are about when the response arrives rather
+        // than what it says: a query served before the file it names has
+        // been reached answers emptily, which is the intended failure
+        // mode and not something to pin.
+        hover_line: int static => 10;
+        hover_column: int static => 20;
+
+        // The compile the first EDIT drives walks every file's
+        // expressions, so the queries queued behind it are answered
+        // during that walk. Ordering on the wire is what the client sees,
+        // so that is what is asserted: at least one hover response ahead
+        // of the diagnostics frame the EDIT itself produces.
+        a_query_sent_during_a_compile_is_answered_before_the_compile_finishes() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            assert analyser.supports("mid-compile-queries") else
+                "analyser should advertise the mid-compile-queries capability\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
+
+            analyser.send_edit_files(edit_files());
+
+            let query_count = 3;
+
+            for i in 0..query_count do
+                analyser.send_hover(path_of(i), hover_line, hover_column);
+            od
+
+            let hovers_before_diagnostics mut = 0;
+            let saw_diagnostics mut = false;
+
+            for i in 0..(query_count + 1) do
+                let response = analyser.read_response();
+
+                if isa Response.DIAGNOSTICS(response) then
+                    saw_diagnostics = true;
+
+                    break;
+                fi
+
+                assert isa Response.HOVER(response) else
+                    "expected a hover or diagnostics response, got {response.get_type().name}\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}";
+
+                hovers_before_diagnostics = hovers_before_diagnostics + 1;
+            od
+
+            Assert.is_true(
+                saw_diagnostics,
+                "the edit's diagnostics frame never arrived\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            Assert.is_true(
+                hovers_before_diagnostics > 0,
+                "every hover waited for the compile to finish: the queries were not interleaved\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            // Drain whatever is left so the counter snapshot below reads
+            // its own response rather than one of these.
+            for i in hovers_before_diagnostics..query_count do
+                let response = analyser.read_response();
+
+                assert isa Response.HOVER(response) else
+                    "expected the remaining hover responses, got {response.get_type().name}\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}";
+            od
+
+            let counts = analyser.stat_counts();
+
+            Assert.is_true(
+                _count(counts, "interleaved-query") >= hovers_before_diagnostics,
+                "the analyser did not count the queries it served mid-compile\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // A whole-project query answers with a set of locations, and a set
+        // built from a use map that is still being rebuilt is incomplete
+        // rather than absent - an incomplete set of rename sites reads as
+        // a complete one. So references waits, and the ordering says so.
+        a_whole_project_query_sent_during_a_compile_waits_for_it() is
+            @test()
+
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit_files(edit_files());
+
+            analyser.send_references(path_of(0), hover_line, hover_column);
+
+            let first = analyser.read_response();
+
+            assert isa Response.DIAGNOSTICS(first) else
+                "references should not be answered before the compile's diagnostics, got {first.get_type().name}\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
+
+            let second = analyser.read_query_response();
+
+            assert isa Response.REFERENCES(second) else
+                "expected the references response after the diagnostics, got {second.get_type().name}\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
+        si
+
+        _count(counts: Collections.Map[string,int], name: string) -> int static is
+            if counts.contains_key(name) then
+                return counts[name];
+            fi
+
+            return 0;
+        si
+    si
+si

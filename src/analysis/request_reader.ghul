@@ -1,0 +1,163 @@
+namespace Analysis is
+    use System.Exception;
+    use System.Threading.Monitor;
+
+    // A frame the reader thread lifted off the client's pipe, or the
+    // reason it could not. Deserialization happens on the reader thread,
+    // so a malformed line becomes a queued PARSE_ERROR rather than an
+    // exception raised at whatever point the despatcher happened to read.
+    //
+    // TIMED_OUT is not read off the pipe at all: it is what a bounded
+    // wait returns when nothing arrived, which is what the idle timeout
+    // is decided from.
+    union QueuedFrame is
+        REQUEST(request: Protocol.Request);
+        PARSE_ERROR(message: string);
+        END_OF_INPUT;
+        TIMED_OUT;
+    si
+
+    // Reads request frames off the client's pipe on a thread of its own
+    // and queues them, so the despatcher can see what is waiting instead
+    // of only what it has already asked for.
+    //
+    // That is what lets a query be answered during a compile: a handler
+    // running on the main thread can ask whether anything is queued and
+    // take it. Nothing else about the analyser becomes concurrent -
+    // every request is still handled on the main thread, one at a time,
+    // and this class touches no compiler state.
+    class REQUEST_READER(_reader: IO.TextReader) is
+        _gate: object;
+        _frames: Collections.LIST[QueuedFrame];
+
+        init(..) is
+            _gate = object();
+            _frames = Collections.LIST[QueuedFrame]();
+        si
+
+        start() is
+            let start: System.Threading.ThreadStart = () is _read_loop(); si;
+
+            let thread = System.Threading.Thread(start);
+
+            // A background thread does not hold the process open, which
+            // is what makes the idle exit and the watchdog recycle able
+            // to end the process while this thread sits in read_line.
+            thread.is_background = true;
+            thread.name = "ghul-analysis-reader";
+
+            thread.start();
+        si
+
+        _read_loop() is
+            do
+                let line: string? mut = null;
+
+                try
+                    line = _reader.read_line();
+                catch ex: Exception
+                    // The pipe went away under us; that is end of input
+                    // by another name.
+                    line = null;
+                yrt
+
+                if !line? then
+                    _push(QueuedFrame.END_OF_INPUT);
+
+                    return;
+                fi
+
+                if string.is_null_or_white_space(line) then
+                    continue;
+                fi
+
+                _push(_deserialize(line));
+            od
+        si
+
+        _deserialize(line: string) -> QueuedFrame static is
+            try
+                let request = Protocol.JSON_PROTOCOL.deserialize_request(line);
+
+                if !request? then
+                    return QueuedFrame.PARSE_ERROR("request line deserialized to nothing");
+                fi
+
+                return QueuedFrame.REQUEST(request);
+            catch ex: Exception
+                return QueuedFrame.PARSE_ERROR("{ex.get_type().name}: {ex.message}");
+            yrt
+        si
+
+        _push(frame: QueuedFrame) is
+            Monitor.enter(_gate);
+
+            try
+                _frames.add(frame);
+
+                Monitor.pulse_all(_gate);
+            finally
+                Monitor.exit(_gate);
+            yrt
+        si
+
+        // Wait for the next frame, giving up after timeout_ms with
+        // TIMED_OUT; a timeout of zero or less waits indefinitely.
+        //
+        // END_OF_INPUT is answered to every later call as well as to the
+        // one that reached it, so a caller that keeps asking keeps being
+        // told the same thing rather than blocking forever.
+        take(timeout_ms: int) -> QueuedFrame is
+            Monitor.enter(_gate);
+
+            try
+                while _frames.count == 0 do
+                    if timeout_ms <= 0 then
+                        Monitor.wait(_gate);
+                    elif !Monitor.wait(_gate, timeout_ms) then
+                        return QueuedFrame.TIMED_OUT;
+                    fi
+                od
+
+                let head = _frames[0];
+
+                if isa QueuedFrame.END_OF_INPUT(head) then
+                    return head;
+                fi
+
+                _frames.remove_at(0);
+
+                return head;
+            finally
+                Monitor.exit(_gate);
+            yrt
+        si
+
+        // Take the queued request at the head of the queue when there is
+        // one and `wanted` accepts it, and nothing otherwise. Never
+        // waits, and never reorders: a frame the caller does not want
+        // stops the scan, so requests are still handled in the order the
+        // client sent them.
+        take_if(wanted: (Protocol.Request) -> bool) -> Protocol.Request? is
+            Monitor.enter(_gate);
+
+            try
+                if _frames.count == 0 then
+                    return null;
+                fi
+
+                let head = _frames[0];
+
+                if let queued: QueuedFrame.REQUEST = head /\ wanted(queued.request) then
+                    _frames.remove_at(0);
+
+                    return queued.request;
+                fi
+
+                return null;
+            finally
+                Monitor.exit(_gate);
+            yrt
+        si
+    si
+si
