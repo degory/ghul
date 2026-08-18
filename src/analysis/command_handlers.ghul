@@ -588,10 +588,6 @@ namespace Analysis is
                     for i in _source_files do
                         i.want_compile_up_to_expressions = true;
 
-                        // the rebuild abandons every symbol these facts
-                        // are keyed on
-                        i.store_free_facts = null;
-
                         if !only_for_file_name? \/ i.file_name =~ only_for_file_name then
                             IoC.CONTAINER.instance.logger.clear(i.file_name, true);
                             i.want_compile_expressions = true;
@@ -693,6 +689,7 @@ namespace Analysis is
                         // diagnostics are kept - no earlier pass re-runs.
                         IoC.CONTAINER.instance.logger.clear_expression_diagnostics(i.file_name);
                         Syntax.Process.RELIANCES.clear_kill_candidates_for(i.file_name);
+                        Syntax.Process.PURE_SLOTS.clear_for(i.file_name);
 
                         _compiler.compile_expressions_only(i);
                     od
@@ -1267,7 +1264,6 @@ namespace Analysis is
             // beyond the body splice (which already dropped the bucket);
             // stated here too so the mutation owns its staleness rule
             // rather than leaning on the splice having run first.
-            retained.store_free_facts = null;
 
             _compiler.build_members_interface(retained, chain, added_list);
 
@@ -1512,8 +1508,12 @@ namespace Analysis is
 
                 incoming.adopt_id(removed_functions[matched_index]);
 
+                // the adopted id carries the outgoing symbol's proven
+                // store-free bit; an edit that also changed the body
+                // resets it to the conservative default, and the next
+                // solve re-derives it
                 if !_body_text_matches(removed_definitions[matched_index], added, outgoing_text, incoming_text) then
-                    incoming.set_store_free(false);
+                    incoming.set_proven_store_free(false);
                 fi
             od
         si
@@ -1710,7 +1710,6 @@ namespace Analysis is
             // false-match a since-reverted body. The retained store-free
             // facts describe the pre-splice bodies for the same reason.
             retained.source_text = donor.source_text;
-            retained.store_free_facts = null;
 
             _compiler.rewalk_bodies(retained, correspondence, body_spans);
 
@@ -1819,6 +1818,21 @@ namespace Analysis is
                         _timers.bump(WORK_COUNTERS.EDIT_PATH_BODY_REWALK);
                     elif handled_by_interface_path then
                         _timers.bump(WORK_COUNTERS.EDIT_PATH_INTERFACE_INCREMENTAL);
+
+                        // The interface path splices the new bodies in
+                        // without recompiling the file's expressions,
+                        // so its expression-level state — hover uses,
+                        // reliance records — still describes the
+                        // pre-edit bodies. Mark the file stale so the
+                        // debounced COMPILE recompiles exactly this
+                        // file and trues that state up.
+                        for edited_path in paths do
+                            if let edited = find_source_file(edited_path) then
+                                _compiler.invalidate_file_expressions(edited);
+                            fi
+                        od
+
+                        _compiler.is_full_compile_needed = true;
                     fi
 
                     if !handled_by_body_rewalk /\ !handled_by_interface_path then
@@ -1836,10 +1850,6 @@ namespace Analysis is
 
                         for i in _source_files_by_path.values do
                             i.want_compile_up_to_expressions = true;
-
-                            // the rebuild abandons every symbol these
-                            // facts are keyed on
-                            i.store_free_facts = null;
 
                             IoC.CONTAINER.instance.logger.clear_global_declaration_diagnostics(i.file_name);
                         od
@@ -2051,58 +2061,6 @@ namespace Analysis is
     ): RequestHandler[Protocol.Request.COMPILE] is
         super();
 
-        // True up the flipped store-free bits by recompiling only the
-        // files that reference a flipped function. True when that fully
-        // covered the flip set; false means the caller must escalate to
-        // the whole-project rebuild - the flip set was unboundable, or a
-        // flipped function's callers can't be enumerated from the
-        // recorded references.
-        _try_targeted_store_free_recompile() -> bool is
-            let flipped = _compiler.last_store_free_flips;
-
-            if !flipped? then
-                return false;
-            fi
-
-            let target_paths = Collections.SET[string]();
-
-            for function in flipped do
-                if !_has_complete_references(function) then
-                    return false;
-                fi
-
-                for reference in IoC.CONTAINER.instance.symbol_use_locations.direct_references_to(function) do
-                    target_paths.add(reference.file_name);
-                od
-            od
-
-            let targets = Collections.LIST[SOURCE_FILE]();
-
-            for source_file in _source_files do
-                if target_paths.contains(source_file.file_name) then
-                    targets.add(source_file);
-                fi
-            od
-
-            if targets.count != target_paths.count then
-                // a reference in a file the analyser doesn't hold can't
-                // be trued up here
-                return false;
-            fi
-
-            // Inside the analysis window, like every other analysis-mode
-            // expression recompile: a diagnostic recorded outside it is
-            // classified as batch output, which the next expression-level
-            // clear deliberately preserves - it would stick forever.
-            IoC.CONTAINER.instance.logger.start_analysis();
-
-            for target in targets do
-                _compiler.recompile_file_expressions(target);
-            od
-
-            return true;
-        si
-
         // A flipped function's callers are enumerable from the recorded
         // references only when calls bind the function itself through
         // ordinary name lookup: a named, source-declared function that
@@ -2152,53 +2110,7 @@ namespace Analysis is
 
             try
                 if !_watchdog.want_restart then
-                    // The incremental EDIT paths recompile expressions
-                    // without re-running infer-store-free, so a store to a
-                    // field added or dropped since the last full build can
-                    // have flipped a function's store-free bit while every
-                    // caller's narrowing was compiled against the old one.
-                    // Re-derive the bits from the retained ASTs; a flip
-                    // means some callers' expression state is stale. When
-                    // the tables are not current a full rebuild runs
-                    // regardless, so the refresh is skipped.
-                    _timers.start("store-free-refresh");
-
-                    let store_free_flipped mut = _compiler.are_tables_current /\ _compiler.refresh_store_free(_source_files);
-
-                    _timers.finish("store-free-refresh");
-
-                    // How many files the refresh re-walked rather than
-                    // serving retained facts - the measure of how well
-                    // fact retention is holding up under the edit mix.
-                    for i in 0.._compiler.last_store_free_walked_files do
-                        _timers.bump("store-free-rewalked-file");
-                    od
-
-                    if store_free_flipped then
-                        // How often an edit actually moves a store-free
-                        // bit decides whether re-deriving at every COMPILE
-                        // tick is the right posture; count flips against
-                        // the refresh count.
-                        _timers.bump("store-free-flip");
-
-                        // A body's narrowings depend only on the bits of
-                        // the functions it references, and recompiling
-                        // expressions cannot move any bit (the store-free
-                        // walk reads nothing compile-expressions writes),
-                        // so recompiling just the files that reference a
-                        // flipped function trues everything up in one
-                        // round - no whole-project rebuild. Falls back to
-                        // the rebuild whenever the flip set or any flipped
-                        // function's reference records can't be trusted to
-                        // be complete.
-                        if _try_targeted_store_free_recompile() then
-                            _timers.bump("store-free-targeted");
-
-                            store_free_flipped = false;
-                        fi
-                    fi
-
-                    if !store_free_flipped /\ !_compiler.is_full_compile_needed then
+                    if !_compiler.is_full_compile_needed then
                         // No interface-affecting edit pending — the rebuild is
                         // skipped. Timed under `compile-skipped` so the
                         // skipped-vs-run split shows in the stats dump.
@@ -2218,7 +2130,7 @@ namespace Analysis is
                         DIAGNOSTICS_COLLECTOR.collect_into(IoC.CONTAINER.instance.logger, diagnostics, checked_paths);
 
                         _timers.finish("compile-skipped");
-                    elif !store_free_flipped /\ _compiler.are_tables_current then
+                    elif _compiler.are_tables_current then
                         // A full compile is needed because some files'
                         // expression-level diagnostics are stale, but the
                         // declaration-level tables already reflect every
@@ -2235,6 +2147,7 @@ namespace Analysis is
                             if !_compiler.is_compiled_through_expressions(i) then
                                 IoC.CONTAINER.instance.logger.clear_expression_diagnostics(i.file_name);
                                 Syntax.Process.RELIANCES.clear_kill_candidates_for(i.file_name);
+                                Syntax.Process.PURE_SLOTS.clear_for(i.file_name);
                             fi
                         od
 
@@ -2270,10 +2183,6 @@ namespace Analysis is
 
                             i.want_compile_up_to_expressions = true;
                             i.want_compile_expressions = true;
-
-                            // the rebuild abandons every symbol these
-                            // facts are keyed on
-                            i.store_free_facts = null;
                         od
 
                         let clear_state = Syntax.Process.CLEAR_STATE_VISITOR();

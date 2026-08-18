@@ -57,22 +57,15 @@ namespace Syntax.Process is
         si
     si
 
-    // Runs after resolve-overrides, before compile-expressions.
-    // Computes for every function declared in the compilation whether
-    // it provably performs no store to any pre-existing heap location
-    // — no field, property, global, indexer or array-element
-    // assignment — directly or through anything a call from its body
-    // could dispatch to. Reads are always harmless; only writes and
-    // unboundable calls disqualify. A call to a store-free function
-    // can never invalidate a field narrowing, which is what
-    // IR.Values.Call.*.is_state_changing_call consumes the bit for.
-    //
-    // The classification runs before types are inferred, so it only
-    // trusts declared types: fields, properties, parameters,
-    // annotated locals, and locals whose initializer type is trivial.
-    // Any call whose callee set it cannot bound — a delegate
-    // invocation, a member of an untyped receiver, an imported
-    // function — disqualifies the caller. Dispatch is bounded using
+    // The body walk behind the infer-effects pass, run after
+    // compile-expressions with the types that pass resolved. Gathers
+    // for every function the facts the effect solvers consume — its
+    // member writes, nulling writes and reads, its bounded callees,
+    // and whether anything in the body defeats bounding — from which
+    // solve_effects derives the member-granular effect relations
+    // (EFFECTS) and the store-free classification written back onto
+    // the symbols. Reads are always harmless; only writes and
+    // unboundable calls disqualify. Dispatch is bounded using
     // resolve-overrides' overrider links; a method reachable through
     // an open class or a trait is never store-free, because an
     // override in another assembly could store.
@@ -85,12 +78,7 @@ namespace Syntax.Process is
     // This pass never reports diagnostics. It runs on incomplete and
     // incorrect code in analysis mode, where the other passes own
     // finding and reporting every problem; anything suspect here just
-    // classifies conservatively. Incremental analysis-mode edit paths
-    // do not re-run it, so their per-edit results can hold stale bits;
-    // COMPILER.refresh_store_free re-runs it at the debounced compile,
-    // and on any flip the compile trues up the files referencing a
-    // flipped function - or rebuilds outright when the flip set can't
-    // be bounded - so callers' narrowings never stay wrong.
+    // classifies conservatively.
     class INFER_STORE_FREE: DefaultVisitor is
         _facts: Collections.MutableMap[Function, STORE_FREE_FACTS];
         _current: STORE_FREE_FACTS?;
@@ -99,56 +87,6 @@ namespace Syntax.Process is
         // The study's record for the function being walked, or null
         // when the study is off. See NARROWING_STUDY.
         _current_record: FUNCTION_EFFECT_FACTS?;
-
-        // Whether the most recent finish_run moved any function's
-        // store-free bit. Only meaningful between finish_run and the
-        // next start_run.
-        _last_run_changed: bool;
-        last_run_changed: bool => _last_run_changed;
-
-        // The functions the most recent finish_run's fixpoint moved, or
-        // null when a broken run made the flip set unboundable. Same
-        // lifetime as last_run_changed.
-        _last_flipped: Collections.List[Function]?;
-        last_flipped: Collections.List[Function]? => _last_flipped;
-
-        // Mirror of _facts scoped to the file currently being walked,
-        // handed back to the caller as the file's reusable fact bucket.
-        // Null outside begin_file_bucket / end_file_bucket.
-        _bucket: Collections.MutableMap[Function, STORE_FREE_FACTS]?;
-
-        // Files whose bodies were actually re-walked during the most
-        // recent finished run, versus absorbed from a retained bucket.
-        // Snapshotted by finish_run; the accumulator resets with each
-        // start_run. Refresh telemetry.
-        _walked_files: int;
-        _last_run_walked_files: int;
-        last_run_walked_files: int => _last_run_walked_files;
-
-        // Start mirroring walked facts into a fresh per-file bucket.
-        begin_file_bucket() is
-            _bucket = Collections.MAP[Function, STORE_FREE_FACTS]();
-            _walked_files = _walked_files + 1;
-        si
-
-        end_file_bucket() -> Collections.MutableMap[Function, STORE_FREE_FACTS] is
-            let result = _bucket!;
-            _bucket = null;
-            return result;
-        si
-
-        // Feed a retained file bucket into this run's facts without
-        // re-walking the file. Callee edges in retained facts can hold
-        // symbol objects an incremental edit has since replaced; the
-        // fixpoint treats such an edge as an unknown target and
-        // classifies the caller conservatively, and the file's bucket is
-        // dropped whenever its expressions recompile, so the pessimism
-        // heals at the next walk.
-        absorb(bucket: Collections.MutableMap[Function, STORE_FREE_FACTS]) is
-            for pair in bucket do
-                _facts[pair.key] = pair.value;
-            od
-        si
 
         // Trivially-derivable static types, including the per-function
         // record of locals whose initializer type was derivable.
@@ -167,7 +105,7 @@ namespace Syntax.Process is
 
             _typer = TRIVIAL_EXPRESSION_TYPER(symbol_table, innate_symbol_lookup);
             _innate_symbol_lookup = innate_symbol_lookup;
-            _local_function_values = Collections.MAP[Symbol, Function]();
+            function_values = FUNCTION_VALUES();
 
             start_run();
         si
@@ -177,8 +115,6 @@ namespace Syntax.Process is
             _typer.reset();
             _current = null;
             _current_function = null;
-            _bucket = null;
-            _walked_files = 0;
         si
 
         // The walk must survive incomplete and incorrect code — it
@@ -210,49 +146,30 @@ namespace Syntax.Process is
         si
 
         // Whether the most recent apply abandoned its walk on an
-        // exception. A partial walk's facts must not be retained as a
-        // file bucket: the functions it never reached would stay absent
-        // from every later run's union instead of getting a fresh walk.
+        // exception. The partial walk's facts stay in this run's union,
+        // which is conservative: whatever was mid-walk keeps its
+        // disqualification.
         _last_walk_failed: bool;
         last_walk_failed: bool => _last_walk_failed;
 
-        // Study-only: repeat the walk reading the types
-        // compile-expressions resolved, rather than the declared-types-
-        // only approximation available when the pass really runs.
+        // Read the types compile-expressions resolved rather than
+        // deriving trivial static types from declarations — the
+        // production setting for the infer-effects pass; off leaves
+        // the declared-types-only approximation, which unit fixtures
+        // without compiled expressions still use.
         set_resolved_mode(on: bool) is
             _typer.use_resolved = on;
             _resolved_mode = on;
+
+            if on then
+                // Before the walk, so a call to one of these is a
+                // trusted leaf rather than a callee edge that poisons
+                // its caller.
+                _trust_value_optional_accessors();
+            fi
         si
 
         _resolved_mode: bool;
-
-        // Facts in, bits out — the graph solving lives in
-        // STORE_FREE_FIXPOINT.
-        finish_run() is
-            _last_run_walked_files = _walked_files;
-
-            try
-                let fixpoint = STORE_FREE_FIXPOINT();
-
-                _last_run_changed = fixpoint.mark(_facts);
-                _last_flipped = fixpoint.flipped;
-
-                _trust_value_optional_accessors();
-            catch ex: Exception
-                // a broken fixpoint must not leave optimistic bits
-                // from a partial write-back behind; treat the run as
-                // having changed, with the flip set unboundable, so any
-                // incremental shortcut escalates
-                _last_run_changed = true;
-                _last_flipped = null;
-
-                for function in _facts.keys do
-                    function.set_store_free(false);
-                od
-            yrt
-
-            start_run();
-        si
 
         // Solve the effect relations over this run's facts and install
         // them for the reliance judge. Called by the infer-effects
@@ -260,8 +177,6 @@ namespace Syntax.Process is
         // file. A failure leaves the registry cleared, which every
         // query answers conservatively.
         solve_effects() is
-            _last_run_walked_files = _walked_files;
-
             try
                 let study = EFFECT_SOLVERS(_facts);
 
@@ -270,7 +185,8 @@ namespace Syntax.Process is
                 let t_w = sw.elapsed_milliseconds;
                 let nulls = study.may_null_sets(false, false);
                 let t_n = sw.elapsed_milliseconds;
-                let store_free = study.solve();
+                let solved = study.solve();
+                let store_free = solved.store_free;
                 let t_s = sw.elapsed_milliseconds;
                 let reads = study.read_sets();
                 let t_r = sw.elapsed_milliseconds;
@@ -283,7 +199,21 @@ namespace Syntax.Process is
                     writes.sets, writes.unbounded,
                     nulls.sets, nulls.unbounded,
                     store_free,
+                    solved.constructs_store_free,
                     reads.sets, reads.unbounded, reads.reads_elements, reads.writes_elements);
+
+                // Mark what the solve proved back onto the symbols,
+                // where the display surfaces read it. Assigned both
+                // ways so a function that stops being provable is
+                // unmarked by the next solve rather than staying
+                // stale-true.
+                for function in _facts.keys do
+                    let root = cast Function?(function.root_specialized_from);
+
+                    if root? then
+                        root.set_proven_store_free(store_free.contains(root));
+                    fi
+                od
 
                 if NARROWING_STUDY.enabled then
                     IO.Std.error.write_line(
@@ -364,7 +294,7 @@ namespace Syntax.Process is
                     let read_function = (cast Semantic.Symbols.Property(member)).read_function;
 
                     if read_function? then
-                        read_function.set_store_free(true);
+                        read_function.mark_declared_pure();
                     fi
                 fi
             od
@@ -421,7 +351,7 @@ namespace Syntax.Process is
             _disqualify_because("unaudited-node:{node.get_type().full_name}");
         si
 
-        // Study-only. Once compile-expressions has run, the node kinds
+        // Once compile-expressions has run, the node kinds
         // this walk never modelled carry enough resolved state to be
         // classified: a `for` names the three iterator members it calls,
         // and every other expression carries the value it compiled to,
@@ -556,7 +486,14 @@ namespace Syntax.Process is
             fi
 
             if let construction: IR.Values.NEW = value then
-                _add_construction_callee(construction.constructor);
+                // constructing a reflected exception writes only the
+                // fresh object — the same trust the declared-types
+                // classification extends, restated here so the edge
+                // to the unwalked BCL constructor does not poison
+                if !_is_store_free_construction(cast Symbol?(construction.constructor.owner)) then
+                    _add_construction_callee(construction.constructor);
+                fi
+
                 _study_note_call_arguments(construction.constructor, construction.arguments);
                 return true;
             fi
@@ -570,7 +507,7 @@ namespace Syntax.Process is
                     return true;
                 fi
 
-                let fn = _function_value_of(call.from);
+                let fn = function_value_of(call.from);
 
                 if fn? then
                     _add_callee(fn);
@@ -594,52 +531,13 @@ namespace Syntax.Process is
             return !value.is_state_changing_call;
         si
 
-        // The function a value denotes, when the value's shape names
-        // one: a lambda literal compiled to a closure, a delegate
-        // constructed from a named function, a function pointer.
-        _function_value_of(value: IR.Values.Value?) -> Function? is
-            if !value? then
-                return null;
-            fi
+        // The resolver from compiled values to the functions they
+        // denote, including the immutable-local record this walk
+        // populates. Shared with the pure-slot judge.
+        function_values: FUNCTION_VALUES public;
 
-            if let view: IR.Values.NARROW_VIEW = value then
-                return _function_value_of(view.underlying);
-            fi
-
-            if let wrapper: IR.Values.WRAPPER = value then
-                return _function_value_of(wrapper.value);
-            fi
-
-            if let load: IR.Values.Load.INSTANCE_ANONYMOUS_FUNCTION = value then
-                return cast Function?(load.symbol);
-            fi
-
-            if let load: IR.Values.Load.STATIC_ANONYMOUS_FUNCTION = value then
-                return cast Function?(load.symbol);
-            fi
-
-            if let load: IR.Values.Load.GLOBAL_ANONYMOUS_FUNCTION = value then
-                return cast Function?(load.symbol);
-            fi
-
-            // an immutable local can only ever hold its initializer's
-            // value, so a load of one denotes whatever function that
-            // named
-            if let load: IR.Values.Load.LOCAL_VARIABLE = value then
-                if _local_function_values.contains_key(load.symbol) then
-                    return _local_function_values[load.symbol];
-                fi
-
-                return null;
-            fi
-
-            return value.referenced_function;
-        si
-
-        // Immutable locals whose initializer named a function value.
-        // Keyed on the local's own symbol, which is unique across the
-        // compilation, so the map never needs clearing.
-        _local_function_values: Collections.MutableMap[Symbol, Function];
+        function_value_of(value: IR.Values.Value?) -> Function? =>
+            function_values.function_value_of(value);
 
         // Record which function values flow into a callee's
         // function-typed parameters. A named value joins the callee's
@@ -654,7 +552,7 @@ namespace Syntax.Process is
             fi
 
             for argument in arguments do
-                let fn = _function_value_of(argument);
+                let fn = function_value_of(argument);
 
                 if fn? then
                     EFFECT_FACTS.note_passed_function(callee, fn);
@@ -1016,10 +914,6 @@ namespace Syntax.Process is
 
                 _facts[symbol] = facts;
 
-                if _bucket? then
-                    _bucket![symbol] = facts;
-                fi
-
                 _current = facts;
                 _current_function = symbol;
 
@@ -1069,7 +963,7 @@ namespace Syntax.Process is
         visit(function: Expressions.FUNCTION) is si
 
         _study_walk_lambda(function: Expressions.FUNCTION) is
-            let symbol = _function_value_of(function.value);
+            let symbol = function_value_of(function.value);
 
             if !symbol? then
                 return;
@@ -1935,11 +1829,11 @@ namespace Syntax.Process is
             fi
 
             if _resolved_mode /\ !(cast Semantic.Symbols.LOCAL_VARIABLE(symbol)).is_mutable_marked then
-                let fn = _function_value_of(
+                let fn = function_value_of(
                     if variable.initializer? then variable.initializer.value else null fi);
 
                 if fn? then
-                    _local_function_values[symbol] = fn;
+                    function_values.note_local(symbol, fn);
                 fi
             fi
 

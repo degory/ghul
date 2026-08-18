@@ -2,29 +2,156 @@ namespace Syntax.Process is
     use Logging;
 
     use Source.LOCATION;
+    use Function = Semantic.Symbols.Function;
 
-    // Enforces pure function-typed slots: a value reaching one must be
-    // a store-free literal, a store-free or declared-pure named
-    // function, or a value whose own static type is already pure.
+    // One value that reached a pure function-typed slot, held until
+    // the effect relations can say whether it is store-free.
+    // `slot_index` is the argument's position for a call record and
+    // -1 for a store: several arguments of one call can fall back to
+    // the same reported location, and the index is what keeps their
+    // records distinct.
+    class PURE_SLOT_RECORD(
+        location: LOCATION,
+        slot_index: int,
+        value: IR.Values.Value?,
+        message: string
+    );
+
+    // Values that reached a pure function-typed slot, recorded while
+    // expressions compile and judged once the effect relations are
+    // solved.
     //
-    // The test is "cannot prove store-free", not "is known to store",
-    // so it is conservative and reports a warning. An unsatisfied
-    // argument also drops heap facts at the call; a store does not,
-    // so for a store the warning is the only signal.
+    // Deferred because a body's own store-freedom is not known until
+    // then: the answer available before expressions are compiled
+    // cannot see the types most receivers are reached through, so it
+    // gives up on bodies that write nothing.
+    //
+    // Held per file and dropped exactly where a file's other
+    // expression-level output is, so an analysis-mode recompile of one
+    // file re-records rather than reporting twice. Speculative walks
+    // are mirrored from the flow: a rolled-back walk's records are
+    // truncated, so an attempt that was scrubbed from the diagnostics
+    // does not report.
+    class PURE_SLOTS is
+        _records: Collections.MAP[string, Collections.LIST[PURE_SLOT_RECORD]] static;
+        _marks: Collections.LIST[int] static;
+
+        init() static is
+            _records = Collections.MAP[string, Collections.LIST[PURE_SLOT_RECORD]]();
+            _marks = Collections.LIST[int]();
+        si
+
+        note(record: PURE_SLOT_RECORD) static is
+            let path = record.location.file_name;
+
+            if !_records.contains_key(path) then
+                _records[path] = Collections.LIST[PURE_SLOT_RECORD]();
+            fi
+
+            _records[path].add(record);
+        si
+
+        clear_for(path: string) static is
+            _records.remove(path);
+        si
+
+        clear() static is
+            _records.clear();
+            _marks.clear();
+        si
+
+        // Speculation, mirrored from NARROWING_FLOW: a record made
+        // inside a walk that is rolled back would otherwise survive the
+        // scrubbing of that walk's diagnostics.
+        speculate() static is
+            _marks.add(_total());
+        si
+
+        commit() static is
+            if _marks.count > 0 then
+                _marks.remove_at(_marks.count - 1);
+            fi
+        si
+
+        roll_back() static is
+            if _marks.count == 0 then
+                return;
+            fi
+
+            let mark = _marks[_marks.count - 1];
+
+            _marks.remove_at(_marks.count - 1);
+            _truncate_to(mark);
+        si
+
+        _total() -> int static is
+            let total mut = 0;
+
+            for entry in _records do
+                total = total + entry.value.count;
+            od
+
+            return total;
+        si
+
+        // Records are appended in walk order across files, so dropping
+        // the newest until the total is back to the mark drops exactly
+        // what the speculative walk added.
+        _truncate_to(mark: int) static is
+            while _total() > mark do
+                let dropped mut = false;
+
+                for entry in _records do
+                    let list = entry.value;
+
+                    if list.count > 0 then
+                        list.remove_at(list.count - 1);
+                        dropped = true;
+                    fi
+                od
+
+                if !dropped then
+                    return;
+                fi
+            od
+        si
+
+        // Hand over what has been recorded and start fresh: the caller
+        // reports against the relations just solved. One record per
+        // location: a body re-walked to convergence (overload retry,
+        // delegate conversion) records the same slot once per walk,
+        // and the last walk is the one whose compilation stands.
+        take() -> Collections.List[PURE_SLOT_RECORD] static is
+            let by_slot = Collections.MAP[(LOCATION, int), PURE_SLOT_RECORD]();
+
+            for entry in _records do
+                for record in entry.value do
+                    by_slot[(record.location, record.slot_index)] = record;
+                od
+            od
+
+            _records.clear();
+            _marks.clear();
+
+            let taken = Collections.LIST[PURE_SLOT_RECORD]();
+
+            for pair in by_slot do
+                taken.add(pair.value);
+            od
+
+            return taken;
+        si
+    si
+
+    // Records values reaching pure function-typed slots as expressions
+    // compile. The judgement itself is PURE_SLOT_JUDGE, after the
+    // effect relations are solved.
     class PURE_SLOT_CHECK is
-        _logger: Logger;
-        _flow: NARROWING_FLOW;
         _build_flags: Compiler.GLOBAL_BUILD_FLAGS;
 
-        init(
-            logger: Logger,
-            flow: NARROWING_FLOW,
-            build_flags: Compiler.GLOBAL_BUILD_FLAGS
-        ) is
+        init(build_flags: Compiler.GLOBAL_BUILD_FLAGS) is
             super.init();
 
-            _logger = logger;
-            _flow = flow;
             _build_flags = build_flags;
         si
 
@@ -43,23 +170,23 @@ namespace Syntax.Process is
             value: IR.Values.Value?,
             syntax_arguments: Trees.Expressions.LIST?
         ) is
-            let function: Semantic.Symbols.Function? mut = null;
+            if _build_flags.no_warn_impure_function_value then
+                return;
+            fi
+
+            let function: Function? mut = null;
             let arguments: Collections.List[IR.Values.Value]? mut = null;
 
-            if isa IR.Values.Call.INSTANCE(value) then
-                let call = cast IR.Values.Call.INSTANCE(value);
+            if let call: IR.Values.Call.INSTANCE = value then
                 function = call.function;
                 arguments = call.arguments;
-            elif isa IR.Values.Call.GLOBAL(value) then
-                let call = cast IR.Values.Call.GLOBAL(value);
+            elif let call: IR.Values.Call.GLOBAL = value then
                 function = call.function;
                 arguments = call.arguments;
-            elif isa IR.Values.Call.STATIC(value) then
-                let call = cast IR.Values.Call.STATIC(value);
+            elif let call: IR.Values.Call.STATIC = value then
                 function = call.function;
                 arguments = call.arguments;
-            elif isa IR.Values.Call.STRUCT(value) then
-                let call = cast IR.Values.Call.STRUCT(value);
+            elif let call: IR.Values.Call.STRUCT = value then
                 function = call.function;
                 arguments = call.arguments;
             else
@@ -73,16 +200,13 @@ namespace Syntax.Process is
                     return;
                 fi
 
-                if formals[i].is_pure_function /\ !is_satisfied(arguments[i]) then
-                    if !_build_flags.no_warn_impure_function_value then
-                        _logger.warn(
+                if formals[i].is_pure_function then
+                    PURE_SLOTS.note(
+                        PURE_SLOT_RECORD(
                             _argument_location(syntax_arguments, i, arguments.count, location),
-                            "impure-function-value",
-                            "argument must be a pure function"
-                        );
-                    fi
-
-                    _flow.on_call(location);
+                            i,
+                            arguments[i],
+                            "argument must be a pure function"));
                 fi
             od
         si
@@ -92,12 +216,47 @@ namespace Syntax.Process is
             index: int,
             count: int,
             fallback: LOCATION
-        ) -> LOCATION =>
-            if syntax_arguments? /\ syntax_arguments.count == count then
-                syntax_arguments.expressions[index].location
-            else
-                fallback
-            fi;
+        ) -> LOCATION is
+            let syntax_index = _syntax_index(syntax_arguments, index, count);
+
+            if syntax_index >= 0 then
+                return syntax_arguments!.expressions[syntax_index].location;
+            fi
+
+            return fallback;
+        si
+
+        // The written argument standing behind built argument
+        // `index`, or -1 when the two lists cannot be aligned. Equal
+        // counts align directly; one extra built argument is the
+        // thread-first `\|>` shape, where the threaded value is the
+        // built call's first argument and the written list supplies
+        // the rest. Anything else is a lowering this cannot see
+        // through, and the caller falls back to the built value and
+        // the call's own location.
+        _syntax_index(
+            syntax_arguments: Trees.Expressions.LIST?,
+            index: int,
+            count: int
+        ) -> int is
+            if !syntax_arguments? then
+                return -1;
+            fi
+
+            let offset = count - syntax_arguments.count;
+
+            if offset != 0 /\ offset != 1 then
+                return -1;
+            fi
+
+            let syntax_index = index - offset;
+
+            if syntax_index < 0 then
+                return -1;
+            fi
+
+            return syntax_index;
+        si
 
         // A value stored into a slot whose type is a pure function
         // type. The slot's type is a claim that it holds store-free
@@ -106,11 +265,49 @@ namespace Syntax.Process is
         check_store(location: LOCATION, target_type: Semantic.Types.Type?, value: IR.Values.Value?) is
             if
                 target_type? /\ target_type.is_pure_function /\
-                !is_satisfied(value) /\
                 !_build_flags.no_warn_impure_function_value
             then
-                _logger.warn(location, "impure-function-value", "value must be a pure function");
+                PURE_SLOTS.note(PURE_SLOT_RECORD(location, -1, value, "value must be a pure function"));
             fi
+        si
+    si
+
+    // Judges what reached a pure function-typed slot, once the effect
+    // relations can answer whether each value is store-free.
+    //
+    // The test is "cannot prove store-free", not "is known to store",
+    // so it is conservative and reports a warning.
+    class PURE_SLOT_JUDGE is
+        _logger: Logger;
+
+        // Resolves a compiled value to the function it denotes,
+        // including a lambda literal's closure and an immutable local
+        // holding one. Owned by INFER_STORE_FREE, whose resolved walk
+        // populates the local-value map this consults.
+        _functions: FUNCTION_VALUES;
+
+        init(logger: Logger, functions: FUNCTION_VALUES) is
+            super.init();
+
+            _logger = logger;
+            _functions = functions;
+        si
+
+        judge() is
+            let trace = System.Environment.get_environment_variable("GHUL_PURE_SLOT_TRACE")?;
+
+            for record in PURE_SLOTS.take() do
+                if !is_satisfied(record.value) then
+                    if trace then
+                        let function = _functions.function_value_of(record.value);
+
+                        IO.Std.error.write_line(
+                            "pure-slot miss at {record.location}: value kind {record.value?.get_type()} resolved {function} effects {EFFECTS.is_store_free(function)} type {record.value?.type}");
+                    fi
+
+                    _logger.warn(record.location, "impure-function-value", record.message);
+                fi
+            od
         si
 
         is_satisfied(argument: IR.Values.Value?) -> bool is
@@ -118,35 +315,41 @@ namespace Syntax.Process is
                 return true;
             fi
 
-            // A reference is typed with the type of the slot it is
-            // read into, so where it names a known function that
-            // function's own store-free bit decides.
-            if let function = argument.referenced_function then
-                return _is_store_free(function);
+            // A read of a slot already typed pure — a local, field or
+            // parameter — is trusted on the type: the store into that
+            // slot is where this same check made the value show
+            // itself, and re-reporting every later read of a slot
+            // whose one offending store was already reported would be
+            // noise.
+            if _is_pure_typed_slot_read(argument) then
+                return true;
             fi
 
-            if argument.has_symbol then
-                let symbol = argument.symbol;
-
-                if isa Semantic.Symbols.Function(symbol) then
-                    return _is_store_free(cast Semantic.Symbols.Function(symbol));
-                elif isa Semantic.Symbols.Variable(symbol) /\ symbol.type? /\ symbol.type.is_pure_function then
-                    return true;
-                fi
+            // A lambda literal, a named function, or an immutable
+            // local holding one: the function's own store-free answer
+            // decides, whether declared, whitelisted or solved.
+            if let function = _functions.function_value_of(argument) then
+                return EFFECTS.is_store_free(function);
             fi
 
+            // Otherwise only the value's own type can say: a slot
+            // already declared pure holds store-free values by the
+            // same contract this check enforces at its stores.
             return argument.type? /\ argument.type.is_pure_function;
         si
 
-        // A literal is answered by what its body did, since
-        // infer-store-free only covers named functions; a named
-        // function by its store-free bit, which a `pure` declaration
-        // sets without the body being provable.
-        _is_store_free(function: Semantic.Symbols.Function) -> bool =>
-            if isa Semantic.Symbols.Closure(function) then
-                function.is_store_free \/ !function.literal_body_impure
-            else
-                function.is_store_free
-            fi;
+        _is_pure_typed_slot_read(argument: IR.Values.Value) -> bool is
+            if !argument.type? \/ !argument.type.is_pure_function then
+                return false;
+            fi
+
+            return
+                isa IR.Values.Load.LOCAL_VARIABLE(argument) \/
+                isa IR.Values.Load.LOCAL_ARGUMENT(argument) \/
+                isa IR.Values.Load.ARGUMENT_SLOT(argument) \/
+                isa IR.Values.Load.INSTANCE_FIELD(argument) \/
+                isa IR.Values.Load.STATIC_FIELD(argument) \/
+                isa IR.Values.Load.GLOBAL_FIELD(argument);
+        si
     si
 si

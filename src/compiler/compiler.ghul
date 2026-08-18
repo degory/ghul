@@ -88,19 +88,7 @@ namespace Compiler is
                     container.resolve_overrides.check_duplicate_global_functions();
                 si
             );
-            add_pass(
-                build_passes,
-                "infer-store-free",
-                () -> void is
-                    container.infer_store_free.start_run();
-                si,
-                (source_file) -> bool => infer_store_free_pass(source_file),
-                () -> void is
-                    container.infer_store_free.finish_run();
-                si
-            );
             add_pass(build_passes, "register-source-intrinsics", (source_file) -> bool => register_source_intrinsics_pass(source_file));
-            add_pass(build_passes, "check-pure-overrides", (source_file) -> bool => check_pure_overrides_pass(source_file));
             add_pass(build_passes, "record-type-argument-uses", (source_file) -> bool => record_type_argument_uses_pass(source_file));
 
             add_pass(build_passes, "mark-boxed-locals", (source_file) -> bool => mark_boxed_locals_pass(source_file));
@@ -140,8 +128,9 @@ namespace Compiler is
                     // consumption of a value that was loaded through a
                     // narrowing fact — see JUDGE_RELIANCES.
                     run_reliance_judge(source_files);
+                    run_post_effects_purity_checks(source_files);
 
-                    if Syntax.Process.NARROWING_STUDY.enabled /\ stopwatch? then
+                    if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? /\ stopwatch? then
                         IO.Std.error.write_line("effects round: {stopwatch.elapsed_milliseconds} ms (walk {walk_ms} solve {solve_ms - walk_ms} judge {stopwatch.elapsed_milliseconds - solve_ms})");
                     fi
                 si
@@ -254,12 +243,9 @@ namespace Compiler is
 
             // Every previously-queued file's expression-level state now
             // references symbols that have just been abandoned. Drop the
-            // marker so query handlers can tell, and the retained
-            // store-free facts, whose keys and callee edges are those
-            // abandoned symbols.
+            // marker so query handlers can tell.
             for f in source_files do
                 f.compiled_through = null;
-                f.store_free_facts = null;
             od
         si
 
@@ -379,6 +365,7 @@ namespace Compiler is
 
             Syntax.Process.RELIANCES.reset_counters();
             Syntax.Process.RELIANCES.clear_kill_candidates();
+            Syntax.Process.PURE_SLOTS.clear();
 
             build(build_passes, source_files);
 
@@ -486,55 +473,6 @@ namespace Compiler is
             container.compile_expressions.report_field_assignments();
         si
 
-        // Re-derive every function's store-free bit from the retained
-        // ASTs and report whether any bit moved. The incremental EDIT
-        // paths recompile expressions without re-running infer-store-free,
-        // so a body edit that adds or drops a store, or changes a callee
-        // set, can flip a callee's bit while every caller's narrowing was
-        // computed against the old one. The whole-program fixpoint needs
-        // facts from every file, so this walks them all; comparing the
-        // fresh bits against the previous run tells the debounced compile
-        // whether trusting the incremental expression state is still
-        // sound. compiled_through is untouched - only the bits are. The
-        // file set is passed in: the compiler's own queue is cleared
-        // between builds, so the analysis handler owns the live set.
-        refresh_store_free(files: Collections.Iterable[SOURCE_FILE]) -> bool is
-            let symbol_table = container.symbol_table;
-
-            container.infer_store_free.start_run();
-
-            for source_file in files do
-                source_file.want_compile_up_to_expressions = true;
-
-                let symbol_table_mark = symbol_table.mark_scope_stack();
-
-                try
-                    infer_store_free_pass(source_file);
-                catch e: Exception
-                    logger.exception(source_file.definition.location, e, "caught exception refreshing store-free bits for {source_file}");
-                finally
-                    symbol_table.release_scope_stack(symbol_table_mark);
-                    container.namespaces.pop_all_namespaces();
-                yrt
-            od
-
-            container.infer_store_free.finish_run();
-
-            return container.infer_store_free.last_run_changed;
-        si
-
-        // The functions the most recent refresh_store_free flipped, or
-        // null when the flip set could not be bounded. Read by the
-        // debounced compile to true up just the files referencing a
-        // flipped function instead of rebuilding the whole project.
-        last_store_free_flips: Collections.List[Semantic.Symbols.Function]? =>
-            container.infer_store_free.last_flipped;
-
-        // How many files the most recent refresh_store_free actually
-        // re-walked, versus serving retained facts. Refresh telemetry.
-        last_store_free_walked_files: int =>
-            container.infer_store_free.last_run_walked_files;
-
         // Drop what compile-expressions left behind for one file and put
         // it back in the set that pass has yet to walk. A CE-output-only
         // clear (preserve_resolved_types) drops that output - including
@@ -552,10 +490,6 @@ namespace Compiler is
             container.state_store_registry.drop_file(source_file.file_name);
 
             source_file.compiled_through = null;
-
-            // this file's bodies are rebinding, so facts derived from
-            // the old bindings no longer describe it
-            source_file.store_free_facts = null;
         si
 
         // Recompile one file's expressions against the current symbol
@@ -565,6 +499,7 @@ namespace Compiler is
 
             logger.clear_expression_diagnostics(source_file.file_name);
             Syntax.Process.RELIANCES.clear_kill_candidates_for(source_file.file_name);
+            Syntax.Process.PURE_SLOTS.clear_for(source_file.file_name);
 
             compile_expressions_only(source_file);
         si
@@ -574,9 +509,9 @@ namespace Compiler is
         // symbol table. The appended subtree is new - nothing referenced
         // it before this edit - so no retained symbol changes and no other
         // file's state is touched: each pass walks only the new nodes.
-        // infer-store-free is not re-run; the new functions carry no
-        // store-free bit, which is the sound not-proven default until the
-        // next full rebuild. Namespaces named by the new declarations
+        // The new functions carry no proven store-free bit, which is
+        // the sound not-proven default until the next effects solve.
+        // Namespaces named by the new declarations
         // merge into the retained namespace map exactly as they would in
         // a full build.
         build_appended(source_file: SOURCE_FILE, new_definitions: Syntax.Trees.Definitions.LIST) is
@@ -1051,41 +986,6 @@ namespace Compiler is
             return false;
         si
 
-        infer_store_free_pass(source_file: SOURCE_FILE) -> bool is
-            let definition = source_file.definition;
-
-            if source_file.want_compile_up_to_expressions then
-                let infer_store_free = container.infer_store_free;
-
-                // A file whose tree and bindings are unchanged since its
-                // facts were last derived contributes them as-is; only
-                // stale files pay the body re-walk. The fixpoint always
-                // runs over the whole run's union, so cross-file
-                // propagation is unaffected.
-                if let retained_facts = source_file.store_free_facts then
-                    infer_store_free.absorb(retained_facts);
-
-                    return true;
-                fi
-
-                infer_store_free.begin_file_bucket();
-
-                infer_store_free.apply(definition);
-
-                let bucket = infer_store_free.end_file_bucket();
-
-                // an abandoned walk's partial facts stay in this run's
-                // union (conservative) but are not retained for reuse
-                if !infer_store_free.last_walk_failed then
-                    source_file.store_free_facts = bucket;
-                fi
-
-                return true;
-            fi
-
-            return false;
-        si
-
         // The infer-effects pass as a directly callable round, for the
         // analysis-mode COMPILE paths that recompile expressions
         // without running the pass list: re-walk every file's bodies
@@ -1110,6 +1010,25 @@ namespace Compiler is
             Syntax.Process.EFFECT_FACTS.collecting = false;
 
             run_reliance_judge(files);
+            run_post_effects_purity_checks(files);
+        si
+
+        // The two purity checks that need a body's own store-freedom:
+        // what reached a pure function-typed slot, and whether an
+        // operator or override that has to be pure actually is. Both
+        // ask the solved effect relations, so both run here rather
+        // than against the declared-types-only approximation that is
+        // all a pass before compile-expressions could have.
+        run_post_effects_purity_checks(files: Collections.Iterable[SOURCE_FILE]) is
+            Syntax.Process.PURE_SLOT_JUDGE(
+                container.logger,
+                container.infer_store_free.function_values).judge();
+
+            for source_file in files do
+                if source_file.want_compile_up_to_expressions then
+                    check_pure_overrides_pass(source_file);
+                fi
+            od
         si
 
         // A reliance error belongs to the body that leaned on the
@@ -1124,11 +1043,23 @@ namespace Compiler is
                 container.symbol_table,
                 container.namespaces);
 
+            // Consumptions are re-derived and re-reported against this
+            // round's solve for every file, recompiled or not, so the
+            // round owns its diagnostics: drop the previous round's and
+            // stamp this round's. The kill report stays outside the
+            // window — its candidates are taken once, so its output
+            // must persist the way any other expression diagnostic
+            // does.
+            logger.clear_reliance_diagnostics();
+            logger.set_is_judging_reliances(true);
+
             for source_file in files do
                 if source_file.want_compile_up_to_expressions then
                     judge.apply(source_file.definition);
                 fi
             od
+
+            logger.set_is_judging_reliances(false);
 
             judge.report_narrowing_kills();
 
