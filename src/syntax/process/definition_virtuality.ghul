@@ -1,0 +1,342 @@
+namespace Syntax.Process is
+    use Source.LOCATION;
+    use Trees;
+
+    use Logging.Logger;
+
+    use Semantic.Symbols.Classy;
+    use Semantic.Symbols.Function;
+    use Semantic.Symbols.Symbol;
+
+    // Walks the AST after resolve-overrides and announces, as an
+    // editor-only inlay at each declared name, what the compiler knows
+    // about that declaration's place in the dispatch hierarchy. ghūl
+    // writes none of it: there is no `virtual`, `override`, `sealed` or
+    // `final` keyword, and `abstract` is never written on a method, so a
+    // reader otherwise has to reconstruct the answer from the rest of
+    // the assembly.
+    //
+    // The glyphs, in the order they are emitted:
+    //
+    //   ◆  abstract — no body, so an implementor has to supply one
+    //   ▲  overrides a base member
+    //   ▼  overridden by a more derived member
+    //   ○  an override could exist outside this assembly
+    //
+    // A declaration that earns none of them gets no inlay at all. That
+    // is the common case — a member that neither overrides nor is
+    // overridden and cannot be — and marking it would put ghost text on
+    // nearly every line, so absence carries it.
+    //
+    // A type's header already states its base type, `abstract` and
+    // `open`, so only what the header does not say is announced: `▼`
+    // when something in the assembly extends or implements it, and `◆`
+    // when it is abstract by inference from a body-less method rather
+    // than by the modifier. Only a class or a trait can earn either: a
+    // struct is extended by nothing, and a union's extenders are its
+    // variants, declared in its own body a line below.
+    //
+    // Both accessors of a property are declared at the property's own
+    // name, so a readable-and-assignable property produces two carriers
+    // at one column; DEFINITION_VIRTUALITY_MERGER folds them into one
+    // hint whose hover answers for each half separately.
+    //
+    // Emission is gated on `Logger.want_hint_for`, which is false
+    // outside analysis mode and for a file the client has not opened,
+    // so a batch build walks the tree and records nothing.
+    class DEFINITION_VIRTUALITY: Visitor is
+        // Base slug. An accessor carrier appends its half so the merger
+        // can tell a get/set pair from two unrelated carriers that
+        // happen to share a column.
+        CODE: string static => "definition-virtuality";
+
+        ABSTRACT: string static => "◆";
+        OVERRIDES: string static => "▲";
+        OVERRIDDEN: string static => "▼";
+        OPEN: string static => "○";
+
+        _logger: Logger;
+        _symbol_table: Semantic.SYMBOL_TABLE;
+
+        init(logger: Logger, symbol_table: Semantic.SYMBOL_TABLE) is
+            super.init();
+
+            _logger = logger;
+            _symbol_table = symbol_table;
+        si
+
+        apply(source_file: Compiler.SOURCE_FILE) is
+            if !_logger.want_hint_for(source_file.definition.location) then
+                return;
+            fi
+
+            source_file.definition.walk(self);
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            let name = function.name;
+
+            if !name? then
+                return;
+            fi
+
+            let symbol = _function_for(function);
+
+            if !symbol? then
+                return;
+            fi
+
+            // A constructor is reached by construction rather than by
+            // dispatch, so it has no virtuality to report.
+            if symbol.is_constructor then
+                return;
+            fi
+
+            let half = _accessor_half(function);
+
+            // A member the compiler wrote — a union's `=~`, its
+            // `get_hash_code`, the `object.equals` bridge — is announced
+            // at the declaration it was synthesised from, where it reads
+            // as a claim about code the user can see. Property and
+            // indexer accessors are synthesised too but stand for a
+            // member that was written, so they stay.
+            if (function.is_synthesized \/ symbol.is_internal) /\ !half? then
+                return;
+            fi
+
+            // A body-less method of a ghūl class is not declared as an
+            // abstract symbol — the class is marked implicitly abstract
+            // and the method gets a throwing body — so the symbol alone
+            // would answer only for a trait member or an import.
+            let body = function.body;
+            let is_abstract = symbol.is_abstract \/ !body? \/ body.is_null;
+            // Names in the hover read relative to the declaring type,
+            // the scope a reader looking at this declaration is in.
+            let scope = cast Semantic.Scope?(symbol.owner);
+
+            let overridees = _described(symbol.overridees, scope);
+            let overriders = _described(symbol.overriders, scope);
+            let is_open = symbol.is_openly_dispatchable /\ !_owner_is_union(symbol);
+
+            if !is_abstract /\ overridees.count == 0 /\ overriders.count == 0 /\ !is_open then
+                return;
+            fi
+
+            let prefix = if half? then "{half} " else "" fi;
+
+            let glyphs = System.Text.StringBuilder();
+            let notes = Collections.LIST[string]();
+
+            if is_abstract then
+                glyphs.append(ABSTRACT);
+                notes.add("{prefix}{ABSTRACT} abstract");
+            fi
+
+            if overridees.count > 0 then
+                glyphs.append(OVERRIDES);
+                notes.add("{prefix}{OVERRIDES} overrides {_join(overridees)}");
+            fi
+
+            if overriders.count > 0 then
+                glyphs.append(OVERRIDDEN);
+                notes.add("{prefix}{OVERRIDDEN} overridden by {_join(overriders)}");
+            fi
+
+            if is_open then
+                glyphs.append(OPEN);
+                notes.add("{prefix}{OPEN} can be overridden outside this assembly");
+            fi
+
+            let code = if half? then "{CODE}-{half}" else CODE fi;
+
+            _logger.inlay(name.location, code, "{glyphs}", "{_subject(function)}\n\n{_bullets(notes)}");
+        si
+
+        visit(`class: Definitions.CLASS) is
+            _announce_type(`class, `class.name);
+        si
+
+        visit(`trait: Definitions.TRAIT) is
+            _announce_type(`trait, `trait.name);
+        si
+
+        _announce_type(node: Trees.Node, name: Trees.Identifiers.Identifier?) is
+            if !name? then
+                return;
+            fi
+
+            let symbol = _classy_for(node);
+
+            if !symbol? then
+                return;
+            fi
+
+            let implementors = _described(symbol.implementors, symbol.enclosing_scope);
+            let is_implicitly_abstract = symbol.is_implicitly_abstract;
+
+            if !is_implicitly_abstract /\ implementors.count == 0 then
+                return;
+            fi
+
+            let glyphs = System.Text.StringBuilder();
+            let notes = Collections.LIST[string]();
+
+            if is_implicitly_abstract then
+                glyphs.append(ABSTRACT);
+                notes.add("{ABSTRACT} abstract — inferred from a body-less method, not written");
+            fi
+
+            if implementors.count > 0 then
+                glyphs.append(OVERRIDDEN);
+
+                let verb = if symbol.is_trait then "implemented by" else "extended by" fi;
+
+                notes.add("{OVERRIDDEN} {verb} {_join(implementors)}");
+            fi
+
+            _logger.inlay(name.location, CODE, "{glyphs}", "{name.name}\n\n{_bullets(notes)}");
+        si
+
+        // What this declaration is called in the hover's first line. An
+        // accessor is named for the property or indexer it serves rather
+        // than for the `$get_` / `get_` symbol the rewriter gave it.
+        _subject(function: Definitions.FUNCTION) -> string is
+            let property = function.for_property;
+
+            if property? /\ property.name? then
+                return property.name.name;
+            fi
+
+            if function.for_indexer? then
+                return "[]";
+            fi
+
+            return function.name!.name;
+        si
+
+        // "get" / "set" for a property or indexer accessor, null for a
+        // method — which is also what tells the merger whether a carrier
+        // is one half of a pair.
+        _accessor_half(function: Definitions.FUNCTION) -> string? is
+            if !function.for_property? /\ !function.for_indexer? then
+                return null;
+            fi
+
+            return if function.is_assign_accessor then "set" else "get" fi;
+        si
+
+        _bullets(notes: Collections.Iterable[string]) -> string is
+            let body = System.Text.StringBuilder();
+
+            for n in notes do
+                if body.length > 0 then
+                    body.append("\n");
+                fi
+
+                body.append("- ").append(n);
+            od
+
+            return "{body}";
+        si
+
+        _join(names: Collections.Iterable[string]) -> string is
+            let joined = System.Text.StringBuilder();
+
+            for n in names do
+                if joined.length > 0 then
+                    joined.append(", ");
+                fi
+
+                joined.append("`").append(n).append("`");
+            od
+
+            return "{joined}";
+        si
+
+        // The related symbols, each rendered as its declaration head by
+        // the same renderer the hover uses. Two entries describing one
+        // declaration — a specialization and the generic it came from —
+        // collapse to a single line, decided on the declaration each
+        // entry specialized from rather than on how the two render:
+        // distinct declarations can render alike, and dropping one of
+        // those would answer "who overrides this?" with a list shorter
+        // than the truth.
+        //
+        // Names render relative to `scope`, so a name that is
+        // unambiguous where the reader is looking stays short and one
+        // that is not carries the least prefix that distinguishes it.
+        _described(symbols: Collections.Iterable[Symbol]?, scope: Semantic.Scope?) -> Collections.LIST[string] is
+            let described = Collections.LIST[string]();
+
+            if !symbols? then
+                return described;
+            fi
+
+            let seen = Collections.LIST[Symbol]();
+
+            let use render_scope = IoC.CONTAINER.instance.name_display.with_scope(scope);
+
+            for s in symbols do
+                let declaration = s.root_specialized_from;
+
+                if seen.contains(declaration) then
+                    continue;
+                fi
+
+                seen.add(declaration);
+                described.add(_describe(s));
+            od
+
+            return described;
+        si
+
+        // A member is named by its whole declaration head, because that
+        // is what tells two overloads apart — the case where a bare name
+        // would answer "who overrides this?" with one entry standing for
+        // two. A type is named by its name alone: its declaration head
+        // adds only the kind, which the surrounding sentence already
+        // says, and drops the namespace that distinguishes two types
+        // sharing a short name.
+        _describe(symbol: Symbol) -> string =>
+            if symbol.is_type then
+                IoC.CONTAINER.instance.name_display.name_for(symbol)
+            else
+                "{symbol}"
+            fi;
+
+        // A union's variants are its whole set of subtypes and are
+        // declared in its own body, so nothing outside the assembly can
+        // add one however the openness default reads.
+        _owner_is_union(symbol: Symbol) -> bool is
+            let owner = symbol.owner;
+
+            if !owner? \/ !isa Classy(owner) then
+                return false;
+            fi
+
+            let classy = cast Classy(owner);
+
+            return classy.is_union \/ classy.is_variant;
+        si
+
+        _function_for(node: Trees.Node) -> Function? is
+            let scope = _symbol_table.scope_for(node);
+
+            if !scope? then
+                return null;
+            fi
+
+            return cast Function?(scope.underlying_scope);
+        si
+
+        _classy_for(node: Trees.Node) -> Classy? is
+            let scope = _symbol_table.scope_for(node);
+
+            if !scope? then
+                return null;
+            fi
+
+            return cast Classy?(scope.underlying_scope);
+        si
+    si
+si
