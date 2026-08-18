@@ -14,22 +14,36 @@ namespace Analysis is
     use Compiler;
 
     class COMMAND_DESPATCHER(
-        _reader: IO.TextReader,
+        _reader: REQUEST_READER,
         _writer: IO.TextWriter,
         _timers: TIMERS,
         _log: IO.TextWriter,
         _watchdog: WATCHDOG,
+        _full_compiler: FULL_COMPILER,
         _want_stats_report: bool,
         _idle_timeout_seconds: int
     ) is
         _command_map: Collections.MAP[System.Type,CommandHandler];
+
+        // The request variants that may be answered part-way through a
+        // compile. See serve_pending_queries for what qualifies.
+        _interleavable: Collections.SET[System.Type];
+
         _last_report_time: System.DateTime;
 
         _listening: bool;
 
+        // Guards against re-entering the interleave: a query served from
+        // inside a compile can reach a handler that compiles in turn,
+        // and its file boundaries would otherwise start another round.
+        _serving_pending: bool;
+
         init(..) is
             _last_report_time = System.DateTime.now;
             _command_map = Collections.MAP[System.Type,CommandHandler]();
+            _interleavable = Collections.SET[System.Type]();
+
+            _reader.start();
         si
 
         // The compiler's own version, sourced from the entry assembly's
@@ -56,33 +70,43 @@ namespace Analysis is
         // unqualified class name (e.g. `HOVER`, `FORMAT_RANGE`) labels the
         // per-command timer in the stats report.
         add_handler(request_variant: System.Type, command_handler: CommandHandler) is
+            add_handler(request_variant, command_handler, false);
+        si
+
+        // As above, with `can_interleave` marking the variant as one
+        // serve_pending_queries may answer part-way through a compile.
+        add_handler(request_variant: System.Type, command_handler: CommandHandler, can_interleave: bool) is
             assert !_command_map.contains_key(request_variant) else "replacing command handler for {request_variant.name}";
 
             _command_map[request_variant] = command_handler;
+
+            if can_interleave then
+                _interleavable.add(request_variant);
+            fi
         si
 
-        // Wait for the next request, exiting instead if none arrives within
-        // the idle timeout. Returns null at end of input, which the caller
-        // already treats as "shut down".
+        // Wait for the next frame the reader thread queued, exiting
+        // instead if none arrives within the idle timeout.
         //
         // Idle-exit lives here rather than in WATCHDOG because it is decided
         // by the absence of work rather than by anything a compile revealed,
         // and because this is the one place the analyser is provably between
         // requests: exiting from anywhere else could truncate a response.
-        read_next_request() -> Protocol.Request? is
-            if _idle_timeout_seconds <= 0 then
-                return Protocol.JSON_PROTOCOL.read_request(_reader);
-            fi
+        read_next_frame() -> QueuedFrame is
+            let frame =
+                _reader.take(
+                    if _idle_timeout_seconds <= 0 then
+                        0
+                    else
+                        _idle_timeout_seconds * 1000
+                    fi
+                );
 
-            let result = Protocol.JSON_PROTOCOL.read_request_or_timeout(_reader, _idle_timeout_seconds * 1000);
-
-            if let request: Protocol.ReadResult.REQUEST = result then
-                return request.request;
-            elif isa Protocol.ReadResult.TIMED_OUT(result) then
+            if isa QueuedFrame.TIMED_OUT(frame) then
                 exit_idle();
             fi
 
-            return null;
+            return frame;
         si
 
         // Announce the exit and go. Distinct from WATCHDOG.recycle, which
@@ -123,65 +147,76 @@ namespace Analysis is
                 // empty and blanks the file.
                 listen_capabilities.add("edit-deltas");
 
+                // A query sent while a compile is running is answered
+                // during it rather than after it. Nothing about the wire
+                // changes - a client that ignores this and waits for its
+                // response as before is served exactly as it was - but a
+                // client that pipelines queries against a compile can
+                // know it will get answers rather than a stall.
+                listen_capabilities.add("mid-compile-queries");
+
                 Protocol.JSON_PROTOCOL.write_response(_writer, Protocol.Response.LISTEN(listen_capabilities, current_compiler_version()));
 
                 _listening = true;
             fi
 
-            let request: Protocol.Request? mut = null;
+            let frame = read_next_frame();
 
-            try
-                request = read_next_request();
-            catch ex: Exception
+            if let parse_error: QueuedFrame.PARSE_ERROR = frame then
                 // A frame the analyser couldn't deserialize is a protocol
                 // mismatch, not analyser instability - typically a client
                 // sending a request variant the analyser doesn't know
                 // (older analyser + newer client). Answer with a discrete
                 // error frame so the client can surface it, and keep the
                 // process alive to serve subsequent requests.
-                _log.write_line("ghūl: could not parse request: {ex.get_type()} {ex.message}");
+                _log.write_line("ghūl: could not parse request: {parse_error.message}");
 
                 Protocol.JSON_PROTOCOL.write_response(
                     _writer,
-                    Protocol.Response.ERROR("parse", "{ex.get_type().name}: {ex.message}", "")
+                    Protocol.Response.ERROR("parse", parse_error.message, "")
                 );
 
                 _watchdog.on_operation_complete(_writer);
 
                 return true;
-            yrt
+            fi
 
-            if !request? then
+            let queued = cast QueuedFrame.REQUEST?(frame);
+
+            if !queued? then
                 _log.write_line("ghūl: reader is at end");
                 _log.flush();
 
                 return false;
             fi
 
+            let request = queued.request;
+
+            despatch(request);
+
+            _watchdog.on_operation_complete(_writer);
+
+            if _want_stats_report then
+                let elapsed_since_last_report = System.DateTime.now.subtract(_last_report_time);
+
+                if elapsed_since_last_report.total_seconds > 60.0D then
+                    _last_report_time = System.DateTime.now;
+
+                    _log.write(_timers);
+                fi
+            fi
+
+            return true;
+        si
+
+        // Route one request to its handler and time it. Reached both from
+        // poll and, for the interleavable variants, from
+        // serve_pending_queries.
+        despatch(request: Protocol.Request) is
             let request_variant = request.get_type();
             let command_name = request_variant.name;
 
-            if _command_map.contains_key(request_variant) then
-                let handler = _command_map[request_variant];
-
-                _timers.start(command_name);
-                handler.handle(request, _writer);
-                _timers.finish(command_name);
-
-                _watchdog.on_operation_complete(_writer);
-
-                if _want_stats_report then
-                    let elapsed_since_last_report = System.DateTime.now.subtract(_last_report_time);
-
-                    if elapsed_since_last_report.total_seconds > 60.0D then
-                        _last_report_time = System.DateTime.now;
-
-                        _log.write(_timers);
-                    fi
-                fi
-
-                return true;
-            else
+            if !_command_map.contains_key(request_variant) then
                 // Registered variants with no handler are also a protocol
                 // mismatch - the request kind exists on the wire but this
                 // build doesn't route it anywhere. Same treatment as an
@@ -193,10 +228,67 @@ namespace Analysis is
                     Protocol.Response.ERROR("unknown_command", "no handler registered for request kind {command_name}", command_name)
                 );
 
-                _watchdog.on_operation_complete(_writer);
-
-                return true;
+                return;
             fi
+
+            let handler = _command_map[request_variant];
+
+            _timers.start(command_name);
+            handler.handle(request, _writer);
+            _timers.finish(command_name);
+        si
+
+        // Answer the queries already waiting on the pipe, from the state
+        // the analyser holds right now, and return to what was being done.
+        //
+        // Called at the per-file boundaries of the compile-expressions
+        // walk, and only there. That window is the one place mid-compile
+        // state is as consistent as it is between requests: every file's
+        // declarations, ancestries and types are resolved before the walk
+        // starts, and the scope and namespace stacks are back at their
+        // base between files. Earlier passes of a from-scratch rebuild
+        // are repopulating the symbol table and answer nothing reliably.
+        //
+        // Only the variants registered as interleavable are taken, and
+        // what qualifies is a query that fails safe: one whose answer is
+        // either right or absent. A whole-project query - references,
+        // implementations, rename - would instead answer from a use map
+        // that is still being rebuilt, and an incomplete set of edit
+        // sites reads as a complete one. Those keep waiting.
+        //
+        // Recompiles are suspended for the duration, so a query that
+        // misses answers from current state rather than starting a
+        // second compile inside this one.
+        serve_pending_queries() is
+            if _serving_pending then
+                return;
+            fi
+
+            _serving_pending = true;
+
+            let symbol_table = IoC.CONTAINER.instance.symbol_table;
+            let scope_mark = symbol_table.mark_scope_stack();
+
+            _full_compiler.suspend_recompiles = true;
+
+            try
+                while let request = _reader.take_if(r => _interleavable.contains(r.get_type())) do
+                    _timers.bump("interleaved-query");
+
+                    despatch(request);
+                od
+            finally
+                // A handler that walks a file - completion, signature
+                // help - pushes scopes as it goes, and one that threw
+                // part-way through would otherwise leave them for the
+                // rest of the compile to trip over.
+                symbol_table.release_scope_stack(scope_mark);
+                IoC.CONTAINER.instance.namespaces.pop_all_namespaces();
+
+                _full_compiler.suspend_recompiles = false;
+
+                _serving_pending = false;
+            yrt
         si
     si
 si
