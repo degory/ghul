@@ -39,7 +39,7 @@ Silence on a low-confidence finding is better than noise. The reviewer's job is 
 
 ### Type system & inference
 
-`src/semantic/types/`, `src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference paths in `src/syntax/process/compile_expressions.ghul`, related IR-value gates are fragile. Patches that work in isolation can break LUB widening, retry-loop convergence, or IL emission gating.
+`src/semantic/types/`, `src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference paths in `src/syntax/process/compile-expressions/compile_expressions.ghul`, related IR-value gates are fragile. Patches that work in isolation can break LUB widening, retry-loop convergence, or IL emission gating.
 
 For changes here, CONTRIBUTING.md requires:
 
