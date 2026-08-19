@@ -4,7 +4,7 @@ The files in this directory implement visitors that walk the syntax trees. Many 
 
 Pass-specific files live in a folder named after the pass they serve (`compile-expressions/`, `generate-il/`, …). Machinery shared across passes gets a folder named for the mechanism (`narrowing/`) or lives at the top level, where the IDE-tooling-only files also sit.
 
-A visitor class too large for one file spans several: the file named after the class holds its head, state and entry points, and each `partial` sibling (named `<class>_<area>.ghul`) holds the walk methods for one area of the tree or one piece of pass machinery. Property declarations stay in the class's main file — see ghul#2111.
+A visitor class too large for one file spans several: the file named after the class holds its head, state and entry points, and each `partial` sibling (named `<class>_<area>.ghul`) holds the walk methods for one area of the tree or one piece of pass machinery.
 
 Common base classes live in `visitor.ghul`, `strictvisitor.ghul` and `scopevisitorbase.ghul`. The `scopedvisitor.ghul` variant threads the symbol table and namespace context through each visit. `defaultvisitor.ghul` extends the scoped variant to funnel every node kind the concrete visitor does not explicitly override into a single `visit_default` hook, for analyses that must make an explicit decision per node kind. When adding a new AST node kind, every one of these base classes needs a matching method — including a `visit_default` forwarder in `DefaultVisitor`, without which the new kind silently bypasses subclasses' defaults.
 
