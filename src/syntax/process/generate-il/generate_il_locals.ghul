@@ -1,0 +1,429 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Local-variable IL: assignments, variable visits, refutable bindings and destructuring.
+    partial GENERATE_IL is
+        visit(assign: Statements.ASSIGNMENT) is
+            super.visit(assign);
+
+            let v = assign.value;
+            if v? then
+                add(v);
+            fi
+        si
+
+        visit(expression: Statements.EXPRESSION) is
+            super.visit(expression);
+
+            try
+                if !expression.want_value /\ expression.expression.value? then
+                    let value = expression.expression.value;
+
+                    let is_void = value.type? /\ value.type.matches(_innate_symbol_lookup.get_void_type());
+
+                    // Bare `await E;` with void result: visit(AWAIT)
+                    // emitted the suspend eagerly; re-emitting the
+                    // wrapper would call gen on its unreplaced DUMMY.
+                    if !is_void \/ !isa Values.WRAPPER(value) then
+                        add(value);
+                    fi
+
+                    if !is_void then
+                        add(Values.INSTRUCTION(ILOpCode.POP));
+                    fi
+                fi
+            catch e: System.Exception
+                _logger.exception(expression.location, e, "caught exception generating IL for expression");
+            yrt
+        si
+
+        // A local's declaration is a slot in the body's signature, so
+        // it is only a local at all inside a block. Answers whether
+        // the symbol was taken as one.
+        _declare_local(symbol: Semantic.Symbols.Symbol?) -> bool is
+            if !_block_context.is_in_block then
+                return false;
+            fi
+
+            if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol /\ local.type? then
+                current_block.add(Values.DECLARE_LOCAL(local.il_name, local.storage_type!));
+            fi
+
+            return true;
+        si
+
+        pre(variable: Variables.VARIABLE) -> bool is
+            super.pre(variable);
+
+            if variable.want_dispose then
+                // variable will be declared outside the enclosing .try
+                // so don't declare it here
+                return false;
+            fi
+
+            // Generator / async body locals: `state_machine_field`
+            // was wired up in compile-expressions (so closures
+            // freezing inside the body capture the right
+            // ldarg.0/ldfld IL). Skip emitting `.locals init` here;
+            // load/store routes through the frame field via
+            // state_machine_field.
+            let cf = current_function;
+            if cf? then
+                let sm_for_function = Semantic.Symbols.state_machine_for(cf);
+
+                if sm_for_function? /\ sm_for_function.frame? then
+                    return false;
+                fi
+
+                let async_sm = Semantic.Symbols.async_state_machine_for(cf);
+
+                if async_sm? /\ async_sm.frame? then
+                    return false;
+                fi
+            fi
+
+            // A local's declaration is a value in the block: metadata
+            // has no `.locals init` directive, and the slot it
+            // allocates has to be in place before any load of the
+            // same name is encoded. A declaration at namespace or
+            // class scope is a field, whose row the structure walk
+            // writes, so nothing is emitted for one here.
+            if _block_context.is_in_block then
+                for name in variable.names do
+                    _declare_local(find(name));
+                od
+            fi
+
+            return false;
+        si
+        
+        visit(v: Variables.VARIABLE) is
+            let initializer = v.initializer;
+            if initializer? then
+                let init_value = initializer.value;
+                if init_value? then
+                    gen_destructuring_initialize(v.left, init_value);
+                    return;
+                fi
+            fi
+
+            // Destructured formal argument: no initializer expression -
+            // the "source" to destructure is the synthesised physical
+            // parameter declare-members attached to this VARIABLE.
+            if v.is_argument /\ !v.left.is_simple_name then
+                let group_symbol = symbol_for(v);
+
+                if group_symbol? then
+                    gen_destructuring_initialize(v.left, group_symbol.load(v.location, null, _symbol_loader));
+                fi
+
+                return;
+            fi
+
+            // No initializer, but the local is captured by a closure
+            // and reassigned, so `mark-boxed-locals` promoted its slot
+            // to `Ghul.BOX[T]`. Allocate the empty box at declaration —
+            // `Variable.store` routes through `_store_boxed_local`,
+            // which emits `newobj Ghul.BOX[T]::.ctor()` when the value
+            // is null. Without this the slot stays null, then the
+            // closure frame's ctor stashes a null box reference and
+            // every later read or write NREs.
+            if v.left.is_simple_name then
+                // is_simple_name => SIMPLE_VARIABLE_LEFT, whose name is non-null
+                let name = v.left.name!;
+                let symbol = find(name);
+
+                if let variable: Semantic.Symbols.LOCAL_VARIABLE = symbol /\ variable.is_boxed then
+                    add(variable.store_empty_box(v.left.location, _symbol_loader));
+                    return;
+                fi
+            fi
+
+            // Loop-scoped `let x: T;` (no initializer) needs an
+            // explicit default store: .NET only initialises locals
+            // on method entry, so without re-zeroing each iteration
+            // the variable carries its previous iteration's value
+            // (issue #483). Outside a loop, the method-entry
+            // initialisation is correct and we leave the existing
+            // behaviour alone. Catch handlers receive their value
+            // from the runtime — skip the default-store there too.
+            if _loops.is_in_loop /\ !_in_catch_variable then
+                gen_destructuring_default(v.left);
+            fi
+        si
+
+        // Drill a Type to its underlying Classy (peeling
+        // Symbols.GENERIC wrapping for specialised generics) — same
+        // shape as CONDITION_ANALYZER.get_classy_for_narrowing but
+        // inlined here so generate_il doesn't need a back-reference
+        // to compile-phase services. Returns null when `t` isn't
+        // a NAMED of a Classy.
+        _classy_of_type(t: Semantic.Types.Type) -> Semantic.Symbols.Classy? is
+            if !isa Semantic.Types.NAMED(t) then
+                return null;
+            fi
+
+            let named = cast Semantic.Types.NAMED(t);
+            let symbol mut = named.symbol;
+
+            if isa Semantic.Symbols.GENERIC(symbol) then
+                symbol = symbol.symbol;
+            fi
+
+            return cast Semantic.Symbols.Classy?(symbol)!;
+        si
+
+        // `if let` clauses' bound names are declared as CLR locals
+        // here — same as `pre(VARIABLE)` does for a plain let. The
+        // store IL itself is emitted later by
+        // `gen_destructuring_initialize` in the if-branch handler.
+        pre(rb: Statements.REFUTABLE_BINDING) -> bool is
+            let cf = current_function;
+            if cf? then
+                let sm_for_function = Semantic.Symbols.state_machine_for(cf);
+
+                if sm_for_function? /\ sm_for_function.frame? then
+                    return false;
+                fi
+
+                let async_sm = Semantic.Symbols.async_state_machine_for(cf);
+
+                if async_sm? /\ async_sm.frame? then
+                    return false;
+                fi
+            fi
+
+            for c in rb.clauses do
+                for name in c.pattern.names! do
+                    _declare_local(find(name));
+                od
+            od
+
+            return false;
+        si
+
+        visit(rb: Statements.REFUTABLE_BINDING) is
+        si
+
+        gen_destructuring_default(left: Variables.VariableLeft) is
+            if left.is_simple_name then
+                // is_simple_name => SIMPLE_VARIABLE_LEFT, whose name is non-null
+                let name = left.name!;
+                let symbol = find(name);
+
+                if !symbol? \/ symbol.is_argument then
+                    return;
+                fi
+                let symbol_type = symbol.type;
+                if !symbol_type? then return; fi
+
+                let default_value = IR.Values.DEFAULT(symbol_type);
+
+                let store = symbol.store(left.location, null, default_value, _symbol_loader, true);
+
+                add(store);
+            else
+                for e in left.elements! do
+                    gen_destructuring_default(e);
+                od
+            fi
+        si
+
+        // TODO use Pre/Visit instead
+        gen_destructuring_initialize(left: Variables.VariableLeft, value: Value) is
+            gen_destructuring_initialize(left, value, null);
+        si
+
+        // Per-element narrowing: when `narrow_branch_label` is set
+        // (the `if let` path), an element carrying a `type_expression`
+        // emits `isinst T; brfalse next` before binding. The cast
+        // result is what gets stored / recursively destructured, so
+        // the bound slot is typed T. Plain `let` and `for` pass null
+        // for the label and just store the raw value (the declared
+        // element type is a compile-time assertion only, not a runtime
+        // test).
+        gen_destructuring_initialize(
+            left: Variables.VariableLeft,
+            value: Value,
+            narrow_branch_label: LABEL?
+        ) is
+            // Literal-leaf inside a destructure pattern — runtime
+            // value-equality test against the source position. Only
+            // valid in refutable contexts (`if let` / `case`-when);
+            // a plain `let` with a literal leaf is rejected during
+            // semantic analysis, so by the time we get here a literal
+            // leaf without a narrow_branch_label is a no-op (the
+            // emit-nothing path).
+            if isa Variables.LITERAL_VARIABLE_LEFT(left) then
+                if narrow_branch_label? then
+                    let literal_leaf = cast Variables.LITERAL_VARIABLE_LEFT(left);
+                    let leaf_state = _variable_left_state.get(literal_leaf);
+
+                    // The value-equality test compile-expressions built
+                    // for this leaf embeds the literal and reads the
+                    // source position through a hole; fill the hole and
+                    // branch on the result. The test can read the
+                    // operand more than once - a null-safe `=~` tests
+                    // presence before dispatching - and an instance
+                    // operator on a value type needs its address, so
+                    // spill anything that is not already a local.
+                    if let
+                        test = leaf_state?.match_test,
+                        operand = leaf_state?.match_operand
+                    then
+                        operand.value =
+                            if value.is_lightweight_pure /\ value.has_address then
+                                value;
+                            else
+                                TEMP(current_block, "literal-leaf", value).load();
+                            fi;
+
+                        get_brancher_for_block().branch(
+                            BRANCH.Z,
+                            test,
+                            narrow_branch_label,
+                            "literal-leaf"
+                        );
+
+                        return;
+                    fi
+
+                    // No test: a `null` leaf, or a type for which
+                    // neither `=~` nor `<>` resolved. Compare raw, which
+                    // is what a bare `==` does too.
+                    literal_leaf.expression.walk(self);
+
+                    let leaf_value = literal_leaf.expression.value;
+                    if leaf_value? then
+                        get_brancher_for_block().branch(
+                            BRANCH.NE,
+                            value,
+                            leaf_value,
+                            narrow_branch_label,
+                            "literal-leaf"
+                        );
+                    fi
+                fi
+
+                return;
+            fi
+
+            let narrowed mut = value;
+
+            let type_expression = left.type_expression;
+            if
+                type_expression? /\
+                type_expression.type? /\
+                narrow_branch_label?
+            then
+                let cast_value = IR.Values.CAST(type_expression.type, value, false);
+                let temp = TEMP(current_block, "narrow", cast_value);
+
+                get_brancher_for_block().branch(BRANCH.Z, temp.load(), narrow_branch_label, "narrow");
+
+                narrowed = temp.load();
+            fi
+
+            if left.is_simple_name then
+                // is_simple_name => SIMPLE_VARIABLE_LEFT, whose name is non-null
+                let name = left.name!;
+                let symbol = find(name);
+
+                if !symbol? then
+                    return;
+                fi
+
+                let store = symbol.store(left.location, null, narrowed, _symbol_loader, true);
+
+                add(store);
+            else
+                let from_type = narrowed.type;
+
+                if !from_type? then return; fi
+
+                // !is_simple_name => a destructure group, whose elements are non-null
+                let elements = left.elements!;
+
+                let get_from =
+                    if narrowed.is_lightweight_pure then
+                        () => narrowed
+                    else
+                        let temp = TEMP(current_block, "destructure", narrowed);
+                        () => temp.load();
+                    fi;
+
+                let is_named_group = elements.count > 0 /\ elements[0].source_field_name?;
+
+                let strategy =
+                    if is_named_group then
+                        let field_names = Collections.LIST[string?]();
+                        for e in elements do
+                            let sfn = e.source_field_name;
+                            field_names.add(if sfn? then sfn.name else null fi);
+                        od
+                        DESTRUCTURE_RESOLVER.resolve_strategy_by_name(from_type, field_names);
+                    else
+                        DESTRUCTURE_RESOLVER.resolve_strategy(from_type, elements.count);
+                    fi;
+
+                if strategy.is_deconstruct then
+                    // is_deconstruct ⇔ deconstruct_function? per its definition
+                    let deconstruct = strategy.deconstruct_function!;
+                    let arg_temps = Collections.LIST[IR.TEMP]();
+                    let call_args = Collections.LIST[Value]();
+
+                    for i in 0..deconstruct.arguments.count do
+                        let ref_type = deconstruct.arguments[i];
+                        let element_type = ref_type.get_element_type();
+                        assert element_type? else "deconstruct arg type has no element type";
+                        let arg_temp = IR.TEMP(current_block, "destructure_arg", i, element_type);
+
+                        arg_temps.add(arg_temp);
+                        call_args.add(IR.Values.ADDRESS(arg_temp.load(), ref_type));
+                    od
+
+                    let call_value =
+                        deconstruct.call(
+                            left.location,
+                            get_from(),
+                            call_args,
+                            null,
+                            _function_caller
+                        );
+
+                    add(call_value);
+
+                    for (i, e) in elements |> index() do
+                        gen_destructuring_initialize(e, arg_temps[i].load(), narrow_branch_label);
+                    od
+                else
+                    let members = strategy.members;
+
+                    for (i, e) in elements |> index() do
+                        let member = members[i];
+
+                        if member? then
+                            let member_value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                            gen_destructuring_initialize(e, member_value, narrow_branch_label);
+                        fi
+                    od
+                fi
+            fi
+        si
+       
+    si
+si

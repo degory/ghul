@@ -1,0 +1,312 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Expression IL: call/await/spill/cast walks, await-suspend construction and string interpolation.
+    partial GENERATE_IL is
+        // Override CALL.walk's default args-first order so SPILLs in
+        // the receiver position emit before AWAIT_SUSPENDs in the
+        // argument position — needed for source-order side effects
+        // across instance-call receivers.
+        pre(call: Trees.Expressions.CALL) -> bool is
+            super.pre(call);
+
+            call.function.walk(self);
+            call.arguments.walk(self);
+
+            return true;
+        si
+
+        visit(`await: Trees.Expressions.AWAIT) is
+            // Emit AWAIT_SUSPEND eagerly, stash the result into a
+            // fresh frame field (NOT a CLR local — CLR locals reset
+            // on every MoveNext re-entry), and rebind the wrapper to
+            // a `ldfld <field>` load. The CLR-local TEMP is a
+            // one-MoveNext bridge: we can't `ldarg.0` before
+            // AWAIT_SUSPEND (would push across its internal labels),
+            // so the suspend's result goes to a tmp first, then
+            // `ldarg.0 / ldloc / stfld`.
+            let await_wrapper = cast Values.WRAPPER?(`await.value);
+
+            if !await_wrapper? then
+                return;
+            fi
+
+            let casm = _current_async_state_machine;
+
+            if !casm? \/ current_function != casm.function then
+                _logger.error(`await.location, "await outside async state-machine context");
+                return;
+            fi
+
+            let operand_value = `await.operand.value;
+            if !operand_value? then return; fi
+            let operand_type = operand_value.type;
+            if !operand_type? then return; fi
+
+            let suspend =
+                _build_await_suspend(operand_value, operand_type, `await.awaiter_field);
+
+            if !suspend? then
+                return;
+            fi
+
+            let frame = casm.frame;
+
+            assert frame? else "async state machine has no frame at await emission";
+
+            let suspend_type = suspend.type;
+
+            if !suspend_type.is_void then
+                let result_field = `await.result_field;
+
+                assert result_field? else "await has no result field at IL generation";
+
+                let result_temp = TEMP(current_block, "await_bridge", suspend);
+
+                add(_build_frame_field_store(frame, result_field, result_temp.load()));
+
+                await_wrapper.value =
+                    IR.Values.Load.INSTANCE_FIELD(
+                        IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                        result_field
+                    );
+            else
+                // void-async — emit the suspend IL eagerly. The wrapper
+                // already holds a void-typed DUMMY which surrounding
+                // emit paths must skip (the type check in
+                // visit(Statements.EXPRESSION) handles the only place
+                // this matters in practice — bare `await E;`).
+                add(suspend);
+            fi
+        si
+
+        visit(spill: Trees.Expressions.SPILL) is
+            // Eagerly emit the operand's IL, then `stfld` to a fresh
+            // frame field. The wrapper's value becomes a
+            // `ldarg.0; ldfld <field>` load that surrounding IR
+            // consumes lazily. Used by the SPILL_AWAITS pass to
+            // persist intermediate values evaluated to the left of an
+            // `await` so they survive the suspend.
+            let spill_wrapper = cast Values.WRAPPER?(spill.value);
+
+            if !spill_wrapper? then
+                return;
+            fi
+
+            let casm = _current_async_state_machine;
+
+            if !casm? \/ current_function != casm.function then
+                _logger.error(spill.location, "SPILL outside async state-machine context");
+                return;
+            fi
+
+            let operand_value = spill.operand.value;
+            if !operand_value? then return; fi
+
+            let frame = casm.frame;
+
+            assert frame? else "async state machine has no frame at spill emission";
+
+            let spill_field = spill.spill_field;
+
+            assert spill_field? else "spill has no frame field at IL generation";
+
+            add(_build_frame_field_store(frame, spill_field, operand_value));
+
+            spill_wrapper.value =
+                IR.Values.Load.INSTANCE_FIELD(
+                    IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                    spill_field
+                );
+        si
+
+        visit(`cast: Trees.Expressions.CAST) is
+            let cast_wrapper = cast Values.WRAPPER?(`cast.value);
+
+            if !cast_wrapper? then return; fi
+
+            let right_value = `cast.right.value;
+            if !right_value? then return; fi
+            let cast_type = cast_wrapper.type;
+            if !cast_type? then return; fi
+
+            // Use the WRAPPER's type, not `cast.type_expression.type`
+            // — for a bare-variant cast on a generic union (a `cast V(x)`
+            // or the `cast` produced by `if let v: V = x` lowering),
+            // compile_expressions.visit(CAST) already substituted the
+            // receiver-specialized variant type, but the user's
+            // type_expression still reads as the open generic.
+            cast_wrapper.value =
+                _type_caster
+                    .cast_value(
+                        `cast.location,
+                        right_value,
+                        cast_type,
+                        true,
+                        `cast.is_checked
+                    );
+        si
+
+        // Build an AWAIT_SUSPEND for `awaited`: allocates a state
+        // number + cold/hot resume labels + a fresh `$awaiter_N`
+        // field, and records the (state, awaiter, label) triple
+        // for entry-dispatch population. Returns null when the
+        // awaiter type cannot be resolved.
+        _build_await_suspend(
+            awaited: Value,
+            awaited_type: Semantic.Types.Type,
+            declared_awaiter_field: Semantic.Symbols.Field?
+        ) -> IR.Values.AWAIT_SUSPEND? is
+            let async_sm = _current_async_state_machine!;
+            let frame = async_sm.frame;
+
+            assert frame? else "async state machine has no frame at await suspend emission";
+
+            let element_type =
+                Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(
+                    awaited_type,
+                    _innate_symbol_lookup.get_unspecialized_task_type()
+                );
+
+            let awaiter_type_opt: Semantic.Types.Type? mut;
+            let result_type: Semantic.Types.Type mut;
+
+            if element_type? then
+                awaiter_type_opt = _innate_symbol_lookup.get_task_awaiter_type(element_type);
+                result_type = element_type;
+            else
+                awaiter_type_opt = _innate_symbol_lookup.get_task_awaiter_void_type();
+                result_type = _innate_symbol_lookup.get_void_type();
+            fi
+
+            if !awaiter_type_opt? then
+                return null;
+            fi
+
+            let awaiter_type = awaiter_type_opt;
+            let state = async_sm.allocate_state();
+            let cold_resume = IR.LABEL();
+            let hot_resume = IR.LABEL();
+            let awaiter_field =
+                declared_awaiter_field ?? frame.declare_awaiter_field(awaiter_type);
+
+            async_sm.record_label(state, awaiter_field, cold_resume);
+
+            _register_resume_with_dispatch(state, cold_resume);
+
+            let unspec_awaiter_type =
+                if element_type? then
+                    // reaching async IL emit implies ghul-runtime resolved
+                    _innate_symbol_lookup.get_unspecialized_task_awaiter_type()!;
+                else
+                    awaiter_type;
+                fi;
+
+            return IR.Values.AWAIT_SUSPEND(
+                result_type,
+                awaited,
+                awaited_type,
+                awaiter_type,
+                unspec_awaiter_type,
+                state,
+                cold_resume,
+                hot_resume,
+                _current_async_end_label!,
+                _specialized_frame_type(frame, async_sm.get_construction_type_arguments(), awaited.location) ?? frame.type!,
+                frame.state_field,
+                awaiter_field,
+                frame.builder_field!
+            );
+        si
+
+        visit(interpolation: Expressions.STRING_INTERPOLATION) is
+            ensure_runtime_symbols_are_materialized();
+
+            enter_block(cast IR.Values.BLOCK?(interpolation.value)!);
+
+            let string_type = _innate_symbol_lookup.get_string_type();
+
+            let literal_length = Literal.NUMBER(interpolation.literal_length, _innate_symbol_lookup.get_int_type());
+            let expression_count = Literal.NUMBER(interpolation.expression_count, _innate_symbol_lookup.get_int_type());
+
+            let interpolator = 
+                TEMP(
+                    current_block,
+                    "interpolator",
+                    IR.Values.NEW(
+                        _interpolation_handler!,
+                        _constructor, [
+                            literal_length,
+                            expression_count
+                        ]:Value
+                    )
+                );
+
+            for eaf in interpolation.values do
+                let expression = eaf.expression;
+                let alignment = eaf.alignment;
+                let format = eaf.format;
+                let expr_value = expression.value!;
+
+                let args = Collections.LIST[Value](1);
+
+                args.add(expr_value);
+
+                if isa Expressions.Literals.STRING(expression) then
+                    if expression.value_string.length == 0 then
+                        continue;
+                    fi
+
+                    let call = _append_literal.call(interpolation.location, interpolator.load(), args, null, _function_caller);
+
+                    add(call);
+                else
+                    let append_formatted: Semantic.Symbols.Symbol mut;
+                    let args = Collections.LIST[Value](3);
+
+                    args.add(expr_value);
+
+                    if format? /\ alignment? then
+                        args.add(alignment.value!);
+                        args.add(Literal.STRING(format, string_type));
+
+                        append_formatted = _append_formatted_generic_alignment_format.specialize([expr_value.type!]);
+
+                    elif format? then
+                        args.add(Literal.STRING(format, string_type));
+
+                        append_formatted = _append_formatted_generic_format.specialize([expr_value.type!]);
+                    elif alignment? then
+                        args.add(alignment.value!);
+
+                        append_formatted = _append_formatted_generic_alignment.specialize([expr_value.type!]);
+                    else
+                        append_formatted = _append_formatted_generic.specialize([expr_value.type!]);
+                    fi
+
+                    let call = append_formatted.call(interpolation.location, interpolator.load(), args, null, _function_caller);
+
+                    add(call);
+                fi
+            od
+
+            let result = _to_string_and_clear.call(interpolation.location, interpolator.load(), System.Array.empty`[Value](), null, _function_caller);
+            add(result);
+
+            leave_block();
+        si        
+    si
+si
