@@ -1,0 +1,389 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use Ghul.Pipes;
+
+    use Logging;
+    use Trees;
+
+    use Semantic.Types.Type;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Per-node classification: visit_default, resolved-value and fused-for classification, study notes and the disqualify family.
+    partial INFER_STORE_FREE is
+        // ==== default: any node kind without an explicit override ====
+
+        visit_default(node: Trees.Node) is
+            if _resolved_mode /\ _classify_resolved(node) then
+                return;
+            fi
+
+            _disqualify_because("unaudited-node:{node.get_type().full_name}");
+        si
+
+        // Once compile-expressions has run, the node kinds
+        // this walk never modelled carry enough resolved state to be
+        // classified: a `for` names the three iterator members it calls,
+        // and every other expression carries the value it compiled to,
+        // whose callee is a bounded edge like any other. Returns whether
+        // the node was classified; false falls through to disqualifying
+        // it as before.
+        _classify_resolved(node: Trees.Node) -> bool is
+            // an element read cannot be pinned to a member symbol;
+            // the read-closure records it as its own dimension
+            if _current_record? then
+                if isa Trees.Expressions.INDEX(node) then
+                    _current_record.reads_elements = true;
+                elif isa Trees.Expressions.AMBIGUOUS_EXPRESSION(node) then
+                    if (cast Trees.Expressions.AMBIGUOUS_EXPRESSION(node)).result == Trees.Expressions.AmbiguousExpressionResult.INDEX then
+                        _current_record.reads_elements = true;
+                    fi
+                fi
+            fi
+
+            if let `for: Statements.FOR = node then
+                if `for.fusion? then
+                    return _classify_fused_for(`for.fusion);
+                fi
+
+                // read_iterator is legitimately null when the loop
+                // expression is already an iterator - the emitter
+                // drives move_next/current on the value directly
+                let move_next = `for.move_next;
+                let read_current = `for.read_current;
+
+                if !move_next? \/ !read_current? then
+                    let expression = `for.expression;
+
+                    let detail =
+                        if !expression? then
+                            "no-expression"
+                        elif !expression.value? then
+                            "no-value"
+                        elif !expression.value.type? then
+                            "no-type"
+                        else
+                            "{expression.value.type}"
+                        fi;
+
+                    _disqualify_because("for-unresolved:{detail}");
+                    return true;
+                fi
+
+                if `for.read_iterator? then
+                    _add_callee(`for.read_iterator);
+                fi
+
+                _add_callee(move_next);
+                _add_callee(read_current);
+
+                return true;
+            fi
+
+            if let expression: Trees.Expressions.Expression = node then
+                let value = expression.value;
+
+                if !value? then
+                    return false;
+                fi
+
+                return _classify_resolved_value(value);
+            fi
+
+            return false;
+        si
+
+        // A fused loop never builds the pipe objects: it iterates the
+        // pinned built-in source directly and runs each map/filter
+        // stage's lambda body inline, so the loop's effects are the
+        // stage bodies' effects. The lambda literals were skipped by
+        // the ordinary walk (creating a closure is effect-free), so
+        // they are walked here, attributed to the enclosing function
+        // exactly as the fused lowering executes them. A stage fed an
+        // arbitrary delegate value rather than a literal is invoked
+        // per element with no bounded callee, so it stays unbounded
+        // unless the value's type is a pure function type.
+        _classify_fused_for(fusion: PIPE_FUSION) -> bool is
+            for stage in fusion.stages_outermost_first do
+                if stage.is_countdown \/ stage.is_index then
+                    continue;
+                fi
+
+                let argument = stage.argument;
+
+                if !argument? then
+                    continue;
+                fi
+
+                if let literal: Trees.Expressions.FUNCTION = argument then
+                    literal.body.walk(self);
+                elif !(argument.value? /\ argument.value.type? /\ argument.value.type.is_pure_function) then
+                    _disqualify_because("fused-stage-delegate");
+                    return true;
+                fi
+            od
+
+            return true;
+        si
+
+        _classify_resolved_value(value: IR.Values.Value) -> bool is
+            if let view: IR.Values.NARROW_VIEW = value then
+                return _classify_resolved_value(view.underlying);
+            fi
+
+            if let call: IR.Values.Call.INSTANCE = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.STATIC = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.GLOBAL = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let call: IR.Values.Call.STRUCT = value then
+                _add_callee(call.function);
+                _study_note_call_arguments(call.function, call.arguments);
+                return true;
+            fi
+
+            if let construction: IR.Values.NEW = value then
+                // constructing a reflected exception writes only the
+                // fresh object — the same trust the declared-types
+                // classification extends, restated here so the edge
+                // to the unwalked BCL constructor does not poison
+                if !_is_store_free_construction(cast Symbol?(construction.constructor.owner)) then
+                    _add_construction_callee(construction.constructor);
+                fi
+
+                _study_note_call_arguments(construction.constructor, construction.arguments);
+                return true;
+            fi
+
+            // Invoking a function value: bounded when the value names
+            // its function, effect-polymorphic when it is one of the
+            // enclosing function's own parameters, unboundable
+            // otherwise.
+            if let call: IR.Values.Call.CLOSURE = value then
+                if !call.is_state_changing_call then
+                    return true;
+                fi
+
+                let fn = function_value_of(call.from);
+
+                if fn? then
+                    _add_callee(fn);
+                    _study_note_call_arguments(fn, call.arguments);
+                    return true;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(call.from) then
+                    if _current_record? then
+                        _current_record.invokes_function_param = true;
+                    fi
+
+                    return true;
+                fi
+
+                return false;
+            fi
+
+            // not a call at all: reading a value writes nothing, and any
+            // sub-expression is classified as the walk reaches it
+            return !value.is_state_changing_call;
+        si
+
+        // The resolver from compiled values to the functions they
+        // denote, including the immutable-local record this walk
+        // populates. Shared with the pure-slot judge.
+
+        function_value_of(value: IR.Values.Value?) -> Function? =>
+            function_values.function_value_of(value);
+
+        // Record which function values flow into a callee's
+        // function-typed parameters. A named value joins the callee's
+        // passed set; the caller's own parameter forwarded onward is
+        // accounted at the caller's own call sites instead; anything
+        // else function-typed makes the callee's parameter values
+        // unknowable - unless its type is pure, which admits only
+        // store-free values whoever invokes it.
+        _study_note_call_arguments(callee: Function?, arguments: Collections.List[IR.Values.Value]) is
+            if !callee? then
+                return;
+            fi
+
+            for argument in arguments do
+                let fn = function_value_of(argument);
+
+                if fn? then
+                    EFFECT_FACTS.note_passed_function(callee, fn);
+                    continue;
+                fi
+
+                if isa IR.Values.Load.LOCAL_ARGUMENT(argument) then
+                    let argument_type = argument.type;
+
+                    if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                        if _current_record? then
+                            let root = cast Function?(callee.root_specialized_from);
+
+                            if root? then
+                                _current_record.forwards_param_to.add(root);
+                            fi
+                        fi
+                    fi
+
+                    continue;
+                fi
+
+                let argument_type = argument.type;
+
+                if argument_type? /\ argument_type.is_function /\ !argument_type.is_pure_function then
+                    EFFECT_FACTS.note_passed_opaque(callee);
+                    NARROWING_STUDY.note_opaque_shape("{argument.get_type().name} -> {callee.name}");
+                fi
+            od
+        si
+
+        // `_disqualify` with the reason recorded for the study, so the
+        // report can say what the walk actually gives up on. First
+        // reason wins: it is the one that made the function unbounded.
+        _disqualify_because(reason: string) is
+            if _current? /\ _current_record? /\ _current_record.unbounded_reason =~ "" then
+                _current_record.unbounded_reason = reason;
+            fi
+
+            _disqualify();
+        si
+
+        _disqualify() is
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_unbounded = true;
+
+                // whatever the walk could not bound could write
+                // anything, so the write set stops being a bound too
+                _current_record.writes_unbounded = true;
+            fi
+        si
+
+        // The subset of `_disqualify` where the walk saw a write to a
+        // pre-existing heap slot rather than merely failing to bound
+        // something. Behaves identically; only the study distinguishes
+        // them.
+        _disqualify_store() is
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+            _current.is_construction_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
+            fi
+        si
+
+        // A store the strict analysis rejects but a construction does
+        // not: writing the receiver's own instance state touches only
+        // the fresh object a `NEW` is building.
+        _disqualify_strict_only() is
+            if !_current? then
+                return;
+            fi
+
+            _current.is_disqualified = true;
+
+            if _current_record? then
+                _current_record.own_stores = true;
+            fi
+        si
+
+
+        // A `self.field` target naming an instance field of the
+        // receiver. `self` is the only receiver the construction bit
+        // says anything about; a member on any other receiver stays a
+        // heap store.
+        _writes_own_instance_field_member(target: Trees.Expressions.Expression?) -> bool is
+            if !target? \/ !isa Trees.Expressions.MEMBER(target) then
+                return false;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(target);
+
+            if !isa Trees.Expressions.SELF(member.left) then
+                return false;
+            fi
+
+            let context = current_instance_context;
+
+            if !context? then
+                return false;
+            fi
+
+            let field_symbol = context.find_member(member.identifier.name);
+
+            return field_symbol? /\ field_symbol.is_field /\ field_symbol.is_instance;
+        si
+
+        // The assign accessor behind a `self.property` target on the
+        // type under construction. Writing a property runs its
+        // accessor rather than storing directly, so the write is only
+        // as safe as that accessor is — an auto-property's accessor
+        // writes nothing but its own backing field and qualifies, a
+        // hand-written one that stores elsewhere does not. Null for any
+        // target that is not an instance property on `self`.
+        _writes_own_instance_property_member(target: Trees.Expressions.Expression?) -> Function? is
+            if !target? \/ !isa Trees.Expressions.MEMBER(target) then
+                return null;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(target);
+
+            if !isa Trees.Expressions.SELF(member.left) then
+                return null;
+            fi
+
+            let context = current_instance_context;
+
+            if !context? then
+                return null;
+            fi
+
+            return _instance_property_assign(context.find_member(member.identifier.name));
+        si
+
+        // A constructor delegating to another constructor on the same
+        // object — `super.init(…)` from a subclass, `self.init(…)` from
+        // a secondary constructor.
+        _is_constructor_chain(member: Trees.Expressions.MEMBER) -> bool =>
+            _in_constructor /\
+            member.identifier.name =~ "init" /\
+            (isa Trees.Expressions.SELF(member.left) \/ isa Trees.Expressions.SUPER(member.left));
+
+        _instance_property_assign(symbol: Symbol?) -> Function? is
+            if !symbol? \/ !symbol.is_instance \/ !isa Semantic.Symbols.Property(symbol) then
+                return null;
+            fi
+
+            return (cast Semantic.Symbols.Property(symbol)).assign_function;
+        si
+
+    si
+si
