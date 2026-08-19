@@ -1,0 +1,572 @@
+namespace Syntax.Process is
+    use Source;
+    use Trees;
+
+    use Logging;
+
+    use Collections.LIST;
+
+    use Ghul.Pipes;
+
+    // TODO rename this: it's not just for properties
+    class ADD_ACCESSORS_FOR_PROPERTIES: Visitor is
+        _pragma_scope_stack: PRAGMA_SCOPE_STACK;
+        _stack: Collections.STACK[Definitions.LIST];
+
+        enclosing_definition: Definitions.LIST => _stack.peek();
+
+        init() is
+            super.init();
+
+            _pragma_scope_stack = PRAGMA_SCOPE_STACK();
+            _stack = Collections.STACK[Definitions.LIST]();
+        si
+
+        apply(root: Node) is
+            root.walk(self);
+        si
+
+        pre(pragma: Definitions.PRAGMA) -> bool is
+            _pragma_scope_stack.enter(pragma.pragma);
+
+            return false;
+        si
+
+        visit(pragma: Definitions.PRAGMA) is
+            _pragma_scope_stack.leave(pragma.pragma);
+        si
+
+        pre(property: Definitions.PROPERTY) -> bool is
+            // The parser synthesises a `Bodies.NULL` read_body for properties
+            // declared in a trait without an explicit body (the abstract-method
+            // marker), so test for a *real* body here — otherwise this fires
+            // spuriously for `field x: T;` in a trait, swallowing the proper
+            // "field is not valid here" diagnostic from declare-symbols.
+            let has_real_body =
+                (property.read_body? /\ !isa Bodies.NULL(property.read_body))
+                \/ property.assign_body?
+                \/ property.assign_argument?;
+
+            if property.modifiers.is_field /\ has_real_body then
+                IoC.CONTAINER.instance.logger
+                    .error(property.modifiers.storage_class!.location, "a field cannot have body");
+                property.modifiers.clear_storage_class();
+            fi
+
+            let name = property.name;
+
+            // `private` on a body declaration has no member to rename
+            // onto — unlike the primary-constructor parameter form, which
+            // the rewriter turns into an underscore-named capture before
+            // this pass ever sees it. Left alone, a plain-named private
+            // property would fall through with no auto-property and no
+            // real body, giving empty accessors that silently discard
+            // writes and read back the default. Reject it and point at
+            // the working spelling.
+            if
+                property.modifiers.is_private /\ name? /\
+                !name.name.starts_with('_') /\ !has_real_body
+            then
+                IoC.CONTAINER.instance.logger.error(
+                    property.modifiers.access_modifier!.location,
+                    "private is not valid on a body declaration",
+                    name.location,
+                    "help: name the member _{name.name} instead"
+                );
+                property.modifiers.clear_access_modifier();
+            fi
+
+            if
+                !property.is_poisoned /\ !property.modifiers.is_field /\ name? /\ (
+                    !name.name.starts_with('_') \/
+                    property.read_body? \/
+                    property.assign_body?
+                )
+            then
+                let is_assignable = !property.read_body? \/ property.assign_argument?;
+
+                add_accessor_functions_for_property(property, is_assignable);
+            fi
+
+            return true;
+        si
+
+        add_accessor_functions_for_property(property: Definitions.PROPERTY, is_assignable: bool) is
+            // gated on a present name by the caller
+            let property_name = property.name!;
+
+            let read_name =
+                Identifiers.Identifier(
+                    property_name.location,
+                    "$get_{property_name.name}"
+                );
+
+            property.is_auto_property =
+                !property.read_body? /\
+                !property.assign_body? /\
+                !property_name.name.starts_with('_') /\
+                !property.modifiers.is_private;
+
+            let backing_variable_name = "${property_name.name}";
+
+            let assign_argument_name mut = "$$value";
+
+            if property.assign_argument != null then
+                assign_argument_name = property.assign_argument.name;
+            fi
+
+            if property.is_auto_property then
+                let backing_variable =
+                    Variables.VARIABLE(
+                        property_name.location,
+                        Identifiers.Identifier(
+                            LOCATION.internal,
+                            backing_variable_name
+                        ),
+                        property.type_expression.copy(),
+                        property.modifiers.is_static,
+                        true,
+                        null
+                    );
+
+                backing_variable.mark_synthesized();
+
+                enclosing_definition.add(backing_variable);
+
+                // The synthesised accessor bodies have no user source —
+                // BLOCK + Statements.LIST locations are internal so the
+                // incremental body re-walk's BODY_SPANS skips them and
+                // does not treat the property declaration itself (at
+                // `property.location`) as "inside" its own getter body.
+                // Inner statements keep `property.location` so any later
+                // diagnostic against the synthesised RETURN / ASSIGNMENT
+                // still anchors on the property declaration the user
+                // wrote.
+                property.read_body =
+                    Trees.Bodies.BLOCK(LOCATION.internal,
+                        Trees.Statements.LIST(LOCATION.internal,
+                            Collections.LIST[Statements.Statement]([
+                                Trees.Statements.RETURN(property.location,
+                                    Trees.Expressions.IDENTIFIER(property.location,
+                                        Trees.Identifiers.Identifier(property.location, backing_variable_name)
+                                    )
+                                )
+                            ]: Statements.Statement)
+                        )
+                    );
+
+                property.assign_body =
+                    Trees.Bodies.BLOCK(LOCATION.internal,
+                        Trees.Statements.LIST(LOCATION.internal,
+                            Collections.LIST[Statements.Statement]([
+                                Trees.Statements.ASSIGNMENT(property.location,
+                                    Trees.Expressions.SIMPLE_LEFT_EXPRESSION(property.location,
+                                        Trees.Expressions.IDENTIFIER(property.location,
+                                            Trees.Identifiers.Identifier(property.location, backing_variable_name)
+                                        )
+                                    ),
+                                    Trees.Expressions.IDENTIFIER(property.location,
+                                        Trees.Identifiers.Identifier(property.location, assign_argument_name)
+                                    )
+                                )
+                            ]: Statements.Statement)
+                        )
+                    );
+            fi
+
+            // A write-only property (an assign body with no read body,
+            // as in a setter-only trigger property) has nothing to
+            // build a getter from.
+            if property.read_body? then
+                let read_function = Definitions.FUNCTION(
+                    property.location,
+                    read_name,
+                    TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
+                    Variables.LIST(property_name.location, Collections.LIST[Variables.VARIABLE](0)),
+                    property.type_expression.copy(),
+                    property.modifiers.copy(),
+                    property.read_body!
+                );
+
+                read_function.for_property = property;
+                read_function.is_underscore_scoped = property_name.name.starts_with('_');
+
+                enclosing_definition.add(
+                    read_function
+                );
+
+                property.read_function = read_function;
+            fi
+
+            if is_assignable \/ property.is_auto_property then
+                let assign_name =
+                    Identifiers.Identifier(
+                        property_name.location,
+                        "$set_{property_name.name}"
+                    );                
+
+                let assign_argument_is_synthesized = !property.assign_argument?;
+
+                if !property.assign_argument? then
+                    property.assign_argument = Identifiers.Identifier(property.location, "$$value");
+                fi
+
+                let assign_argument_variable =
+                    Variables.VARIABLE(
+                        property.assign_argument!.location,
+                        property.assign_argument!,
+                        property.type_expression.copy(),
+                        false,
+                        true,
+                        null
+                    );
+
+                if assign_argument_is_synthesized then
+                    assign_argument_variable.mark_synthesized();
+                fi
+
+                let assign_function = Definitions.FUNCTION(
+                    property_name.location,
+                    assign_name,
+                    TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
+                    Variables.LIST(LOCATION.internal, Collections.LIST[Variables.VARIABLE]([
+                        assign_argument_variable
+                    ]:Variables.VARIABLE)),
+                    TypeExpressions.NAMED(
+                        LOCATION.internal,
+                        Identifiers.Identifier(
+                            LOCATION.internal,
+                            "void"
+                        )
+                    ),
+                    property.modifiers.copy(),
+                    property.assign_body!
+                );
+
+                assign_function.for_property = property;
+                assign_function.is_assign_accessor = true;
+                assign_function.is_underscore_scoped = property_name.name.starts_with('_');
+
+                enclosing_definition.add(
+                    assign_function
+                );
+
+                property.assign_function = assign_function;
+            fi
+        si
+
+        visit(property: Definitions.PROPERTY) is
+        si
+
+        pre(indexer: Definitions.INDEXER) -> bool is
+            let name: string mut;
+            let location: LOCATION mut;
+
+            if indexer.name? then
+                name = indexer.name.name;
+                location = indexer.name.location;
+            else
+                name = "Item";
+                location = indexer.location;
+            fi
+
+            if indexer.read_body? then
+                let read_accessor = Definitions.FUNCTION(
+                    indexer.location,
+                    Identifiers.Identifier(
+                        location,
+                        "get_{name}"
+                    ),
+                    TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
+                    Variables.LIST(
+                        LOCATION.internal,
+                        Collections.LIST[Variables.VARIABLE]([indexer.index_argument.copy()]:Variables.VARIABLE)),
+                    indexer.type_expression.copy(),
+                    indexer.modifiers.copy(),
+                    indexer.read_body!
+                );
+                read_accessor.for_indexer = indexer;
+                enclosing_definition.add(read_accessor);
+            fi
+
+            if indexer.assign_body? then
+                let assign_accessor = Definitions.FUNCTION(
+                    indexer.location,
+                    Identifiers.Identifier(
+                        location,
+                        "set_{name}"
+                    ),
+                    TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
+                    Variables.LIST(LOCATION.internal, Collections.LIST[Variables.VARIABLE]([
+                        indexer.index_argument.copy(),
+                        Variables.VARIABLE(
+                            indexer.assign_argument!.location,
+                            indexer.assign_argument!.copy(),
+                            indexer.type_expression.copy(),
+                            false,
+                            true,
+                            null
+                        )
+                    ]:Variables.VARIABLE)),
+                    TypeExpressions.NAMED(
+                        LOCATION.internal,
+                        Identifiers.Identifier(
+                            LOCATION.internal,
+                            "void"
+                        )
+                    ),
+                    indexer.modifiers.copy(),
+                    indexer.assign_body!
+                );
+                assign_accessor.for_indexer = indexer;
+                assign_accessor.is_assign_accessor = true;
+                enclosing_definition.add(assign_accessor);
+            fi
+                       
+            return true;
+        si
+
+        pre(`class: Definitions.CLASS) -> bool is
+            _stack.push(`class.body);
+
+            add_object_equals_bridge(`class);
+
+            return false;
+        si
+
+        // A type that declares `=~` gets the `Object.Equals` bridge so
+        // .NET reaches the operator the user wrote. Skipped when the
+        // body already supplies that method, which is then the
+        // author's own bridge and is left alone.
+        //
+        // The bridge also requires the type to declare its own
+        // `get_hash_code`. .NET pairs the two - values that compare
+        // equal must hash equal, and a hash-based collection consults
+        // the hash first - and a type that declares neither is
+        // consistent as it stands, comparing and hashing by identity.
+        // Bridging on its own would break that pair rather than
+        // complete it: equality would answer by the operator while the
+        // hash still answered by identity, so two equal keys would
+        // land in different buckets. The hash cannot be synthesised
+        // either, since an operator is free to be coarser than the
+        // fields it reads and a memberwise hash would then disagree
+        // with it. So the type is left alone and the missing half is
+        // reported.
+        add_object_equals_bridge(classy: Definitions.Classy) is
+            if
+                classy.is_poisoned \/
+                !declares_function(classy.body, "=~") \/
+                declares_object_equals(classy.body)
+            then
+                return;
+            fi
+
+            if !declares_function(classy.body, "get_hash_code") then
+                IoC.CONTAINER.instance.logger.warn(
+                    classy.name.location,
+                    "equality-without-hash",
+                    "{classy.name.name} defines =~ but no get_hash_code, so .NET comparisons will not use the operator"
+                );
+
+                return;
+            fi
+
+            classy.body.add(
+                get_object_equals_bridge(
+                    LOCATION.internal,
+                    get_classy_type_expression(classy)
+                )
+            );
+        si
+
+        visit(`class: Definitions.CLASS) is
+            _stack.pop();
+        si
+
+        pre(`trait: Definitions.TRAIT) -> bool is
+            _stack.push(`trait.body);
+
+            return false;
+        si
+
+        visit(`trait: Definitions.TRAIT) is
+            _stack.pop();
+        si
+
+        // Members synthesized for a partial/impl block's properties -
+        // accessor functions, auto-property backing variables - belong
+        // in the block's own body, so that DECLARE_MEMBERS declares
+        // them into the block's target type. Without this the block's
+        // list never reaches the stack and they land in the enclosing
+        // namespace's body, where they are declared as globals.
+        pre(`partial: Definitions.PARTIAL) -> bool is
+            _stack.push(`partial.body);
+
+            return false;
+        si
+
+        visit(`partial: Definitions.PARTIAL) is
+            _stack.pop();
+        si
+
+        pre(`impl: Definitions.IMPL) -> bool is
+            _stack.push(`impl.body);
+
+            return false;
+        si
+
+        visit(`impl: Definitions.IMPL) is
+            _stack.pop();
+        si
+
+        pre(`struct: Definitions.STRUCT) -> bool is
+            _stack.push(`struct.body);
+
+            add_object_equals_bridge(`struct);
+
+            return false;
+        si
+
+        visit(`struct: Definitions.STRUCT) is
+            _stack.pop();
+        si
+
+        pre(`union: Definitions.UNION) -> bool is
+            _stack.push(`union.body);
+
+            if `union.is_poisoned then
+                return false;
+            fi
+
+            let unit_variant_count mut = 0;
+            let non_unit_variant_count mut = 0;
+            let default_variants = Collections.LIST[Definitions.VARIANT]();
+
+            for definition in `union.body do
+                if isa Definitions.VARIANT(definition) then
+                    let variant = definition;
+
+                    let own_field_count =
+                        variant.fields
+                        |> filter(f => !f.is_inherited_primary)
+                        |> count();
+
+                    if own_field_count > 0 then
+                        non_unit_variant_count = non_unit_variant_count + 1;
+                    else
+                        unit_variant_count = unit_variant_count + 1;
+                    fi
+
+                    if variant.is_default then
+                        default_variants.add(variant);
+                    fi
+                fi
+            od
+
+            if non_unit_variant_count == 0 /\ unit_variant_count == 0 then
+                IoC.CONTAINER.instance.logger
+                    .error(`union.location, "union must have at least one variant");
+            fi
+
+            // Default-variant validation. The actual pick used by
+            // `compile_access` for `?`/`!` lives on `Symbols.UNION`,
+            // set during declare_members once the variant symbols
+            // exist. Here we just diagnose obvious mistakes that
+            // would otherwise produce a surprising default later.
+            if default_variants.count > 1 then
+                for d in default_variants do
+                    let others = LIST[RELATED_LOCATION]();
+
+                    for other in default_variants do
+                        if other != d then
+                            others.add(RELATED_LOCATION(other.location, "also marked default here"));
+                        fi
+                    od
+
+                    IoC.CONTAINER.instance.logger
+                        .error(d.location, "a union can have at most one default variant", others);
+                od
+            elif default_variants.count == 1 then
+                let d = default_variants[0];
+
+                let own_field_count =
+                    d.fields
+                    |> filter(f => !f.is_inherited_primary)
+                    |> count();
+
+                if own_field_count == 0 then
+                    IoC.CONTAINER.instance.logger
+                        .error(d.location, "a default variant must hold at least one value");
+                fi
+            fi
+
+            // Synthesise structural equality on the union and its
+            // variants. The union's `=~` returns false (the runtime
+            // type is always some variant; this base is purely
+            // overridden). Each variant overrides `=~` with an isa
+            // check + field-by-field `object.equals`, the latter of
+            // which gives value semantics for primitives via boxing,
+            // for strings, and recursively for other unions whose
+            // synthesised `equals(object?)` we add here too.
+            // Synthesised `equals(object?)` makes the union a sound
+            // dictionary key; `get_hash_code` is required by the
+            // .NET equality contract (equal objects must hash equal).
+            `union.body.add(_synthesized(get_typed_equals_method_for_union(`union)));
+            `union.body.add(_synthesized(get_object_equals_method_for_union(`union)));
+            `union.body.add(_synthesized(get_hash_code_method_for_union()));
+
+            for definition in `union.body do
+                if isa Definitions.VARIANT(definition) then
+                    let variant = definition;
+
+                    variant.body.add(_synthesized(get_typed_equals_method_for_variant(variant, `union)));
+                    variant.body.add(_synthesized(get_hash_code_method_for_variant(variant)));
+                fi
+            od
+
+            return false;
+        si
+
+        visit(`union: Definitions.UNION) is
+            _stack.pop();
+        si
+
+        // These carry the union's or variant's own declaration location
+        // rather than an internal one, so nothing else distinguishes
+        // them from a member the user wrote there.
+        _synthesized(function: Definitions.FUNCTION) -> Definitions.FUNCTION static is
+            function.mark_synthesized();
+
+            return function;
+        si
+
+        pre(variant: Trees.Definitions.VARIANT) -> bool is
+            super.pre(variant);
+            _stack.push(variant.body);
+            return false;
+        si
+
+        visit(variant: Trees.Definitions.VARIANT) is
+            if variant.is_poisoned then
+                _stack.pop();
+                return;
+            fi
+
+            let init_function = get_init_method_for_variant(variant);
+
+            variant.body.add(init_function);
+
+            _stack.pop();
+        si
+
+        pre(`namespace: Definitions.NAMESPACE) -> bool is
+            _stack.push(`namespace.body);
+
+            return false;
+        si
+
+        visit(`namespace: Definitions.NAMESPACE) is
+            _stack.pop();
+        si
+    si
+si

@@ -1,0 +1,708 @@
+namespace Syntax.Process is
+    use Source;
+    use Logging;
+    use Trees;
+
+    // Synthesis helpers: capture matching, pragma rewrapping,
+    // auto-property and deconstruct generation, variant splice
+    // expansion and secondary-init chaining. The walk itself is in
+    // rewrite_primary_constructors.ghul.
+    partial REWRITE_PRIMARY_CONSTRUCTORS is
+        _strip_orphan_super_calls(classy: Trees.Definitions.Classy) is
+            let kept = Collections.LIST[Trees.Definitions.Definition]();
+            let any_dropped mut = false;
+
+            for d in classy.body do
+                if isa Trees.Definitions.SUPER_CALL(d) then
+                    _logger.error(
+                        d.location,
+                        "super(...) declaration requires a primary constructor header"
+                    );
+                    any_dropped = true;
+                else
+                    if _has_init_modifier(d) then
+                        _logger.error(
+                            d.location,
+                            "init modifier is only valid on a primary constructor parameter"
+                        );
+                    fi
+                    kept.add(d);
+                fi
+            od
+
+            if any_dropped then
+                classy.body.clear_definitions();
+
+                for d in kept do
+                    classy.body.add(d);
+                od
+            fi
+        si
+
+        _is_unmatched_capture_shorthand(d: Trees.Definitions.Definition) -> bool is
+            if !isa Trees.Definitions.PROPERTY(d) then
+                return false;
+            fi
+
+            let p = cast Trees.Definitions.PROPERTY(d);
+
+            if p.read_body? \/ p.assign_body? then
+                return false;
+            fi
+
+            return p.name? /\ p.type_expression.is_inferred;
+        si
+
+        // Every @pragma(...) wrapping `d`, outermost first, unwrapping
+        // as many levels as were stacked - a declaration can carry more
+        // than one.
+        _collect_pragmas(d: Trees.Definitions.Definition) -> Collections.LIST[Trees.Definitions.PRAGMA] is
+            let result = Collections.LIST[Trees.Definitions.PRAGMA]();
+            let current: Trees.Definitions.Definition mut = d;
+
+            while isa Trees.Definitions.PRAGMA(current) do
+                let p = cast Trees.Definitions.PRAGMA(current);
+
+                result.add(p);
+                current = p.definition;
+            od
+
+            return result;
+        si
+
+        // Rebuilds the nesting `_collect_pragmas` unwrapped, around a
+        // freshly synthesised definition in place of the original one.
+        _rewrap_pragmas(
+            pragmas: Collections.LIST[Trees.Definitions.PRAGMA],
+            inner: Trees.Definitions.Definition
+        ) -> Trees.Definitions.Definition is
+            let result: Trees.Definitions.Definition mut = inner;
+            let i mut = pragmas.count - 1;
+
+            while i >= 0 do
+                let p = pragmas[i];
+
+                result = Trees.Definitions.PRAGMA(p.pragma.location :: result.location, p.pragma, result);
+                i = i - 1;
+            od
+
+            return result;
+        si
+
+        _is_init_function(d: Trees.Definitions.Definition) -> bool is
+            if !isa Trees.Definitions.FUNCTION(d) then
+                return false;
+            fi
+
+            let f = cast Trees.Definitions.FUNCTION(d);
+
+            return f.name? /\ f.name.name =~ "init";
+        si
+
+        _is_primary_init(f: Trees.Definitions.FUNCTION) -> bool is
+            // init(..) — exactly one parameter and it's the splice marker.
+            let args = f.arguments.variables;
+
+            return args.count == 1 /\ args[0].is_splice;
+        si
+
+        _arg_list_has_splice(args: Trees.Variables.LIST?) -> bool is
+            if !args? then
+                return false;
+            fi
+
+            for v in args do
+                if v.is_splice then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        _count_splices(args: Trees.Variables.LIST?) -> int is
+            if !args? then
+                return 0;
+            fi
+
+            let n mut = 0;
+
+            for v in args do
+                if v.is_splice then
+                    n = n + 1;
+                fi
+            od
+
+            return n;
+        si
+
+        _strip_underscore(name: string) -> string is
+            if name.length > 0 /\ name[0] == '_' then
+                return name.substring(1);
+            fi
+
+            return name;
+        si
+
+        // Diagnoses incoherent combinations on a primary-ctor parameter:
+        // - `init` combined with any visibility modifier or with another
+        //   storage modifier means "no field, but also make the (non-
+        //   existent) field public / a plain field" — incoherent.
+        // - `init` combined with a `_`-prefixed name means "no field, but
+        //   the name implies a private field" — same incoherence.
+        // The rewriter only flags; it doesn't strip, so the user sees
+        // every diagnostic in one pass.
+        _validate_primary_param_modifiers(p: Trees.Variables.VARIABLE) is
+            let modifiers = p.modifiers;
+
+            if !modifiers? then
+                return;
+            fi
+
+            if modifiers.is_init then
+                if let modifiers.access_modifier? then
+                    _logger.error(
+                        access_modifier.location,
+                        "init modifier cannot combine with visibility modifiers"
+                    );
+                fi
+                if let
+                    modifiers.storage_class? /\
+                    !storage_class.is_init
+                then
+                    _logger.error(
+                        storage_class.location,
+                        "init modifier cannot combine with other storage modifiers"
+                    );
+                fi
+                if let
+                    p.name? /\
+                    name.name.length > 0 /\
+                    name.name[0] == '_'
+                then
+                    _logger.error(
+                        p.location,
+                        "init modifier cannot combine with a _-prefixed parameter name"
+                    );
+                fi
+            fi
+        si
+
+        // Body decls with the `init` modifier are diagnosed at the body-
+        // iteration step. This helper recognises the (FUNCTION / PROPERTY)
+        // shapes that carry modifier lists.
+        _has_init_modifier(d: Trees.Definitions.Definition) -> bool is
+            if isa Trees.Definitions.PROPERTY(d) then
+                let p = cast Trees.Definitions.PROPERTY(d);
+                return p.modifiers.is_init;
+            fi
+            if isa Trees.Definitions.FUNCTION(d) then
+                let f = cast Trees.Definitions.FUNCTION(d);
+                return f.modifiers.is_init;
+            fi
+            return false;
+        si
+
+        // Synthesise a body-level field/property declaration mirroring the
+        // primary-ctor parameter, ready to flow through
+        // `add_accessors_for_properties` and `declare_symbols` as if the
+        // user had written it by hand. Strips the `init` modifier from
+        // the synthesised modifier list as a safety net — even though the
+        // caller has already filtered INIT params, leaving INIT on the
+        // body decl would re-trigger the "init only on primary param"
+        // diagnostic.
+        _synthesise_auto_property(p: Trees.Variables.VARIABLE) -> Trees.Definitions.PROPERTY =>
+            let loc = p.location in
+            let modifiers = _make_body_modifiers(p) in
+            Trees.Definitions.PROPERTY(
+                loc,
+                p.type_expression.copy(),
+                _body_property_name(p),
+                modifiers,
+                null,
+                null,
+                null
+            );
+
+        // `private` names the member the way the naming convention does:
+        // `v: int private` captures into `_v`, leaving the parameter
+        // itself as `v`. The underscore is what the later passes read for
+        // visibility, so `_make_body_modifiers` drops the modifier rather
+        // than carrying both spellings of the same fact.
+        _body_property_name(p: Trees.Variables.VARIABLE) -> Trees.Identifiers.Identifier is
+            let name = p.name!;
+
+            if _is_private_param(p) /\ !name.name.starts_with('_') then
+                return Trees.Identifiers.Identifier(name.location, "_{name.name}");
+            fi
+
+            return name.copy();
+        si
+
+        _is_private_param(p: Trees.Variables.VARIABLE) -> bool is
+            if let p.modifiers?, modifiers.access_modifier? /\ access_modifier.is_private then
+                return true;
+            fi
+
+            return false;
+        si
+
+        _make_body_modifiers(p: Trees.Variables.VARIABLE) -> Trees.Modifiers.LIST is
+            let loc = p.location;
+            let modifiers = p.modifiers;
+
+            if !modifiers? then
+                return Trees.Modifiers.LIST(loc, null, null);
+            fi
+
+            let access: Trees.Modifiers.AccessModifier? mut = null;
+            let storage: Trees.Modifiers.StorageClass? mut = null;
+
+            if let modifiers.access_modifier? /\ !access_modifier.is_private then
+                access = access_modifier.copy();
+            fi
+
+            // Drop INIT — it has no meaning on the body decl. Other
+            // storage classes (FIELD, etc.) flow through.
+            if let modifiers.storage_class? /\ !storage_class.is_init then
+                storage = storage_class.copy();
+            fi
+
+            return Trees.Modifiers.LIST(loc, access, storage);
+        si
+
+        // See `DESTRUCTURE_RESOLVER` for the precedence the synthesised
+        // deconstruct slots into. Guard preconditions:
+        //   - User wrote no `deconstruct` of any arity in this class body.
+        //   - User exposed no backtick-numeric property (`0`, `1`, ...).
+        //   - At least one public-readable capture exists to expose.
+        // The synthesised method is `public`, instance, with one `T ref`
+        // parameter per included capture (named after the capture so the
+        // body reads naturally; the destructure call site only ever
+        // matches by arity + ref-ness).
+        _maybe_synthesise_deconstruct(
+            classy: Trees.Definitions.Classy,
+            class_location: LOCATION,
+            primary_params: Trees.Variables.LIST,
+            param_for_capture: Collections.MAP[Trees.Definitions.PROPERTY, Trees.Variables.VARIABLE],
+            already_captured_param_names: Collections.SET[string],
+            kept: Collections.MutableList[Trees.Definitions.Definition]
+        ) is
+            for d in classy.body do
+                if isa Trees.Definitions.FUNCTION(d) then
+                    let f = cast Trees.Definitions.FUNCTION?(d)!;
+                    if f.name? /\ f.name.name =~ "deconstruct" then
+                        return;
+                    fi
+                elif isa Trees.Definitions.PROPERTY(d) then
+                    let p = cast Trees.Definitions.PROPERTY?(d)!;
+                    if p.name? /\ Semantic.Symbols.Symbol.is_positional_member_name(p.name.name) then
+                        return;
+                    fi
+                fi
+            od
+
+            // Reverse-lookup table: primary-ctor parameter name -> its
+            // capture property. Built once so the capture-collection loop
+            // below stays O(captures).
+            let capture_for_param_name = Collections.MAP[string, Trees.Definitions.PROPERTY]();
+            for kvp in param_for_capture do
+                let cap = kvp.key;
+                let param = kvp.value;
+                if let param.name? then
+                    capture_for_param_name[name.name] = cap;
+                fi
+            od
+
+            let deconstruct_captures = Collections.LIST[Trees.Definitions.PROPERTY]();
+            for p in primary_params do
+                let name = p.name;
+                if !name? then
+                    continue;
+                fi
+                if !already_captured_param_names.contains(name.name) then
+                    continue;
+                fi
+                if !capture_for_param_name.contains_key(name.name) then
+                    continue;
+                fi
+                let capture = capture_for_param_name[name.name];
+                if !_is_public_readable_capture(capture) then
+                    continue;
+                fi
+                deconstruct_captures.add(capture);
+            od
+
+            if deconstruct_captures.count == 0 then
+                return;
+            fi
+
+            let deconstruct = _synthesise_deconstruct(class_location, deconstruct_captures);
+
+            // Wrap in an @IL.name("Deconstruct") pragma so the method
+            // satisfies the standard .NET `Deconstruct` contract used by
+            // C# positional patterns and other cross-language consumers.
+            kept.add(_wrap_in_il_name_pragma(class_location, "Deconstruct", deconstruct));
+        si
+
+        _is_public_readable_capture(p: Trees.Definitions.PROPERTY) -> bool is
+            // ghūl carries read-visibility two ways: an explicit
+            // access modifier, or a leading `_` on the name (the
+            // convention: "_x" -> protected for reading). Both must
+            // be checked — the synthesised deconstruct is `public`,
+            // and surfacing a protected member through it would
+            // bypass the encapsulation the user signalled.
+            if let p.modifiers?, modifiers.access_modifier? /\ access_modifier.is_private then
+                return false;
+            fi
+            if p.name? /\ p.name.name.length > 0 /\ p.name.name[0] == '_' then
+                return false;
+            fi
+            return true;
+        si
+
+        _synthesise_deconstruct(
+            class_location: LOCATION,
+            captures: Collections.List[Trees.Definitions.PROPERTY]
+        ) -> Trees.Definitions.FUNCTION is
+            let arg_vars = Collections.LIST[Trees.Variables.VARIABLE]();
+            let body_stmts = Collections.LIST[Trees.Statements.Statement]();
+
+            for capture in captures do
+                let cap_loc = capture.location;
+                let arg_type =
+                    Trees.TypeExpressions.REFERENCE(
+                        cap_loc,
+                        capture.type_expression.copy()
+                    );
+                let arg =
+                    Trees.Variables.VARIABLE(
+                        cap_loc,
+                        capture.name!.copy(),
+                        arg_type,
+                        false,
+                        true,
+                        null
+                    );
+                arg.mark_argument();
+                arg_vars.add(arg);
+
+                body_stmts.add(_make_deconstruct_assignment(capture));
+            od
+
+            let arg_list = Trees.Variables.LIST(class_location, arg_vars);
+            let body =
+                Trees.Bodies.BLOCK(
+                    LOCATION.internal,
+                    Trees.Statements.LIST(LOCATION.internal, body_stmts)
+                );
+            let modifiers =
+                Trees.Modifiers.LIST(
+                    class_location,
+                    Trees.Modifiers.PUBLIC(class_location),
+                    null
+                );
+
+            return
+                Trees.Definitions.FUNCTION(
+                    class_location,
+                    Trees.Identifiers.Identifier(LOCATION.internal, "deconstruct"),
+                    Trees.TypeExpressions.LIST(LOCATION.internal, Collections.LIST[Trees.TypeExpressions.TypeExpression](0)),
+                    arg_list,
+                    Trees.TypeExpressions.INFER(class_location),
+                    modifiers,
+                    body
+                );
+        si
+
+        _make_deconstruct_assignment(
+            capture: Trees.Definitions.PROPERTY
+        ) -> Trees.Statements.Statement is
+            let loc = capture.location;
+
+            // <capture-name>! = self.<capture-name>;
+            //
+            // Postfix `!` on a `T ref` LHS lowers to a `stobj <T>` —
+            // the write-through-ref form. Without it,
+            // `<capture-name> = self.<...>` would error with
+            // "Ghul.T is not assignable to Ghul.T ref".
+            let arg_ref =
+                Trees.Expressions.IDENTIFIER(loc, capture.name!.copy());
+            let unwrap = Trees.Expressions.UNWRAP(loc, arg_ref);
+            let left = Trees.Expressions.SIMPLE_LEFT_EXPRESSION(loc, unwrap);
+
+            let self_expr = Trees.Expressions.SELF(loc);
+            let right =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    capture.name!.copy(),
+                    loc
+                );
+
+            return Trees.Statements.ASSIGNMENT(loc, left, right);
+        si
+
+        _wrap_in_il_name_pragma(
+            loc: LOCATION,
+            il_name: string,
+            definition: Trees.Definitions.Definition
+        ) -> Trees.Definitions.PRAGMA is
+            let name_literal = Trees.Expressions.Literals.STRING(loc, il_name);
+            let args = Collections.LIST[Trees.Expressions.Expression]();
+            args.add(name_literal);
+            let pragma =
+                Trees.Pragmas.PRAGMA(
+                    loc,
+                    Trees.Identifiers.Identifier(loc, "IL.name"),
+                    Trees.Expressions.LIST(loc, args),
+                    null
+                );
+            return Trees.Definitions.PRAGMA(loc, pragma, definition);
+        si
+
+        _make_super_init_call(
+            super_call: Trees.Definitions.SUPER_CALL
+        ) -> Trees.Statements.Statement is
+            let loc = super_call.location;
+            let arg_exprs = Collections.LIST[Trees.Expressions.Expression]();
+
+            for arg_expr in super_call.args do
+                arg_exprs.add(arg_expr);
+            od
+
+            // super.init(args)
+            let super_expr = Trees.Expressions.SUPER(loc);
+            let init_identifier = Trees.Identifiers.Identifier(loc, "init");
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    super_expr,
+                    init_identifier,
+                    loc
+                );
+            let call =
+                Trees.Expressions.CALL(
+                    loc,
+                    member,
+                    Trees.Expressions.LIST(loc, arg_exprs)
+                );
+
+            return Trees.Statements.EXPRESSION(loc, call);
+        si
+
+        _make_capture_assignment(capture: Trees.Definitions.PROPERTY, param: Trees.Variables.VARIABLE) -> Trees.Statements.Statement is
+            let loc = capture.location;
+
+            // self.<capture-name> = <param-name>;
+            let self_expr = Trees.Expressions.SELF(loc);
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    capture.name!.copy(),
+                    loc
+                );
+            let left = Trees.Expressions.SIMPLE_LEFT_EXPRESSION(loc, member);
+            let right =
+                Trees.Expressions.IDENTIFIER(
+                    loc,
+                    param.name!.copy()
+                );
+
+            return Trees.Statements.ASSIGNMENT(loc, left, right);
+        si
+
+        // Expand `..` in the variant's field list against the
+        // enclosing union's primary parameters. The splice marker is
+        // replaced in-place by deep-copies of the primary params, each
+        // marked is_inherited_primary. They stay in variant.fields so
+        // every existing consumer (arity, equality, hash, destructure)
+        // continues to see the variant's full shape. declare_symbols
+        // skips declaring inherited entries as variant-side fields —
+        // the union base owns the storage and variants inherit through
+        // the union → variant base-class relationship. The variant's
+        // synthesised init forwards inherited args to super.init(...);
+        // non-inherited fields get the usual self.<f> = <f>. Validates
+        // exactly one `..` per variant.
+        _expand_variant_splice(variant: Trees.Definitions.VARIANT, primary_params: Trees.Variables.LIST) is
+            if variant.is_poisoned then
+                return;
+            fi
+
+            let splice_count = _count_splices(variant.fields);
+
+            if splice_count == 0 then
+                if variant.fields.count == 0 then
+                    // No field list — splice the primary parameters as if
+                    // the user had written `(..)`.
+                    let new_fields = Collections.LIST[Trees.Variables.VARIABLE]();
+
+                    for p in primary_params do
+                        let inherited = _copy_variable(p);
+                        inherited.mark_inherited_primary();
+                        new_fields.add(inherited);
+                    od
+
+                    variant.set_fields(Trees.Variables.LIST(variant.fields.location, new_fields));
+                    return;
+                fi
+
+                _logger.error(
+                    variant.location,
+                    "variant of a union with a primary constructor header must include .. to splice in the primary parameters"
+                );
+                return;
+            fi
+
+            if splice_count > 1 then
+                _logger.error(
+                    variant.location,
+                    "variant field list contains more than one .."
+                );
+            fi
+
+            let new_fields = Collections.LIST[Trees.Variables.VARIABLE]();
+            let expanded mut = false;
+
+            for v in variant.fields do
+                if v.is_splice then
+                    if !expanded then
+                        for p in primary_params do
+                            let inherited = _copy_variable(p);
+                            inherited.mark_inherited_primary();
+                            new_fields.add(inherited);
+                        od
+
+                        expanded = true;
+                    fi
+                else
+                    new_fields.add(v);
+                fi
+            od
+
+            variant.set_fields(Trees.Variables.LIST(variant.fields.location, new_fields));
+        si
+
+        _reject_stray_splice(variant: Trees.Definitions.VARIANT) is
+            if variant.is_poisoned then
+                return;
+            fi
+
+            for v in variant.fields do
+                if v.is_splice /\ !v.is_poisoned then
+                    _logger.error(
+                        v.location,
+                        ".. requires the surrounding union to declare a primary constructor header"
+                    );
+                    v.poison(true);
+                fi
+            od
+        si
+
+        _expand_secondary_init(f: Trees.Definitions.FUNCTION, primary_params: Trees.Variables.LIST) is
+            // Build the new argument list: every existing argument
+            // except the splice marker, with the primary parameters
+            // spliced in at the first splice's position. Any extra
+            // splice markers (already flagged as errors above) are
+            // dropped — expanding more than one would duplicate the
+            // primary parameter names and cascade into redefinition
+            // diagnostics that the user's own error already accounts
+            // for.
+            let old_args = f.arguments.variables;
+            let new_args = Collections.LIST[Trees.Variables.VARIABLE]();
+            let expanded mut = false;
+
+            for v in old_args do
+                if v.is_splice then
+                    if !expanded then
+                        for p in primary_params do
+                            new_args.add(_copy_variable(p));
+                        od
+
+                        expanded = true;
+                    fi
+                else
+                    new_args.add(v);
+                fi
+            od
+
+            let expanded_args =
+                Trees.Variables.LIST(
+                    f.arguments.location,
+                    new_args
+                );
+
+            f.arguments = expanded_args;
+
+            // Prepend `self.init(<primary args>);` to the body.
+            if f.body? /\ isa Trees.Bodies.BLOCK(f.body) then
+                let block = cast Trees.Bodies.BLOCK(f.body);
+                let chain = _make_self_init_chain(f.location, primary_params);
+
+                let new_statements = Collections.LIST[Trees.Statements.Statement]();
+                new_statements.add(chain);
+
+                for s in block.statements do
+                    new_statements.add(s);
+                od
+
+                block.statements.replace_all(new_statements);
+            fi
+        si
+
+        _make_self_init_chain(loc: LOCATION, primary_params: Trees.Variables.LIST) -> Trees.Statements.Statement is
+            let arg_exprs = Collections.LIST[Trees.Expressions.Expression]();
+
+            for p in primary_params do
+                arg_exprs.add(
+                    Trees.Expressions.IDENTIFIER(loc, p.name!.copy())
+                );
+            od
+
+            let self_expr = Trees.Expressions.SELF(loc);
+            let init_identifier = Trees.Identifiers.Identifier(loc, "init");
+            let member =
+                Trees.Expressions.MEMBER(
+                    loc,
+                    self_expr,
+                    init_identifier,
+                    loc
+                );
+            let call =
+                Trees.Expressions.CALL(
+                    loc,
+                    member,
+                    Trees.Expressions.LIST(loc, arg_exprs)
+                );
+
+            return Trees.Statements.EXPRESSION(loc, call);
+        si
+
+        _copy_variable(v: Trees.Variables.VARIABLE) -> Trees.Variables.VARIABLE is
+            let result =
+                Trees.Variables.VARIABLE(
+                    v.location,
+                    v.name!.copy(),
+                    v.type_expression.copy(),
+                    false,
+                    true,
+                    null
+                );
+
+            result.mark_argument();
+
+            return result;
+        si
+
+        _copy_variable_list(list: Trees.Variables.LIST) -> Trees.Variables.LIST is
+            let copied = Collections.LIST[Trees.Variables.VARIABLE]();
+
+            for v in list do
+                copied.add(_copy_variable(v));
+            od
+
+            return Trees.Variables.LIST(list.location, copied);
+        si
+    si
+si
