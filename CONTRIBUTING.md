@@ -120,7 +120,7 @@ it does, rather than assuming.
 
 The type system and inference machinery - `src/semantic/types/`,
 `src/semantic/symbols/`, `src/semantic/overload_resolver.ghul`, the inference
-paths in `src/syntax/process/compile_expressions.ghul`, and the IR value gates
+paths in `src/syntax/process/compile-expressions/compile_expressions.ghul`, and the IR value gates
 around them - are the most fragile part of the compiler. A patch that works in
 isolation can still interact badly with constraint accumulation, least-upper-bound
 widening, retry-loop convergence, or IL emission. So the bar here is higher than
