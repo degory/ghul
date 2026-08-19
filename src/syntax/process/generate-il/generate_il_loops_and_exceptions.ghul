@@ -1,0 +1,796 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Loop and exception IL: try, catch, do and for walks, and the fused and guarded for loops.
+    partial GENERATE_IL is
+        pre(`try: Statements.TRY) -> bool is
+            super.pre(`try);
+
+            return true;
+        si
+
+        get_exception_handler_temps() -> (outer_try: LOOP_LABELS?, return_needed: TEMP, return_value: TEMP?) is
+            let return_type = current_function!.return_type;
+
+            let return_needed: TEMP mut;
+            let return_value: TEMP? mut = _;
+
+            let outer_try = _loops.get_current_try();
+
+            if outer_try? then
+                // get_current_try returns only try-form labels, whose init sets return_needed
+                return_needed = outer_try.return_needed!;
+                return_value = outer_try.return_value;
+            else
+                return_needed = TEMP(current_block, "need_return", 1, _innate_symbol_lookup.get_bool_type());
+
+                if return_type? /\ !return_type.matches(_innate_symbol_lookup.get_void_type()) then
+                    return_value = TEMP(current_block, "return", return_type);                
+                fi
+            fi
+
+            return (outer_try, return_needed, return_value);
+        si
+
+        gen_exception_handler_exit(outer_try: LOOP_LABELS?, label: LOOP_LABELS, return_value: TEMP?) is
+            let brancher = get_brancher_for_block();
+
+            brancher.label(label.start);
+            brancher.branch(BRANCH.Z, label.return_needed!.load(), label.end);
+
+            if outer_try? then
+                if return_value? then
+                    assert outer_try.return_value? else "outer try has no return value temporary";
+                    outer_try.return_value.store(return_value.load());
+                fi
+
+                if outer_try.is_in_finally then
+                    outer_try.return_needed!.store(Literal.NUMBER(1, _innate_symbol_lookup.get_bool_type()));
+                    brancher.branch(outer_try.middle);
+                else
+                    brancher.leave(outer_try.start);
+                fi
+            elif
+                _current_async_state_machine? /\
+                _current_async_success_label? /\
+                current_function == _current_async_state_machine!.function
+            then
+                // State-machine async: a return inside a try block
+                // accumulates the value in `return_value` and the
+                // "need return" flag. The post-try emit reaches here
+                // — for state-machine async we stash the value to
+                // `_result` and `leave success_label` (NOT `ret`),
+                // so the trailer's `builder.SetResult` fires.
+                let frame = _current_async_state_machine!.frame;
+
+                assert frame? else "async state machine has no frame at exception handler exit emission";
+
+                let result_field = frame.result_field;
+
+                if return_value? /\ result_field? then
+                    add(_build_frame_field_store(frame, result_field, return_value.load()));
+                fi
+
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, _current_async_success_label!));
+            else
+                if return_value? then
+                    add(return_value.load());
+                fi
+
+                add(Values.RET());
+            fi
+
+            brancher.label(label.end);
+        si
+
+        visit(`try: Statements.TRY) is
+            if
+                `try.catches.count == 0 /\
+                !`try.`finally?
+            then
+                `try.body.walk(self);
+
+                super.visit(`try);
+
+                return;
+            fi
+
+            let brancher = get_brancher_for_block();
+
+            let return_type = current_function!.return_type;
+
+            let (outer_try, return_needed, return_value) = get_exception_handler_temps();
+
+            let label = _loops.enter_try(return_needed, return_value);
+
+            let need_double_try = `try.catches.count > 0 /\ `try.`finally?;
+
+            // The extent each handler is attached to. With both
+            // catches and a finally the two `.try` blocks are separate
+            // extents, the finally's covering the catches; with only
+            // one kind of handler there is a single block and both
+            // names stand for it.
+            let body_extent = Values.TRY_EXTENT();
+
+            let finally_extent =
+                if need_double_try then
+                    Values.TRY_EXTENT()
+                else
+                    body_extent
+                fi;
+
+            let outer_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
+            let body_dispatch_holder: ASYNC_DISPATCH_HOLDER? mut = null;
+
+            if need_double_try then
+                add(Values.TRY_START(finally_extent));
+                outer_dispatch_holder = _maybe_push_dispatch_holder();
+            fi
+
+            add(Values.TRY_START(body_extent));
+
+            body_dispatch_holder = _maybe_push_dispatch_holder();
+
+            `try.body.walk(self);
+
+            _maybe_pop_dispatch_holder(body_dispatch_holder);
+
+            brancher.leave(label.start);
+
+            add(Values.TRY_END(body_extent));
+
+            _try_extents.push(body_extent);
+
+            for c in `try.catches do
+                c.walk(self);
+            od
+
+            _try_extents.pop();
+
+            if need_double_try then
+                _maybe_pop_dispatch_holder(outer_dispatch_holder);
+                add(Values.TRY_END(finally_extent));
+            fi
+
+            let `finally = `try.`finally;
+
+            if `finally? then
+                label.is_in_finally = true;
+
+                let region = Values.PROTECTED_REGION(finally_extent, null);
+
+                add(Values.HANDLER_START(region));
+
+                let skip_finally_label = _open_finally_state_guard();
+
+                `finally.walk(self);
+
+                _close_finally_state_guard(skip_finally_label);
+
+                brancher.label(label.middle);
+
+                add(Values.INSTRUCTION(ILOpCode.ENDFINALLY));
+                add(Values.HANDLER_END(region));
+            fi
+
+            _loops.leave_loop();
+
+            // let outer_try = _loops.get_current_try();
+            gen_exception_handler_exit(outer_try, label, return_value);
+
+            super.visit(`try);
+        si
+
+        pre(`catch: Statements.CATCH) -> bool is
+            super.pre(`catch);
+
+            return true;
+        si
+
+        visit(`catch: Statements.CATCH) is
+            let variable = `catch.variable!;
+
+            let region =
+                Values.PROTECTED_REGION(
+                    _try_extents.peek(),
+                    variable.type_expression.type!);
+
+            add(Values.HANDLER_START(region));
+
+            let brancher = get_brancher_for_block();
+
+            // Catch handler enters with the exception on the stack
+            // and immediately stores it into the catch variable. The
+            // loop-scoped default-store added for issue #483 must be
+            // suppressed here — it would clobber the caught value.
+            _in_catch_variable = true;
+            variable.walk(self);
+            _in_catch_variable = false;
+
+            let symbol = find(variable.name!);
+
+            // State-machine-resident catch variable (async function):
+            // the exception's on the stack but `stloc <name>` would
+            // reference an undeclared CLR local since pre(VARIABLE)
+            // skipped the `.locals init` directive. Route through
+            // the frame field via a temp instead.
+            if let v: Semantic.Symbols.Variable = symbol, sm_field = v.state_machine_field then
+                let exception_type = variable.type_expression.type!;
+                let caught = ".catch_exc";
+
+                add(Values.DECLARE_LOCAL(caught, exception_type));
+                add(Values.STORE_TEMP(caught, exception_type));
+
+                add(
+                    _build_frame_field_store(
+                        cast Semantic.Symbols.STATE_MACHINE_FRAME_BASE?(sm_field.owner)!,
+                        sm_field,
+                        Values.Load.TEMP(caught, exception_type)));
+            else
+                add(
+                    Values.STORE_TEMP(
+                        symbol!.il_name,
+                        variable.type_expression.type!));
+            fi
+
+            `catch.body.walk(self);
+
+            brancher.leave(_loops.get_current_try()!.start);
+
+            add(Values.HANDLER_END(region));
+
+            super.visit(`catch);
+        si
+
+        pre(`do: Statements.DO) -> bool is
+            super.pre(`do);
+
+            return true;
+        si
+
+        visit(`do: Statements.DO) is
+            let brancher = get_brancher_for_block();
+
+            let loop = _loops.enter_loop();
+
+            brancher.label(loop.start);
+
+            if let `do.binding? then
+                // `while let` clauses: emit the same per-clause
+                // test / bind sequence as `if let`, but branch
+                // failures to `loop.end` (loop exit) instead of an
+                // arm-`next` label. Each iteration re-evaluates
+                // every clause's scrutinee and re-binds — the
+                // bound names are freshly stored on each pass.
+                let first = _emit_if_let_clause_test(binding.clauses[0], loop.end, true, brancher);
+
+                self.pre(binding);
+
+                if first? then
+                    _emit_if_let_clause_bind(binding.clauses[0], first, loop.end);
+                fi
+
+                if binding.clauses[0].guard? then
+                    binding.clauses[0].guard!.walk(self);
+                    brancher.branch(BRANCH.Z, binding.clauses[0].guard!.value!, loop.end, "while-let-guard");
+                fi
+
+                let i mut = 1;
+                while i < binding.clauses.count do
+                    let clause = binding.clauses[i];
+
+                    let temp = _emit_if_let_clause_test(clause, loop.end, false, brancher);
+
+                    if temp? then
+                        _emit_if_let_clause_bind(clause, temp, loop.end);
+                    fi
+
+                    if clause.guard? then
+                        clause.guard.walk(self);
+                        brancher.branch(BRANCH.Z, clause.guard!.value!, loop.end, "while-let-guard");
+                    fi
+
+                    i = i + 1;
+                od
+            elif `do.condition? then
+                `do.condition.walk(self);
+
+                brancher.branch(BRANCH.Z, `do.condition!.value!, loop.end, "while");
+            fi
+
+            `do.body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            super.visit(`do);
+
+            _loops.leave_loop();
+        si
+
+        pre(`for: Statements.FOR) -> bool is
+            super.pre(`for);
+
+            return true;
+        si
+
+        visit(`for: Statements.FOR) is
+            // A recognised, fusible Pipe[T] chain is lowered to one
+            // inline loop over the pinned base, applying the map/filter
+            // stages per element, instead of iterating the built pipe
+            // objects. Not in a state machine, whose iterator must live
+            // on the frame to survive yield/await re-entry - those fall
+            // through to the normal loop below.
+            if
+                `for.fusion? /\
+                !Semantic.Symbols.state_machine_for(current_function)? /\
+                !Semantic.Symbols.async_state_machine_for(current_function)?
+            then
+                if `for.fusion!.needs_guard then
+                    _visit_guarded_for(`for);
+                else
+                    _visit_fused_for(`for);
+                fi
+
+                return;
+            fi
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            let expression = `for.expression!;
+            let variable = `for.variable!;
+            let body = `for.body!;
+
+            let iterator: Value mut;
+
+            if `for.read_iterator? then
+                iterator = `for.read_iterator.call(expression.location, expression.value!, Collections.LIST[Value](0), null, _function_caller);
+            else
+                iterator = expression.value!;
+            fi
+
+            variable.walk(self);
+
+            // Generator / async FOR: the iterator value has to survive
+            // every yield / await in the body, so it is read and written
+            // through the frame field compile-expressions allocated for
+            // it. The regular CLR-local TEMP path would reset on every
+            // MoveNext re-entry.
+            let iterator_field = `for.iterator_field;
+            let iterator_frame = _current_state_machine_frame();
+
+            if iterator_field? /\ iterator_frame? then
+                add(_build_frame_field_store(iterator_frame, iterator_field, iterator));
+            fi
+
+            let temp: TEMP? mut = null;
+
+            if !iterator_field? then
+                temp = TEMP(current_block, "iterator", iterator);
+            fi
+
+            brancher.label(loop.start);
+
+            let load_iter_a =
+                if iterator_field? then
+                    cast Value(IR.Values.Load.INSTANCE_FIELD(
+                        IR.Values.Load.REFERENCE_SELF(iterator_frame!, iterator_frame.type),
+                        iterator_field
+                    ));
+                else
+                    cast Value(temp!.load());
+                fi;
+
+            let has_next = `for.move_next!.call(expression.location, load_iter_a, Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let load_iter_b =
+                if iterator_field? then
+                    cast Value(IR.Values.Load.INSTANCE_FIELD(
+                        IR.Values.Load.REFERENCE_SELF(iterator_frame!, iterator_frame.type),
+                        iterator_field
+                    ));
+                else
+                    cast Value(temp!.load());
+                fi;
+
+            let current = `for.read_current!.call(expression.location, load_iter_b, Collections.LIST[Value](0), null, _function_caller);
+
+            gen_destructuring_initialize(variable.left, current);
+
+            // not to generate code for the expression itself, but to capture IL for any anonymous function bodies:
+            // TODO check that if expressions within the expression are emitted correctly
+            expression.walk(self);
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+        // Declare the per-stage locals a fused chain needs before its loop,
+        // filling `stage_delegates` / `stage_counters` parallel to the
+        // stages (null where a slot does not apply): an inlined stage's
+        // parameter local, a delegate stage's hoisted function value, an
+        // index stage's running counter initialised to its start. Shared by
+        // the pure and guarded fused-loop emitters.
+        _setup_fused_stages(
+            fusion: Syntax.Process.PIPE_FUSION,
+            stage_delegates: Collections.LIST[TEMP?],
+            stage_counters: Collections.LIST[TEMP?]
+        ) is
+            for stage in fusion.stages_outermost_first do
+                if stage.is_countdown then
+                    // take/skip: evaluate the count once into a running
+                    // counter the loop decrements per pulled element.
+                    let counter = TEMP(current_block, "fused_countdown", _innate_symbol_lookup.get_int_type());
+                    counter.store(stage.argument!.value!);
+                    stage_delegates.add(null);
+                    stage_counters.add(counter);
+                elif stage.is_inlined then
+                    add(
+                        Values.DECLARE_LOCAL(
+                            stage.param_local!.il_name, stage.param_local!.storage_type!));
+                    stage_delegates.add(null);
+                    stage_counters.add(null);
+                elif stage.is_index then
+                    let counter = TEMP(current_block, "fused_index", _innate_symbol_lookup.get_int_type());
+                    counter.store(Literal.NUMBER(stage.index_start, _innate_symbol_lookup.get_int_type()));
+                    stage_delegates.add(null);
+                    stage_counters.add(counter);
+                else
+                    stage_delegates.add(TEMP(current_block, "fused_stage", stage.argument!.value!));
+                    stage_counters.add(null);
+                fi
+            od
+        si
+
+        // Apply a fused chain's stages to `element` innermost-first,
+        // returning the fully-transformed value. A map result and an index
+        // result each land in a fresh temp so a downstream stage can reload
+        // them; a filter reject branches to `loop_start` (the next pull); an
+        // index stage builds INDEXED_VALUE(counter++, current) directly.
+        // Shared by the pure and guarded fused-loop emitters.
+        _apply_fused_stages(
+            fusion: Syntax.Process.PIPE_FUSION,
+            element: Value,
+            stage_delegates: Collections.List[TEMP?],
+            stage_counters: Collections.List[TEMP?],
+            brancher: BLOCK_BRANCHER,
+            loop_start: LABEL,
+            loop_end: LABEL
+        ) -> Value is
+            let int_type = _innate_symbol_lookup.get_int_type();
+
+            let current_value: Value mut = element;
+
+            let index mut = fusion.stages_outermost_first.count - 1;
+
+            while index >= 0 do
+                let stage = fusion.stages_outermost_first[index];
+
+                if stage.is_take then
+                    // Decrement the counter for this element; once it goes
+                    // negative the take limit is spent, so leave the loop.
+                    // The element passes through unchanged otherwise.
+                    brancher.branch(BRANCH.LT, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER(0, int_type)), loop_end);
+                elif stage.is_skip then
+                    // Decrement the counter; while it stays non-negative this
+                    // is a leading element to drop, so pull the next one.
+                    brancher.branch(BRANCH.GE, cast Value(IR.Values.PRE_DECREMENT(stage_counters[index]!.il_name, int_type)), cast Value(Literal.NUMBER(0, int_type)), loop_start);
+                else
+                    let stage_result: Value mut;
+
+                    if stage.is_inlined then
+                        // Assign the incoming element to the parameter local;
+                        // the pre-harvested body IR reads it (and any captured
+                        // outer locals) as ordinary locals - no delegate, no
+                        // frame.
+                        add(IR.Values.Store.LOCAL_VARIABLE(stage.param_local!, current_value));
+
+                        stage_result = stage.inline_body!;
+                    elif stage.is_index then
+                        // INDEXED_VALUE(counter, current) with the counter
+                        // post-incremented in place - no INDEX_PIPE object.
+                        let arguments = Collections.LIST[Value]();
+                        arguments.add(cast Value(IR.Values.POST_INCREMENT(stage_counters[index]!.il_name, int_type)));
+                        arguments.add(current_value);
+
+                        stage_result = IR.Values.NEW(stage.indexed_value_type!, stage.indexed_value_constructor!, arguments);
+                    else
+                        let delegate = stage_delegates[index]!.load();
+                        let func_type = stage.argument!.value!.type!;
+
+                        let result_type =
+                            if func_type.is_action then
+                                _innate_symbol_lookup.get_void_type();
+                            else
+                                func_type.arguments[func_type.arguments.count - 1];
+                            fi;
+
+                        let call_arguments = Collections.LIST[Value]();
+                        call_arguments.add(current_value);
+
+                        stage_result = IR.Values.Call.CLOSURE(delegate, result_type, func_type.is_action, func_type, call_arguments);
+                    fi
+
+                    if stage.is_filter then
+                        // Rejected elements skip straight to the next pull.
+                        brancher.branch(BRANCH.Z, stage_result, loop_start);
+                    else
+                        current_value = TEMP(current_block, "fused_mapped", stage_result).load();
+                    fi
+                fi
+
+                index = index - 1;
+            od
+
+            return current_value;
+        si
+
+        // Lower a recognised fusible Pipe[T] chain to a single loop:
+        // drive the pinned base's own iterator, apply each map/filter/index
+        // stage inline per element (map/index assign a temp, filter skips to
+        // the next element), then bind the loop variable and run the
+        // body. The built MAP_PIPE / FilterPipe / INDEX_PIPE objects and
+        // their per-element virtual dispatch are never emitted.
+        _visit_fused_for(`for: Statements.FOR) is
+            let fusion = `for.fusion!;
+            let source = fusion.source;
+            let variable = `for.variable!;
+            let body = `for.body!;
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            // Iterate the source directly - the wrapping pipe objects are
+            // never built. read_iterator is null when the source is its
+            // own iterator (e.g. a range).
+            let iterator: Value mut;
+
+            if fusion.source_read_iterator? then
+                iterator = fusion.source_read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller);
+            else
+                iterator = source.value!;
+            fi
+
+            variable.walk(self);
+
+            let temp = TEMP(current_block, "fused_iterator", iterator);
+
+            // Per-stage setup: an inlined stage needs a slot for its
+            // parameter local; a delegate stage hoists its function value
+            // into a local so the delegate is built once, not per element;
+            // an index stage needs a running counter, initialised to its
+            // start.
+            let stage_delegates = Collections.LIST[TEMP?]();
+            let stage_counters = Collections.LIST[TEMP?]();
+
+            _setup_fused_stages(fusion, stage_delegates, stage_counters);
+
+            brancher.label(loop.start);
+
+            let has_next = fusion.source_move_next!.call(source.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let element = fusion.source_read_current!.call(source.location, temp.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            let current_value = _apply_fused_stages(fusion, element, stage_delegates, stage_counters, brancher, loop.start, loop.end);
+
+            gen_destructuring_initialize(variable.left, current_value);
+
+            // Emit any anonymous-function bodies in the chain (the
+            // map/filter lambdas, plus anything inside the source).
+            // Walking these nodes emits the nested closure method bodies
+            // without emitting the pipe-construction IL itself.
+            source.walk(self);
+
+            for stage in fusion.stages_outermost_first do
+                if stage.argument? then
+                    stage.argument.walk(self);
+                fi
+            od
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+        // Lower a fusible chain whose source could dynamically be a user
+        // Pipe with an overridden map/filter (any non-sealed source). The
+        // chain is fused behind a per-site guard that tests the source the
+        // same way pipe() does: `source isa Pipe[element]` true means
+        // pipe() would short-circuit to the source and run its own
+        // map/filter, so take the ordinary pipe-object loop; false means
+        // pipe() wraps the source in the built-in default pipe, so the
+        // fused loop is equivalent. Guard and pipe() agree by construction,
+        // so this is sound with no runtime-library change.
+        //
+        // Both paths share ONE copy of the loop body: generate_il emits
+        // precomputed IR and IR.Values.BLOCK is single-shot, so a
+        // val-block in the body could not be walked twice. Instead a
+        // loop-invariant `use_fused` flag selects the advance mechanism per
+        // element (a perfectly predictable branch). Never reached inside a
+        // state machine - visit(FOR)'s dispatch keeps generator/async loops
+        // on the normal lowering, whose iterator lives on the frame to
+        // survive yield/await.
+        _visit_guarded_for(`for: Statements.FOR) is
+            let fusion = `for.fusion!;
+            let source = fusion.source;
+            let variable = `for.variable!;
+            let body = `for.body!;
+            let expression = `for.expression!;
+
+            let brancher = get_brancher_for_block();
+            let loop = _loops.enter_loop();
+
+            let bool_type = _innate_symbol_lookup.get_bool_type();
+            let element_type = `for.read_current!.return_type!;
+
+            variable.walk(self);
+
+            // Shared mutable locals, declared once before the guard branch.
+            // `use_fused` is set once (loop-invariant); `element_slot`
+            // carries the per-element value into the shared bind + body.
+            let use_fused = TEMP(current_block, "guard_use_fused", bool_type);
+            let element_slot = TEMP(current_block, "guard_element", element_type);
+
+            // Fallback iterator (the built pipe chain's) and fused iterator
+            // (the source's own). Each is stored in only one branch; the
+            // other stays default and is never read on that path.
+            let pipe_iterator_type =
+                if `for.read_iterator? then
+                    `for.read_iterator.return_type!
+                else
+                    expression.value!.type!
+                fi;
+
+            let source_iterator_type =
+                if fusion.source_read_iterator? then
+                    fusion.source_read_iterator.return_type!
+                else
+                    source.value!.type!
+                fi;
+
+            let pipe_iterator = TEMP(current_block, "guard_pipe_iterator", pipe_iterator_type);
+            let source_iterator = TEMP(current_block, "guard_source_iterator", source_iterator_type);
+
+            // Per-stage setup for the fused path (shared with the pure
+            // fused loop): declared before the guard branch. On the fallback
+            // path these stay unused - a hoisted delegate is simply built
+            // and not read.
+            let stage_delegates = Collections.LIST[TEMP?]();
+            let stage_counters = Collections.LIST[TEMP?]();
+
+            _setup_fused_stages(fusion, stage_delegates, stage_counters);
+
+            let fused_setup = LABEL();
+            let after_setup = LABEL();
+
+            // if source isa Pipe[element] then fall back else fuse.
+            let is_pipe = cast Value(IR.Values.ISA(bool_type, fusion.guard_isa_type!, source.value!));
+
+            brancher.branch(BRANCH.Z, is_pipe, fused_setup, "pipe-guard");
+
+            // Fallback setup: build the pipe chain and iterate it, exactly
+            // as the normal for loop would.
+            use_fused.store(Literal.NUMBER(0, bool_type));
+
+            let pipe_iterator_value =
+                if `for.read_iterator? then
+                    `for.read_iterator.call(expression.location, expression.value!, Collections.LIST[Value](0), null, _function_caller)
+                else
+                    expression.value!
+                fi;
+
+            pipe_iterator.store(pipe_iterator_value);
+
+            brancher.branch(after_setup);
+
+            // Fused setup: drive the source's own iterator directly - the
+            // pipe objects are never built.
+            brancher.label(fused_setup);
+
+            use_fused.store(Literal.NUMBER(1, bool_type));
+
+            let source_iterator_value =
+                if fusion.source_read_iterator? then
+                    fusion.source_read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller)
+                else
+                    source.value!
+                fi;
+
+            source_iterator.store(source_iterator_value);
+
+            brancher.label(after_setup);
+
+            // --- Merged loop over one shared body. ---
+            brancher.label(loop.start);
+
+            let fused_advance = LABEL();
+            let bind = LABEL();
+
+            brancher.branch(BRANCH.NZ, use_fused.load(), fused_advance, "use-fused");
+
+            // Fallback advance: pull from the pipe chain's iterator.
+            let fallback_has_next = `for.move_next!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, fallback_has_next, loop.end);
+
+            let fallback_current = `for.read_current!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            element_slot.store(fallback_current);
+
+            brancher.branch(bind);
+
+            // Fused advance: pull from the source, apply stages inline.
+            brancher.label(fused_advance);
+
+            let has_next = fusion.source_move_next!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            brancher.branch(BRANCH.Z, has_next, loop.end);
+
+            let element = fusion.source_read_current!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller);
+
+            let current_value = _apply_fused_stages(fusion, element, stage_delegates, stage_counters, brancher, loop.start, loop.end);
+
+            element_slot.store(current_value);
+
+            // --- Shared bind + body (walked once). ---
+            brancher.label(bind);
+
+            gen_destructuring_initialize(variable.left, element_slot.load());
+
+            body.walk(self);
+
+            brancher.branch(loop.start);
+
+            brancher.label(loop.end);
+
+            // Emit the nested closure method bodies (the map/filter lambdas
+            // and anything inside the source) exactly once. The fallback
+            // path's pipe chain and the fused path's delegate temps both
+            // reference these methods; a second walk would redefine them.
+            source.walk(self);
+
+            for stage in fusion.stages_outermost_first do
+                if stage.argument? then
+                    stage.argument.walk(self);
+                fi
+            od
+
+            super.visit(`for);
+
+            _loops.leave_loop();
+        si
+
+    si
+si

@@ -1,0 +1,375 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Exiting statements: return (including targeted val-block returns), yield, state stamps and throw.
+    partial GENERATE_IL is
+        visit(r: Statements.RETURN) is
+            super.visit(r);
+
+            // Val-block-targeted return: push the value onto the
+            // evaluation stack and `br` to the block's end_label
+            // rather than emitting `ret`. The val-block frame is on
+            // the IL stack with the same AST node identity stamped
+            // on r.val_block_target.
+            if let target = r.val_block_target then
+                _gen_val_block_targeted_return(r, target);
+                return;
+            fi
+
+            let function = current_function;
+
+            // State-machine async return: stash the value into
+            // `_result` (value-async only) and `leave` to the
+            // success label so the MoveNext trailer fires
+            // `builder.SetResult` and returns. The standard
+            // `ret` path below would unwind MoveNext without
+            // signalling completion to the builder.
+            let casm = _current_async_state_machine;
+            let success_label = _current_async_success_label;
+
+            if
+                casm? /\
+                success_label? /\
+                function == casm.function
+            then
+                let frame = casm.frame;
+
+                assert frame? else "async state machine has no frame at return emission";
+
+                let expression = r.expression;
+                if expression? then
+                    let expr_value = expression.value;
+                    let result_field = frame.result_field;
+                    let class_result_type = frame.class_result_type;
+                    if expr_value? /\ result_field? /\ class_result_type? then
+                        let boxed_value =
+                            _boxer.box_if_needed(
+                                expr_value,
+                                class_result_type
+                            );
+                        add(_build_frame_field_store(frame, result_field, boxed_value));
+                    fi
+                fi
+
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
+                return;
+            fi
+
+            let value: Value? mut = null;
+            let return_type = if function? then function.return_type else null fi;
+
+            let expression = r.expression;
+            if
+                expression? /\
+                return_type?
+            then
+                let expr_value = expression.value;
+                if expr_value? /\ expr_value.type? then
+                    value =
+                        _boxer.box_if_needed(
+                            expr_value,
+                            return_type
+                        );
+                fi
+            fi
+
+            // Bare `return;` from a non-void function: push the
+            // default value of the return type. Matches the fall-
+            // off-end emission below and honours the warning at
+            // compile_bindings.pre_return ("return without value
+            // from non void function returns default value of type
+            // {T}"). Without this, `ret` runs with nothing on the
+            // stack and the JIT rejects the IL with
+            // `InvalidProgramException`.
+            if
+                !value? /\
+                return_type? /\
+                return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
+            then
+                value = IR.Values.DEFAULT(return_type);
+            fi
+
+            let current_try = _loops.get_current_try();
+
+            if current_try? then
+                if value? then
+                    current_try.return_value!.store(value);
+                fi
+
+                current_try.return_needed!.store(Literal.NUMBER(1, _innate_symbol_lookup.get_bool_type()));
+
+                let brancher = get_brancher_for_block();
+
+                if current_try.is_in_finally then
+                    brancher.branch(current_try.middle);
+                else
+                    brancher.leave(current_try.start);
+                fi
+            else
+                if value? then
+                    add(value);
+                fi
+
+                add(Values.RET());
+            fi
+        si
+
+        // Emit IL for a `return E` whose target is a `val ... lav`
+        // block (innermost wins, recorded by compile-expressions on
+        // the RETURN AST node). The frame on `_val_block_il_stack`
+        // matches `target` by identity. Three shapes vary by where
+        // the value lives across the exit:
+        //
+        // Capture mode, no inner `.try`: push the value onto the
+        // evaluation stack and `br` to the frame's end_label —
+        // same shape `if` / `case`-in-expression branches use.
+        //
+        // Spill mode (val-block body contains an `await` / `yield`,
+        // so VAL_BLOCK.pre allocated a spill field on the state-
+        // machine frame): `stfld` the value into that field. The
+        // stack ends up empty so `leave` is well-formed even
+        // across an inner `.try`; the val-block's BLOCK contents
+        // become a `ldfld` of the same field, so all paths
+        // converge with the value in the field.
+        //
+        // Capture mode crossing an inner `.try`: a `br` across a
+        // protected region is invalid IL; `leave` requires an
+        // empty stack we can't deliver while carrying the value.
+        // Mirrors the function-return-from-try pattern — stash
+        // the value into the eagerly-allocated CLR-local TEMP on
+        // the frame, `leave` to a cross-try join label that sits
+        // outside any inner try, `ldloc` the TEMP at the join,
+        // and fall through into end_label with the value on the
+        // stack. Void val-blocks skip the TEMP and `leave`
+        // end_label directly.
+        _gen_val_block_targeted_return(r: Statements.RETURN, target: Trees.Expressions.VAL_BLOCK) is
+            let frame: VAL_BLOCK_IL? mut = null;
+
+            let i mut = _val_block_il_stack.count - 1;
+            while i >= 0 do
+                let candidate = _val_block_il_stack[i];
+                if candidate.block == target then
+                    frame = candidate;
+                    i = -1;
+                else
+                    i = i - 1;
+                fi
+            od
+
+            assert frame? else "val_block_target stamped on return has no matching IL frame";
+
+            // A `.try` opened INSIDE the val-block body is still
+            // open at this return — `_loops.open_try_count`
+            // exceeds the count we cached at val-block entry.
+            let crosses_try = _loops.open_try_count > frame.enclosing_try_count;
+
+            // Resolve the value to deliver. Bare `return;` in a
+            // value-required val-block defers its diagnostic to
+            // visit_return (inferred-return lambdas need the body
+            // walk to settle first); emit the result type's
+            // default so the IL verifies — matches the bare-
+            // return-from-non-void-function path at visit(RETURN).
+            let value: IR.Values.Value? mut = null;
+            if !frame.is_void /\ frame.result_type? then
+                let result_type = frame.result_type;
+
+                if let expression = r.expression then
+                    if let v = expression.value then
+                        value = _boxer.box_if_needed(v, result_type);
+                    else
+                        value = IR.Values.DEFAULT(result_type);
+                    fi
+                else
+                    value = IR.Values.DEFAULT(result_type);
+                fi
+            fi
+
+            if let spill_field = frame.spill_field then
+                // Spill mode: stfld into the val-block's spill
+                // field. Stack is empty after stfld so `leave`
+                // and `br` are both valid; use `leave` only when
+                // crossing an inner try (where `br` would be
+                // invalid IL).
+                let stored = Values.BLOCK();
+
+                if let v = value then
+                    stored.add(v);
+                fi
+
+                add(
+                    _build_frame_field_store(
+                        _current_state_machine_frame()!, spill_field, stored));
+
+                if crosses_try then
+                    get_brancher_for_block().leave(frame.end_label);
+                else
+                    get_brancher_for_block().branch(frame.end_label);
+                fi
+            elif !crosses_try then
+                // Capture mode no-cross-try: push the value and
+                // `br` end_label — the join shape if / case use.
+                if let v = value then
+                    add(v);
+                fi
+                get_brancher_for_block().branch(frame.end_label);
+            elif !value? then
+                // Capture mode cross-try, void val-block: nothing
+                // to carry, `leave end_label` directly. (end_label
+                // sits outside any inner try because the frame
+                // cached enclosing_try_count.)
+                get_brancher_for_block().leave(frame.end_label);
+            else
+                // Capture mode cross-try, value val-block: stash
+                // value into the pre-allocated cross_try_temp,
+                // `leave` to cross_try_join_label. VAL_BLOCK.pre's
+                // post-body emission `ldloc`s the TEMP at the join
+                // and falls into end_label.
+                assert frame.cross_try_temp? else "capture-mode val-block missing cross-try TEMP";
+                assert frame.cross_try_join_label? else "capture-mode val-block missing cross-try join label";
+
+                frame.cross_try_used = true;
+                frame.cross_try_temp!.store(value);
+                get_brancher_for_block().leave(frame.cross_try_join_label!);
+            fi
+        si
+
+        // Generator yield IL emission:
+        //
+        //     ldarg.0
+        //     <X's IR>           // expression value (boxed-if-needed
+        //                        // against the element type)
+        //     stfld _current
+        //     ldarg.0
+        //     ldc.i4 N           // freshly-allocated state number
+        //     stfld _state
+        //     ldc.i4.1
+        //     ret
+        //     Label_N:           // resumption point recorded so the
+        //                        // entry dispatch can jump here on
+        //                        // a subsequent MoveNext call
+        //
+        // The state number / label pair is recorded on the enclosing
+        // generator function's STATE_MACHINE so `_visit_generator_
+        // function` can populate the entry-dispatch placeholder
+        // after the body walk completes.
+        visit(`yield: Statements.YIELD) is
+            super.visit(`yield);
+
+            let function = current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if !state_machine? then
+                return;
+            fi
+
+            let frame = state_machine.frame;
+
+            assert frame? else "generator state machine has no frame at IL generation";
+
+            let state = state_machine.allocate_state();
+            let resume = LABEL();
+
+            state_machine.record_label(state, resume);
+
+            _register_resume_with_dispatch(state, resume);
+
+            // Store yielded value into _current.
+            let current = Values.BLOCK();
+
+            if `yield.expression.value? then
+                current.add(
+                    _boxer.box_if_needed(
+                        `yield.expression.value,
+                        frame.element_type
+                    )
+                );
+            fi
+
+            add(_build_frame_field_store(frame, frame.current_field, current));
+
+            // Stamp the resumption state — keep the CLR local
+            // `'.gen_state'` in sync so state-guarded finally
+            // bodies see the suspending value when our `leave`
+            // (below) fires them.
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.Literal.NUMBER(state, _innate_symbol_lookup.get_int_type()),
+                ".gen_state");
+
+            // Suspend. From INSIDE an inner `.try`, `ret` is
+            // invalid IL; emit `leave` to a shared return-true label
+            // at MoveNext's outer scope. From OUTSIDE any inner try
+            // (only the outer dispatch holder open), `ret` is fine.
+            if _async_dispatch_stack.count > 1 then
+                if !_current_generator_yield_return_label? then
+                    _current_generator_yield_return_label = LABEL();
+                fi
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, _current_generator_yield_return_label));
+            else
+                add(Values.INSTRUCTION(ILOpCode.LDC_I4_1));
+                add(Values.RET());
+            fi
+
+            add(Values.MARK_LABEL(resume));
+
+            // Cold-resume cleanup: clear state to -1 (and the local)
+            // so a subsequent `leave` (next yield's suspend, or the
+            // end-of-try leave on exhaustion) sees the "not
+            // suspending" sentinel. Without this, the finally body's
+            // state guard would still see the previous yield's state
+            // and skip cleanup forever.
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.INSTRUCTION(ILOpCode.LDC_I4_M1),
+                ".gen_state");
+        si
+
+        // Write a state value to BOTH the CLR local cached at MoveNext
+        // entry AND the state-machine frame's state field, so later
+        // `leave`s out of `.try` blocks fire finally bodies that see
+        // the correct sentinel via the local. `value` loads the state
+        // number for a suspend, or -1 for the not-suspending sentinel.
+        _emit_state_stamp(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            state_field: Semantic.Symbols.Field,
+            value: Values.Value,
+            state_local_il: string
+        ) is
+            let stamped = Values.BLOCK();
+
+            stamped.add(value);
+            stamped.add(Values.INSTRUCTION(ILOpCode.DUP));
+            stamped.add(Values.STORE_TEMP(state_local_il, _innate_symbol_lookup.get_int_type()));
+
+            add(_build_frame_field_store(frame, state_field, stamped));
+        si
+
+        visit(`throw: Statements.THROW) is
+            super.visit(`throw);
+
+            add(
+                _boxer.box_if_value(
+                    `throw.expression!.value!
+                )
+            );
+
+            add(Values.INSTRUCTION(ILOpCode.THROW));
+        si
+
+    si
+si

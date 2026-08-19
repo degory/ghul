@@ -1,0 +1,685 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Async machinery: the async outer method, dispatch holders, frame construction and the
+    // async state-machine class emission.
+    partial GENERATE_IL is
+        // The outer method of an async function: everything
+        // ASYNC_METHOD_LAUNCH emits, plus the return that hands back the
+        // builder's task.
+        _emit_async_outer_method_srm(
+            symbol: Semantic.Symbols.Function,
+            launch: IR.Values.ASYNC_METHOD_LAUNCH
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                launch.gen(_context);
+
+                body.ret();
+
+                assembly_emitter.handles.set_body_offset(symbol, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(symbol, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
+        si
+
+        // The frame type as it must be named in IL: constructed over the
+        // type arguments visible inside the owning function, so a frame
+        // declared in a generic owner is never referred to by its open
+        // form. Null when the frame is not generic.
+        _specialized_frame_type(
+            frame: Semantic.Symbols.Classy,
+            construction_type_args: Collections.List[Semantic.Types.Type]?,
+            location: Source.LOCATION
+        ) -> Semantic.Types.Type? is
+            if !construction_type_args? then
+                return null;
+            fi
+
+            return Semantic.Types.GENERIC(location, frame, construction_type_args);
+        si
+
+        // Async-function IL emission. Parallels
+        // `_pre_generator_function`: emits the outer method (newobj
+        // SM, builder.Start, return Task) and stashes a MoveNext
+        // BLOCK to be flushed when the enclosing class closes.
+        // MoveNext wraps the body in a try/catch routing exceptions
+        // through `builder.SetException` and success through
+        // `builder.SetResult`.
+        _pre_async_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE) -> bool is
+            let frame = async_state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "async function must return Tasks.TASK or Tasks.TASK[T]");
+                return true;
+            fi
+
+            frame.declare();
+
+            let construction_type_args = async_state_machine.get_construction_type_arguments();
+
+            let constructor =
+                _specialized_constructor(
+                    frame, frame.constructor, construction_type_args, symbol.location);
+
+            // The local holding the state machine, and the type argument
+            // to builder.Start, both name the frame type. A frame in a
+            // generic owner is generic too, so both need the constructed
+            // form — the open form does not resolve at run time.
+            let state_machine_type =
+                _specialized_frame_type(frame, construction_type_args, symbol.location) ?? frame.type!;
+
+            // ctor args: instance methods prepend `ldarg.0` for
+            // _outer_self, then each user-declared parameter via
+            // `ldarg '<name>'`. Build them as a sequence Value so
+            // ASYNC_METHOD_LAUNCH composes them in the right order.
+            let ctor_args_block = Values.BLOCK();
+
+            // The enclosing method's own arguments, forwarded
+            // positionally: an instance method's receiver occupies slot
+            // 0, so its declared arguments start at 1.
+            let slot mut = if symbol.is_emitted_with_receiver then 1 else 0 fi;
+
+            if frame.outer_self_field? then
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(0, "ldarg.0"));
+            fi
+            for arg_name in symbol.argument_names do
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(slot, "ldarg '{arg_name}'"));
+                slot = slot + 1;
+            od
+            ctor_args_block.close();
+
+            let task_type = symbol.return_type!;
+
+            // Open-T forms — only meaningful for the generic
+            // (value-async) builder/Task. For void-async, the
+            // builder type is non-generic and Create / get_Task
+            // signatures have no class-T to resolve, so pass null
+            // (ASYNC_METHOD_LAUNCH falls back to the constructed
+            // owner type for the signature).
+            let unspec_builder: Semantic.Types.Type? mut = null;
+            let unspec_task: Semantic.Types.Type? mut = null;
+            if !frame.is_void then
+                unspec_builder = _innate_symbol_lookup.get_unspecialized_async_task_method_builder_type();
+                unspec_task = _innate_symbol_lookup.get_unspecialized_task_type();
+            fi
+
+            let launch = IR.Values.ASYNC_METHOD_LAUNCH(
+                task_type,
+                state_machine_type,
+                constructor,
+                ctor_args_block,
+                frame.state_field,
+                frame.builder_field!,
+                unspec_builder,
+                unspec_task,
+                ".sm"
+            );
+
+            _emit_async_outer_method_srm(symbol, launch);
+
+            // --- Walk the body into MoveNext's block ---
+            async_state_machine.install_body_emission_overrides();
+
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            add(Values.MAX_STACK(64));
+
+            // Cache the state field to a CLR local at MoveNext entry.
+            // Every AWAIT_SUSPEND keeps this local in sync via
+            // `dup; stloc; stfld` so the per-region dispatch (below)
+            // and the finally-body state guards read a stable value.
+            //
+            // Finally bodies (let-use auto-dispose and user-written
+            // `finally`) state-guard their work on the same local:
+            // when V_state >= 0 the function is mid-suspend (the
+            // `leave` from the AwaitUnsafeOnCompleted path fires the
+            // finally before exiting), and side effects must be
+            // skipped.
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".async_state");
+
+            // Labels used by the trailer: success fall-through and
+            // the end of the wrapping try/catch. The entire MoveNext
+            // body lives inside a `.try` whose handler routes
+            // exceptions through `builder.SetException(e)`.
+            let success_label = IR.LABEL();
+            let end_label = IR.LABEL();
+
+            // Stash the emission context so visit(LET-await),
+            // visit(AWAIT), and visit(RETURN) inside the body know
+            // they're inside this state machine and can reach the
+            // frame / labels they need to emit. Cleared after the
+            // body walk so anything else emitted at this nesting
+            // level (other functions, nested classes' visits)
+            // goes through the standard paths.
+            let prev_async_sm = _current_async_state_machine;
+            let prev_success = _current_async_success_label;
+            let prev_end = _current_async_end_label;
+            _current_async_state_machine = async_state_machine;
+            _current_async_success_label = success_label;
+            _current_async_end_label = end_label;
+
+            // Walk the body. visit(AWAIT) appends AWAIT_SUSPEND IR
+            // Values into move_next_block; other statements emit
+            // normally.
+            if function.body? then
+                function.body.walk(self);
+            fi
+
+            // Body fell off the end: leave success_label so the
+            // trailer fires.
+            add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
+
+            _current_async_state_machine = prev_async_sm;
+            _current_async_success_label = prev_success;
+            _current_async_end_label = prev_end;
+
+            // Populate the outer dispatch from the holder that
+            // accumulated awaits not enclosed in any inner `.try`.
+            _pop_async_dispatch_holder(outer_dispatch_holder);
+
+            leave_block();
+            leave_scope(function);
+
+            async_state_machine.uninstall_body_emission_overrides();
+
+            _pending_async_state_machines.add(
+                PENDING_ASYNC_STATE_MACHINE(
+                    async_state_machine,
+                    move_next_block,
+                    success_label,
+                    end_label
+                )
+            );
+
+            return true;
+        si
+
+        // The state-local IL spelling of the innermost open
+        // dispatch holder — `'.async_state'` for async state
+        // machines, `'.gen_state'` for generators, null when no
+        // state machine is open. Used by `.try` emission and the
+        // finally-body state guard so the same code paths emit the
+        // right local name without each caller having to know.
+        _current_state_local_il() -> string? is
+            if _async_dispatch_stack.count == 0 then
+                return null;
+            fi
+            return _async_dispatch_stack[_async_dispatch_stack.count - 1].state_local_il;
+        si
+
+        // Declare a CLR `int32` local in the MoveNext frame, copy
+        // the state field into it, and push the outer dispatch
+        // holder bound to that local. Returns the pushed holder so
+        // the caller can pop it at the end of the body walk via
+        // `_pop_async_dispatch_holder`. Used by every state-machine
+        // entry point (named function, lambda closure, generator).
+        // `state_local_il` is the local's IL spelling —
+        // `'.async_state'` for async, `'.gen_state'` for
+        // generators — and travels with the holder so inner
+        // dispatch sites pick it up.
+        _open_state_machine_entry(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            state_field: Semantic.Symbols.Field,
+            state_local_il: string
+        ) -> ASYNC_DISPATCH_HOLDER is
+            add(Values.DECLARE_LOCAL(state_local_il, _innate_symbol_lookup.get_int_type()));
+            add(_build_frame_field_load(frame, state_field));
+            add(Values.STORE_TEMP(state_local_il, _innate_symbol_lookup.get_int_type()));
+
+            let block = Values.BLOCK();
+            add(block);
+            let holder = ASYNC_DISPATCH_HOLDER(block, state_local_il);
+            _async_dispatch_stack.add(holder);
+            return holder;
+        si
+
+        // Push an inner dispatch holder at the top of a `.try` body
+        // if we're inside a state-machine method. Returns the
+        // holder (to pop later) or null when no state machine is
+        // open — the caller can pass that null back to
+        // `_maybe_pop_dispatch_holder` for symmetric cleanup
+        // without an `if` at every call site.
+        _maybe_push_dispatch_holder() -> ASYNC_DISPATCH_HOLDER? is
+            if !_current_state_local_il()? then
+                return null;
+            fi
+            return _push_async_dispatch_holder();
+        si
+
+        _maybe_pop_dispatch_holder(holder: ASYNC_DISPATCH_HOLDER?) is
+            if holder? then
+                _pop_async_dispatch_holder(holder);
+            fi
+        si
+
+        // The state-machine frame for the current function — async
+        // or generator, whichever applies. Used by the BLOCK-with-
+        // suspend spill in `LIST.visit` / `visit(IF)` / `visit(CASE)`
+        // (in expression position) to allocate spill fields that
+        // survive across MoveNext re-entries.
+        _current_state_machine_frame() -> Semantic.Symbols.STATE_MACHINE_FRAME_BASE? is
+            let casm = _current_async_state_machine;
+
+            if casm? /\ casm.frame? then
+                return casm.frame;
+            fi
+
+            let cf = current_function;
+            if cf? then
+                let sm = Semantic.Symbols.state_machine_for(cf);
+                if sm? /\ sm.frame? then
+                    return sm.frame;
+                fi
+            fi
+
+            return null;
+        si
+
+        // Build the IR Value that loads from `field` on the current
+        // state-machine frame — used as the spilled BLOCK's stand-in
+        // value. The consumer that does `add(block)` reads this
+        // load when the BLOCK gens, in place of the original body
+        // IL.
+        _build_frame_field_load(frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE, spill_field: Semantic.Symbols.Field) -> IR.Values.Value =>
+            IR.Values.Load.INSTANCE_FIELD(
+                IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                spill_field
+            );
+
+        // The counterpart store: `value` is emitted between the frame
+        // reference and the `stfld`, so anything that leaves one item
+        // on the stack can stand in for it.
+        _build_frame_field_store(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME_BASE,
+            `field: Semantic.Symbols.Field,
+            value: IR.Values.Value
+        ) -> IR.Values.Value =>
+            IR.Values.Store.INSTANCE_FIELD(
+                IR.Values.Load.REFERENCE_SELF(frame, frame.type),
+                `field,
+                value
+            );
+
+        // BLOCK-with-suspend spill path for `Statements.LIST` in
+        // expression position. The capture-mode LIST.visit wraps
+        // its body in lots of state-machine plumbing (dispatch
+        // holders, exception-handler temps, `.try` for `want
+        // _dispose`) that the spill path doesn't need — the body
+        // emits inline in outer current_block, the result lands
+        // in a frame field, and the BLOCK ends up holding just a
+        // load. Returns true if the spill path ran (caller skips
+        // the ordinary capture path); false otherwise.
+        _try_spill_block_with_suspend(list: Statements.LIST) -> bool is
+            let spiller = COMPOSITE_VALUE_SPILLER(
+                self,
+                list,
+                list.value,
+                _current_state_machine_frame()
+            );
+
+            if !spiller.is_spilling then
+                return false;
+            fi
+
+            // Walk body in outer current_block. Statement IL —
+            // including visit(AWAIT) / visit(YIELD) suspend
+            // emissions and nested composites' own spills — lands
+            // in outer, in the same flat stream as the SM
+            // dispatcher.
+            for s in list.statements do
+                enter_node(s);
+                try
+                    s.walk(self);
+                finally
+                    leave_node(s);
+                yrt
+            od
+
+            // Tail-evaluate-and-spill. By now the tail's value is a
+            // clean load (any tail-internal suspends already
+            // hoisted by visit(AWAIT) / visit(YIELD), and any
+            // tail-internal composites already spilled themselves),
+            // so the ldarg.0 / value-IL / stfld sequence has no
+            // suspend between receiver push and stfld.
+            if let list.last?, last.value? then
+                spiller.emit_value(value);
+            fi
+
+            spiller.leave();
+
+            return true;
+        si
+
+
+        // Record a (state, resume_label) pair with the innermost
+        // open dispatch holder, so its dispatch block (at the top
+        // of its `.try` body OR at MoveNext outer scope) routes
+        // cold-resume entries to {resume_label}. No-op outside a
+        // state machine.
+        _register_resume_with_dispatch(state: int, resume_label: IR.LABEL) is
+            if _async_dispatch_stack.count == 0 then
+                return;
+            fi
+            let holder = _async_dispatch_stack[_async_dispatch_stack.count - 1];
+            holder.register(state, resume_label);
+        si
+
+        // Emit the `if V_state >= 0 → skip` guard at the top of a
+        // finally body in a state-machine method. The `leave` that
+        // ends a suspend (AwaitUnsafeOnCompleted or yield) fires the
+        // surrounding finally with state >= 0; the user's code must
+        // not run then. Real exits (state == -1) and exceptional
+        // unwinds run the finally normally.
+        //
+        // Returns the skip label so the caller can plant it at the
+        // end of the guarded code via `_close_finally_state_guard`.
+        // Returns null when not inside a state machine — caller
+        // emits the finally body unguarded.
+        _open_finally_state_guard() -> LABEL? is
+            let state_local_il = _current_state_local_il();
+
+            if !state_local_il? then
+                return null;
+            fi
+
+            let skip = LABEL();
+
+            let int_type = _innate_symbol_lookup.get_int_type();
+
+            get_brancher_for_block().branch(
+                BRANCH.GE,
+                Values.Load.TEMP(state_local_il, int_type),
+                Values.Literal.NUMBER(0, int_type),
+                skip);
+
+            return skip;
+        si
+
+        _close_finally_state_guard(skip: LABEL?) is
+            if skip? then
+                get_brancher_for_block().label(skip);
+            fi
+        si
+
+        // Push a new dispatch holder onto the stack and emit its
+        // placeholder block at the current emission point. Returns
+        // the holder so the caller can pop it once the protected
+        // region's body has been walked. Use when opening a `.try`
+        // body inside an async function or generator so the
+        // AWAIT_SUSPENDs / YIELDs that fire in the body register
+        // here and the dispatch ends up inside the same region as
+        // the targets it reaches. The new holder inherits its
+        // state-local IL spelling from the top of the stack — the
+        // outer holder (pushed at MoveNext entry) chose the name
+        // (`'.async_state'` for async, `'.gen_state'` for
+        // generators) so inner holders just match.
+        _push_async_dispatch_holder() -> ASYNC_DISPATCH_HOLDER is
+            assert _async_dispatch_stack.count > 0 else "no outer dispatch holder to inherit state-local name from";
+            let outer = _async_dispatch_stack[_async_dispatch_stack.count - 1];
+            let block = Values.BLOCK();
+            add(block);
+            let holder = ASYNC_DISPATCH_HOLDER(block, outer.state_local_il);
+            _async_dispatch_stack.add(holder);
+            return holder;
+        si
+
+        // Populate the holder's dispatch block from registered
+        // (state, cold_resume_label) entries and pop. No-op if no
+        // entries — keeps emitted IL minimal when a `.try` body
+        // contains no awaits.
+        _pop_async_dispatch_holder(holder: ASYNC_DISPATCH_HOLDER) is
+            _populate_async_dispatch(holder);
+            assert _async_dispatch_stack.count > 0 else "dispatch holder stack underflow";
+            _async_dispatch_stack.remove_at(_async_dispatch_stack.count - 1);
+        si
+
+        // Fill the holder's placeholder block with one
+        // `ldloc V_state; ldc.i4 N; beq cold_resume_N` entry per
+        // registered await. The placeholder was inserted into the
+        // surrounding emission stream when the holder was pushed —
+        // these instructions now sit at the top of the protected
+        // region's body, before any user code.
+        _populate_async_dispatch(holder: ASYNC_DISPATCH_HOLDER) is
+            for entry in holder.entries do
+                holder.block.add(
+                    Values.Load.TEMP(holder.state_local_il, _innate_symbol_lookup.get_int_type()));
+                holder.block.add(
+                    Values.Literal.NUMBER(entry.state, _innate_symbol_lookup.get_int_type()));
+                holder.block.add(
+                    Values.BRANCH_TO(ILOpCode.BEQ, entry.cold_resume_label));
+            od
+        si
+
+        // Emit all pending state-machine classes accumulated during
+        // the walk of an enclosing class or namespace. Called at the
+        // tail of visit(`class) / visit(`namespace) so the classes
+        // land at namespace scope, parallel to the user's class.
+        emit_pending_state_machines() is
+            if _pending_state_machines.count > 0 then
+                let pending = _pending_state_machines;
+                _pending_state_machines = Collections.LIST[PENDING_STATE_MACHINE]();
+
+                for psm in pending do
+                    _emit_state_machine_class(psm.state_machine, psm.move_next_block);
+                od
+            fi
+
+            if _pending_async_state_machines.count > 0 then
+                let pending = _pending_async_state_machines;
+                _pending_async_state_machines = Collections.LIST[PENDING_ASYNC_STATE_MACHINE]();
+
+                for pasm in pending do
+                    _emit_async_state_machine_class(
+                        pasm.async_state_machine,
+                        pasm.move_next_block,
+                        pasm.success_label,
+                        pasm.end_label
+                    );
+                od
+            fi
+        si
+
+        // Emits the synthesised IAsyncStateMachine class — parallels
+        // `_emit_state_machine_class` for generators. Class members:
+        // `$state`, `$builder`, `$result` (value-async), `$outer_self`
+        // (instance), `$arg_*`, `$local_*`, `$awaiter_*` fields; ctor;
+        // MoveNext (with entry-dispatch and try/catch routing through
+        // the builder); trivial SetStateMachine.
+        _emit_async_state_machine_class(
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE,
+            move_next_block: Values.BLOCK,
+            success_label: IR.LABEL,
+            end_label: IR.LABEL
+        ) is
+            let frame = async_state_machine.frame;
+
+            assert frame? else "async state machine has no frame at IL emission";
+
+            async_state_machine.install_body_emission_overrides();
+
+            try
+                _gen_async_state_machine_ctor_srm(frame);
+
+                _emit_async_frame_member_body_srm(
+                    frame,
+                    IR.Emitter.FrameMember.MOVE_NEXT,
+                    () is
+                        _gen_async_move_next_srm(
+                            frame, move_next_block, success_label, end_label);
+                    si);
+
+                _emit_async_frame_member_body_srm(
+                    frame,
+                    IR.Emitter.FrameMember.SET_STATE_MACHINE,
+                    () is si);
+            finally
+                async_state_machine.uninstall_body_emission_overrides();
+            yrt
+        si
+
+        // A synthesised async frame member, encoded into a body of its
+        // own and deposited against the key the structure walk reads.
+        // `emit` writes the body; SetStateMachine's writes nothing,
+        // because the whole of it is the `ret` added here.
+        _emit_async_frame_member_body_srm(
+            frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME,
+            member: IR.Emitter.FrameMember,
+            emit: () -> void
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                emit();
+
+                body.ret();
+
+                assembly_emitter.handles.set_frame_member_body(
+                    frame, member, body.flush(assembly_emitter));
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
+        si
+
+        // MoveNext, wrapped in the try/catch that routes an escaping
+        // exception through the builder. The success path falls out of
+        // the region to `success_label`, completes the task, and both
+        // paths meet at `end_label`.
+        _gen_async_move_next_srm(
+            frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME,
+            move_next_block: Values.BLOCK,
+            success_label: IR.LABEL,
+            end_label: IR.LABEL
+        ) is
+            let body = _context.current_srm_body_emitter!;
+
+            let builder_field = frame.builder_field!;
+            let builder_type = builder_field.type!;
+            let exception_type = _innate_symbol_lookup.get_exception_type();
+
+            let state_field = _context.resolve_field_target(frame.state_field);
+            let builder_reference = _context.resolve_field_target(builder_field);
+
+            let try_start = body.mark_region_boundary();
+
+            move_next_block.gen(_context);
+
+            let try_end = body.mark_region_boundary();
+            let handler_start = try_end;
+
+            body.declare_local(_EXCEPTION_LOCAL, exception_type);
+            body.stloc(_EXCEPTION_LOCAL);
+            body.ldarg(0);
+            body.ldc_i4(-1);
+            body.stfld(state_field);
+            body.ldarg(0);
+            body.ldflda(builder_reference);
+            body.ldloc(_EXCEPTION_LOCAL);
+            body.call(
+                _context.resolve_async_builder_set_exception(builder_type, exception_type));
+            body.branch(System.Reflection.Metadata.ILOpCode.LEAVE, end_label);
+
+            let handler_end = body.mark_region_boundary();
+
+            body.add_catch_region(
+                try_start,
+                try_end,
+                handler_start,
+                handler_end,
+                _context.resolve_type_token(exception_type));
+
+            body.mark_label(success_label);
+            body.ldarg(0);
+            body.ldc_i4(-1);
+            body.stfld(state_field);
+            body.ldarg(0);
+            body.ldflda(builder_reference);
+
+            let result_field = frame.result_field;
+
+            if result_field? then
+                body.ldarg(0);
+                body.ldfld(_context.resolve_field_target(result_field));
+            fi
+
+            body.call(_context.resolve_async_builder_set_result(builder_type, result_field?));
+
+            body.mark_label(end_label);
+        si
+
+        _EXCEPTION_LOCAL: string static => ".exception";
+
+        // The frame's constructor: chain to Object, then copy each
+        // constructor argument into the field the lowering declared for
+        // it. The builder is not among them — the outer method creates
+        // it and stores it after the newobj.
+        _gen_async_state_machine_ctor_srm(frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                body.ldarg(0);
+                body.call(_context.resolve_object_constructor());
+
+                let slot mut = 1;
+
+                if let outer_self_field = frame.outer_self_field then
+                    body.ldarg(0);
+                    body.ldarg(slot);
+                    body.stfld(_context.resolve_field_target(outer_self_field));
+
+                    slot = slot + 1;
+                fi
+
+                for arg_field in frame.argument_fields do
+                    body.ldarg(0);
+                    body.ldarg(slot);
+                    body.stfld(_context.resolve_field_target(arg_field));
+
+                    slot = slot + 1;
+                od
+
+                body.ret();
+
+                assembly_emitter.handles.set_body_offset(
+                    frame.constructor, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(
+                    frame.constructor, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
+        si
+
+    si
+si

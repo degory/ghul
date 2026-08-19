@@ -1,0 +1,411 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Generator state machines: the outer-method stub, the MoveNext body walk and the deferred
+    // state-machine class emission.
+    partial GENERATE_IL is
+        // Generator IL emission:
+        //
+        //   1. The outer user-facing method gets a stub body
+        //      (`newobj $StateMachine.ctor(); ret`) emitted inline,
+        //      so the AST visit order is unchanged for the caller.
+        //   2. The function body is walked here (recursively, via
+        //      self) into a fresh IR.Values.BLOCK that represents
+        //      MoveNext's body. Yield statements emit their state-
+        //      machine IL into this block as they are walked.
+        //   3. The state-machine class itself is deferred — captured
+        //      in `_pending_state_machines` and emitted at the SAME
+        //      level as the user's class (after `visit(`class)`
+        //      closes the user class), since CIL doesn't allow
+        //      classes nested inside method bodies.
+        _pre_generator_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, state_machine: Semantic.Symbols.STATE_MACHINE) -> bool is
+            let frame = state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "generator must return Pipe[T]");
+
+                return true;
+            fi
+
+            // Realise the frame's symbol-level declarations (fields
+            // + ctor) once. Required for both the outer method's
+            // newobj reference and the state-machine class itself.
+            frame.declare();
+
+            // --- Outer user-facing method ---
+            //
+            // Forward this method's own arguments, construct the
+            // frame, return it.
+            _emit_generator_outer_method_srm(symbol, frame, state_machine);
+
+            // --- Walk the body into MoveNext's block ---
+            //
+            // The block lands captured on PENDING_STATE_MACHINE
+            // alongside the state machine; `_emit_pending_state_
+            // machines` writes it out inside the class definition
+            // once the enclosing user class has closed.
+            //
+            // For a generic generator, move each function-T symbol to
+            // a class-level position on the frame, so any IR.Values
+            // inside MoveNext that baked in function-T (callvirt owner
+            // types on the for-each dispatch, locals init for the
+            // iterator current, etc.) reach `!N` — MoveNext has no
+            // type parameters of its own — rather than `!!N`.
+            state_machine.install_body_emission_overrides();
+
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            // `.maxstack` must precede any IL opcodes in the
+            // method body. Add it before the dispatch placeholder
+            // so the populated dispatch IL lands after the
+            // directive at the start of MoveNext.
+            add(Values.MAX_STACK(64));
+
+            // Cache the state field to a CLR local at MoveNext
+            // entry. Every yield keeps it in sync via `dup; stloc;
+            // stfld` so per-region dispatches and state-guarded
+            // finally bodies read a stable value. Same pattern as
+            // the async path — needed to allow yield inside `.try`
+            // without branching into a protected region from
+            // outside (ECMA-335 forbids that, and the previous
+            // centralized-dispatch shape had exactly that bug).
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".gen_state");
+
+            // Stash the previous generator-yield-return label so
+            // nested generator functions (rare) don't trip over
+            // each other. visit(YIELD) lazily allocates a label the
+            // first time it needs to `leave` from inside a `.try`.
+            let prev_yield_return = _current_generator_yield_return_label;
+            _current_generator_yield_return_label = null;
+
+            // Walk the body. Visitors fire pre/visit on every
+            // node; visit(YIELD) is the interesting one — it
+            // appends state-machine IL into current_block
+            // (which IS move_next_block).
+            if function.body? then
+                function.body.walk(self);
+            fi
+
+            // Fell-off-end trailer: mark done, return false. Plain
+            // `ret` since we're at the MoveNext outer scope (no
+            // open `.try`).
+            add(_build_frame_field_store(
+                frame, frame.state_field, Values.INSTRUCTION(ILOpCode.LDC_I4_M1)));
+            add(Values.INSTRUCTION(ILOpCode.LDC_I4_0));
+            add(Values.RET());
+
+            // If any yield inside an inner `.try` used the
+            // leave-return-true label, emit it now (outside any try)
+            // followed by `ldc.i4.1; ret`. Reached only via `leave
+            // L:` from inside a protected region.
+            if let yield_return_label = _current_generator_yield_return_label then
+                add(Values.MARK_LABEL(yield_return_label));
+                add(Values.INSTRUCTION(ILOpCode.LDC_I4_1));
+                add(Values.RET());
+            fi
+
+            _current_generator_yield_return_label = prev_yield_return;
+
+            _pop_async_dispatch_holder(outer_dispatch_holder);
+
+            leave_block();
+            leave_scope(function);
+
+            // Uninstall — re-installed by _emit_state_machine_class
+            // around move_next_block.gen() so deferred IR.Value.gen()
+            // calls inside MoveNext still see the override. Between
+            // here and there, other class members emit normally.
+            state_machine.uninstall_body_emission_overrides();
+
+            _pending_state_machines.add(PENDING_STATE_MACHINE(state_machine, move_next_block));
+
+            // Skip the framework's default body walk + the framework's
+            // visit(function) close-out path. Our visit(function)
+            // sees the state-machine and returns early.
+            return true;
+        si
+
+        _visit_generator_function(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function, state_machine: Semantic.Symbols.STATE_MACHINE) is
+            // _pre_generator_function emitted the outer method and
+            // captured the move_next block onto _pending_state_machines.
+            // Nothing more to do at AST visit time.
+        si
+
+        // `newobj` operand for the SM frame's constructor. For a
+        // generic frame, constructs a specialized type so the
+        // class-T's appear in the signature; for a non-generic frame,
+        // just the default ctor's IL reference. Exceptions in lookup
+        // are logged and a sentinel returned.
+        // A generator's outer method, encoded rather than written. Its
+        // whole body is: forward this method's own arguments, construct
+        // the frame, return it.
+        //
+        // The row is the function's own, so this deposits its offset the
+        // same way an ordinary method body does.
+        _emit_generator_outer_method_srm(
+            symbol: Semantic.Symbols.Function,
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            state_machine: Semantic.Symbols.STATE_MACHINE
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            // An instance generator hands `this` to the frame's
+            // constructor, which stores it into _outer_self so the
+            // body's `self` access can read back through the frame.
+            let slot mut = if symbol.is_emitted_with_receiver then 1 else 0 fi;
+
+            if frame.outer_self_field? then
+                body.ldarg(0);
+            fi
+
+            for i in 0..symbol.argument_names.count do
+                body.ldarg(slot);
+
+                slot = slot + 1;
+            od
+
+            body.new_object(
+                _context.resolve_call_target(
+                    _specialized_frame_constructor(frame, state_machine, symbol.location)));
+
+            body.ret();
+
+            assembly_emitter.handles.set_body_offset(symbol, body.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(symbol, body.il_outputs);
+        si
+
+        // The frame constructor as it must be named from outside: on the
+        // frame's own instantiation when the frame is generic, and on
+        // the frame itself otherwise.
+        _specialized_frame_constructor(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            state_machine: Semantic.Symbols.STATE_MACHINE,
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function =>
+            _specialized_constructor(
+                frame,
+                frame.constructor,
+                state_machine.get_construction_type_arguments(),
+                location);
+
+        // The same, for any frame: a constructed generic's constructor
+        // is a different symbol from the open type's, and only the
+        // constructed one names a type that exists at run time.
+        _specialized_constructor(
+            frame: Semantic.Symbols.Classy,
+            default_constructor: Semantic.Symbols.Function,
+            construction_type_args: Collections.List[Semantic.Types.Type]?,
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function is
+            // With no type arguments there is nothing to specialize
+            // over, and the constructed form would be a second symbol
+            // for the same constructor — one the numbering pass never
+            // saw, so it has no row and gets named as if it were
+            // imported.
+            if !construction_type_args? \/ construction_type_args.count == 0 then
+                return default_constructor;
+            fi
+
+            if let specialized =
+                _specialized_frame_type(frame, construction_type_args, location)
+            then
+                if let function: Semantic.Symbols.Function = specialized.find_member("init") then
+                    return function;
+                fi
+            fi
+
+            return default_constructor;
+        si
+
+        _emit_state_machine_class(state_machine: Semantic.Symbols.STATE_MACHINE, move_next_block: Values.BLOCK) is
+            let frame = state_machine.frame;
+
+            assert frame? else "state machine has no frame at IL emission";
+
+            // Re-install the body-emission override so deferred
+            // IR.Value.gen() inside MoveNext renders function-T as
+            // class-level `!N`. Uninstalled at the bottom of this
+            // method.
+            state_machine.install_body_emission_overrides();
+
+            // .ctor — parameterless, chains to Object::.ctor.
+            _gen_state_machine_ctor_srm(frame);
+
+            // MoveNext — populated during the body walk.
+            _emit_frame_member_body_srm(
+                frame, IR.Emitter.FrameMember.MOVE_NEXT, move_next_block);
+
+            // Other Iterator[T] / IDisposable members.
+            _gen_state_machine_accessors_srm(frame);
+
+            state_machine.uninstall_body_emission_overrides();
+        si
+
+        // A frame member the lowering synthesises, encoded into a body
+        // of its own and deposited against the (frame, member) key the
+        // structure walk reads when it writes the row. There is no
+        // symbol to key on: the member exists only in the emitted
+        // assembly.
+        _emit_frame_member_body_srm(
+            frame: Semantic.Symbols.STATE_MACHINE_FRAME,
+            member: IR.Emitter.FrameMember,
+            block: Values.BLOCK
+        ) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let previous = _context.current_srm_body_emitter;
+
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            block.gen(_context);
+
+            _context.current_srm_body_emitter = previous;
+
+            assembly_emitter.handles.set_frame_member_body(
+                frame, member, body.flush(assembly_emitter));
+        si
+
+        // The frame's constructor: chain to Object, then copy each
+        // constructor argument into the field the lowering declared for
+        // it. It is a declared symbol with a row of its own, so its body
+        // is deposited the same way any other method's is.
+        _gen_state_machine_ctor_srm(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            body.ldarg(0);
+            body.call(_context.resolve_object_constructor());
+
+            // Argument layout mirrors what STATE_MACHINE_FRAME.declare
+            // set up: [$outer_self,] arg0, arg1, ... The constructor is
+            // an instance method, so its declared arguments start at
+            // slot 1.
+            let slot mut = 1;
+
+            if let outer_self_field = frame.outer_self_field then
+                body.ldarg(0);
+                body.ldarg(slot);
+                body.stfld(_context.resolve_field_target(outer_self_field));
+
+                slot = slot + 1;
+            fi
+
+            for arg_field in frame.argument_fields do
+                body.ldarg(0);
+                body.ldarg(slot);
+                body.stfld(_context.resolve_field_target(arg_field));
+
+                slot = slot + 1;
+            od
+
+            body.ret();
+
+            assembly_emitter.handles.set_body_offset(
+                frame.constructor, body.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(
+                frame.constructor, body.il_outputs);
+        si
+
+
+        // The iterator surface every consumer reaches a frame through.
+        // Each body is fixed and small, so they are built here rather
+        // than walked: get_Current reads the current field,
+        // GetEnumerator returns self, Dispose does nothing, Reset zeroes
+        // the state, and ToString joins the pipe.
+        _gen_state_machine_accessors_srm(frame: Semantic.Symbols.STATE_MACHINE_FRAME) is
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let handles = assembly_emitter.handles;
+
+            // get_Current — read the current field.
+            let get_current = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            get_current.ldarg(0);
+            get_current.ldfld(_context.resolve_field_target(frame.current_field));
+            get_current.ret();
+            handles.set_frame_member_body(
+                frame,
+                IR.Emitter.FrameMember.GET_CURRENT,
+                get_current.flush(assembly_emitter));
+
+            // GetEnumerator — the frame implements Iterator[T] itself,
+            // so it is its own enumerator.
+            let get_enumerator = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            get_enumerator.ldarg(0);
+            get_enumerator.ret();
+            handles.set_frame_member_body(
+                frame,
+                IR.Emitter.FrameMember.GET_ENUMERATOR,
+                get_enumerator.flush(assembly_emitter));
+
+            // Dispose — a no-op. A generator abandoned mid-flight does
+            // not run the user's finally bodies.
+            let dispose = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            dispose.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.DISPOSE, dispose.flush(assembly_emitter));
+
+            // Reset — rewind to the initial state, so the next MoveNext
+            // re-enters at state 0 and re-runs the body from the top.
+            let reset = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            reset.ldarg(0);
+            reset.ldc_i4(0);
+            reset.stfld(_context.resolve_field_target(frame.state_field));
+            reset.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.RESET, reset.flush(assembly_emitter));
+
+            // ToString — a generator is a Pipe[T], so stringify it the
+            // way every other Pipe does. The trait's default is a
+            // default interface method and does not override
+            // Object.ToString, so each implementing class needs its own.
+            let to_string = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+            to_string.ldarg(0);
+            to_string.ldstr(assembly_emitter, ", ");
+            to_string.call_virtual(_context.resolve_pipe_join(_pipe_ancestor(frame)));
+            to_string.ret();
+            handles.set_frame_member_body(
+                frame, IR.Emitter.FrameMember.TO_STRING, to_string.flush(assembly_emitter));
+        si
+
+        // The frame's own `Pipe[T]`, constructed over the element type
+        // it yields. Read off the frame's ancestors rather than rebuilt,
+        // for the reason `resolve_pipe_join` records.
+        _pipe_ancestor(frame: Semantic.Symbols.STATE_MACHINE_FRAME) -> Semantic.Types.Type is
+            let looked_up = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            assert looked_up? else "Pipe[T] is not available";
+
+            let unspecialized: Semantic.Types.Type = looked_up;
+
+            if let found = frame.find_ancestor(unspecialized) then
+                return found;
+            fi
+
+            assert false else
+                "state-machine frame '{frame.name}' does not implement Pipe[T]";
+
+            return unspecialized;
+        si
+
+
+    si
+si

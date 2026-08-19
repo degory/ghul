@@ -1,0 +1,601 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Conditional IL: if-let clause tests and binds, if statements, case and match arms, and null tests.
+    partial GENERATE_IL is
+        // Emit the scrutinee evaluation, optional isinst cast, the
+        // presence test, and the branch-to-fail for one `if let`
+        // clause. Returns the temp holding the (possibly cast)
+        // scrutinee value so the caller can bind the clause's
+        // pattern from it; returns null when there is nothing to
+        // bind (a missing scrutinee value, defensive).
+        _emit_if_let_clause_test(
+            c: Statements.REFUTABLE_BINDING_CLAUSE,
+            fail: LABEL,
+            is_first: bool,
+            brancher: BLOCK_BRANCHER
+        ) -> TEMP? is
+            c.scrutinee.walk(self);
+
+            if !c.scrutinee.value? then
+                return null;
+            fi
+
+            let scrutinee_value = c.scrutinee.value;
+            let typed_value: Value mut = scrutinee_value;
+
+            if let c.narrow_type_expression?, narrow_type_expression.type? then
+                // The scrutinee's value type already reflects the
+                // then-edge narrowing applied in compile_conditionals
+                // — when the scrutinee is an identifier and the
+                // narrow target is a variant, narrowing specialises
+                // (e.g. `CONS` -> `CONS[int]`) by mutating the
+                // symbol type via NARROWING_FLOW. Use that
+                // specialised form as the isinst target so the
+                // runtime test references the closed-generic
+                // variant. Detect "specialised form" by checking the
+                // value-type and the written narrow type share the
+                // same classy (i.e. the value type is the narrow
+                // target with type args bound). Otherwise — e.g. the
+                // scrutinee is a member access typed wider than the
+                // narrow target — use the written narrow type
+                // itself, so the isinst tests the target.
+                let written_narrow = type;
+                let scrutinee_type = scrutinee_value.type;
+                let scrutinee_classy = _classy_of_type(scrutinee_type!);
+                let written_classy = _classy_of_type(written_narrow);
+
+                let narrow_target =
+                    if
+                        !scrutinee_type.is_inferred /\
+                        !scrutinee_type.is_error /\
+                        scrutinee_classy? /\
+                        written_classy? /\
+                        scrutinee_classy == written_classy
+                    then
+                        scrutinee_type;
+                    else
+                        written_narrow;
+                    fi;
+
+                typed_value =
+                    _type_caster.cast_value(
+                        c.location,
+                        scrutinee_value,
+                        narrow_target,
+                        true,
+                        false
+                    );
+            fi
+
+            let temp = TEMP(current_block, "if_let", typed_value);
+
+            let init_type = typed_value.type!;
+
+            // The presence test: a reference type is absent when
+            // null; an option-shaped value type is absent when its
+            // `has_value` member is false.
+            let presence: Value? mut = null;
+
+            if init_type.is_value_type then
+                let has_value_member = init_type.find_member("has_value");
+
+                if has_value_member? then
+                    presence = has_value_member.load(LOCATION.internal, temp.load(), _symbol_loader);
+                fi
+            else
+                presence = temp.load();
+            fi
+
+            if presence? then
+                if is_first then
+                    brancher.branch(BRANCH.Z, presence, fail, "if");
+                else
+                    brancher.branch(BRANCH.Z, presence, fail, "elif");
+                fi
+            fi
+
+            return temp;
+        si
+
+        // Bind one clause's pattern from the temp produced by the
+        // clause's test. Reference bindings take the value as-is;
+        // option-shaped value-type bindings unwrap `.value` first.
+        _emit_if_let_clause_bind(
+            c: Statements.REFUTABLE_BINDING_CLAUSE,
+            temp: TEMP,
+            fail: LABEL
+        ) is
+            let init_type = temp.load().type;
+
+            // Option-shaped means both `has_value` and `value` — a bare
+            // `value` member is not enough (see the case-arm equivalent
+            // above).
+            if init_type.is_value_type then
+                let has_value_member = init_type.find_member("has_value");
+
+                if has_value_member? then
+                    let value_member = init_type.find_member("value");
+
+                    if value_member? then
+                        gen_destructuring_initialize(
+                            c.pattern,
+                            value_member.load(LOCATION.internal, temp.load(), _symbol_loader),
+                            fail
+                        );
+
+                        return;
+                    fi
+                fi
+            fi
+
+            gen_destructuring_initialize(c.pattern, temp.load(), fail);
+        si
+
+        pre(i: Statements.IF) -> bool is
+            super.pre(i);
+
+            return true;
+        si
+        
+        visit(`if: Statements.IF) is
+            let is_first mut = true;
+            let seen_else mut = false;
+
+            let end = LABEL();
+
+            // Spill the IF's value through a frame field when the
+            // body contains a suspend; otherwise capture as usual.
+            // See COMPOSITE_VALUE_SPILLER. Recursive: inner
+            // composites (val-blocks, nested IFs) handle their own
+            // suspends the same way. `if.value` is non-null exactly
+            // when `if.want_value` is true (visit_if sets it only
+            // in that case), so the spiller takes the value
+            // directly.
+            let spiller = COMPOSITE_VALUE_SPILLER(
+                self,
+                `if,
+                `if.value,
+                _current_state_machine_frame()
+            );
+
+            spiller.enter();
+
+            let brancher = get_brancher_for_block();
+
+            for b in `if.branches do
+                let next = LABEL();
+                let first_clause_temp: TEMP? mut = null;
+
+                if let b.condition? /\ !b.binding? then
+                    // Enter the arm's own scope before walking the
+                    // condition: a `val ... lav` condition can declare
+                    // its own locals (`if val let v = e; v lav then`),
+                    // and those live in the arm's scope, not the
+                    // enclosing one.
+                    self.pre(b);
+
+                    condition.walk(self);
+
+                    if is_first then
+                        brancher.branch(BRANCH.Z, condition.value!, next, "if");
+                    else
+                        brancher.branch(BRANCH.Z, condition.value!, next, "elif");
+                    fi
+                elif let b.binding? then
+                    // `if let` branch: for each clause, evaluate its
+                    // scrutinee into a temp, emit an isinst for the
+                    // type test when the clause carries `: V`, branch
+                    // past this arm if the result has no value, then
+                    // bind the clause's pattern. Clauses chain left
+                    // to right; every clause's test and optional
+                    // guard must succeed for the then-arm to fire.
+                    //
+                    // The first clause's scrutinee evaluates BEFORE
+                    // the if-arm scope opens, so its own bindings are
+                    // not visible to it (matching the single-clause
+                    // shape). Subsequent clauses' scrutinees evaluate
+                    // INSIDE the scope after earlier clauses' bindings
+                    // are stored — letting `if let x = a, y = x.b`
+                    // chain values through.
+                    first_clause_temp = _emit_if_let_clause_test(binding.clauses[0], next, is_first, brancher);
+
+                    // enter if block scope:
+                    self.pre(b);
+                else
+                    seen_else = true;
+
+                    // enter if block scope:
+                    self.pre(b);
+                fi
+
+                if let b.binding? then
+                    // Declare CLR locals for every clause's pattern
+                    // up front — pre(REFUTABLE_BINDING) iterates all
+                    // clauses.
+                    self.pre(binding);
+
+                    if first_clause_temp? then
+                        _emit_if_let_clause_bind(binding.clauses[0], first_clause_temp, next);
+                    fi
+
+                    if binding.clauses[0].guard? then
+                        binding.clauses[0].guard!.walk(self);
+                        brancher.branch(BRANCH.Z, binding.clauses[0].guard!.value!, next, "if-let-guard");
+                    fi
+
+                    let i mut = 1;
+                    while i < binding.clauses.count do
+                        let clause = binding.clauses[i];
+
+                        let temp = _emit_if_let_clause_test(clause, next, false, brancher);
+
+                        if temp? then
+                            _emit_if_let_clause_bind(clause, temp, next);
+                        fi
+
+                        if clause.guard? then
+                            clause.guard.walk(self);
+                            brancher.branch(BRANCH.Z, clause.guard!.value!, next, "if-let-guard");
+                        fi
+
+                        i = i + 1;
+                    od
+                fi
+
+                b.body.walk(self);
+
+                // no-op?
+                b.accept(self);
+
+                if `if.want_value then
+                    if let b.body.value? then
+                        // Coerce the branch value to the IF's result type
+                        // so a value-type branch flowing into a wider slot
+                        // is boxed (T -> object) or wrapped (T -> T?); the
+                        // else branch already lowers null -> default at
+                        // compile time, but a present-value branch pushes
+                        // its bare value here and must match the join type.
+                        let block_type = `if.value?.type;
+                        let coerced =
+                            if block_type? /\ !block_type.is_void /\ !block_type.is_error then
+                                _boxer.box_if_needed(value, block_type)
+                            else
+                                value
+                            fi;
+
+                        spiller.emit_value(coerced);
+
+                        // Discard the capture-mode value when the IF is
+                        // in expected-void position but a branch supplied
+                        // a non-void value. Spill mode stfld'd into a
+                        // typed field so no extra pop is needed.
+                        if let
+                            `if.expected_type? /\
+                            !spiller.is_spilling /\
+                            expected_type.is_void /\
+                            !value.type!.is_void
+                        then
+                            add(Values.INSTRUCTION(ILOpCode.POP));
+                        fi
+                    fi
+                fi
+
+                brancher.branch(end);
+                brancher.label(next);
+
+                is_first = false;
+            od
+
+            brancher.label(end);
+
+            super.visit(`if);
+
+            spiller.leave();
+        si
+
+        pre(`case: Statements.CASE) -> bool is
+            super.pre(`case);
+
+            return true;
+        si
+
+        visit(`case: Statements.CASE) is
+            // Spill the CASE's value through a frame field when the
+            // body contains a suspend; otherwise capture as usual.
+            // See COMPOSITE_VALUE_SPILLER. `case.value` is non-null
+            // exactly when `case.want_value` is true.
+            let spiller = COMPOSITE_VALUE_SPILLER(
+                self,
+                `case,
+                `case.value,
+                _current_state_machine_frame()
+            );
+
+            spiller.enter();
+
+            // The scrutinee was spilled once into a temp in
+            // compile-expressions (see CASE_STATE); emit the spill and
+            // read the temp. Reusing the single load Value across every
+            // label and pattern arm is safe - Load.TEMP.gen is an
+            // idempotent ldloc - and preserves the scrutinee's
+            // single-evaluation semantics.
+            if `case.scrutinee_spill? then
+                current_block.add(`case.scrutinee_spill!);
+            fi
+
+            let scrutinee_load = `case.scrutinee_load!;
+
+            let brancher = get_brancher_for_block();
+
+            let labels = _loops.enter_loop();
+
+            let has_else mut = false;
+            for m in `case.matches do
+                if !m.expressions? /\ !m.pattern? then
+                    has_else = true;
+                fi
+            od
+
+            for m in `case.matches do
+                let next = LABEL();
+
+                if m.expressions? then
+                    // Per-label value-equality test Values, built in
+                    // compile-expressions (see CASE_MATCH_STATE). A
+                    // non-null test embeds its label, so it is emitted
+                    // and branched on directly; a null test means no
+                    // operator resolved (or the label is `null`), so
+                    // generate-il falls back to a raw compare.
+                    let tests = m.tests;
+
+                    if m.expressions.expressions.count == 1 then
+                        let test: IR.Values.Value? = if tests? then tests[0] else null fi;
+
+                        if test? then
+                            brancher.branch(BRANCH.Z, test, next);
+                        else
+                            m.expressions.expressions[0].walk(self);
+
+                            let label_value = m.expressions!.expressions[0].value!;
+
+                            if (label_value.type?.is_null ?? false) then
+                                // `when null` is a presence test, not a
+                                // value compare: match absence. Branch
+                                // to `next` when the scrutinee is present.
+                                gen_case_null_test(scrutinee_load, `case.expression.value!.type!, next, false);
+                            else
+                                brancher.branch(BRANCH.NE, scrutinee_load, label_value, next);
+                            fi
+                        fi
+                    elif m.expressions.expressions.count > 1 then
+                        let match = LABEL();
+
+                        for i in 0..m.expressions!.expressions.count do
+                            let test: IR.Values.Value? = if tests? then tests[i] else null fi;
+
+                            if test? then
+                                brancher.branch(BRANCH.NZ, test, match);
+                            else
+                                let e = m.expressions!.expressions[i];
+                                e.walk(self);
+
+                                let label_value = e.value!;
+
+                                if (label_value.type?.is_null ?? false) then
+                                    // `when null` in a multi-label arm:
+                                    // branch to `match` when absent.
+                                    gen_case_null_test(scrutinee_load, `case.expression.value!.type!, match, true);
+                                else
+                                    brancher.branch(BRANCH.EQ, scrutinee_load, label_value, match);
+                                fi
+                            fi
+                        od
+
+                        brancher.branch(next);
+
+                        brancher.label(match);
+                    fi
+
+                    m.walk(self);
+                elif m.pattern? then
+                    // Pattern arm: enter the arm's scope, narrow the
+                    // case temp against the pattern's type (ascription
+                    // → isinst; option-shape value type → has_value),
+                    // branch to `next` on failure, then bind. Mirrors
+                    // `if let`'s presence-test + bind shape, applied
+                    // against the case's scrutinee TEMP instead of a
+                    // per-branch initializer TEMP.
+                    self.pre(m);
+
+                    let pattern = m.pattern!;
+                    let init_type: Semantic.Types.Type mut = `case.expression.value!.type!;
+                    let arm_source: IR.Values.Value mut = scrutinee_load;
+
+                    if pattern.is_explicit_type /\ pattern.type_expression.type? then
+                        init_type = pattern.type_expression.type;
+                        arm_source = IR.Values.CAST(init_type, arm_source, false);
+                    fi
+
+                    let arm_temp = TEMP(current_block, "case_let", arm_source);
+
+                    // An option-shape value type is one with both
+                    // `has_value` and `value` members. Requiring both
+                    // matters: a plain value type can legitimately have
+                    // a member named `value` — a tuple with an element
+                    // so named, for instance — and unwrapping through
+                    // it would bind the pattern against that element
+                    // instead of the whole value.
+                    let value_member: Semantic.Symbols.Symbol? mut = null;
+                    let presence: IR.Values.Value? mut = null;
+                    if init_type.is_value_type then
+                        let has_value_member = init_type.find_member("has_value");
+                        if has_value_member? then
+                            presence = has_value_member.load(LOCATION.internal, arm_temp.load(), _symbol_loader);
+                            value_member = init_type.find_member("value");
+                        fi
+                    else
+                        presence = arm_temp.load();
+                    fi
+
+                    if presence? then
+                        brancher.branch(BRANCH.Z, presence, next, "case-let");
+                    fi
+
+                    self.pre(pattern);
+
+                    if value_member? then
+                        // Option-shape value type: bind from the
+                        // unwrapped `.value` member.
+                        gen_destructuring_initialize(
+                            pattern.left,
+                            value_member.load(LOCATION.internal, arm_temp.load(), _symbol_loader),
+                            next
+                        );
+                    else
+                        gen_destructuring_initialize(pattern.left, arm_temp.load(), next);
+                    fi
+
+                    if m.guard? then
+                        m.guard.walk(self);
+                        brancher.branch(BRANCH.Z, m.guard!.value!, next, "case-when-guard");
+                    fi
+
+                    self.visit(m);
+                else
+                    m.walk(self);
+                fi
+
+                if `case.want_value then
+                    if let m.statements.value? then
+                        // Coerce the arm value to the CASE's result type
+                        // so a value-type arm flowing into a wider slot is
+                        // boxed (T -> object) or wrapped (T -> T?), matching
+                        // the join type the other arms deliver.
+                        let block_type = `case.value?.type;
+                        let coerced =
+                            if block_type? /\ !block_type.is_void /\ !block_type.is_error then
+                                _boxer.box_if_needed(value, block_type)
+                            else
+                                value
+                            fi;
+
+                        spiller.emit_value(coerced);
+
+                        if let
+                            `case.expected_type? /\
+                            !spiller.is_spilling /\
+                            expected_type.is_void /\
+                            !value.type!.is_void
+                        then
+                            add(Values.INSTRUCTION(ILOpCode.POP));
+                        fi
+                    fi
+                fi
+
+                brancher.branch(_loops.get_current_loop()!.end);
+
+                brancher.label(next);
+            od
+
+            // An exhaustive case-expression without an `else` arm
+            // falls through here with no value pushed when none of
+            // the arms matched — impossible at runtime, but the IL
+            // verifier can't see that. Emit a throw so the stack
+            // invariant holds for the verifier; the throw is dead.
+            if `case.want_value /\ `case.is_exhaustive /\ !has_else then
+                add(
+                    Literal.STRING(
+                        "case is not exhaustive at runtime",
+                        _innate_symbol_lookup.get_string_type()
+                    )
+                );
+                add(Values.NEW_ASSERT_FAILED_EXCEPTION());
+                add(Values.INSTRUCTION(ILOpCode.THROW));
+            elif `case.want_value /\ `case.requires_default_fallthrough /\ !has_else then
+                // Open-domain case-expression with a defaultable
+                // expected type and no `else` arm — push default(T)
+                // for the no-match path. CASE_EXHAUSTIVENESS_CHECKER
+                // has emitted the `case-needs-else` warning.
+                add(IR.Values.DEFAULT(`case.expected_type!));
+            fi
+
+            brancher.label(_loops.get_current_loop()!.end);
+
+            _loops.leave_loop();
+
+            super.visit(`case);
+
+            spiller.leave();
+        si
+
+        // Emit a `when null` test against the case scrutinee: a presence
+        // test, not a value compare. For a value-type optional
+        // (`Nullable[T]`, `MAYBE[T]`) read `has_value`; for a reference
+        // optional the receiver itself is the presence. `branch_on_absent`
+        // selects which edge branches to `target`: a single-label `when
+        // null` arm skips to `next` when the scrutinee is present; a null
+        // label in a multi-label arm jumps to `match` when it is absent.
+        gen_case_null_test(
+            scrutinee_load: Values.Value,
+            scrutinee_type: Semantic.Types.Type,
+            target: IR.LABEL,
+            branch_on_absent: bool
+        ) is
+            let presence: Values.Value? mut =
+                if scrutinee_type.is_value_type then
+                    let has_value_member = scrutinee_type.find_member("has_value");
+
+                    if has_value_member? then
+                        has_value_member.load(LOCATION.internal, scrutinee_load, _symbol_loader);
+                    else
+                        null;
+                    fi
+                else
+                    scrutinee_load;
+                fi;
+
+            if presence? then
+                if branch_on_absent then
+                    get_brancher_for_block().branch(BRANCH.Z, presence, target);
+                else
+                    get_brancher_for_block().branch(BRANCH.NZ, presence, target);
+                fi
+            else
+                let null_value = IR.Values.NULL(scrutinee_type);
+
+                if branch_on_absent then
+                    get_brancher_for_block().branch(BRANCH.EQ, scrutinee_load, null_value, target);
+                else
+                    get_brancher_for_block().branch(BRANCH.NE, scrutinee_load, null_value, target);
+                fi
+            fi
+        si
+
+        pre(match: Statements.CASE_MATCH) -> bool is
+            super.pre(match);
+
+            return true;
+        si        
+
+        visit(match: Statements.CASE_MATCH) is
+            match.statements.accept(self);
+
+            super.visit(match);
+        si
+
+    si
+si

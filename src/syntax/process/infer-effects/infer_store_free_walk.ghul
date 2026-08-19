@@ -1,0 +1,344 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use Ghul.Pipes;
+
+    use Logging;
+    use Trees;
+
+    use Semantic.Types.Type;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // The function-context walk: function, property, indexer and lambda entry, assignments and
+    // store-target classification.
+    partial INFER_STORE_FREE is
+        // ==== function context ====
+
+        pre(function: Definitions.FUNCTION) -> bool is
+            enter_scope(function);
+
+            if _current? then
+                // function definitions do not nest; if the tree ever
+                // produces one, poison the enclosing classification
+                // rather than mis-attribute the nested body's facts
+                _current.is_disqualified = true;
+            fi
+
+            _typer.reset();
+
+            let symbol = function_for(function);
+
+            if symbol? then
+                let facts = STORE_FREE_FACTS();
+
+                _facts[symbol] = facts;
+
+                _current = facts;
+                _current_function = symbol;
+
+                _note_study_function(function, symbol);
+            else
+                _current = null;
+                _current_function = null;
+                _current_record = null;
+            fi
+
+            return false;
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            leave_scope(function);
+
+            _current = null;
+            _current_function = null;
+        si
+
+        // Property and indexer accessor bodies arrive as synthesised
+        // sibling FUNCTION definitions; the original nodes carry the
+        // same body and would double-classify it.
+        pre(property: Definitions.PROPERTY) -> bool => true;
+        visit(property: Definitions.PROPERTY) is si
+
+        pre(indexer: Definitions.INDEXER) -> bool => true;
+        visit(indexer: Definitions.INDEXER) is si
+
+        // A lambda body does not run when the enclosing function
+        // merely creates the closure; any invocation happens through
+        // a delegate-typed value, which is never a bounded callee.
+        // Closure symbols are never marked store-free.
+        //
+        // In resolved mode the body is walked anyway, under the
+        // closure's own function symbol, so the effect-polymorphic
+        // absorption has a write set for every function value it can
+        // trace to a literal.
+        pre(function: Expressions.FUNCTION) -> bool is
+            if _resolved_mode then
+                _study_walk_lambda(function);
+            fi
+
+            return true;
+        si
+
+        visit(function: Expressions.FUNCTION) is si
+
+        _study_walk_lambda(function: Expressions.FUNCTION) is
+            let symbol = function_value_of(function.value);
+
+            if !symbol? then
+                return;
+            fi
+
+            let root = cast Function?(symbol.root_specialized_from);
+
+            if !root? \/ _facts.contains_key(root) then
+                return;
+            fi
+
+            let saved_facts = _current;
+            let saved_function = _current_function;
+            let saved_record = _current_record;
+
+            let facts = STORE_FREE_FACTS();
+
+            _facts[root] = facts;
+            _current = facts;
+            _current_function = root;
+
+            EFFECT_FACTS.note_function(root, root.name, "", "{function.location}", "lambda");
+            _current_record = EFFECT_FACTS.record_for(root);
+
+            enter_scope(function);
+            function.body.walk(self);
+            leave_scope(function);
+
+            _current = saved_facts;
+            _current_function = saved_function;
+            _current_record = saved_record;
+        si
+
+        // ==== stores ====
+
+        // The target of a store is written, not read: walking it
+        // generically would classify the member as a read as well,
+        // adding its getter's edges - and disqualifying outright when
+        // the property is assign-only and has no getter. So the
+        // children are driven by hand: the value and every receiver
+        // and index expression inside the target are walked, the
+        // target member itself is not.
+        pre(assign: Statements.ASSIGNMENT) -> bool is
+            assign.right.walk(self);
+
+            _walk_assignment_target_operands(assign.left);
+
+            return true;
+        si
+
+        _walk_assignment_target_operands(left: Trees.Expressions.AssignmentLeftExpression?) is
+            if !left? then
+                return;
+            fi
+
+            if isa Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left) then
+                _walk_store_target_operands((cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left)).expression);
+            elif isa Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left) then
+                for element in (cast Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left)).elements do
+                    _walk_assignment_target_operands(element);
+                od
+            fi
+        si
+
+        _walk_store_target_operands(target: Trees.Expressions.Expression?) is
+            if !target? then
+                return;
+            fi
+
+            if let member: Trees.Expressions.MEMBER = target then
+                if !isa Trees.Expressions.SELF(member.left) then
+                    member.left.walk(self);
+                fi
+
+                return;
+            fi
+
+            if let index: Trees.Expressions.INDEX = target then
+                index.left.walk(self);
+                index.index.walk(self);
+                return;
+            fi
+
+            if let ambiguous: Trees.Expressions.AMBIGUOUS_EXPRESSION = target then
+                if ambiguous.result == Trees.Expressions.AmbiguousExpressionResult.INDEX then
+                    _walk_store_target_operands(ambiguous.index);
+                elif ambiguous.left? then
+                    ambiguous.left.walk(self);
+                fi
+
+                return;
+            fi
+
+            // a bare identifier target: nothing inside it to read
+        si
+
+        visit(assign: Statements.ASSIGNMENT) is
+            if !_current? then
+                return;
+            fi
+
+            // Study-only: whether this assignment's value could be
+            // absent. An RHS of declared non-optional type cannot be
+            // null under the language's own rules; anything optional or
+            // untypeable counts as possibly-null.
+            let rhs_type = _typer.try_type(assign.right);
+
+            _study_rhs_nulling = !rhs_type? \/ rhs_type.is_optional;
+
+            _classify_assignment_target(assign.left);
+
+            _study_rhs_nulling = false;
+        si
+
+
+        // Flag the current function as assigning a possibly-absent
+        // value to member-or-wider storage. A constructor's writes to
+        // its own fresh instance cannot make any pre-existing member
+        // absent, so they are excluded.
+        _study_note_nulling(own_instance: bool) is
+            if !_current_record? \/ !_study_rhs_nulling then
+                return;
+            fi
+
+            if _in_constructor /\ own_instance then
+                return;
+            fi
+
+            _current_record.assigns_optional = true;
+        si
+
+        // The member-keyed refinement of the above: record which member
+        // the possibly-null assignment targets, or that it could not be
+        // resolved. Unlike the coarse flag, a constructor's writes to
+        // its own instance are NOT excluded: the fresh-instance
+        // argument only holds at a construction site, and the solved
+        // sets answer for plain calls too - a constructor reached by
+        // delegation, or invoked directly on an existing receiver,
+        // nulls a pre-existing member like any other method would.
+        _study_note_nulling_member(symbol: Symbol?, own_instance: bool) is
+            if !_current_record? \/ !_study_rhs_nulling then
+                return;
+            fi
+
+            if symbol? then
+                _current_record.nulling_writes.add(symbol.root_specialized_from);
+            else
+                _current_record.nulling_unbounded = true;
+            fi
+        si
+
+        _classify_assignment_target(left: Trees.Expressions.AssignmentLeftExpression?) is
+            if !left? then
+                _disqualify_because("assign-target-null");
+                return;
+            fi
+
+            if isa Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left) then
+                _classify_simple_store((cast Trees.Expressions.SIMPLE_LEFT_EXPRESSION(left)).expression);
+            elif isa Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left) then
+                for element in (cast Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION(left)).elements do
+                    _classify_assignment_target(element);
+                od
+            else
+                _disqualify_because("assign-target-shape");
+            fi
+        si
+
+        _classify_simple_store(target: Trees.Expressions.Expression?) is
+            _study_note_store(target);
+
+            if _writes_own_instance_field_member(target) then
+                // `self.field = …` writes only the receiver's own
+                // state: disqualifies the strict bit but not
+                // construction, exactly like the bare-field form below
+                _disqualify_strict_only();
+                return;
+            fi
+
+            let member_assign_function = _writes_own_instance_property_member(target);
+
+            if member_assign_function? then
+                // `self.property = …` reaches that same state through
+                // the property's accessor
+                _disqualify_strict_only();
+                _add_construction_callee(member_assign_function);
+                return;
+            fi
+
+            if _is_local_target(target) then
+                // reassigning a local variable or parameter is
+                // callee-private
+                return;
+            fi
+
+            if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
+                // a member, index or other compound target is a heap
+                // store
+                _disqualify_store();
+                return;
+            fi
+
+            let identifier = (cast Trees.Expressions.IDENTIFIER(target)).identifier;
+
+            if identifier.is_qualified then
+                _disqualify_store();
+                return;
+            fi
+
+            let symbol = try_find(identifier);
+
+            if symbol? /\ symbol.is_field /\ symbol.is_instance then
+                // a bare instance-field name resolves to the receiver's
+                // own field, so the write disqualifies the strict bit
+                // but not construction
+                _disqualify_strict_only();
+                return;
+            fi
+
+            let assign_function = _instance_property_assign(symbol);
+
+            if assign_function? then
+                // the bare-name form of the own-property write handled
+                // above
+                _disqualify_strict_only();
+                _add_construction_callee(assign_function);
+                return;
+            fi
+
+            // a global variable, or a target the walk could not
+            // resolve: either way the write is not to a local
+            _disqualify_store();
+        si
+
+        // A bare name for a local variable or a parameter — the one
+        // storage location a function can write without any caller
+        // seeing it.
+        _is_local_target(target: Trees.Expressions.Expression?) -> bool is
+            if !target? \/ !isa Trees.Expressions.IDENTIFIER(target) then
+                return false;
+            fi
+
+            let identifier = (cast Trees.Expressions.IDENTIFIER(target)).identifier;
+
+            if identifier.is_qualified then
+                return false;
+            fi
+
+            let symbol = try_find(identifier);
+
+            return
+                symbol? /\
+                (isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/ isa Semantic.Symbols.LOCAL_ARGUMENT(symbol));
+        si
+
+    si
+si

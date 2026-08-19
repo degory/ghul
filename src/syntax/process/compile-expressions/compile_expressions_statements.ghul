@@ -1,0 +1,516 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // Definition and statement walks: pragmas, attributes, functions, let, for, destructuring
+    // strategy, let-in, assert-in and assignments.
+    partial COMPILE_EXPRESSIONS is
+        pre(pragma: Trees.Definitions.PRAGMA) -> bool is
+            _pragma_scope_stack.enter(pragma.pragma);
+
+            return false;
+        si
+
+        visit(pragma: Trees.Definitions.PRAGMA) is
+            _pragma_scope_stack.leave(pragma.pragma);
+
+            resolve_attribute(pragma);
+        si
+
+        // An attribute pragma applies to the definition it wraps; unwrap
+        // any nested pragmas to reach that definition's symbol.
+        resolve_attribute(pragma: Trees.Definitions.PRAGMA) is
+            let definition: Trees.Definitions.Definition mut = pragma.definition;
+
+            while isa Trees.Definitions.PRAGMA(definition) do
+                definition = cast Trees.Definitions.PRAGMA(definition).definition;
+            od
+
+            _attribute_resolver.resolve(pragma.pragma, symbol_for(definition));
+        si
+
+        // Iterative body walk. Returning true here suppresses the
+        // walk framework's default child traversal so visit() can walk
+        // arguments once and the body up to N times. Constraints set
+        // on AST nodes during a walk persist across iterations
+        // (TypeConstrained.upgrade_constraint is narrowing-only), so
+        // each pass either narrows the constraint set or stays put;
+        // convergence is _logger.is_clean (no errors and no flagged
+        // wild/inferred type consumption).
+        pre(function: Trees.Definitions.FUNCTION) -> bool is
+            super.pre(function);
+            return true;
+        si
+
+        visit(function: Trees.Definitions.FUNCTION) is
+            let symbol = symbol_for(function);
+
+            // Declare-symbols rejected the declaration outright — a
+            // generator or async function in a context that has no such
+            // kind — so there is no function symbol to compile the body
+            // against, and walking it anyway trips assertions that assume
+            // an enclosing function. The rejection has already been
+            // reported.
+            if !isa Semantic.Symbols.Function(symbol) then
+                super.visit(function);
+
+                return;
+            fi
+
+            let state_machine: Semantic.Symbols.STATE_MACHINE? mut = null;
+            let async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE? mut = null;
+
+            // Generator / async: realise the state-machine frame's
+            // argument fields and `_outer_self` field before the body
+            // walks. A closure inside the body captures loaded values
+            // at compile-expressions time, and
+            // the captured `Load.LOCAL_ARGUMENT.gen` only redirects
+            // through `ldarg.0; ldfld _arg_<name>` when
+            // `state_machine_field` is populated on the symbol —
+            // populating it later (generate-il) would be too late.
+            //
+            // Also install the function-T → class-T gen_type override
+            // so that any closure captured inside the body — and
+            // any IR.Values it captures that ref a function-T
+            // symbol — emits `!N` (class-level on the state machine)
+            // rather than `!!N` (method-level, which has no meaning
+            // inside MoveNext). The override is uninstalled after the
+            // body walk; generate-il re-installs it around its own
+            // body / state-machine emission paths.
+            if let function_symbol: Semantic.Symbols.Function = symbol then
+                // A closure body compiled during this walk re-marks any
+                // argument it captures; a mark left by an earlier walk is
+                // stale once an edit removes the capturing lambda, and
+                // would wrongly reject assignments to a mut argument.
+                // Re-derive from scratch on each walk of the owning body.
+                for argument_name in function_symbol.argument_names do
+                    if let argument: Semantic.Symbols.LOCAL_ARGUMENT = function_symbol.find_direct(argument_name) then
+                        argument.is_captured = false;
+                    fi
+                od
+
+                state_machine = Semantic.Symbols.state_machine_for(function_symbol);
+                async_state_machine = Semantic.Symbols.async_state_machine_for(function_symbol);
+
+                if state_machine? /\ state_machine.frame? then
+                    state_machine.frame!.declare();
+                    state_machine.install_body_emission_overrides();
+                elif async_state_machine? /\ async_state_machine.frame? then
+                    async_state_machine.frame!.declare();
+                    async_state_machine.install_body_emission_overrides();
+                fi
+            fi
+
+            _lambdas.visit_function_definition(function);
+
+            if state_machine? /\ state_machine.frame? then
+                state_machine.uninstall_body_emission_overrides();
+            elif async_state_machine? /\ async_state_machine.frame? then
+                async_state_machine.uninstall_body_emission_overrides();
+            fi
+
+            // Yield inside try/catch/finally needs the fault-block /
+            // state-machine-finalisation dance C# uses and isn't
+            // implemented in v1. The "yield + await in same body"
+            // diagnostic fires earlier in declare-symbols, where
+            // both AST forms are still observable.
+            if state_machine? /\ function.body? then
+                YIELD_IN_TRY_SCANNER(_logger).scan(function.body!);
+            fi
+
+            if async_state_machine? /\ function.body? then
+                AWAIT_IN_PROTECTED_SCANNER(_logger).scan(function.body!);
+            fi
+
+            super.visit(function);
+        si
+
+        pre(`let: Trees.Statements.LET) -> bool is
+            super.pre(`let);
+            return _bindings.pre_let(`let);
+        si
+
+        visit(`let: Trees.Statements.LET) is
+            super.visit(`let);
+            _bindings.visit_let(`let);
+        si
+        
+        pre(`for: Trees.Statements.FOR) -> bool is
+            super.pre(`for);
+
+            try
+                _pre(`for);
+            catch ex: Exception
+                _logger.exception(`for.location, ex, "exception compiling for");
+            yrt
+            
+            return true;
+        si
+        
+        _pre(`for: Trees.Statements.FOR) -> bool is
+            let symbol: Semantic.Symbols.Symbol mut;
+
+            let type: Type mut = Semantic.Types.ERROR();
+
+            let expression = `for.expression;
+            let variable = `for.variable;
+
+            if expression? /\ !expression.is_poisoned then
+                expression.walk(self);
+
+                // Iterable inference: a still-placeholder for-loop
+                // expression records an ITERABLE_CONSTRAINT on its
+                // origin so the body-retry loop can filter candidate
+                // types to those that actually iterate. set_iterator_for
+                // below will still emit "not iterable" on this iter —
+                // the speculate/roll-back wrapper drops the error on
+                // retry once the placeholder resolves.
+                if let
+                    ev = expression.value,
+                    ev_type = ev.type
+                /\ isa Semantic.Types.INFERRED_VARIABLE_TYPE(ev_type)
+                then
+                    let placeholder = cast Semantic.Types.INFERRED_VARIABLE_TYPE(ev_type);
+
+                    _logger.mark_consumed_any_if(placeholder.origin.add_constraint(Semantic.ITERABLE_CONSTRAINT()));
+                fi
+
+                if let ev = expression.value /\ set_iterator_for(`for, ev.type!, false) then
+                    check_receiver_present(expression);
+
+                    if !variable? then
+                        type = `for.read_current!.return_type!;
+                    elif let
+                        te = variable.type_expression,
+                        te_type = te.type
+                    /\ !isa Trees.TypeExpressions.INFER(te)
+                    then
+                        if te_type.is_assignable_from(`for.read_current!.return_type!) then
+                            type = te_type;
+                        else
+                            _logger.error(variable.location, "type mismatch");
+                        fi
+                    else
+                        type = `for.read_current!.return_type!;
+                    fi
+                fi
+            fi
+
+            `for.fusion = _recognize_pipe_fusion(`for);
+
+            if variable? /\ !variable.is_poisoned then
+                set_symbol_type(variable.left, type);
+
+                // Generator: register the per-iteration loop variable
+                // on the state-machine frame so closures inside the
+                // body that capture it freeze correctly. Same
+                // rationale as the LET path above; `for.variable` is
+                // not walked through the visitor framework here, so
+                // we call the helper directly.
+                _declare_state_machine_local_fields(variable.left);
+            fi
+
+            let body = `for.body;
+
+            if body? then
+                // Loop kill-set narrowing: narrows on variables the
+                // loop writes are dropped (the back-edge could
+                // invalidate them); narrows on variables it never
+                // writes survive the loop.
+                let kept = _loops.loop_kept_env(`for);
+                let epoch = _flow.heap_epoch;
+                let mark = _flow.crossing_mark;
+
+                _flow.set_env(kept);
+                body.walk(self);
+
+                // The assignment kill-set covers direct writes but
+                // not member stores inside the body, so a store
+                // during the walk drops the kept environment's heap
+                // facts before restoration; the body's calls attach
+                // as crossings.
+                if _flow.heap_killed_since(epoch) then
+                    kept.drop_heap_facts();
+                else
+                    _flow.adopt_crossings_since(kept, mark);
+                fi
+
+                _flow.set_env(kept);
+            fi
+            return false;
+        si
+
+        pre(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) -> bool is
+            super.pre(left);
+            return _bindings.pre_simple_left(left);
+        si
+
+        visit(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) is
+            super.visit(left);
+            _bindings.visit_simple_left(left);
+        si
+
+        // True iff `value` is statically known to hold a value — its
+        // type is settled and is not an optional / null type.
+        is_non_optional_value(value: IR.Values.Value?) -> bool =>
+            value? /\ value.type? /\ value.type.is_settled /\
+            !value.type!.is_null /\ !value.type!.is_optional;
+        
+        // Resolve the destructure strategy (see DESTRUCTURE_RESOLVER)
+        // and log an error against `location` for any unresolvable
+        // case. When `field_names` is null the destructure is
+        // positional and the failure is reported as a count
+        // mismatch if the source has positional members, otherwise
+        // as a not-destructurable source. When `field_names` is
+        // non-null the destructure is by-name and each missed name
+        // is reported individually.
+        resolve_destructure_strategy(
+            location: LOCATION,
+            from_type: Type?,
+            element_count: int,
+            field_names: Collections.List[string?]?
+        ) -> DESTRUCTURE_STRATEGY =>
+            DESTRUCTURE_RESOLVER.resolve_strategy_reporting(_logger, location, from_type, element_count, field_names);
+
+        pre(left: Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION) -> bool is
+            super.pre(left);
+
+            let from = left.value;
+
+            if !from? then
+                return true;
+            fi
+            
+            let from_type = from.type;
+
+            if !from_type? then
+                return true;
+            fi
+
+            if from_type.is_error then
+                return true;
+            fi
+
+            let elements = left.elements;
+
+            // Assignment-style destructure `(a, b) = expr` is
+            // positional-only — by-name destructure uses the `let
+            // (local = field, …) = expr` form, which goes through
+            // the VariableLeft path instead.
+            let strategy = resolve_destructure_strategy(left.location, from_type, elements.count, null);
+
+            let block = IR.Values.BLOCK();
+
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function!;
+                let arg_temps = Collections.LIST[IR.TEMP]();
+                let call_args = Collections.LIST[IR.Values.Value]();
+
+                for i in 0..deconstruct.arguments.count do
+                    let ref_type = deconstruct.arguments[i];
+                    let element_type = ref_type.get_element_type()!;
+                    let arg_temp = IR.TEMP(block, "destructure_arg", i, element_type);
+
+                    arg_temps.add(arg_temp);
+                    call_args.add(IR.Values.ADDRESS(arg_temp.load(), ref_type));
+                od
+
+                let call_value =
+                    deconstruct.call(
+                        left.location,
+                        from,
+                        call_args,
+                        null,
+                        _function_caller
+                    );
+
+                block.add(call_value);
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+
+                    element.compile_expressions_state.value = arg_temps[i].load();
+
+                    element.walk(self);
+
+                    if element.value? then
+                        block.add(element.value);
+                    fi
+                od
+            else
+                let members = strategy.members;
+                let get_from = from.get_temp_copier(block, "destructure");
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let member = members[i];
+
+                    if member? then
+                        element.compile_expressions_state.value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                        element.walk(self);
+
+                        if element.value? then
+                            block.add(element.value);
+                        fi
+                    fi
+                od
+            fi
+
+            block.close();
+            left.compile_expressions_state.value = block;
+
+            return true;
+        si
+
+        pre(let_in: Trees.Expressions.LET_IN) -> bool is
+            super.pre(let_in);
+
+            return false;
+        si
+
+        visit(let_in: Trees.Expressions.LET_IN) is
+            super.visit(let_in);
+            _bindings.visit_let_in(let_in);
+        si
+
+        pre(assert_in: Trees.Expressions.ASSERT_IN) -> bool is
+            super.pre(assert_in);
+
+            let epoch = _flow.heap_epoch;
+            let mark = _flow.crossing_mark;
+
+            assert_in.condition.walk(self);
+
+            // A store during the condition's own walk means its
+            // derived heap facts cannot be kept (`assert _f? /\
+            // mutate() in …`); its calls attach as crossings. The
+            // message's walk is outside the span: it only runs on
+            // the failure path, so its effects don't invalidate what
+            // the passing condition proves.
+            let condition_killed = _flow.heap_killed_since(epoch);
+            let condition_mark_end = _flow.crossing_mark;
+
+            // Walk the message *before* installing the condition-holds
+            // narrowing, because the message expression is only
+            // evaluated on the failure path — where the condition does
+            // not hold — and must type-check against the unnarrowed env.
+            if assert_in.message? then
+                assert_in.message.walk(self);
+                _check_assertion_message(assert_in.message!);
+            fi
+
+            if _check_assertion_condition(assert_in.condition) then
+                let facts = _condition_analyzer.analyze_condition(assert_in.condition, _flow.current_env);
+
+                if condition_killed then
+                    facts.then_env.drop_heap_facts();
+                else
+                    _flow.adopt_crossings_between(facts.then_env, mark, condition_mark_end);
+                fi
+
+                _flow.set_env(facts.then_env);
+            fi
+
+            assert_in.expression.walk(self);
+
+            return true;
+        si
+
+        visit(assert_in: Trees.Expressions.ASSERT_IN) is
+            let value = assert_in.expression.value;
+
+            if
+                !value? \/
+                !value.check_is_consumable(_logger, assert_in.expression.location)
+            then
+                assert_in.compile_expressions_state.value = IR.Values.DUMMY(Semantic.Types.ERROR(), assert_in.location);
+                return;
+            fi
+
+            assert_in.compile_expressions_state.value = value;
+        si
+        
+        pre(assignment: Trees.Statements.ASSIGNMENT) -> bool =>
+            _bindings.pre_assignment(assignment);
+
+        pre(expression: Trees.Statements.EXPRESSION) -> bool is
+            super.pre(expression);
+
+            // A STATEMENT- or VAL_BLOCK-shaped expression wrapped in
+            // an expression-statement is value-required only if the
+            // surrounding list demands a value at this slot. Push
+            // that down so a void-tail block / `if`-arm with no value
+            // in expression-statement position is accepted silently.
+            if let statement_expression: Trees.Expressions.STATEMENT = expression.expression then
+                statement_expression.want_value = expression.want_value;
+                statement_expression.void_tolerated = expression.void_tolerated;
+            elif let val_block: Trees.Expressions.VAL_BLOCK = expression.expression then
+                val_block.want_value = expression.want_value;
+                val_block.void_tolerated = expression.void_tolerated;
+            fi
+
+            return false;
+        si
+
+        visit(expression: Trees.Statements.EXPRESSION) is
+            super.visit(expression);
+            _bindings.visit_expression_statement(expression);
+
+            if let val_block: Trees.Expressions.VAL_BLOCK = expression.expression then
+                if _is_redundant_val_block(val_block) then
+                    _logger.warn(
+                        val_block.location,
+                        "redundant-val-block",
+                        "val block is redundant"
+                    );
+                fi
+            fi
+        si
+
+        // True when this val-block is in expression-statement position
+        // and could be inlined: the surrounding statement list already
+        // accepts the same shape of body. Two refusals: a return inside
+        // targets this block (inlining would re-route the return to the
+        // enclosing function), or the body declares a local (inlining
+        // would widen its scope).
+        _is_redundant_val_block(block: Trees.Expressions.VAL_BLOCK) -> bool is
+            if block.has_targeted_return then
+                return false;
+            fi
+            for s in block.body.statements do
+                if isa Trees.Statements.LET(s) then
+                    return false;
+                fi
+            od
+            return true;
+        si
+
+        pre(r: Trees.Statements.RETURN) -> bool is
+            super.pre(r);
+            return _bindings.pre_return(r);
+        si
+
+        visit(r: Trees.Statements.RETURN) is
+            super.visit(r);
+            _bindings.visit_return(r);
+        si
+
+    si
+si

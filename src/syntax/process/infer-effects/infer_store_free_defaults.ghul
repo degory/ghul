@@ -1,0 +1,284 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use Ghul.Pipes;
+
+    use Logging;
+    use Trees;
+
+    use Semantic.Types.Type;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Variable declarations and the no-op default visits for node kinds that cannot store.
+    partial INFER_STORE_FREE is
+        // ==== local variable declarations ====
+
+        visit(variable: Variables.VARIABLE) is
+            if !_current? then
+                return;
+            fi
+
+            if variable.want_dispose then
+                // `let use` runs dispose() at scope exit. Before
+                // compile-expressions the value's type is unknown, so
+                // the disposal cannot be bounded; after it, the
+                // dispose member resolves like any other callee.
+                if !_resolved_mode then
+                    _disqualify_because("let-use-dispose");
+                    return;
+                fi
+
+                let disposed_type = _typer.try_type(variable.initializer);
+
+                if !disposed_type? then
+                    _disqualify_because("let-use-dispose-untyped");
+                    return;
+                fi
+
+                let dispose = disposed_type.find_member("dispose");
+
+                if !dispose? then
+                    _disqualify_because("let-use-dispose-unresolved");
+                    return;
+                fi
+
+                _add_callee_edges(dispose);
+            fi
+
+            if variable.is_argument then
+                // parameter types come from the symbol; a default
+                // value expression is walked as part of this body and
+                // classified like any other code
+                return;
+            fi
+
+            let name = variable.name;
+
+            if !name? then
+                return;
+            fi
+
+            let symbol = find(name.name);
+
+            if !symbol? \/ !isa Semantic.Symbols.LOCAL_VARIABLE(symbol) then
+                return;
+            fi
+
+            if _resolved_mode /\ !(cast Semantic.Symbols.LOCAL_VARIABLE(symbol)).is_mutable_marked then
+                let fn = function_value_of(
+                    if variable.initializer? then variable.initializer.value else null fi);
+
+                if fn? then
+                    function_values.note_local(symbol, fn);
+                fi
+            fi
+
+            // An explicitly-declared local carries its type on the
+            // declaration node, resolved before this pass. Read it there,
+            // not from the symbol: the symbol's `type` field is also
+            // written later by compile-expressions inference, so reading
+            // it would make the store-free classification depend on
+            // whether that later pass has run — it has in an analysis-mode
+            // refresh, it has not in a batch build.
+            if !isa TypeExpressions.INFER(variable.type_expression) then
+                if let declared = _typer.usable(variable.type_expression.type) then
+                    _typer.set_local_type(symbol, declared);
+                fi
+
+                return;
+            fi
+
+            let initializer_type = _typer.try_type(variable.initializer);
+
+            if initializer_type? then
+                _typer.set_local_type(symbol, initializer_type);
+            fi
+        si
+
+        // An assert's condition and message classify like any other
+        // code as the walk reaches them; the construct-and-throw
+        // machinery a failing assert runs is compiler-synthesised —
+        // it allocates a fresh exception and stores nothing that
+        // existed before it, so even a caller that catches the
+        // failure observes an unchanged heap.
+        visit(`assert: Statements.ASSERT) is si
+        visit(assert_in: Expressions.ASSERT_IN) is si
+
+        // Interpolation formats each fragment by calling to_string
+        // on it. When a fragment's static type is known, that
+        // dispatch is bounded like any other member call — the
+        // fixpoint checks the type's to_string and every override a
+        // call could reach; primitive and object to_string bodies
+        // are trusted imports. An untyped fragment, or one with a
+        // format specifier (which selects a different, culture-aware
+        // formatting path), cannot be bounded.
+        visit(interpolation: Expressions.STRING_INTERPOLATION) is
+            if !_current? then
+                return;
+            fi
+
+            for fragment in interpolation.values do
+                if fragment.is_expression then
+                    if fragment.format? then
+                        _disqualify_because("interpolation-format");
+                        return;
+                    fi
+
+                    let fragment_type = _typer.try_type(fragment.expression);
+
+                    if !fragment_type? then
+                        _disqualify_because("interpolation-fragment-untyped");
+                        return;
+                    fi
+
+                    _add_callee_edges(fragment_type.find_member("to_string"));
+                fi
+            od
+        si
+
+        // ==== innate bodies ====
+
+        visit(block: Bodies.INNATE) is
+            if !_current? then
+                return;
+            fi
+
+            if !STORE_FREE_INNATES.is_store_free(block.name) then
+                _disqualify_because("innate-not-store-free");
+            fi
+        si
+
+        // ==== audited-harmless node kinds ====
+        //
+        // Everything below either has no effect of its own (its
+        // children are classified independently as the walk reaches
+        // them) or cannot occur in an executable position.
+
+        visit(identifier: Identifiers.Identifier) is si
+        visit(identifier: Identifiers.QUALIFIED) is si
+        visit(modifier: Modifiers.Modifier) is si
+        visit(modifiers: Modifiers.LIST) is si
+        visit(pragma: Pragmas.PRAGMA) is si
+        visit(pragma: Statements.PRAGMA) is si
+
+        visit(type_expression: TypeExpressions.TypeExpression) is si
+        visit(type_expression: TypeExpressions.INFER) is si
+        visit(structured: TypeExpressions.Structured) is si
+        visit(array: TypeExpressions.ARRAY_) is si
+        visit(pointer: TypeExpressions.POINTER) is si
+        visit(optional: TypeExpressions.OPTIONAL) is si
+        visit(reference: TypeExpressions.REFERENCE) is si
+        visit(member: TypeExpressions.MEMBER) is si
+        visit(named: TypeExpressions.NAMED) is si
+        visit(types: TypeExpressions.LIST) is si
+        visit(generic: TypeExpressions.GENERIC) is si
+        visit(function: TypeExpressions.FUNCTION) is si
+        visit(functions: TypeExpressions.FUNCTION_GROUP) is si
+        visit(tuple: TypeExpressions.TUPLE) is si
+        visit(element: TypeExpressions.NAMED_TUPLE_ELEMENT) is si
+        visit(element: TypeExpressions.UNDEFINED) is si
+        visit(constraint: TypeExpressions.TYPE_PARAMETER_CONSTRAINT) is si
+
+        visit(literal: Expressions.Literals.Literal) is si
+        visit(`string: Expressions.Literals.STRING) is si
+        visit(integer: Expressions.Literals.INTEGER) is si
+        visit(float: Expressions.Literals.FLOAT) is si
+        visit(character: Expressions.Literals.CHARACTER) is si
+        visit(boolean: Expressions.Literals.BOOLEAN) is si
+        visit(none: Expressions.Literals.NONE) is si
+
+        visit(`null: Expressions.NULL) is si
+        visit(`self: Expressions.SELF) is si
+        visit(`super: Expressions.SUPER) is si
+        visit(`cast: Expressions.CAST) is si
+        visit(`isa: Expressions.ISA) is si
+        visit(`isa: Expressions.TYPEOF) is si
+        visit(`default: Expressions.DEFAULT) is si
+        visit(has_value: Expressions.HAS_VALUE) is si
+        visit(unwrap: Expressions.UNWRAP) is si
+        visit(tuple: Expressions.TUPLE) is si
+        visit(variable: Expressions.TUPLE_ELEMENT) is si
+        visit(sequence: Expressions.SEQUENCE) is si
+        visit(list: Expressions.LIST) is si
+        visit(variable: Expressions.VARIABLE) is si
+        visit(statement: Expressions.STATEMENT) is si
+        visit(block: Expressions.VAL_BLOCK) is si
+        visit(member: Expressions.EXPLICIT_SPECIALIZATION) is si
+
+        // In resolved mode the disposal is bounded per variable, from
+        // the initializer's compiled type - see the want_dispose case
+        // in visit(variable) - so the statement-level catch-alls only
+        // fire when the type was unknowable.
+        visit(statement: Expressions.LET_IN) is
+            if statement.want_dispose /\ !_resolved_mode then
+                _disqualify_because("let-in-dispose");
+            fi
+
+            leave_scope(statement);
+        si
+
+        visit(left: Trees.Expressions.SIMPLE_LEFT_EXPRESSION) is si
+        visit(destructure_left: Trees.Expressions.DESTRUCTURING_LEFT_EXPRESSION) is si
+
+        visit(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) is si
+        visit(destructure_left: Trees.Variables.DESTRUCTURING_VARIABLE_LEFT) is si
+        visit(left: Trees.Variables.LITERAL_VARIABLE_LEFT) is si
+        visit(variables: Variables.LIST) is si
+
+        visit(statements: Statements.LIST) is si
+        visit(expression: Statements.EXPRESSION) is si
+        visit(`return: Statements.RETURN) is si
+        visit(`throw: Statements.THROW) is si
+        visit(`if: Statements.IF) is si
+        visit(`break: Statements.BREAK) is si
+        visit(`continue: Statements.CONTINUE) is si
+        visit(rb: Statements.REFUTABLE_BINDING) is si
+
+        visit(l: Statements.LET) is
+            if l.want_dispose /\ !_resolved_mode then
+                _disqualify_because("let-dispose");
+            fi
+        si
+
+        visit(if_branch: Statements.IF_BRANCH) is
+            leave_scope(if_branch);
+        si
+
+        visit(`case: Statements.CASE) is
+            leave_scope(`case);
+        si
+
+        visit(case_match: Statements.CASE_MATCH) is
+            leave_scope(case_match);
+        si
+
+        visit(`try: Statements.TRY) is
+            leave_scope(`try);
+        si
+
+        visit(`catch: Statements.CATCH) is
+            leave_scope(`catch);
+        si
+
+        visit(`do: Statements.DO) is
+            leave_scope(`do);
+        si
+
+        visit(labelled: Statements.LABELLED) is
+        si
+
+        visit(expression: Bodies.EXPRESSION) is
+            leave_scope(expression);
+        si
+
+        visit(block: Bodies.BLOCK) is
+            leave_scope(block);
+        si
+
+        // a bodiless declaration stores nothing; whether calls to it
+        // are safe is decided by its overriders through the fixpoint
+        visit(block: Bodies.NULL) is si
+    si
+si

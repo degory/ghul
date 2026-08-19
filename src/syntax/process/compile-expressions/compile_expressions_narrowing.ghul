@@ -1,0 +1,488 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // Receiver-presence checks, narrowing targets, access paths, pure-slot checks and call bookkeeping.
+    partial COMPILE_EXPRESSIONS is
+        // If `expr` is an unqualified identifier resolving (in the
+        // current scope) to a narrowing subject, return that symbol;
+        // null otherwise. Subjects are local variables, fields, and
+        // properties whose getter is proven store-free — for those,
+        // re-reading under an unchanged heap repeats the same
+        // presence and dynamic-type answers, and the flow transfers
+        // (on_call / on_heap_store) forget them the moment the heap
+        // may have changed. A property with an unproven getter never
+        // narrows. Qualified and member-access targets are deferred.
+        // Warn when a value is dereferenced through an optional receiver
+        // not proven to hold a value here. Optionality is one concept
+        // regardless of representation — a reference `T?`, a value-type
+        // NULLABLE[T], or an unconstrained MAYBE[T] all answer is_optional
+        // and are treated alike. Member access, indexing and `for ... in`
+        // all reach the receiver's members off its non-optional shape, so
+        // an un-narrowed optional receiver may be absent at the
+        // dereference. A receiver proven present by flow narrowing is
+        // safe. On by default; `--no-warn-null-deref` opts out.
+        check_receiver_present(receiver: Trees.Expressions.Expression) is
+            if _build_flags.no_warn_null_deref then
+                return;
+            fi
+
+            let value = receiver.value;
+
+            if !value? then
+                return;
+            fi
+
+            let type = value.type;
+
+            if !type? \/ !type.is_optional then
+                return;
+            fi
+
+            let target = try_get_narrowing_target(receiver);
+
+            if target? /\ _flow.is_non_null(target) then
+                return;
+            fi
+
+            let subject = if target? then target.name else "receiver" fi;
+
+            _logger.warn(receiver.location, "null-deref", "{subject} may not hold a value here");
+        si
+
+        // The member an assignment writes, for the definite-assignment
+        // domain alone, written either `self.x = ...` or bare `x = ...`.
+        //
+        // The narrowing target answers a different question and declines
+        // both of these. It declines `self.x = x` where a parameter
+        // shadows the member, because a presence fact proven of the
+        // parameter must not be borrowed by the member - but the write
+        // happens whatever is shadowing, and the constructor idiom
+        // `init(x: T) is self.x = x; si` depends on that. And it declines
+        // a property whose getter is not proven store-free, because a
+        // getter that stores could invalidate what was narrowed - but
+        // "was it written" is settled by the write itself, and the getter
+        // of an auto-property on an `open` class is exactly the case that
+        // cannot be proven.
+        try_get_member_assigned(expr: Trees.Expressions.Expression?) -> Semantic.Symbols.Symbol? is
+            if !expr? then
+                return null;
+            fi
+
+            let context = current_instance_context;
+
+            if !context? then
+                return null;
+            fi
+
+            if let self_member: Trees.Expressions.MEMBER = expr /\ isa Trees.Expressions.SELF(self_member.left) then
+                if self_member.is_coalesce \/ self_member.identifier.is_qualified then
+                    return null;
+                fi
+
+                return context.find_direct(self_member.identifier.name);
+            fi
+
+            if let identifier: Trees.Expressions.IDENTIFIER = expr then
+                if identifier.identifier.is_qualified then
+                    return null;
+                fi
+
+                // Resolved through the enclosing scope rather than
+                // straight off the instance, so a local or parameter of
+                // the same name is seen to shadow the member - a bare
+                // `x = ...` then writes the local and no member is
+                // assigned. `try_find` rather than `find` because this is
+                // speculative: `find` reports an unresolved name, and the
+                // real resolution of this expression reports it already.
+                let symbol = try_find(identifier.identifier);
+
+                if symbol? /\ symbol == context.find_direct(identifier.identifier.name) then
+                    return symbol;
+                fi
+            fi
+
+            return null;
+        si
+
+        try_get_narrowing_target(expr: Trees.Expressions.Expression?) -> Semantic.Symbols.Symbol? is
+            if !expr? then
+                return null;
+            fi
+
+            // `self` narrows like a local, keyed on its instance-context
+            // symbol. It can't be reassigned and an object's concrete type
+            // is fixed for its lifetime, so a narrowing on `self` is never
+            // killed by a call - it is sounder to narrow than a local.
+            if isa Trees.Expressions.SELF(expr) then
+                return current_instance_context;
+            fi
+
+            // `self.x` usually names the same location the bare `x`
+            // does, and where it does the two spellings share one fact
+            // rather than keying their own — a guard written one way is
+            // then seen by a use written the other.
+            //
+            // Only where it does. The bare form resolves by lexical
+            // scope lookup, so a local or parameter of the same name
+            // shadows the member and the two spellings name different
+            // locations — the `init(name: string?)` that assigns
+            // `self.name = name` is the everyday case. Sharing a fact
+            // across that pair would narrow the member on presence
+            // proved of the parameter. So the member is looked up on
+            // the enclosing instance and the two must agree by
+            // identity; where they don't, neither spelling may borrow
+            // the other's fact and `self.x` narrows on nothing.
+            if let self_member: Trees.Expressions.MEMBER = expr /\ isa Trees.Expressions.SELF(self_member.left) then
+                if self_member.is_coalesce \/ self_member.identifier.is_qualified then
+                    return null;
+                fi
+
+                let context = current_instance_context;
+
+                if !context? then
+                    return null;
+                fi
+
+                let target = _narrowing_target_named(self_member.identifier);
+
+                if !target? \/ target != context.find_direct(self_member.identifier.name) then
+                    return null;
+                fi
+
+                return target;
+            fi
+
+            if !isa Trees.Expressions.IDENTIFIER(expr) then
+                return null;
+            fi
+
+            return _narrowing_target_named(expr.identifier);
+        si
+
+        // The symbol an unqualified name narrows on, or null when it
+        // names nothing the flow analysis tracks: a local or field, or
+        // a property whose getter is proven store-free.
+        _narrowing_target_named(identifier: Trees.Identifiers.Identifier) -> Semantic.Symbols.Symbol? is
+            if identifier.is_qualified then
+                return null;
+            fi
+
+            let symbol = find(identifier);
+
+            if !symbol? then
+                return null;
+            fi
+
+            if isa Semantic.Symbols.Variable(symbol) then
+                return symbol;
+            fi
+
+            if isa Semantic.Symbols.Property(symbol) then
+                let property = cast Semantic.Symbols.Property(symbol);
+
+                // Optimistic: any readable property narrows. Whether
+                // its getter is really store-free is judged where a
+                // consumption leans on a fact read through it - see
+                // JUDGE_RELIANCES; a consumption the un-narrowed type
+                // already satisfies asks nothing of the getter.
+                if property.read_function? then
+                    return property;
+                fi
+            fi
+
+            return null;
+        si
+
+        // Build the re-readable access path an expression names, or
+        // null when it isn't one: a local- or field-rooted chain of
+        // instance field / store-free-getter reads (`receiver.prop`,
+        // `receiver.a.b`). Calls, indexers, `?.`, qualified names,
+        // self / super roots, struct receivers and properties with
+        // unproven getters are all excluded — the result must be a
+        // location that re-reads to the same presence answer under an
+        // unchanged heap, and the flow transfers drop its facts the
+        // moment the heap may have changed. Each hop is re-resolved
+        // through `find` / `find_member` so the check site (`x.y?`)
+        // and every use site (`x.y`) agree on the same root Variable
+        // and member Symbols by identity, and so key the same
+        // presence fact.
+        try_build_access_path(expr: Trees.Expressions.Expression?) -> ACCESS_PATH? is
+            if !expr? \/ !isa Trees.Expressions.MEMBER(expr) then
+                return null;
+            fi
+
+            let member = cast Trees.Expressions.MEMBER(expr);
+
+            if member.is_coalesce \/ member.identifier.is_qualified then
+                return null;
+            fi
+
+            let root: Semantic.Symbols.Symbol? mut = null;
+            let members = Collections.LIST[Semantic.Symbols.Symbol]();
+
+            if isa Trees.Expressions.IDENTIFIER(member.left) then
+                let id = cast Trees.Expressions.IDENTIFIER(member.left);
+
+                // The root is subject to the same rule as a hop: a
+                // local or field read directly, or a property whose
+                // getter is proven store-free. `try_get_narrowing_target`
+                // is that rule, so a path root is exactly a symbol the
+                // flow analysis already tracks on its own — which is
+                // what makes the fact recorded at `h.name?` the one
+                // read back at every later `h.name`.
+                let symbol = try_get_narrowing_target(id);
+
+                if !symbol? then
+                    return null;
+                fi
+
+                root = symbol;
+            else
+                let left_path = try_build_access_path(member.left);
+
+                if !left_path? then
+                    return null;
+                fi
+
+                root = left_path.root;
+
+                for m in left_path.members do
+                    members.add(m);
+                od
+            fi
+
+            let left_value = member.left.value;
+
+            if !left_value? \/ !left_value.type? then
+                return null;
+            fi
+
+            let left_type = left_value.type;
+
+            if !isa Semantic.Types.NAMED(left_type) \/ left_type.is_value_type then
+                return null;
+            fi
+
+            let hop = left_type.find_member(member.identifier.name);
+
+            if !hop? \/ !hop.is_instance then
+                return null;
+            fi
+
+            if !hop.is_field then
+                let property = cast Semantic.Symbols.Property?(hop);
+
+                // as in try_get_narrowing_target: any readable
+                // property is an eligible hop, judged where a
+                // consumption leans on the fact
+                if !property? \/ !property.read_function? then
+                    return null;
+                fi
+            fi
+
+            members.add(hop);
+
+            return ACCESS_PATH(root, members);
+        si
+
+        _check_pure_slots(
+            location: LOCATION,
+            value: IR.Values.Value?,
+            syntax_arguments: Trees.Expressions.LIST?
+        ) is
+            _pure_slots.check_call(location, value, syntax_arguments);
+        si
+
+        // Record a compiled call or construction as a crossing on
+        // every live heap fact — its receiver and arguments are
+        // already read, and the callee may reassign a field through
+        // an aliased receiver, so a later use of a fact carried over
+        // this point is judged against it. `location` is the source
+        // site of the expression: a Call value carries no ambient
+        // location of its own, so the crossing must be anchored to
+        // the syntax node rather than to `value.location`.
+        _note_call(location: LOCATION, value: IR.Values.Value?) is
+            _note_self_call(value);
+
+            if !value? \/ !value.is_state_changing_call then
+                // not a call at all, or a call whose callee is
+                // structurally store-free — declared pure, a
+                // whitelisted import, a synthesized backing read, a
+                // pure function-typed invocation. Only the structural
+                // tiers gate here: the proven answer does not exist
+                // until after the solve, and a crossing skipped on a
+                // stale proof could never be judged.
+                return;
+            fi
+
+            _flow.on_call_of(location, _called_function_of(value));
+        si
+
+        // The single bounded callee behind a state-changing value, or
+        // null for a closure invocation or anything else with no one
+        // callee, which no judgement can discharge.
+        _called_function_of(value: IR.Values.Value?) -> Semantic.Symbols.Function? is
+            if let call: IR.Values.Call.INSTANCE = value then
+                return call.function;
+            elif let call: IR.Values.Call.STATIC = value then
+                return call.function;
+            elif let call: IR.Values.Call.GLOBAL = value then
+                return call.function;
+            elif let call: IR.Values.Call.STRUCT = value then
+                return call.function;
+            elif let construction: IR.Values.NEW = value then
+                return construction.constructor;
+            elif let view: IR.Values.NARROW_VIEW = value then
+                return _called_function_of(view.underlying);
+            fi
+
+            return null;
+        si
+
+        // A call on `self` to a method of the enclosing type that cannot
+        // be overridden, recorded on the must-call domain so a
+        // constructor can be credited with what the callee assigns.
+        //
+        // Overridable is excluded rather than resolved: a subclass
+        // override may assign nothing, and crediting the statically
+        // resolved body would hide the null the check exists to find.
+        _note_self_call(value: IR.Values.Value?) is
+            if let call: IR.Values.Call.INSTANCE = value then
+                if !call.from.is_self then
+                    return;
+                fi
+
+                let callee = call.function;
+
+                if callee.is_virtual /\ !_cannot_be_overridden(callee) then
+                    return;
+                fi
+
+                _flow.mark_called(callee);
+            fi
+        si
+
+        // True when no override of `callee` can exist. Two conditions,
+        // and both are needed: none in this build, which
+        // `has_no_overriders` answers, and none possible from another
+        // assembly, which only the owner's closure answers. A ghūl
+        // class is closed to other assemblies unless declared `open`,
+        // so an absence of overriders is the whole story there and
+        // nowhere else — a trait, a struct, an imported type and an
+        // `open` class can each be extended downstream by an override
+        // that assigns nothing.
+        _cannot_be_overridden(callee: Semantic.Symbols.Function) -> bool is
+            // A constructor is reached through the type it constructs, so
+            // there is no slot for a subclass to take over — the runtime
+            // rejects a virtual `.ctor`, and the emitter never marks one.
+            // The symbol reports `is_virtual` all the same, so a
+            // constructor chaining to another would otherwise be declined
+            // wherever the owner is `open`.
+            if callee.is_constructor then
+                return true;
+            fi
+
+            if !callee.has_no_overriders then
+                return false;
+            fi
+
+            let owner = cast Semantic.Symbols.Classy?(callee.owner);
+
+            // A closed trait's implementor set is enumerable in the same
+            // way a closed class's subclass set is, so this could take
+            // one too. It is left to classes deliberately: what the
+            // trait case buys has not been measured, and getting it
+            // wrong silently drops a store the caller depends on.
+            return owner? /\ owner.is_class /\ !owner.is_open;
+        si
+
+        // True iff `type` is a non-optional reference type — the kind
+        // of slot the non-optional-by-default check guards. Value
+        // types, `T?`, type variables, void and error/placeholder
+        // types are all excluded.
+        _is_non_optional_reference(type: Semantic.Types.Type?) -> bool =>
+            type? /\ type.is_named /\
+            !type.is_value_type /\ !type.is_optional /\
+            !type.is_type_variable /\ !type.is_void /\
+            !type.is_error /\ !type.is_inferred;
+
+        // True iff a value of `source` static type is guaranteed
+        // castable to `target` at runtime. The plain assignability
+        // check covers the direct subtype case. For an INTERSECTION
+        // source (produced by class+trait flow narrowing — the
+        // `if isa T(x) then cast T(x)` idiom when T is a trait
+        // cross-cutting x's declared type), the intersection value
+        // IS every member, so a target assignable from any member
+        // is guaranteed to succeed.
+        _cast_target_covers_source(target: Semantic.Types.Type, source: Semantic.Types.Type) -> bool is
+            if target.is_assignable_from(source) then
+                return true;
+            fi
+
+            if isa Semantic.Types.INTERSECTION(source) then
+                let intersection = source;
+
+                for m in intersection.members do
+                    if target.is_assignable_from(m) then
+                        return true;
+                    fi
+                od
+            fi
+
+            return false;
+        si
+
+        // Non-optional-by-default: warn when a `T?` local the flow
+        // analysis has not proven present reaches a non-optional
+        // reference slot. `x?` / `isa` / `if let` clear it; an
+        // explicit `x!` is exempt — the user took responsibility. A
+        // non-variable `T?` source — a call result, a field — is not
+        // flow-tracked, so it stays silent rather than risk a false
+        // positive. The bare `null` literal is handled separately, in
+        // visit(NULL), via its constraint. On by default;
+        // `--no-warn-non-optional` opts out. A warning, not an error,
+        // during the migration; the end state is `T?` not
+        // assignment-compatible with `T`.
+        check_non_optional(target: Semantic.Types.Type?, source: Trees.Expressions.Expression?, location: Source.LOCATION) is
+            if _build_flags.no_warn_non_optional \/ !target? \/ !source? then
+                return;
+            fi
+
+            if !_is_non_optional_reference(target) then
+                return;
+            fi
+
+            let value = source.value;
+
+            if !value? \/ !value.type? then
+                return;
+            fi
+
+            if value.type.is_optional /\ !isa Trees.Expressions.UNWRAP(source) then
+                let v = try_get_narrowing_target(source);
+
+                if v? /\ !_flow.is_non_null(v) then
+                    _logger.warn(location, "non-optional", "{target} expected but {v.name} may not hold a value");
+                fi
+            fi
+        si
+
+    si
+si

@@ -1,0 +1,435 @@
+namespace Syntax.Process.Printer is
+    use Collections;
+
+    use Trees;
+    use Source;
+
+    use Lexical.TRIVIA;
+
+
+    // Expression and member formatting: interpolation, variables, properties, modifiers,
+    // calls, parameter and argument lists.
+    partial FORMATTER is
+
+        // --- faithfulness fix: string interpolation. The inherited visit
+        //     runs each literal fragment through visit(STRING), which wraps
+        //     it in quotes — producing invalid nested-string output. Emit the
+        //     literal fragments as raw escaped text instead. ---
+
+        visit(interpolation: Expressions.STRING_INTERPOLATION) is
+            note(interpolation.location);
+
+            write(cast char(34));
+
+            for fragment in interpolation.values do
+                if fragment.is_expression then
+                    write('{');
+                    fragment.expression.accept(self);
+                    if let fragment.alignment? then
+                        write(',');
+                        alignment.accept(self);
+                    fi
+                    if fragment.format? then
+                        let format = fragment.format!;
+                        write(':');
+                        write(format);
+                    fi
+                    write('}');
+                else
+                    emit_interpolation_literal(fragment);
+                fi
+            od
+
+            write(cast char(34));
+        si
+
+        emit_interpolation_literal(fragment: Expressions.INTERPOLATION_FRAGMENT) is
+            let literal = cast Expressions.Literals.STRING?(fragment.expression);
+
+            if !literal? then
+                return;
+            fi
+
+            for c in literal.value_string do
+                if c == '{' then
+                    write('{');
+                    write('{');
+                elif c == '}' then
+                    write('}');
+                    write('}');
+                else
+                    write_escape_char(c);
+                fi
+            od
+        si
+
+        // --- faithfulness fix: the inherited write_escape_char renders
+        //     control characters via string.format("X", ci), which returns
+        //     the literal "X" (no placeholder), mangling e.g. '\n' to '\X'.
+        //     Emit the escapes the tokenizer actually understands. ---
+
+        write_escape_char(c: char) is
+            let ci = cast int(c);
+
+            if c == '\n' then
+                write("\\");
+                write('n');
+            elif ci == 9 then
+                write("\\");
+                write('t');
+            elif ci == 13 then
+                write("\\");
+                write('r');
+            elif ci == 34 then
+                write("\\");
+                write(cast char(34));
+            elif ci == 92 then
+                write("\\\\");
+            elif ci < 32 then
+                write("\\");
+                write("{(ci >> 6) & 7}");
+                write("{(ci >> 3) & 7}");
+                write("{ci & 7}");
+            else
+                write(c);
+            fi
+        si
+
+        // --- faithfulness fix: a VARIABLE carries three optional pieces
+        //     the inherited printer never emits — the `..` splice marker
+        //     (only inside a secondary `init` formal-arg list), the
+        //     trailing `mut` keyword (set by the parser when source had
+        //     `mut`), and a trailing modifier suffix list (only on
+        //     primary-ctor parameter declarations, where `public`,
+        //     `field`, and `init` describe the auto-generated body
+        //     member). ---
+
+        visit(variable: Variables.VARIABLE) is
+            note(variable.location);
+
+            if variable.is_splice then
+                write("..");
+                return;
+            fi
+
+            variable.left.accept(self);
+
+            let variable_type_expression = variable.type_expression;
+
+            if !isa TypeExpressions.INFER(variable_type_expression) then
+                write(": ");
+                variable_type_expression.accept(self);
+            fi
+
+            if variable.is_mutable_marked then
+                write(" mut");
+            fi
+
+            if let variable.modifiers? /\ !modifiers.is_empty then
+                write(" ");
+                emit_modifiers(modifiers);
+            fi
+
+            let initializer = variable.initializer;
+            if initializer? then
+                write(" = ");
+                initializer.accept(self);
+            fi
+        si
+
+        // --- faithfulness fix: a body-less property (a field) is terminated
+        //     with `;` and a newline, which the plain printer omits ---
+
+        visit(property: Definitions.PROPERTY) is
+            if property.name? then
+                property.name.accept(self);
+            fi
+
+            let property_type_expression = property.type_expression;
+
+            if !isa TypeExpressions.INFER(property_type_expression) then
+                write(": ");
+                property_type_expression.accept(self);
+            fi
+
+            if !property.modifiers.is_empty then
+                write(" ");
+                emit_modifiers(property.modifiers);
+            fi
+
+            if !property.read_body? /\ !property.assign_body? then
+                write_line(";");
+                return;
+            fi
+
+            let out_again = indent_property(property.read_body?, property.assign_body?);
+
+            if property.read_body? then
+                property.read_body.accept(self);
+                if property.assign_body? then
+                    write_line(",");
+                else
+                    after_body(property.read_body!);
+                fi
+            else
+                write(" ");
+            fi
+
+            if property.assign_body? then
+                write("= ");
+                property.assign_argument!.accept(self);
+                property.assign_body!.accept(self);
+                after_body(property.assign_body!);
+            fi
+
+            if out_again then
+                outdent();
+            fi
+        si
+
+        // Emit modifiers without the trailing space the inherited
+        // Modifiers.LIST visit appends (which would strand a space before a
+        // following `;`).
+        emit_modifiers(modifiers: Modifiers.LIST) is
+            let first mut = true;
+
+            if let modifiers.access_modifier? then
+                access_modifier.accept(self);
+                first = false;
+            fi
+
+            if let modifiers.storage_class? then
+                if !first then
+                    write(" ");
+                fi
+                storage_class.accept(self);
+                first = false;
+            fi
+
+            if modifiers.is_pure then
+                if !first then
+                    write(" ");
+                fi
+                write("pure");
+                first = false;
+            fi
+        si
+
+        // --- wrapping: call argument lists and function parameter lists ---
+
+        visit(call: Expressions.CALL) is
+            note(call.location);
+            if call.is_pipe_wrap then
+                for argument in call.arguments do
+                    argument.accept(self);
+                od
+                // Trailing space: `.` is an operator char, so `|.` would
+                // tokenise as a single operator instead of pipe-then-dot.
+                write(" | ");
+                return;
+            fi
+            if call.is_thread_first /\ call.arguments.count >= 1 then
+                call.arguments.expressions[0].accept(self);
+                write(" |> ");
+                call.function.accept(self);
+                write("(");
+                emit_argument_list(call.arguments, 1);
+                write(")");
+            else
+                call.function.accept(self);
+                write("(");
+                emit_argument_list(call.arguments);
+                write(")");
+            fi
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            if let function.name? then
+                name.accept(self);
+            fi
+
+            if _has_type_arguments(function.generic_arguments) then
+                write("[");
+                function.generic_arguments.accept(self);
+                write("]");
+            fi
+
+            write("(");
+            emit_parameter_list(function.arguments);
+            write(")");
+
+            let function_type_expression = function.type_expression;
+
+            if !isa TypeExpressions.INFER(function_type_expression) then
+                write(" -> ");
+                function_type_expression.accept(self);
+            fi
+
+            if !function.modifiers.is_empty then
+                write(" ");
+                emit_modifiers(function.modifiers);
+            fi
+
+            let body = function.body;
+
+            if body? then
+                write(" ");
+                body.accept(self);
+            fi
+
+            after_body(body);
+        si
+
+        emit_parameter_list(parameters: Variables.LIST) is
+            if !_has_parameters(parameters) then
+                return;
+            fi
+
+            _builder.begin_group();
+            _builder.begin_nest(4);
+            _builder.soft_line();
+
+            let first mut = true;
+            for p in parameters do
+                if !first then
+                    _builder.text(",");
+                    _builder.line();
+                fi
+                p.accept(self);
+                first = false;
+            od
+
+            _builder.end_nest();
+            _builder.soft_line();
+            _builder.end_group();
+        si
+
+        _has_parameters(parameters: Variables.LIST?) -> bool is
+            if !parameters? then
+                return false;
+            fi
+            for p in parameters do
+                return true;
+            od
+            return false;
+        si
+
+        _has_type_arguments(arguments: TypeExpressions.LIST?) -> bool is
+            if !arguments? then
+                return false;
+            fi
+            for a in arguments do
+                return true;
+            od
+            return false;
+        si
+
+        // --- faithfulness fix: a NAMED_TUPLE_ELEMENT in type-parameter
+        //     position can carry up to four pieces of constraint syntax
+        //     past its name:type slot — the trailing kind keyword after a
+        //     type bound (`[T: A class]`), an `init` ctor constraint, and a
+        //     trailing `in` / `out` variance. The inherited visit emits
+        //     only `name: type_expression`, dropping the other three.
+        //     The `[T: out]` variance-only form also needs its
+        //     TYPE_PARAMETER_CONSTRAINT(NONE) placeholder suppressed
+        //     (the inherited path renders it as `?`). ---
+
+        visit(element: TypeExpressions.NAMED_TUPLE_ELEMENT) is
+            note(element.location);
+            element.name.accept(self);
+            write(": ");
+
+            let constraint = cast TypeExpressions.TYPE_PARAMETER_CONSTRAINT?(element.type_expression);
+            let is_placeholder =
+                constraint? /\
+                constraint.kind == Semantic.Symbols.TypeParameterConstraintKind.NONE;
+            let need_separator mut = false;
+
+            if !is_placeholder then
+                element.type_expression.accept(self);
+                need_separator = true;
+            fi
+
+            if element.combined_kind != Semantic.Symbols.TypeParameterConstraintKind.NONE then
+                if need_separator then
+                    write(" ");
+                fi
+                write(_constraint_kind_keyword(element.combined_kind));
+                need_separator = true;
+            fi
+
+            if element.has_constructor then
+                if need_separator then
+                    write(" ");
+                fi
+                write("init");
+                need_separator = true;
+            fi
+
+            if element.variance == Semantic.Types.TypeVariance.COVARIANT then
+                if need_separator then
+                    write(" ");
+                fi
+                write("out");
+            elif element.variance == Semantic.Types.TypeVariance.CONTRAVARIANT then
+                if need_separator then
+                    write(" ");
+                fi
+                write("in");
+            fi
+        si
+
+        _constraint_kind_keyword(kind: Semantic.Symbols.TypeParameterConstraintKind) -> string is
+            if kind == Semantic.Symbols.TypeParameterConstraintKind.REFERENCE then
+                return "class";
+            elif kind == Semantic.Symbols.TypeParameterConstraintKind.VALUE then
+                return "struct";
+            elif kind == Semantic.Symbols.TypeParameterConstraintKind.OPTIONAL then
+                return "optional";
+            fi
+            return "";
+        si
+
+        emit_argument_list(arguments: Expressions.LIST) is
+            emit_argument_list(arguments, 0);
+        si
+
+        emit_argument_list(arguments: Expressions.LIST, start: int) is
+            if arguments.count <= start then
+                return;
+            fi
+
+            _builder.begin_group();
+            _builder.begin_nest(4);
+            _builder.soft_line();
+
+            let first mut = true;
+            for i in start..arguments.count do
+                if !first then
+                    _builder.text(",");
+                    _builder.line();
+                fi
+                arguments.expressions[i].accept(self);
+                first = false;
+            od
+
+            // Written hard against the argument it trails, inside the nest,
+            // so a broken layout puts it at the end of that argument's line
+            // and leaves the closing bracket on its own.
+            if arguments.has_trailing_comma then
+                _builder.text(",");
+            fi
+
+            _builder.end_nest();
+            _builder.soft_line();
+            _builder.end_group();
+        si
+
+        _has_arguments(arguments: Expressions.LIST) -> bool is
+            for a in arguments do
+                return true;
+            od
+            return false;
+        si
+    si
+si

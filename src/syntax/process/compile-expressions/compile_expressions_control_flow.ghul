@@ -1,0 +1,775 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // Control-flow walks: yield, throw, break, continue, assertions, try, catch, do, if, case,
+    // statement lists and expression bodies.
+    partial COMPILE_EXPRESSIONS is
+        visit(`throw: Trees.Statements.THROW) is
+            super.visit(`throw);
+
+            // Control does not fall through a throw.
+            _flow.set_unreachable();
+
+            if !`throw.expression? then
+                return;
+            fi
+
+            if
+                !Value.check_is_consumable(_logger, `throw.expression.location, `throw.expression.value)
+            then
+                return;
+            fi
+
+            let exception_type = _innate_symbol_lookup.get_exception_type();
+
+            if !exception_type.is_assignable_from(`throw.expression!.value!.type!) then
+                _logger.warn(`throw.expression!.location, "non-exception-throw", "thrown value is not derived from System.Exception");
+            fi
+
+            // FIXME: need to signal to any enclosing expression if statement that this is a throw so
+            // if all branches are throws, an error can be reported
+        si
+
+        pre(`yield: Trees.Statements.YIELD) -> bool is
+            super.pre(`yield);
+
+            // The yielded expression's type must match the element
+            // type T (drawn from the enclosing function's
+            // `Iterable[T]` / `Iterator[T]` return type). Setting
+            // the constraint here — before walking the expression —
+            // lets the expression participate in inference / overload
+            // resolution against the expected type, like RETURN's
+            // value does in compile_bindings.pre_return.
+            let function = _symbol_table.current_function;
+
+            assert function? else "yield outside a function";
+
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if state_machine? /\ function.return_type? then
+                let element_type = _yield_element_type_for(function);
+
+                if element_type? /\ !element_type.is_inferred then
+                    `yield.expression.set_expected_type(
+                        element_type,
+                        "yielded value of type {{0}} is not assignable to element type {{1}}"
+                    );
+                fi
+            fi
+
+            return false;
+        si
+
+        visit(`yield: Trees.Statements.YIELD) is
+            super.visit(`yield);
+
+            let function = _symbol_table.current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if !state_machine? then
+                if function? /\ function.is_closure then
+                    _logger.error(
+                        `yield.location,
+                        "cannot yield in function literal"
+                    );
+                else
+                    _logger.error(
+                        `yield.location,
+                        "generator must return Pipe[T]"
+                    );
+                fi
+
+                return;
+            fi
+
+            assert function? else "state_machine_for returned non-null for null function";
+
+            if !Value.check_is_consumable(_logger, `yield.expression.location, `yield.expression.value) then
+                return;
+            fi
+
+            // Verify the function's return type is actually an
+            // Iterable[T] / Iterator[T]. The yield-presence test in
+            // declare-symbols routes here without inspecting the
+            // return type, so a body with `yield` and a non-iterable
+            // return type lands here as a diagnostic.
+            let element_type = _yield_element_type_for(function);
+
+            if !element_type? then
+                _logger.error(
+                    `yield.location,
+                    "generator must return Pipe[T]"
+                );
+            fi
+        si
+
+        // Extract `T` from a generator's `Pipe[T]` return type, or
+        // null if the return type is not a Pipe[T] (a generator must
+        // return Ghul.Pipes.Pipe[T]). T is taken from the Pipe itself,
+        // not its Iterable[T] base, so the concrete element type — not
+        // Pipe's own type parameter — is recovered.
+        //
+        // When the Pipe trait is unavailable (compiling ghul-runtime
+        // itself, where the assembly is not yet loadable) fall back to
+        // the bare Iterable[T] / Iterator[T] forms.
+        _yield_element_type_for(function: Semantic.Symbols.Function) -> Semantic.Types.Type? is
+            if !function.return_type? then
+                return null;
+            fi
+
+            let return_type = function.return_type;
+
+            let pipe = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            if pipe? then
+                return Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(return_type, pipe);
+            fi
+
+            let iterator = _innate_symbol_lookup.get_unspecialized_iterator_type();
+            let iterable = _innate_symbol_lookup.get_unspecialized_iterable_type();
+
+            let candidates = Collections.LIST[Semantic.Types.Type]();
+            candidates.add(iterator);
+            candidates.add(iterable);
+
+            return Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract_from_any(return_type, candidates);
+        si
+
+        // The postfix `|` operator's operand is already a Pipe[T] — so
+        // wrapping it again is redundant and `x |` should be a no-op.
+        // Decided purely from the operand's static type.
+        _pipe_wrap_operand_already_pipe(call: Trees.Expressions.CALL) -> bool is
+            if call.arguments.count != 1 then
+                return false;
+            fi
+
+            let operand = call.arguments.expressions[0];
+
+            let value = operand.value;
+
+            if !value? \/ !value.type? then
+                return false;
+            fi
+
+            let pipe = _innate_symbol_lookup.get_unspecialized_pipe_type();
+
+            if !pipe? then
+                return false;
+            fi
+
+            return Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(value.type, pipe)?;
+        si
+
+        visit(`break: Trees.Statements.BREAK) is
+            super.visit(`break);
+
+            // Control does not fall through a break.
+            _flow.set_unreachable();
+        si
+
+        visit(`continue: Trees.Statements.CONTINUE) is
+            super.visit(`continue);
+
+            // Control does not fall through a continue.
+            _flow.set_unreachable();
+        si
+
+        _check_assertion_condition(condition: Trees.Expressions.Expression) -> bool is
+            let value = condition.value;
+
+            if
+                !value? \/
+                !value.type? \/
+                !value.check_is_consumable(_logger, condition.location)
+            then
+                return false;
+            fi
+
+            if
+                !_innate_symbol_lookup
+                    .get_bool_type()
+                    .is_assignable_from(value.type!)
+            then
+                _logger.error(condition.location, "assertion expression must be bool");
+            fi
+
+            return true;
+        si
+
+        _check_assertion_message(message: Trees.Expressions.Expression?) is
+            if !message? then
+                return;
+            fi
+
+            let value = message.value;
+
+            if !value? \/ !value.type? then
+                return;
+            fi
+
+            value.check_is_consumable(_logger, message.location);
+
+            if
+                !_innate_symbol_lookup
+                    .get_exception_type()
+                    .is_assignable_from(value.type!)
+                /\
+                !_innate_symbol_lookup
+                    .get_string_type()
+                    .is_assignable_from(value.type!)
+            then
+                _logger.error(message.location, "assertion else must be string or System.Exception");
+            fi
+        si
+
+        pre(`assert: Trees.Statements.ASSERT) -> bool is
+            super.pre(`assert);
+
+            // Controlled walk so the epoch span covers the condition
+            // alone: a kill during its walk means its derived heap
+            // facts cannot survive (`assert _f? /\ mutate();`), but
+            // the message only runs on the failure path, so its kills
+            // don't invalidate what the passing condition proves.
+            let epoch = _flow.heap_epoch;
+            let mark = _flow.crossing_mark;
+
+            _access.assert_condition_depth = _access.assert_condition_depth + 1;
+
+            `assert.expression.walk(self);
+
+            _access.assert_condition_depth = _access.assert_condition_depth - 1;
+
+            _assert_condition_killed_stack.add(_flow.heap_killed_since(epoch));
+            _assert_condition_marks_stack.add((from_mark = mark, to_mark = _flow.crossing_mark));
+
+            if `assert.message? then
+                `assert.message.walk(self);
+            fi
+
+            return true;
+        si
+
+        visit(`assert: Trees.Statements.ASSERT) is
+            super.visit(`assert);
+
+            let condition_killed = _assert_condition_killed_stack[_assert_condition_killed_stack.count - 1];
+            _assert_condition_killed_stack.remove_at(_assert_condition_killed_stack.count - 1);
+
+            let condition_marks = _assert_condition_marks_stack[_assert_condition_marks_stack.count - 1];
+            _assert_condition_marks_stack.remove_at(_assert_condition_marks_stack.count - 1);
+
+            // `assert false` always throws — control does not
+            // continue past it.
+            if
+                isa Trees.Expressions.Literals.BOOLEAN(`assert.expression) /\
+                (cast Trees.Expressions.Literals.BOOLEAN(`assert.expression)).value_string =~ "false"
+            then
+                _flow.set_unreachable();
+            fi
+
+            if !_check_assertion_condition(`assert.expression) then
+                return;
+            fi
+
+            // Apply the assert's narrowing to the fall-through:
+            // since a failed assert throws, only the then-branch of
+            // the condition reaches subsequent code. So `assert x?`
+            // narrows x to non-optional and `assert isa T(x)` to T
+            // in the rest of the enclosing scope, the same way
+            // `if !cond then throw ... fi` would.
+            let facts = _condition_analyzer.analyze_condition(`assert.expression, _flow.current_env);
+
+            if condition_killed then
+                facts.then_env.drop_heap_facts();
+            else
+                _flow.adopt_crossings_between(facts.then_env, condition_marks.from_mark, condition_marks.to_mark);
+            fi
+
+            _flow.set_env(facts.then_env);
+
+            _check_assertion_message(`assert.message);
+        si
+
+        pre(`try: Trees.Statements.TRY) -> bool is
+            super.pre(`try);
+            return _loops.pre_try(`try);
+        si
+
+        visit(`try: Trees.Statements.TRY) is
+            super.visit(`try);
+            _loops.visit_try(`try);
+        si
+
+        pre(`catch: Trees.Statements.CATCH) -> bool is
+            super.pre(`catch);
+            return _loops.pre_catch(`catch);
+        si
+
+        visit(`catch: Trees.Statements.CATCH) is
+            super.visit(`catch);
+            _loops.visit_catch(`catch);
+        si
+
+        pre(`do: Trees.Statements.DO) -> bool is
+            super.pre(`do);
+            return _loops.pre_do(`do);
+        si
+
+        visit(`do: Trees.Statements.DO) is
+            if
+                let `do?.condition? /\
+                Value.check_is_consumable(_logger, condition.location, condition.value)
+            then
+                if !condition.value!.type!.matches(_innate_symbol_lookup.get_bool_type()) then
+                    _logger.error(condition.location, "while condition must be bool");
+                fi
+            fi
+
+            super.visit(`do);
+
+            _loops.visit_do(`do);
+        si
+
+        pre(`if: Trees.Statements.IF_BRANCH) -> bool is
+            super.pre(`if);
+            return _conditionals.pre_if_branch(`if);
+        si
+
+        visit(`if: Trees.Statements.IF_BRANCH) is
+            _conditionals.visit_if_branch(`if);
+            super.visit(`if);
+        si
+
+        pre(expression: Trees.Bodies.EXPRESSION) -> bool is
+            super.pre(expression);
+
+            let function = current_function;
+
+            if
+                !function? \/
+                !function.return_type?
+            then
+                return false;
+            fi
+
+            if function.return_type.is_sentinel then
+                // An inferred return type has not yet said whether the
+                // body yields a value, so a body that only performs
+                // void work is not an error here. Mark the position
+                // void-tolerant; visit settles the return as void once
+                // the body has been walked.
+                if function.return_type.is_inferred then
+                    _mark_body_void_tolerated(expression.expression);
+                fi
+
+                return false;
+            fi
+
+            expression.expression.set_expected_type(function.return_type, "cannot return value of type {{0}} where {{1}} expected");
+
+            // A void-returning `=> body` doesn't need its body to yield
+            // a value. Push that down into any STATEMENT- / VAL_BLOCK-
+            // shaped body so a non-value-providing tail is accepted
+            // silently.
+            if function.return_type!.is_void then
+                if let statement_expression: Trees.Expressions.STATEMENT = expression.expression then
+                    statement_expression.want_value = false;
+                elif let val_block: Trees.Expressions.VAL_BLOCK = expression.expression then
+                    val_block.want_value = false;
+                fi
+            fi
+
+            return false;
+
+        si
+
+        _mark_body_void_tolerated(body: Trees.Expressions.Expression) is
+            if let statement_expression: Trees.Expressions.STATEMENT = body then
+                statement_expression.void_tolerated = true;
+            elif let val_block: Trees.Expressions.VAL_BLOCK = body then
+                val_block.void_tolerated = true;
+            fi
+        si
+
+        visit(expression: Trees.Bodies.EXPRESSION) is
+            let function = current_function;
+
+            // A diverging body — `=> throw E`, or an `=> if/case` whose
+            // every arm diverges — yields no value but is valid. Keep an
+            // explicitly declared return type; settle an inferred one as
+            // void since there is nothing to infer from.
+            if
+                function? /\
+                !expression.expression.value? /\
+                _flow.is_unreachable
+            then
+                super.visit(expression);
+
+                if DIVERGING_VALUE_POSITION.settles_inferred_return_to_void(function.return_type) then
+                    function.set_return_type(_innate_symbol_lookup.get_void_type());
+                fi
+
+                return;
+            fi
+
+            let value = expression.expression?.value;
+
+            if
+                !function? \/
+                !function.return_type? \/
+                !value? \/
+                !value.type?
+            then
+                super.visit(expression);
+
+                expression.expression.compile_expressions_state.value = IR.Values.DUMMY(Semantic.Types.ERROR(), expression.expression.location);
+
+                if function? /\ (!function.return_type? \/ function.return_type.is_wild) then
+                    function.set_return_type(Semantic.Types.ERROR());
+                fi
+
+                return;
+            fi
+
+            let void_type = _innate_symbol_lookup.get_void_type();
+
+            if function.return_type!.is_inferred then
+                if Value.check_is_consumable_allow_void(_logger, expression.expression.location, value) then
+                    // Body contains let-await → wrap the bare-T body
+                    // expression as `Tasks.TASK.from_result(expr)` and
+                    // settle the inferred return as Task[T]. Values
+                    // already typed Task[?] are pinned as-is.
+                    // Mirrors the wrap in visit_return.
+                    let value_type: Semantic.Types.Type? mut = value.type;
+
+                    if
+                        function.wrap_inferred_return_as_task /\
+                        value_type.is_settled /\
+                        !_bindings.task_conversion.is_task_type(value_type)
+                    then
+                        let task_type = _innate_symbol_lookup.get_task_type(value_type);
+
+                        if task_type? then
+                            let wrapped = _bindings.task_conversion.try_wrap_value_as_task_expression(expression.expression, task_type, self);
+                            if wrapped? then
+                                expression.expression = wrapped;
+                                value_type = expression.expression.value!.type;
+                            fi
+                        fi
+                    fi
+
+                    function.set_return_type(value_type!);
+                elif value.type? /\ value.type.is_error then
+                    function.set_return_type(Semantic.Types.ERROR());
+                fi
+            elif function.return_type!.matches(void_type) /\ !function.return_type!.is_type_variable then
+                if !value.type!.matches(void_type) then
+                    _logger
+                        .error(
+                            expression.location,
+                            "cannot return value from function of void type"
+                        );
+                fi
+            elif !function.return_type!.is_assignable_from(value.type!) then
+                // Implicit T → TASK[T] widening at expression-body return
+                // position. Same mechanism as visit_return: synthesise
+                // Tasks.TASK.from_result(orig) and re-resolve.
+                let wrapped = _bindings.task_conversion.try_wrap_value_as_task_expression(expression.expression, function.return_type!, self);
+                if wrapped? then
+                    expression.expression = wrapped;
+                else
+                    _logger
+                        .error(
+                            expression.location,
+                            "cannot return value of type {value.type} where {function.return_type} expected"
+                        );
+                fi
+            else
+                Value.check_is_consumable_allow_void(_logger, expression.expression.location, value);
+            fi
+
+            check_non_optional(function.return_type, expression.expression, expression.expression.location);
+
+            _pure_slots.check_store(expression.expression.location, function.return_type, expression.expression.value);
+
+            super.visit(expression);
+        si
+        
+        pre(statement: Trees.Expressions.STATEMENT) -> bool is
+            super.pre(statement);
+
+            statement.statement.compile_expressions_state.want_value = statement.want_value;
+            statement.statement.compile_expressions_state.void_tolerated = statement.void_tolerated;
+
+            return false;
+        si
+
+        visit(statement: Trees.Expressions.STATEMENT) is
+            // An `if` / `case` in a void-tolerant position that declined
+            // to produce a value is a void body, not a missing one, so
+            // this position is void too. Dropping want_value leaves the
+            // statement shape IL generation already emits for a body
+            // whose return type was written out as void.
+            if statement.void_tolerated /\ !statement.statement.value? then
+                statement.want_value = false;
+            fi
+
+            // A diverging statement (`throw`, or an `if`/`case` whose
+            // every arm diverges) legitimately yields no value; the
+            // unreachable continuation needs none.
+            if DIVERGING_VALUE_POSITION.is_missing_value_reportable(statement.want_value, statement.statement.value?, _flow.is_unreachable) then
+                _logger.warn(statement.location, "statement-expression-no-value", "statement expression has no value");
+            fi
+
+            if statement.statement.value? then
+                statement.compile_expressions_state.value = statement.statement.value;
+            elif !statement.want_value then
+                // Void-tolerant position (expression-statement, void-
+                // returning `=>` body) with an `if`/`case` whose
+                // branches don't all provide values: synthesise a void
+                // block value so the consumer has something to thread
+                // through rather than a null that downstream passes
+                // treat as an error.
+                statement.compile_expressions_state.value = IR.Values.BLOCK(
+                    _innate_symbol_lookup.get_void_type()
+                );
+            fi
+        si
+
+        pre(block: Trees.Expressions.VAL_BLOCK) -> bool is
+            super.pre(block);
+
+            // The body's tail is the only fall-through value
+            // contributor. Push want_value down through the LIST to
+            // its last statement so it must provide a value when this
+            // block is consumed; the surrounding context (expression-
+            // statement, void-returning `=>` body) may also write
+            // false here to allow a void tail.
+            block.body.compile_expressions_state.want_value = block.want_value;
+            block.body.compile_expressions_state.void_tolerated = block.void_tolerated;
+
+            // Push this block as the innermost return target before
+            // walking its body. Returns inside read the top of stack
+            // in pre_return / visit_return; nested val-blocks override
+            // the current top while their own body is walked.
+            _val_block_stack.add(block);
+
+            return false;
+        si
+
+        visit(block: Trees.Expressions.VAL_BLOCK) is
+            // Pop ourselves off the val-block stack regardless of
+            // outcome — every push in pre must be balanced by a pop
+            // here, otherwise an outer return-target lookup picks up
+            // a stale inner block.
+            assert _val_block_stack.count > 0 else "val_block_stack underflow";
+            let top = _val_block_stack[_val_block_stack.count - 1];
+            assert top? /\ top == block else "val_block_stack head is not the block being visited";
+            _val_block_stack.remove_at(_val_block_stack.count - 1);
+
+            // A body that yields no value in a void-tolerant position
+            // (an inferred function-literal return) makes the block
+            // void rather than valueless. Nothing returns out of it
+            // either, so there is no other contributor to LUB with.
+            if
+                block.void_tolerated /\
+                !block.body.value? /\
+                block.return_types.count == 0
+            then
+                block.want_value = false;
+            fi
+
+            if !block.want_value then
+                // Void-tolerant position: yield a void block value so
+                // the consumer (expression-statement, void-returning
+                // `=>` body) has something to thread through. Returns
+                // from inside the block are still emitted as branches
+                // by generate-il; the value here is the fall-through
+                // type, which is void in this branch.
+                block.compile_expressions_state.value = IR.Values.BLOCK(
+                    _innate_symbol_lookup.get_void_type()
+                );
+                return;
+            fi
+
+            // LUB over every value-contributing source: returns
+            // targeting us (recorded by visit_return as we walked the
+            // body) and the tail expression's value type (if the tail
+            // provides one). When the tail itself diverges (every
+            // path returns from us), block.body.value may still be
+            // set by the LIST visitor — it conservatively types as
+            // BLOCK(last.value.type) — but the LUB shape below
+            // tolerates either presence.
+            let lub = LEAST_UPPER_BOUND_MAP();
+
+            for t in block.return_types do
+                if !t.is_error then
+                    lub.add(t);
+                fi
+            od
+
+            if let block.body.value?, value.type? /\ !type.is_error then
+                lub.add(type);
+            fi
+
+            let lub_type = lub.get_result();
+
+            if lub_type? then
+                block.compile_expressions_state.value = IR.Values.BLOCK(lub_type);
+            elif block.body.value? then
+                // No usable LUB contributions but the body produced a
+                // value of some sentinel / error type — pass it
+                // through so downstream phases see a real Value and
+                // diagnose at the original location.
+                block.compile_expressions_state.value = block.body.value;
+            else
+                // Body's tail doesn't provide a value and there are
+                // no returns to LUB with. The body walk has already
+                // emitted "expected a value" at the offending
+                // statement (compile_expressions.visit(Statements
+                // .LIST) — the val-block contract is the same as
+                // the LIST contract there); add the parallel "no
+                // value" warning the if/case-in-expression form
+                // emits in the same situation, and stand up a DUMMY
+                // value so downstream walks have a typed Value.
+                _logger.warn(
+                    block.location,
+                    "statement-expression-no-value",
+                    "statement expression has no value"
+                );
+
+                block.compile_expressions_state.value = IR.Values.DUMMY_BLOCK(
+                    Semantic.Types.ERROR(),
+                    block.location,
+                    "val block produced no value"
+                );
+            fi
+
+            _declare_composite_spill_field(block, block.value);
+        si
+
+        pre(list: Trees.Statements.LIST) -> bool is
+            super.pre(list);
+            return true;
+        si
+
+        visit(list: Trees.Statements.LIST) is
+            let enclosing_statement_list = current_statement_list;
+            current_statement_list = list;
+
+            try
+                if let list.last? then
+                    last.compile_expressions_state.want_value = list.want_value;
+                    last.compile_expressions_state.void_tolerated = list.void_tolerated;
+                fi
+
+                for s in list.statements do
+                    self.enter_node(s);
+                    try
+                        s.walk(self);
+                    finally
+                        self.leave_node(s);
+                    yrt
+                od
+
+                if !list.want_value then
+                    return;
+                fi
+                    
+                if list.is_empty then
+                    _logger.error(list.location, "expected a value");
+                    return;
+                fi
+
+                let last = list.last;
+
+                if !last? then
+                    return;
+                fi
+
+                if !last.provides_value then
+                    // Tolerate a non-value-providing tail when every
+                    // path through the body has already diverged
+                    // (returned / thrown). Fall-through is dead
+                    // code; the consumer needs the IL emitted for
+                    // its side effects but no value need be left
+                    // on the stack.
+                    if !_flow.is_unreachable then
+                        _logger.error(last.location, "expected a value");
+                    fi
+                    return;
+                fi
+
+                if let last.value? then
+                    list.compile_expressions_state.value = IR.Values.BLOCK(value.type!);
+
+                    // A list that disposes needs its body inside the
+                    // protected region, which the spill path does not
+                    // build - so it always captures.
+                    if !list.want_dispose then
+                        _declare_composite_spill_field(list, list.value);
+                    fi
+                fi
+            finally
+                current_statement_list = enclosing_statement_list;
+            yrt
+        si
+
+        pre(`if: Trees.Statements.IF) -> bool is
+            super.pre(`if);
+            return _conditionals.pre_if(`if);
+        si
+
+        visit(`if: Trees.Statements.IF) is
+            _conditionals.visit_if(`if);
+
+            _declare_composite_spill_field(`if, `if.value);
+        si
+
+        pre(`case: Trees.Statements.CASE) -> bool is
+            super.pre(`case);
+            return _conditionals.pre_case(`case);
+        si
+
+        visit(`case: Trees.Statements.CASE) is
+            _conditionals.visit_case(`case);
+
+            _declare_composite_spill_field(`case, `case.value);
+
+            super.visit(`case);
+        si
+
+        pre(arm: Trees.Statements.CASE_MATCH) -> bool is
+            super.pre(arm);
+            return _conditionals.pre_case_match(arm);
+        si
+
+        visit(arm: Trees.Statements.CASE_MATCH) is
+            _conditionals.visit_case_match(arm);
+            super.visit(arm);
+        si
+
+        // Do not descend into properties (otherwise accessor functions will be walked twice)
+        pre(property: Trees.Definitions.PROPERTY) -> bool => true;
+
+        visit(property: Trees.Definitions.PROPERTY) is
+        si
+    si
+si

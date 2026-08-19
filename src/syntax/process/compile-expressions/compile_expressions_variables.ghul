@@ -1,0 +1,682 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // Variable-left walks: simple, destructuring and literal leaves, variable visits and
+    // symbol type assignment for destructuring.
+    partial COMPILE_EXPRESSIONS is
+        pre(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) -> bool => false;
+        visit(left: Trees.Variables.SIMPLE_VARIABLE_LEFT) is
+            let symbol = find(left.name);
+
+            if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+                let left_state = _variable_left_state.get_or_add(left);
+
+                symbol.define();
+
+                let right_location =
+                    if left_state.right_location? then
+                        left_state.right_location;
+                    else
+                        left.location;
+                    fi;
+
+                // Iterative-inference re-narrowing: an iter-N type
+                // that's a sentinel or contains a placeholder may
+                // be overwritten on iter N+1 with the now-narrower
+                // value (e.g. Function[placeholder, int] →
+                // Function[int, int] once the lambda arg resolves).
+                //
+                // is_settled alone isn't enough: an overload candidate
+                // that loses to a sibling can still leave its own
+                // still-unbound method type-parameter committed as
+                // the right-hand value's type on an earlier iter -
+                // e.g. C from a losing >>[A,B,C] candidate that
+                // failed to bind C. That's a real, non-sentinel type,
+                // so is_settled reports it as final - but the
+                // parameter isn't one of this function's own generic
+                // parameters, so it can never mean anything here and
+                // must be re-derived rather than kept.
+                let current_type = typed_symbol.type;
+
+                let needs_set mut =
+                    !current_type? \/
+                    !current_type.is_settled \/
+                    current_type.has_function_generic_argument_foreign_to(current_function);
+
+                if
+                    !needs_set /\
+                    REFUTABLE_LEAF_RETYPE.needs_retype(
+                        left.is_refutable,
+                        left_state.explicit_type?,
+                        left_state.right_value?
+                    )
+                then
+                    needs_set = true;
+                fi
+
+                if needs_set then
+                    if left_state.explicit_type? then
+                        typed_symbol.set_type(left_state.explicit_type);
+                    elif left_state.right_value? then
+                        let right_value = left_state.right_value;
+
+                        if Value.check_is_consumable(_logger, right_location, right_value) then
+                            typed_symbol.set_type(right_value.type!);
+                        else
+                            typed_symbol.set_type(Semantic.Types.ERROR());
+                        fi
+                    else
+                        // No explicit type and no initializer
+                        // (`let l;`). Try the LUB accumulated from
+                        // later assignments; otherwise stand-in with
+                        // an INFERRED_VARIABLE_TYPE placeholder so
+                        // subsequent assignments can attach
+                        // constraints and the body retry loop
+                        // resolves on iteration N+1.
+                        //
+                        // !is_sentinel deliberate (not is_settled):
+                        // if try_get_inferred_type returns a
+                        // composite-with-placeholder LUB, we commit
+                        // it on iter N. The needs_set path above
+                        // uses is_settled, so iter N+1 picks the
+                        // slot up again and may refresh with a
+                        // more-resolved value. !is_sentinel accepts
+                        // a one-iter delayed convergence in exchange
+                        // for not re-deriving the LUB every iter
+                        // while it's stable.
+                        if isa Semantic.Symbols.Variable(symbol) then
+                            let variable = symbol;
+                            let inferred = variable.try_get_inferred_type();
+
+                            if inferred? /\ !inferred.is_sentinel then
+                                typed_symbol.set_type(inferred);
+                            else
+                                typed_symbol.set_type(Semantic.Types.INFERRED_VARIABLE_TYPE(variable));
+                            fi
+                        fi
+                    fi
+                elif
+                    left_state.explicit_type? /\
+                    left_state.right_value? /\
+                    Value.check_is_consumable(_logger, right_location, left_state.right_value)
+                then
+                    let explicit_type = left_state.explicit_type!;
+                    let right_value = left_state.right_value!;
+
+                    if
+                        !left.is_refutable /\
+                        !explicit_type.is_assignable_from(right_value.type!)
+                    then
+                        // Refutable bindings (`if let p: T = e`) skip
+                        // this check: the type ascription is a
+                        // runtime narrowing test, the scrutinee is
+                        // typically wider than `T`, and the cast may
+                        // fail — that's the whole point of the
+                        // construct.
+                        _logger.error(
+                            left_state.variable_location!,
+                            "{right_value.type} is not assignable to {explicit_type}");
+                    fi
+                fi
+
+                if left_state.right_value? then
+                    left_state.value = symbol.store(left.location, null, left_state.right_value, _symbol_loader, true);
+
+                    // A non-optional initializer leaves the local
+                    // known to hold a value — even where its declared
+                    // type is `T?` — so a following dereference does
+                    // not warn. Skipped when the local's declared
+                    // type is already non-optional (the presence bit
+                    // is redundant and the hint would be noise).
+                    if
+                        isa Semantic.Symbols.Variable(symbol) /\
+                        is_non_optional_value(left_state.right_value)
+                    then
+                        let variable = cast Semantic.Symbols.Variable(symbol);
+                        let variable_type = variable.type;
+
+                        if variable_type? /\ variable_type.is_optional then
+                            _flow.mark_non_null(variable);
+                            _flow.report_narrowing_site(
+                                left.location,
+                                "narrowing-assign",
+                                "►",
+                                INLAY_TYPE.render(variable_type.as_non_optional())
+                            );
+                        fi
+                    fi
+                fi
+            else
+                _logger.error(left.name.location, "couldn't find typed symbol for variable {left.name}");
+            fi
+        si
+
+        pre(left: Trees.Variables.DESTRUCTURING_VARIABLE_LEFT) -> bool is
+            // A destructured formal argument has no initializer to walk
+            // a value from - its leaves' types are already assigned by
+            // resolve-explicit-types from the parameter's aggregate
+            // type, and generate-il sources the unpack directly from
+            // the synthesised parameter symbol. Nothing here applies.
+            if left.is_argument_left then
+                return true;
+            fi
+
+            // Per-element type ascription: each element of a destructure
+            // pattern can carry its own `: T` (e.g. `(c: Cat, d: Dog)`,
+            // or recursively `((x: int, y: int): Point, c: Color)`).
+            // Walk the type_expression and pin the element's
+            // `explicit_type` so the bound symbol gets the declared
+            // type rather than the raw source-member type. The runtime
+            // narrowing test for the refutable path is emitted later
+            // by `gen_destructuring_initialize` in generate_il.
+            for e in left.elements do
+                if let e.type_expression? then
+                    type_expression.walk(self);
+
+                    if let type_expression.type? then
+                        _variable_left_state.get_or_add(e).explicit_type = type;
+                    fi
+                fi
+            od
+
+            let left_state = _variable_left_state.get_or_add(left);
+
+            let from mut = left_state.right_value;
+
+            if !from? then
+                _logger.error(left.location, "cannot destructure without initializer");
+                return true;
+            fi
+
+            let from_type mut =
+                if left_state.explicit_type? then
+                    left_state.explicit_type;
+                else
+                    from.type;
+                fi;
+
+            if !from_type? then
+                _logger.error(left.location, "oops: null type");
+
+                from_type = Semantic.Types.ERROR();
+            fi
+
+            // Refutable destructure on an optional source: the `if let`
+            // presence test has already excluded null at this point, so
+            // resolve members against the unwrapped type and load them
+            // from the unwrapped value. A value-type `T?` unwraps via
+            // its synthesised `value` member; a reference `T?` keeps
+            // the same backing value and just drops the optional flag.
+            if left.is_refutable /\ from_type.is_optional then
+                if from_type.is_value_type then
+                    let value_member = from_type.find_member("value");
+
+                    if value_member? then
+                        from = value_member.load(LOCATION.internal, from, _symbol_loader);
+                        from_type = from.type!;
+                    fi
+                else
+                    from_type = from_type.as_non_optional();
+                    from = IR.Values.TYPE_WRAPPER(from_type, from);
+                fi
+            fi
+
+            // Destructure on a still-unresolved placeholder: emit a
+            // DESTRUCTURE_CONSTRAINT(member_count) on the
+            // placeholder's origin so the body-retry loop can filter
+            // candidate types against it, then defer rather than
+            // hard-erroring "cannot destructure". Without this the
+            // body-retry never gets a useful signal — the destructure
+            // type is fixed and the lambda's RHS placeholder is
+            // forced to resolve via some other use.
+            if isa Semantic.Types.INFERRED_VARIABLE_TYPE(from_type) then
+                let placeholder = from_type;
+                let constraint = Semantic.DESTRUCTURE_CONSTRAINT(left.elements.count);
+
+                _logger.mark_consumed_any_if(placeholder.origin.add_constraint(constraint));
+
+                return true;
+            fi
+
+            let elements = left.elements;
+
+            // The parser enforces all-or-nothing per group: either
+            // every element carries a source_field_name (named
+            // group) or none do (positional group). Sample the
+            // first to decide which strategy entry point to call.
+            let is_named_group = elements.count > 0 /\ elements[0].source_field_name?;
+
+            let field_names: Collections.List[string?]? mut = null;
+            if is_named_group then
+                let names = Collections.LIST[string?]();
+                for element in elements do
+                    // is_named_group: the parser enforces all-or-nothing
+                    // source field names per destructure group
+                    names.add(element.source_field_name!.name);
+                od
+                field_names = names;
+            fi
+
+            let strategy = resolve_destructure_strategy(left.location, from_type, elements.count, field_names);
+
+            let block = IR.Values.BLOCK();
+
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function!;
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let element_type = deconstruct.arguments[i].get_element_type()!;
+
+                    let element_state = _variable_left_state.get_or_add(element);
+
+                    element_state.right_value = IR.Values.DUMMY(element_type, element.location);
+
+                    element_state.variable_location = left_state.variable_location;
+                    element_state.right_location = left_state.right_location;
+
+                    element.walk(self);
+
+                    if element_state.value? then
+                        block.add(element_state.value);
+                    fi
+                od
+            else
+                let members = strategy.members;
+                let get_from = from.get_temp_copier(block, "destructure");
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+                    let member = members[i];
+
+                    if member? then
+                        let element_state = _variable_left_state.get_or_add(element);
+
+                        element_state.right_value = member.load(LOCATION.internal, get_from(), _symbol_loader);
+
+                        element_state.variable_location = left_state.variable_location;
+                        element_state.right_location = left_state.right_location;
+
+                        element.walk(self);
+
+                        if element_state.value? then
+                            block.add(element_state.value);
+                        fi
+                    fi
+                od
+            fi
+
+            block.close();
+
+            left_state.value = block;
+
+            return true;
+        si
+
+        visit(destructure_left: Trees.Variables.DESTRUCTURING_VARIABLE_LEFT) is
+        si
+
+        // A literal leaf inside a destructure pattern — a runtime
+        // equality test, not a binding. The expression carries its
+        // own type (literal kinds map to fixed types; an enum-member
+        // name expression types to its enum). The expression is
+        // walked via default descent; the source position's type is
+        // pushed down as a constraint so a `null` leaf picks up the
+        // source position's nullable type (other literal kinds
+        // inherit the constraint as a no-op, since their type is
+        // fixed by their token kind). Literal-vs-source mismatches
+        // are diagnosed eagerly by `visit(LITERAL_VARIABLE_LEFT)`
+        // below, not via the constraint message.
+        pre(left: Trees.Variables.LITERAL_VARIABLE_LEFT) -> bool is
+            let right_value = _variable_left_state.get_or_add(left).right_value;
+
+            if right_value? /\ right_value.type? then
+                left.expression.set_expected_type(
+                    right_value.type,
+                    "literal pattern type {{0}} is not comparable to source position type {{1}}"
+                );
+            fi
+            return false;
+        si
+
+        visit(left: Trees.Variables.LITERAL_VARIABLE_LEFT) is
+            // State survives between walks of the same node, so drop any
+            // test a previous walk built before deciding to build one.
+            let leaf_state = _variable_left_state.get_or_add(left);
+
+            leaf_state.match_test = null;
+            leaf_state.match_operand = null;
+
+            // A matching leaf in a non-refutable context (plain `let`)
+            // is a silent no-op at runtime — the pattern would never
+            // actually test the source value, so subsequent bindings
+            // run as if the leaf were a wildcard. Reject it loudly
+            // here so the user is forced to write either `if let`
+            // / `case`-when (where the leaf becomes an actual
+            // equality test) or remove the leaf.
+            if !left.is_refutable then
+                _logger.error(
+                    left.location,
+                    "a matching leaf is only allowed inside a refutable binding (if let or case-when arm)"
+                );
+
+                return;
+            fi
+
+            // A leaf whose type is incompatible with the source
+            // position's type can never match — the runtime equality
+            // test is statically dead. Reject with a clear diagnostic
+            // here rather than letting the IL emit and surface as a
+            // less helpful comparison-operator error later.
+            if let
+                rv = leaf_state.right_value, source_type = rv.type,
+                ev = left.expression.value, literal_type = ev.type
+            then
+                if
+                    !source_type.is_assignable_from(literal_type) /\
+                    !literal_type.is_assignable_from(source_type)
+                then
+                    _logger.error(
+                        left.location,
+                        "a leaf of type {literal_type} cannot match source position of type {source_type}"
+                    );
+
+                    return;
+                fi
+
+                _build_literal_leaf_test(left, source_type, ev);
+            fi
+        si
+
+        // Build the runtime test a literal leaf performs against its
+        // source position, the way `=~` (falling back to `<>`) would, so
+        // a leaf whose type declares an equality operator matches by
+        // value rather than by reference. Shares the `case` `when`
+        // label builder, so the two refutable constructs agree on what
+        // a literal matches.
+        //
+        // The source position's value does not exist until IL
+        // generation walks the pattern, so the test is built against a
+        // hole that generation fills in. Leaving the test unbuilt is
+        // always safe: generation falls back to the raw compare, which
+        // is what a bare `==` does too.
+        _build_literal_leaf_test(
+            left: Trees.Variables.LITERAL_VARIABLE_LEFT,
+            source_type: Semantic.Types.Type,
+            literal_value: IR.Values.Value
+        ) is
+            // A `null` leaf is a presence test rather than a value
+            // comparison; a null operand would build a null-typed temp
+            // the back end cannot encode. Generation matches absence.
+            if literal_value.type?.is_null ?? false then
+                return;
+            fi
+
+            let operand = IR.Values.WRAPPER(IR.Values.DUMMY(source_type, left.location));
+
+            let test =
+                build_equality_test(operand, literal_value, "=~", left.location) ??
+                build_equality_test(operand, literal_value, "<>", left.location);
+
+            if !test? then
+                return;
+            fi
+
+            let state = _variable_left_state.get_or_add(left);
+
+            state.match_operand = operand;
+            state.match_test = test;
+        si
+
+        pre(variable: Trees.Variables.VARIABLE) -> bool is
+            // Attribute pragmas on a formal-argument parameter — walk
+            // their argument expressions here since this override
+            // suppresses VARIABLE's own default child walk (returns
+            // true below).
+            if variable.pragmas? then
+                for pragma in variable.pragmas do
+                    pragma.walk(self);
+                od
+            fi
+
+            variable.type_expression.walk(self);
+
+            // push explicit type down into the variable left
+            if let te_type = variable.type_expression.type /\ variable.is_explicit_type then
+                _variable_left_state.get_or_add(variable.left).explicit_type = te_type;
+            fi
+
+            if variable.is_refutable then
+                variable.left.mark_refutable_recursive();
+            fi
+
+            // A bare `_` initializer of a simple local with no
+            // explicit type is treated exactly like a no-initializer
+            // `let`: the type is inferred from later assignments.
+            // `_` only contributes the definite-assignment fact — the
+            // LET deferred-init tracking keys off `initializer?`,
+            // which is true here, so the variable is not warned.
+            let bare_default =
+                isa Trees.Expressions.DEFAULT(variable.initializer) /\
+                !(cast Trees.Expressions.DEFAULT(variable.initializer)).type_expression? /\
+                !variable.is_explicit_type /\
+                variable.left.is_simple_name;
+
+            if let init = variable.initializer /\ !bare_default /\ !variable.is_argument then
+                if let te = variable.type_expression, te_type = te.type /\ !isa Trees.TypeExpressions.INFER(te) then
+                    // if we have both an explicit type and an initializer, we
+                    // can push a type constraint down into the initializer
+                    init.set_expected_type(te_type, "{{0}} is not assignable to {{1}}");
+                fi
+
+                init.walk(self);
+
+                // push the initializer value down into the variable left
+                let left_state = _variable_left_state.get_or_add(variable.left);
+
+                if let init_value = init.value then
+                    left_state.right_value = init_value;
+                else
+                    left_state.right_value = IR.Values.DUMMY(Semantic.Types.ERROR(), init.location);
+                fi
+
+                left_state.variable_location = variable.location;
+                left_state.right_location = init.location;
+            fi
+
+            // No-type, no-initializer is now allowed: the variable's
+            // type is inferred from later assignments via the
+            // INFERRED_VARIABLE_TYPE placeholder + LUB accumulator
+            // (#1174 — see visit(SIMPLE_VARIABLE_LEFT) below). If
+            // no assignment ever fires, the placeholder remains
+            // and the variable's first use will produce a
+            // "cannot infer" error.
+
+            variable.left.walk(self);
+
+            // Generator: register the new local on the state-machine
+            // frame so a closure later in the body that captures it
+            // references the frame field rather than a
+            // CLR-local slot that doesn't exist inside MoveNext.
+            // No-op outside a generator function; idempotent on the
+            // field (declare_local_field returns the existing field
+            // and only refreshes its type on subsequent calls).
+            _declare_state_machine_local_fields(variable.left);
+
+            return true;
+        si
+
+        visit(variable: Trees.Variables.VARIABLE) is
+            // A typed `let x: T = e` — check the initializer against
+            // the declared type. An untyped `let` infers its type
+            // from the initializer, so there is no slot to violate.
+            let type_expression = variable.type_expression;
+            let initializer = variable.initializer;
+
+            if initializer? then
+                check_non_optional(
+                    type_expression.type,
+                    initializer,
+                    initializer.location
+                );
+
+                _pure_slots.check_store(initializer.location, type_expression.type, initializer.value);
+            fi
+
+            if let pragmas = variable.pragmas then
+                let target = symbol_for(variable);
+
+                for pragma in pragmas do
+                    _attribute_resolver.resolve(pragma, target);
+                od
+            fi
+        si
+
+        // TODO used by for loop - needs removing
+        set_symbol_type(left: Trees.Variables.VariableLeft, type: Type) is
+
+            if left.is_simple_name then
+                // is_simple_name => SIMPLE_VARIABLE_LEFT, whose name is non-null
+                let symbol = find(left.name!);
+
+                if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                    let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                    symbol.define();
+
+                    typed_symbol.set_type(type);
+                else
+                    _logger.error(left.location, "couldn't find typed symbol for variable {left.name}");
+                fi
+            else
+                set_symbol_destructure_types(left, type);
+            fi
+        si
+
+        // TODO used by for loop - needs removing
+        set_symbol_destructure_types(left: Trees.Variables.VariableLeft, from_type: Type) is
+            let elements = left.elements;
+
+            if !elements? then
+                return;
+            fi
+
+            let is_named_group = elements.count > 0 /\ elements[0].source_field_name?;
+
+            let field_names: Collections.List[string?]? mut = null;
+            if is_named_group then
+                let names = Collections.LIST[string?]();
+                for element in elements do
+                    // is_named_group: the parser enforces all-or-nothing
+                    // source field names per destructure group
+                    names.add(element.source_field_name!.name);
+                od
+                field_names = names;
+            fi
+
+            let strategy = resolve_destructure_strategy(left.location, from_type, elements.count, field_names);
+
+            if strategy.is_deconstruct then
+                let deconstruct = strategy.deconstruct_function!;
+
+                for i in 0..elements.count do
+                    let element = elements[i];
+
+                    let element_type = deconstruct.arguments[i].get_element_type()!;
+
+                    if element.is_simple_name then
+                        let symbol = find(element.name!);
+
+                        if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                            let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                            symbol.define();
+
+                            typed_symbol.set_type(element_type);
+                        else
+                            _logger.error(element.location, "couldn't find typed symbol for destructuring element {element.name}");
+                        fi
+                    else
+                        set_symbol_destructure_types(element, element_type);
+                    fi
+                od
+
+                return;
+            fi
+
+            let members = strategy.members;
+
+            for i in 0..elements.count do
+                let element = elements[i];
+                let member = members[i];
+
+                if member? then
+                    let member_type = member.type;
+
+                    if element.is_simple_name then
+                        let symbol = find(element.name!);
+
+                        if symbol? /\ isa Semantic.Types.SettableTyped(symbol) then
+                            let typed_symbol = cast Semantic.Types.SettableTyped(symbol);
+
+                            symbol.define();
+
+                            if member_type? then
+                                typed_symbol.set_type(member_type);
+                            fi
+                        else
+                            _logger.error(element.location, "couldn't find typed symbol for destructuring element {element.name}");
+                        fi
+                    elif member_type? then
+                        set_symbol_destructure_types(element, member_type);
+                    fi
+                fi
+            od
+        si
+        
+        // TODO used by for loop - needs removing
+        get_destructure_types(type: Type?) -> Collections.List[Type] is
+            let result = Collections.LIST[Type]();
+
+            if !type? \/ !type.is_value_tuple then
+                return result;                
+            fi
+
+            get_destructure_types_into(type, result);
+
+            return result;
+        si
+        
+        // TODO used by for loop - needs removing
+        get_destructure_types_into(type: Type, into: Collections.MutableList[Type]) is
+            let result = Collections.LIST[Type]();
+
+            for t in type.arguments do
+                if t.is_value_tuple then
+                    get_destructure_types_into(t, into);
+                else
+                    into.add(t);
+                fi
+            od
+        si
+
+    si
+si

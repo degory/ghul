@@ -1,0 +1,432 @@
+namespace Syntax.Process is
+    use System.Reflection.Metadata.ILOpCode;
+    use IO.Std;
+
+    use System.Text.StringBuilder;
+        
+    use Logging;
+    use Trees;
+    use Source;
+
+    use IR;
+    use IR.Values;
+
+    use Ghul.Pipes;
+
+
+    // Function and closure IL: plain function pre/visit and SRM emission, closure walking and
+    // the async-closure prologue.
+    partial GENERATE_IL is
+        pre(function: Definitions.FUNCTION) -> bool is
+            let symbol = function_for(function)!;
+
+            // Generator branch: a `*_GENERATOR_*` function expands
+            // into TWO IL methods (the outer stub returning a fresh
+            // state-machine instance + the state machine class with
+            // its MoveNext / get_Current / GetEnumerator / Dispose /
+            // Reset implementations). The split is handled by the
+            // gen-generator-function path so the rest of generate_il
+            // doesn't need to know.
+            //
+            // Both branches come before ordinary function emission,
+            // because a state machine is a shape rather than a body:
+            // the expansion has to happen before any of the pieces it
+            // produces can be emitted.
+            let state_machine = Semantic.Symbols.state_machine_for(cast Semantic.Symbols.Function?(symbol)!);
+
+            if state_machine? then
+                return _pre_generator_function(function, cast Semantic.Symbols.Function?(symbol)!, state_machine);
+            fi
+
+            // Async branch (parallel to the generator branch above).
+            let async_sm = Semantic.Symbols.async_state_machine_for(cast Semantic.Symbols.Function?(symbol)!);
+
+            if async_sm? then
+                return _pre_async_function(function, cast Semantic.Symbols.Function?(symbol)!, async_sm);
+            fi
+
+            return _pre_function_srm(function, cast Semantic.Symbols.Function?(symbol)!);
+        si
+
+        // Emission for every function the assembly defines. The
+        // structure walk has already
+        // reserved this function's MethodDef row and will write it once
+        // the walk is done, so nothing here touches metadata: the body
+        // is encoded into its own buffer and its offset left against
+        // the symbol.
+        _pre_function_srm(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function) -> bool is
+            // A declaration with no body - an abstract method, or a
+            // trait member left to its implementors - has nothing to
+            // encode, and its row is marked abstract rather than
+            // pointed at an empty body.
+            if symbol.is_abstract then
+                return true;
+            fi
+
+            enter_scope(function);
+
+            _context.current_srm_body_emitter = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            // Entry-point detection is a semantic question, not a
+            // naming rule the emitter can reapply: it accepts a global
+            // function or a static method, checks the signature, and
+            // reports a second candidate.
+            symbol.gen_entrypoint(_context);
+
+            if _entrypoint_pragma_pending then
+                _entrypoint_pragma_pending = false;
+
+                if let emitter = _context.srm_assembly_emitter then
+                    emitter.entry_point_function = symbol;
+                fi
+            fi
+
+            enter_block();
+
+            return false;
+        si
+
+        // The tail of `visit(function)` below.
+        _visit_function_srm(function: Definitions.FUNCTION, symbol: Semantic.Symbols.Function) is
+            let body_emitter = _context.current_srm_body_emitter!;
+            let assembly_emitter = _context.srm_assembly_emitter;
+
+            current_block.gen(_context);
+            leave_block();
+
+            // A non-void function ends with a default value loaded
+            // ahead of the trailing `ret`. The
+            // `ret` is unreachable whenever every path already
+            // returned, but unreachable is not the same as unverified:
+            // a method containing a protected region is checked whole,
+            // so a bare `ret` where a value is due is rejected outright
+            // rather than pruned.
+            if
+                let return_type = symbol.return_type
+                /\ return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
+            then
+                Values.DEFAULT_RETURN(return_type).gen(_context);
+            fi
+
+            body_emitter.ret();
+
+            assembly_emitter.handles.set_body_offset(symbol, body_emitter.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(symbol, body_emitter.il_outputs);
+
+            _context.current_srm_body_emitter = null;
+
+            leave_scope(function);
+        si
+
+        visit(function: Definitions.FUNCTION) is
+            let symbol = symbol_for(function);
+
+            let state_machine = Semantic.Symbols.state_machine_for(cast Semantic.Symbols.Function?(symbol)!);
+
+            if state_machine? then
+                _visit_generator_function(function, cast Semantic.Symbols.Function?(symbol)!, state_machine);
+
+                return;
+            fi
+
+            let async_sm = Semantic.Symbols.async_state_machine_for(cast Semantic.Symbols.Function?(symbol)!);
+
+            if async_sm? then
+                // _pre_async_function already emitted the outer
+                // method and stashed the move_next block onto
+                // _pending_async_state_machines. Nothing else to
+                // do at AST visit time.
+                return;
+            fi
+
+            let symbol_function = cast Semantic.Symbols.Function?(symbol)!;
+
+            if !symbol_function.is_abstract then
+                _visit_function_srm(function, symbol_function);
+            fi
+        si
+
+        pre(function: Trees.Expressions.FUNCTION) -> bool is
+            super.pre(function);
+
+            let closure = cast Semantic.Symbols.Closure?(scope_for(function));
+
+            if !closure? then
+                return true;
+            fi
+
+            closure.map_type_arguments();
+
+            return true;
+        si
+
+        visit(function: Trees.Expressions.FUNCTION) is
+            let closure = cast Semantic.Symbols.Closure?(scope_for(function))!;
+
+            // Async closure dispatch (parallel to the named-function
+            // path in pre(Definitions.FUNCTION)). The lambda's $anon
+            // method body becomes a state-machine launch sequence
+            // (Create + MoveNext + return Task); the lambda body
+            // walks into a separate move_next_block; the SM class is
+            // queued for emission at class/namespace tail.
+            let async_sm = Semantic.Symbols.async_state_machine_for(closure);
+            if async_sm? then
+                _emit_async_closure(function, closure, async_sm);
+                super.visit(function);
+                closure.unmap_type_arguments();
+                return;
+            fi
+
+            enter_block();
+
+            // Safety net: if a closure's return type resolved to ERROR
+            // (e.g. its body referenced a variable that itself never got
+            // a type), the consume-side check that should have surfaced
+            // a diagnostic missed this path — but `get_il_type()` will
+            // throw NotImplementedException as soon as we ask it to emit
+            // ERROR. Report a located diagnostic at the function's site
+            // and skip IL emission for this body. The function symbol
+            // itself remains valid; any caller will already have its
+            // own ERROR-typed result and will be handled by its own
+            // visit. (See error.ghul:30-34 for the underlying rule.)
+            if closure.return_type? /\ closure.return_type.is_error then
+                _logger.error(function.location, "cannot infer return type here");
+                leave_block();
+                super.visit(function);
+                closure.unmap_type_arguments();
+                return;
+            fi
+
+            // The closure's body is encoded into a method body of its
+            // own. The enclosing method is mid-encode, so its emitter
+            // is set aside for the duration and restored after: the
+            // two bodies are separate, and the instructions of one
+            // must not land in the other.
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let enclosing_member = assembly_emitter.current_emission_member;
+            let body_emitter = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body_emitter;
+
+            // Instructions in this body name types in the closure's terms,
+            // and a TypeSpec they reference is built from here rather than
+            // from the closure's own signature, so the emitter is told
+            // which member it is writing into.
+            assembly_emitter.current_emission_member = closure;
+
+            _gen_closure_destructure_prologue(function, closure);
+
+            function.body.walk(self);
+
+            if
+                closure.return_type? /\
+                closure.return_type.compare(_innate_symbol_lookup.get_void_type()) != Semantic.Types.MATCH.SAME
+            then
+                add(Values.DEFAULT_RETURN(closure.return_type!));
+            fi
+
+            add(Values.RET());
+
+            current_block.gen(_context);
+
+            leave_block();
+
+            assembly_emitter.handles.set_body_offset(
+                closure, body_emitter.flush(assembly_emitter));
+            assembly_emitter.handles.set_il_outputs(
+                closure, body_emitter.il_outputs);
+
+            _context.current_srm_body_emitter = enclosing;
+            assembly_emitter.current_emission_member = enclosing_member;
+
+            super.visit(function);
+
+            closure.unmap_type_arguments();
+        si
+
+        // Declare and fill the names bound by any destructured lambda
+        // parameter, before the body that reads them runs. The
+        // parameter itself is one physical argument holding the
+        // aggregate; its leaves are ordinary locals, so they need both
+        // a `.locals init` slot and the unpacking stores - the same
+        // pair `pre(Variables.VARIABLE)` and `visit(Variables.VARIABLE)`
+        // emit for a named function's destructured formal argument.
+        _gen_closure_destructure_prologue(
+            function: Trees.Expressions.FUNCTION,
+            closure: Semantic.Symbols.Closure
+        ) is
+            for a in function.arguments.expressions do
+                let argument = cast Trees.Expressions.VARIABLE?(a);
+
+                if !argument? \/ !argument.left? then
+                    continue;
+                fi
+
+                let left = argument.left;
+
+                for name in left.names! do
+                    _declare_local(closure.find_direct(name.name));
+                od
+
+                let group_symbol = closure.find_direct(argument.name.name);
+
+                if group_symbol? then
+                    gen_destructuring_initialize(left, group_symbol.load(argument.location, null, _symbol_loader));
+                fi
+            od
+        si
+
+        // Async closure: the lambda's $anon body becomes a builder-
+        // create / Start / return-Task launch sequence; the user body
+        // walks into a separate move_next_block; the SM class is
+        // queued for class-tail emission alongside named-function SMs.
+        _emit_async_closure(
+            function: Trees.Expressions.FUNCTION,
+            closure: Semantic.Symbols.Closure,
+            async_state_machine: Semantic.Symbols.ASYNC_STATE_MACHINE
+        ) is
+            let frame = async_state_machine.frame;
+
+            if !frame? then
+                _logger.error(function.location, "async function must return Tasks.TASK or Tasks.TASK[T]");
+                return;
+            fi
+
+            frame.declare();
+
+            // Body walk before launch IL — populates the frame's
+            // await labels / locals / awaiters before launch
+            // references any of them.
+            async_state_machine.install_body_emission_overrides();
+
+            enter_scope(function);
+
+            let move_next_block = Values.BLOCK();
+
+            enter_block(move_next_block);
+
+            add(Values.MAX_STACK(64));
+
+            // Same V_state caching + per-region dispatch pattern as
+            // `_pre_async_function` (see its commentary). Awaits in
+            // the closure body register with the outer holder unless
+            // an inner `.try` pushes its own.
+            let outer_dispatch_holder =
+                _open_state_machine_entry(frame, frame.state_field, ".async_state");
+
+            let success_label = IR.LABEL();
+            let end_label = IR.LABEL();
+
+            let prev_async_sm = _current_async_state_machine;
+            let prev_success = _current_async_success_label;
+            let prev_end = _current_async_end_label;
+            _current_async_state_machine = async_state_machine;
+            _current_async_success_label = success_label;
+            _current_async_end_label = end_label;
+
+            function.body.walk(self);
+
+            add(Values.BRANCH_TO(ILOpCode.LEAVE, success_label));
+
+            _current_async_state_machine = prev_async_sm;
+            _current_async_success_label = prev_success;
+            _current_async_end_label = prev_end;
+
+            _pop_async_dispatch_holder(outer_dispatch_holder);
+
+            leave_block();
+            leave_scope(function);
+
+            async_state_machine.uninstall_body_emission_overrides();
+
+            // --- Build the builder-launch sequence ---
+            enter_block();
+            add(Values.MAX_STACK(64));
+
+            let construction_type_args = async_state_machine.get_construction_type_arguments();
+
+            let constructor =
+                _specialized_constructor(
+                    frame, frame.constructor, construction_type_args, function.location);
+
+            let state_machine_type =
+                _specialized_frame_type(frame, construction_type_args, function.location) ?? frame.type!;
+
+            // Ctor args: instance closures prepend ldarg.0 (the
+            // closure-frame instance, which holds captures), then
+            // each user-declared lambda parameter via ldarg '<name>'.
+            let ctor_args_block = Values.BLOCK();
+
+            // As above: the closure's receiver, when it has one, takes
+            // slot 0 and its declared parameters follow.
+            let slot mut = if closure.is_emitted_with_receiver then 1 else 0 fi;
+
+            if frame.outer_self_field? then
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(0, "ldarg.0"));
+            fi
+            for arg_name in closure.argument_names do
+                ctor_args_block.add(Values.Load.ARGUMENT_SLOT(slot, "ldarg '{arg_name}'"));
+                slot = slot + 1;
+            od
+            ctor_args_block.close();
+
+            let task_type = closure.return_type!;
+
+            let unspec_builder: Semantic.Types.Type? mut = null;
+            let unspec_task: Semantic.Types.Type? mut = null;
+            if !frame.is_void then
+                unspec_builder = _innate_symbol_lookup.get_unspecialized_async_task_method_builder_type();
+                unspec_task = _innate_symbol_lookup.get_unspecialized_task_type();
+            fi
+
+            let launch = IR.Values.ASYNC_METHOD_LAUNCH(
+                task_type,
+                state_machine_type,
+                constructor,
+                ctor_args_block,
+                frame.state_field,
+                frame.builder_field!,
+                unspec_builder,
+                unspec_task,
+                ".sm"
+            );
+
+            add(launch);
+            add(Values.RET());
+
+            // The launch is the closure's own method body, not part of
+            // whatever is being emitted around the literal, so it needs
+            // a body emitter of its own or it lands in the enclosing
+            // method.
+            let assembly_emitter = _context.srm_assembly_emitter;
+            let enclosing = _context.current_srm_body_emitter;
+            let body = IR.Emitter.SRM_METHOD_BODY_EMITTER();
+
+            _context.current_srm_body_emitter = body;
+
+            try
+                current_block.gen(_context);
+
+                assembly_emitter.handles.set_body_offset(
+                    closure, body.flush(assembly_emitter));
+                assembly_emitter.handles.set_il_outputs(
+                    closure, body.il_outputs);
+            finally
+                _context.current_srm_body_emitter = enclosing;
+            yrt
+
+            leave_block();
+
+            _pending_async_state_machines.add(
+                PENDING_ASYNC_STATE_MACHINE(
+                    async_state_machine,
+                    move_next_block,
+                    success_label,
+                    end_label
+                )
+            );
+        si
+
+    si
+si
