@@ -1,0 +1,219 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // Name and reference walks: calls, identifiers, presence tests, unwraps, references, null and default values.
+    partial COMPILE_EXPRESSIONS is
+        pre(call: Trees.Expressions.CALL) -> bool => true;
+        visit(call: Trees.Expressions.CALL) is
+            let mark = _logger.mark();
+
+            try
+                super.pre(call);
+
+                // Push the call's expected type into the callee
+                // expression. A unit-variant `Option.NONE` sitting at
+                // call.function reads it in visit_member and asks
+                // OWNER_CONSTRAINT_SPECIALIZER for the specialised
+                // owner — the same binding the resolve_constructor
+                // path performs for the parenthesised form. Non-variant
+                // callees ignore the field.
+                if call.expected_type? then
+                    call.function.set_expected_type(call.expected_type, call.expected_type_error_message);
+                fi
+
+                // Mark the callee so a reflected TYPE_GROUP resolves to its
+                // generic member for construction rather than collapsing to
+                // the (often non-constructible) arity-0 member.
+                call.function.mark_call_target();
+
+                // Function walks outside the speculation level that
+                // `visit_call` rolls back during constraint-push
+                // retry, so diagnostics from sub-walks of the function
+                // expression aren't scrubbed alongside first-pass
+                // overload noise.
+                call.function.walk(self);
+
+                _logger.speculate();
+
+                // Snapshot the pre-argument narrowing facts so an
+                // overload-retry re-walk resets to what the first walk
+                // saw; on success the final walk's facts are kept.
+                let use flow_speculation = _flow.speculate_then_commit();
+
+                call.arguments.walk(self);
+
+                if call.is_pipe_wrap /\ _pipe_wrap_operand_already_pipe(call) then
+                    // `x |` where x is already a Pipe[T] is a no-op:
+                    // yield the operand directly rather than wrapping it
+                    // in another adaptor. A compile-time decision on the
+                    // operand's static type.
+                    call.compile_expressions_state.value = call.arguments.expressions[0].value;
+                else
+                    _calls.visit_call(call);
+
+                    // A terminal Pipe consumer (`.count()`, ...) over a
+                    // fusible chain lowers to an inline driving loop instead
+                    // of building the pipe objects and iterating them.
+                    let fused = _recognize_consumer_fusion(call);
+
+                    if fused? then
+                        call.compile_expressions_state.value = fused;
+                    fi
+                fi
+
+                _check_pure_slots(call.location, call.value, call.arguments);
+                _note_call(call.location, call.value);
+
+                _logger.commit();
+            catch e: Exception
+                call.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), call.location);
+                _logger.release(mark);
+
+                _logger.exception(call.location, e, "exception compiling call");
+            yrt
+        si
+
+        visit(identifier: Trees.Expressions.IDENTIFIER) is
+            let mark = _logger.mark();
+
+            try
+                _access.visit_identifier(identifier);
+                _note_call(identifier.location, identifier.value);
+
+            catch ex: Exception
+                _logger.exception(identifier.location, ex, "something went wrong with identifier");
+
+            finally
+                _logger.release(mark);
+            yrt
+        si
+
+        visit(has_value: Trees.Expressions.HAS_VALUE) is
+            _access.visit_has_value(has_value);
+            _note_call(has_value.location, has_value.value);
+        si
+
+        visit(unwrap: Trees.Expressions.UNWRAP) is
+            _access.visit_unwrap(unwrap);
+            _note_call(unwrap.location, unwrap.value);
+        si
+
+        // An operand of `ref` is an address, not a value read. Suppress
+        // the operand's definite-assignment check by recording its target
+        // for the identifier load to skip, and reset the write flag so it
+        // is re-derived from scratch this walk (robust to speculative
+        // retry and inference iteration, which the flag does not otherwise
+        // participate in). The resolved call does the real read-check and
+        // assignment in `note_reference_arguments`.
+        pre(reference: Trees.Expressions.REFERENCE) -> bool is
+            reference.writes_target = false;
+            _reference_operand_target = try_get_narrowing_target(reference.left);
+
+            return false;
+        si
+
+        visit(reference: Trees.Expressions.REFERENCE) is
+            _reference_operand_target = null;
+            _access.visit_reference(reference);
+        si
+
+        // True while walking the operand of the `ref` that writes to
+        // `symbol` — consulted by the identifier load to skip the
+        // definite-assignment check on an address-of operand.
+        is_reference_operand_target(symbol: Semantic.Symbols.Symbol) -> bool =>
+            _reference_operand_target? /\ symbol == _reference_operand_target;
+
+        // Definite assignment for `ref` arguments, run once the call is
+        // resolved so the matched parameter's direction is known. A slot
+        // the callee reads (any by-ref except pure `out`) requires the
+        // target to be assigned already; a slot it writes (any by-ref
+        // except pure `in`) assigns it. The write flag is recorded on the
+        // REFERENCE so the condition analyzer can carry that assignment
+        // onto the branch edges a `ref` in a condition reaches.
+        note_reference_arguments(call: Trees.Expressions.CALL, function: Semantic.Symbols.Function) is
+            if call.argument_names? then
+                return;
+            fi
+
+            for i in 0..call.arguments.count do
+                let expr = call.arguments.expressions[i];
+
+                if !isa Trees.Expressions.REFERENCE(expr) then
+                    continue;
+                fi
+
+                let reference = expr;
+                let target = try_get_narrowing_target(reference.left);
+
+                if !target? then
+                    continue;
+                fi
+
+                if
+                    function.argument_reads(i) /\
+                    !_build_flags.no_warn_definite_assignment /\
+                    isa Semantic.Symbols.Variable(target) /\
+                    _flow.is_tracked(target) /\
+                    !_flow.is_assigned(target)
+                then
+                    _logger.warn(reference.location, "definite-assignment", "{target.name} may be used before it is assigned", target.location, "variable declared here");
+                fi
+
+                reference.writes_target = function.argument_writes(i);
+
+                if reference.writes_target then
+                    _flow.mark_assigned(target);
+                fi
+            od
+        si
+
+        visit(`null: Trees.Expressions.NULL) is
+            // For a value-type `T?` target (NULLABLE[T]) `null` is the
+            // empty Nullable — a zeroed value, not a reference. Lower
+            // it as an IR.Values.DEFAULT; a plain ldnull would be
+            // invalid IL against a value-type slot. Reference-type
+            // targets keep the ordinary null reference.
+            if let `null.expected_type? /\ expected_type.is_value_type /\ expected_type.is_optional then
+                `null.compile_expressions_state.value = IR.Values.DEFAULT(expected_type);
+            else
+                `null.compile_expressions_state.value = NULL(Semantic.Types.NULL());
+            fi
+
+        si
+
+        visit(`default: Trees.Expressions.DEFAULT) is
+            _literals.visit_default(`default);
+
+            // Non-optional-by-default: `default` reaching a non-optional
+            // reference slot resolves to null at runtime, the same hole
+            // as a bare `null` literal. Same warning category and flag
+            // as visit(NULL) — one migration, one flip.
+            if
+                !_build_flags.no_warn_non_optional /\
+                `default.value? /\
+                _is_non_optional_reference(`default.value!.type)
+            then
+                let target = `default.value!.type;
+                _logger.warn(`default.location, "non-optional", "default where non-optional {target} expected");
+            fi
+        si
+
+    si
+si

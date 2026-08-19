@@ -1,0 +1,243 @@
+namespace Syntax.Process is
+    use System.Exception;
+
+    use IO.Std;
+        
+    use Logging;
+    use Source;
+
+    use IR.Values;
+    use IR.VALUE_CONVERTER;
+    use IR.VALUE_BOXER;
+
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+    use Semantic.Types.Type;
+
+    use Syntax.Trees.Definitions.PRAGMA;
+
+    use Ghul.Pipes;
+
+
+    // State-machine frame declaration: iterator, spill, await-result and awaiter fields for generator and async bodies.
+    partial COMPILE_EXPRESSIONS is
+        // A `for` inside a generator or async function keeps its
+        // iterator in a frame field, so that it survives the
+        // suspensions in the loop body. Allocated here, with the rest
+        // of the frame's state, rather than while the loop is emitted:
+        // the emitted assembly's rows are numbered before any body is
+        // compiled, so a field first declared during emission is
+        // numbered by nothing and has no row to reference.
+        //
+        // No-op outside a state machine.
+        _declare_state_machine_iterator_field(`for: Trees.Statements.FOR, iterator_type: Type) is
+            let function = current_function;
+
+            if !function? then
+                return;
+            fi
+
+            let frame = _state_machine_frame_for(function);
+
+            if !frame? then
+                return;
+            fi
+
+            `for.iterator_field = frame.declare_anonymous_field("for_iterator", iterator_type);
+        si
+
+        // Frame fields for the two values an await has to carry across
+        // a suspend: whatever was already on the stack to its left, and
+        // its own result. Allocated here for the same reason the loop
+        // iterator above is — a field first declared while the body is
+        // emitted is numbered by nothing.
+        //
+        // Declared once. A body re-walk sees the field already there
+        // and leaves it alone, rather than allocating a second and
+        // leaving the first as a member nothing reads.
+        //
+        // No-op outside a state machine.
+        _declare_spill_field(spill: Trees.Expressions.SPILL, type: Type) is
+            if spill.spill_field? then
+                return;
+            fi
+
+            if let frame = _enclosing_state_machine_frame() then
+                spill.spill_field = frame.declare_spill_field(type);
+            fi
+        si
+
+        // The frame field a composite value expression routes its result
+        // through when its body suspends. Recording one is what tells IL
+        // generation to spill rather than capture, so the conditions here
+        // are the whole decision.
+        //
+        // Allocated here for the same reason the fields above are: the
+        // emitter runs after the rows the assembly contains have been
+        // fixed, so a field first declared while a body is emitted is
+        // numbered by nothing and the assembly loads and then dies
+        // looking for it.
+        _declare_composite_spill_field(node: Trees.Node, value: Value?) is
+            if _composite_spill_state.get(node)? then
+                return;
+            fi
+
+            if !value? \/ !isa IR.Values.BLOCK(value) then
+                return;
+            fi
+
+            // A void result carries no data across the join, and
+            // declaring a void-typed field would itself produce invalid
+            // IL. Capture mode handles it.
+            let type = value.type;
+
+            if type.is_void then
+                return;
+            fi
+
+            if !_contains_suspend(node) then
+                return;
+            fi
+
+            if let frame = _enclosing_state_machine_frame() then
+                _composite_spill_state.set(node, frame.declare_anonymous_field("spill", type));
+            fi
+        si
+
+        _contains_suspend(node: Trees.Node) -> bool =>
+            val
+                let scanner = CONTAINS_SUSPEND_SCANNER();
+                node.walk(scanner);
+                scanner.found
+            lav;
+
+        _declare_await_result_field(`await: Trees.Expressions.AWAIT, type: Type) is
+            if `await.result_field? then
+                return;
+            fi
+
+            if let frame = _enclosing_state_machine_frame() then
+                `await.result_field = frame.declare_spill_field(type);
+            fi
+        si
+
+        // The awaiter an `await` holds while suspended. Its type is
+        // settled by the awaited task's element type, which is worked
+        // out here, so the field is allocated here too.
+        _declare_awaiter_field(`await: Trees.Expressions.AWAIT, element_type: Type) is
+            if `await.awaiter_field? then
+                return;
+            fi
+
+            let awaiter_type =
+                if element_type.is_void then
+                    _innate_symbol_lookup.get_task_awaiter_void_type()
+                else
+                    _innate_symbol_lookup.get_task_awaiter_type(element_type)
+                fi;
+
+            if !awaiter_type? then
+                return;
+            fi
+
+            if let frame: Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME =
+                _enclosing_state_machine_frame()
+            then
+                `await.awaiter_field = frame.declare_awaiter_field(awaiter_type);
+            fi
+        si
+
+        _declare_lambda_state_machine_frame(function: Trees.Expressions.FUNCTION) is
+            let closure = cast Semantic.Symbols.Function?(function.scope);
+
+            if !closure? then
+                return;
+            fi
+
+            if let state_machine = Semantic.Symbols.state_machine_for(closure) then
+                if let frame = state_machine.frame then
+                    frame.declare();
+                fi
+            elif let async_state_machine = Semantic.Symbols.async_state_machine_for(closure) then
+                if let frame = async_state_machine.frame then
+                    frame.declare();
+                fi
+            fi
+        si
+
+        _enclosing_state_machine_frame() -> Semantic.Symbols.STATE_MACHINE_FRAME_BASE? is
+            let function = current_function;
+
+            if !function? then
+                return null;
+            fi
+
+            return _state_machine_frame_for(function);
+        si
+
+        // The frame of whichever kind of state machine encloses
+        // `function`, or null when none does. Generator and async are
+        // mutually exclusive — declare-symbols rejects a function that
+        // is both.
+        _state_machine_frame_for(
+            function: Semantic.Symbols.Function
+        ) -> Semantic.Symbols.STATE_MACHINE_FRAME_BASE? is
+            if let state_machine = Semantic.Symbols.state_machine_for(function) then
+                return state_machine.frame;
+            fi
+
+            if let async_state_machine = Semantic.Symbols.async_state_machine_for(function) then
+                return async_state_machine.frame;
+            fi
+
+            return null;
+        si
+
+        // Iterate the names on a variable-left pattern and, when the
+        // enclosing function is a generator, register each LOCAL_VARIABLE
+        // with the state-machine frame. LOCAL_ARGUMENTs are filtered out
+        // — those are already wired by `frame.declare()` at function
+        // entry — and non-generator functions are a no-op.
+        _declare_state_machine_local_fields(left: Trees.Variables.VariableLeft) is
+
+            let function = current_function;
+
+            if !function? then
+                return;
+            fi
+
+            // Try generator first, then async — they're mutually
+            // exclusive (declare-symbols enforces, see the
+            // generator-and-async-not-allowed diagnostic).
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+            let async_state_machine = Semantic.Symbols.async_state_machine_for(function);
+
+            let names_into = Collections.LIST[Trees.Identifiers.Identifier]();
+            left.get_names_into(names_into);
+
+            if state_machine? /\ state_machine.frame? then
+                let frame = state_machine.frame;
+
+                assert frame? else "state_machine.frame? was true but field is null";
+
+                for name in names_into do
+                    let symbol = find(name);
+                    if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol then
+                        frame.declare_local_field(local);
+                    fi
+                od
+            elif async_state_machine? /\ async_state_machine.frame? then
+                let frame = async_state_machine.frame;
+
+                assert frame? else "async_state_machine.frame? was true but field is null";
+
+                for name in names_into do
+                    let symbol = find(name);
+                    if let local: Semantic.Symbols.LOCAL_VARIABLE = symbol then
+                        frame.declare_local_field(local);
+                    fi
+                od
+            fi
+        si
+
+    si
+si
