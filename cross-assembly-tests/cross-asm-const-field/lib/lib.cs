@@ -30,6 +30,11 @@ public static class Constants
     public const char Separator = ';';
     public const long Big = 9_000_000_000L;
 
+    // The argument-default channel: a `_` argument reads the declared
+    // .NET default, whose enum value has to survive at the width the
+    // enum was declared over.
+    public static long Take(Wide w = Wide.Huge) => (long)w;
+
     // Not a metadata constant: the C# compiler emits a decimal `const` as
     // a static readonly field, so this stays an ordinary field read.
     public const decimal Rate = 1.5m;
