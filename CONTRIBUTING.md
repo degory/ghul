@@ -142,8 +142,10 @@ widening, retry-loop convergence, or IL emission. So the bar here is higher than
   the reasoning visible in the diff, or notices it broke something.
 
 Unit tests go in `unit-tests/src/`, one file per class under test, named
-`<class>_tests.ghul`. See the files already there for the `@test()` annotation
-and assertion conventions.
+`<class>_tests.ghul`. Test classes carry `@TestClass()` and test methods
+`@Test()` — aliases of the MSTest attribute types imported with `use` — and
+assertions are global functions declared in `assertions.ghul`. See the files
+already there for the conventions.
 
 ## Documentation
 
