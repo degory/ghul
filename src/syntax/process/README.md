@@ -22,7 +22,7 @@ The `COMPILER` class (see `src/compiler/compiler.ghul`) runs these in order:
 8. **resolve_ancestors.ghul** – attaches base classes and trait implementations.
 9. **resolve_explicit_variable_types.ghul** – checks variables with explicit types against their initialisers.
 10. **resolve_overrides.ghul** – verifies override methods match inherited signatures.
-11. **infer-effects/infer_store_free.ghul** – proves which functions cannot store to pre-existing heap locations; flow narrowing keeps field, property and member-path narrows alive across calls to them.
+11. **infer-effects/infer_store_free.ghul** – proves which functions cannot store to pre-existing heap locations; flow narrowing keeps field, property and member-path narrows alive across calls to them. The same walk classifies monotone-memoiser getters (see `infer-effects/monotone_memoiser.ghul`), whose presence answers cannot flip back to absent, so a presence fact read through one survives the getter's own call.
 12. **record_type_argument_uses.ghul** – records generic type argument usage for later IL generation.
 13. **compile-expressions/compile_expressions.ghul** – translates expressions into the intermediate representation.
 14. **generate-il/generate_il.ghul** – final pass that emits .NET IL when building an assembly.
