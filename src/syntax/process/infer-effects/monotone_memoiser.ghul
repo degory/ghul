@@ -1,0 +1,617 @@
+namespace Syntax.Process is
+    use Logging;
+    use Trees;
+
+    use Function = Semantic.Symbols.Function;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // Recognises the guarded-memoiser getter shape whose presence
+    // answers are monotone: once the memoised member holds a value it
+    // is never made absent again, so two adjacent reads through the
+    // getter agree on presence.
+    //
+    // The shape: every member write in the body targets one instance
+    // field of the receiver, every written value has a non-optional
+    // static type, every absent-typed return sits inside an arm whose
+    // condition proved that field absent, every other return returns
+    // the field, and control cannot fall off the end of the body
+    // (which would return an unguarded absent value). Local writes and
+    // calls are unrestricted here - their effect on the member is
+    // bounded by the solved relations, which the query consults.
+    //
+    // Why that is sound for presence: a read that answered present
+    // returned the member, so the member was non-null when the call
+    // ended; nothing runs between adjacent reads, so the next call
+    // starts with the member still non-null; the solved relations
+    // show nothing the getter can reach writes an absent value to it,
+    // so it is still non-null at every guard; an absent-typed return
+    // needs a guard that proved it absent; contradiction - the next
+    // read returns the member, present. Type narrows are deliberately
+    // not covered: a rewrite while absent can change the runtime type
+    // a wider-typed member holds.
+    class MONOTONE_MEMOISER_SHAPE: DefaultVisitor is
+        _typer: TRIVIAL_EXPRESSION_TYPER;
+
+        _failed: bool;
+        _write_member: Symbol?;
+        _return_member: Symbol?;
+        _has_return_member: bool;
+        _absent_guards: Collections.LIST[Collections.LIST[Symbol]];
+
+        // One entry per enclosing if-arm: the member whose absence
+        // that arm's condition proved, or null when it proved nothing
+        // usable. A return under an arm is dominated by every guard
+        // on the stack, so absence established at any depth counts.
+        _guard_stack: Collections.LIST[Symbol?];
+        _if_stack: Collections.LIST[Statements.IF];
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES,
+            typer: TRIVIAL_EXPRESSION_TYPER
+        )
+        is
+            super.init(logger, symbol_table, namespaces);
+
+            _typer = typer;
+            _absent_guards = Collections.LIST[Collections.LIST[Symbol]]();
+            _guard_stack = Collections.LIST[Symbol?]();
+            _if_stack = Collections.LIST[Statements.IF]();
+        si
+
+        // Walk a property read accessor's body and return the
+        // canonical memoised member, or null when the shape is not
+        // the guarded-memoiser one. Never reports anything: a shape
+        // mismatch is a conservative decline, not a diagnostic.
+        classify_getter(body: Bodies.Body?) -> Symbol? is
+            _failed = false;
+            _write_member = null;
+            _return_member = null;
+            _has_return_member = false;
+            _absent_guards.clear();
+
+            if !body? then
+                return null;
+            fi
+
+            let mark = mark_scope_stack();
+
+            try
+                if isa Bodies.BLOCK(body) then
+                    let block = cast Bodies.BLOCK(body);
+
+                    block.walk(self);
+
+                    if _falls_through(block.statements) then
+                        _failed = true;
+                    fi
+                elif isa Bodies.EXPRESSION(body) then
+                    _note_return((cast Bodies.EXPRESSION(body)).expression);
+                else
+                    _failed = true;
+                fi
+            catch ex: System.Exception
+                _failed = true;
+            yrt
+
+            release_scope_stack(mark);
+
+            if _failed then
+                return null;
+            fi
+
+            let member mut = _write_member;
+
+            if _has_return_member then
+                if _return_member? /\ _write_member? /\ _return_member != _write_member then
+                    return null;
+                fi
+
+                if !member? then
+                    member = _return_member;
+                fi
+            fi
+
+            if !member? then
+                return null;
+            fi
+
+            let memoised = member;
+
+            for guards in _absent_guards do
+                if !_guarded_by(guards, memoised) then
+                    return null;
+                fi
+            od
+
+            return memoised;
+        si
+
+        _guarded_by(guards: Collections.LIST[Symbol], member: Symbol) -> bool static is
+            for guard in guards do
+                if guard == member then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        // A lambda body runs on invocation, not during the getter's
+        // own call, so its returns and writes are not this body's;
+        // its effect on the member arrives through the solved
+        // relations like any other callee.
+        pre(function: Expressions.FUNCTION) -> bool => true;
+        visit(function: Expressions.FUNCTION) is si
+
+        // Node kinds this walk does not handle carry no shape
+        // information of their own - their effect on the member is
+        // the solved relations' question, not this one.
+        visit_default(node: Trees.Node) is si
+
+        pre(assign: Statements.ASSIGNMENT) -> bool is
+            _note_assignment(assign);
+
+            return false;
+        si
+
+        visit(`return: Statements.RETURN) is
+            // a return inside a val block exits that block, not the
+            // getter
+            if `return.val_block_target? then
+                return;
+            fi
+
+            _note_return(`return.expression);
+        si
+
+        pre(`if: Statements.IF) -> bool is
+            _if_stack.add(`if);
+
+            return false;
+        si
+
+        visit(`if: Statements.IF) is
+            _if_stack.remove_at(_if_stack.count - 1);
+        si
+
+        pre(if_branch: Statements.IF_BRANCH) -> bool is
+            let result = super.pre(if_branch);
+
+            let current_if: Statements.IF? =
+                if _if_stack.count > 0 then _if_stack[_if_stack.count - 1] else null fi;
+
+            _guard_stack.add(_arm_absent_member(if_branch, current_if));
+
+            return result;
+        si
+
+        visit(if_branch: Statements.IF_BRANCH) is
+            _guard_stack.remove_at(_guard_stack.count - 1);
+
+            super.visit(if_branch);
+        si
+
+        // The member whose absence `branch`'s arm entry proves, or
+        // null. A conditioned arm proves absence when its condition
+        // is (or conjoins) a negated presence test on the receiver's
+        // own field. An `if let` arm (a binding, no condition) proves
+        // nothing here. The else arm (no condition, no binding) is
+        // entered only when every sibling condition was false, so a
+        // sibling's bare presence test proves absence there.
+        _arm_absent_member(branch: Statements.IF_BRANCH, current_if: Statements.IF?) -> Symbol? is
+            if branch.condition? then
+                return _then_arm_absent_member(branch.condition);
+            fi
+
+            if branch.binding? \/ !current_if? then
+                return null;
+            fi
+
+            for sibling in current_if.branches do
+                if sibling.condition? /\ isa Expressions.HAS_VALUE(sibling.condition) then
+                    let member = _self_member_of((cast Expressions.HAS_VALUE(sibling.condition)).left);
+
+                    if member? then
+                        return member;
+                    fi
+                fi
+            od
+
+            return null;
+        si
+
+        _then_arm_absent_member(condition: Expressions.Expression) -> Symbol? is
+            if isa Expressions.BINARY(condition) then
+                let binary = cast Expressions.BINARY(condition);
+
+                if binary.operation.name =~ "/\\" then
+                    let from_left = _then_arm_absent_member(binary.left);
+
+                    if from_left? then
+                        return from_left;
+                    fi
+
+                    return _then_arm_absent_member(binary.right);
+                fi
+
+                return null;
+            fi
+
+            if isa Expressions.UNARY(condition) then
+                let unary = cast Expressions.UNARY(condition);
+
+                if unary.operation.name =~ "!" /\ isa Expressions.HAS_VALUE(unary.right) then
+                    return _self_member_of((cast Expressions.HAS_VALUE(unary.right)).left);
+                fi
+            fi
+
+            return null;
+        si
+
+        _note_assignment(assign: Statements.ASSIGNMENT) is
+            let left = assign.left;
+
+            if isa Expressions.SIMPLE_LEFT_EXPRESSION(left) then
+                _note_store_target(
+                    (cast Expressions.SIMPLE_LEFT_EXPRESSION(left)).expression,
+                    assign.right);
+                return;
+            fi
+
+            if isa Expressions.DESTRUCTURING_LEFT_EXPRESSION(left) then
+                // a destructuring store cannot give the per-element
+                // written types this shape needs
+                _failed = true;
+                return;
+            fi
+
+            _failed = true;
+        si
+
+        _note_store_target(target: Expressions.Expression?, value: Expressions.Expression?) is
+            let member = _self_member_of(target);
+
+            if member? then
+                if _write_member? /\ _write_member != member then
+                    _failed = true;
+                    return;
+                fi
+
+                _write_member = member;
+
+                let type = _typer.try_type(value);
+
+                if !type? \/ type.is_optional then
+                    _failed = true;
+                fi
+
+                return;
+            fi
+
+            if _is_local_target(target) then
+                return;
+            fi
+
+            // a store to anything but the receiver's own memoised
+            // field - another object's member, a property, a global,
+            // an element
+            _failed = true;
+        si
+
+        _is_local_target(target: Expressions.Expression?) -> bool is
+            if !target? \/ !isa Expressions.IDENTIFIER(target) then
+                return false;
+            fi
+
+            let identifier = (cast Expressions.IDENTIFIER(target)).identifier;
+
+            if identifier.is_qualified then
+                return false;
+            fi
+
+            let symbol = try_find(identifier);
+
+            return
+                symbol? /\
+                (isa Semantic.Symbols.LOCAL_VARIABLE(symbol) \/ isa Semantic.Symbols.LOCAL_ARGUMENT(symbol));
+        si
+
+        // The receiver's own instance field named by `target`, or
+        // null for anything else - another object's member, a
+        // property, a local, an unresolved name.
+        _self_member_of(target: Expressions.Expression?) -> Symbol? is
+            if !target? then
+                return null;
+            fi
+
+            if isa Expressions.IDENTIFIER(target) then
+                let identifier = (cast Expressions.IDENTIFIER(target)).identifier;
+
+                if identifier.is_qualified then
+                    return null;
+                fi
+
+                let symbol = try_find(identifier);
+
+                if symbol? /\ symbol.is_field /\ symbol.is_instance then
+                    return symbol.root_specialized_from;
+                fi
+
+                return null;
+            fi
+
+            if isa Expressions.MEMBER(target) then
+                let member = cast Expressions.MEMBER(target);
+
+                if !isa Expressions.SELF(member.left) then
+                    return null;
+                fi
+
+                let context = current_instance_context;
+
+                if !context? then
+                    return null;
+                fi
+
+                let symbol = context.find_member(member.identifier.name);
+
+                if symbol? /\ symbol.is_field /\ symbol.is_instance then
+                    return symbol.root_specialized_from;
+                fi
+            fi
+
+            return null;
+        si
+
+        _note_return(expression: Expressions.Expression?) is
+            if !expression? then
+                _note_absent_return();
+                return;
+            fi
+
+            if isa Expressions.NULL(expression) then
+                _note_absent_return();
+                return;
+            fi
+
+            let member = _self_member_of(expression);
+
+            if member? then
+                if _has_return_member /\ _return_member != member then
+                    _failed = true;
+                    return;
+                fi
+
+                _return_member = member;
+                _has_return_member = true;
+                return;
+            fi
+
+            let type = _typer.try_type(expression);
+
+            if type? /\ type.is_optional then
+                _note_absent_return();
+            else
+                // a present value from somewhere other than the
+                // member, or nothing the typer can type
+                _failed = true;
+            fi
+        si
+
+        _note_absent_return() is
+            let guards = Collections.LIST[Symbol]();
+
+            for operand in _guard_stack do
+                if operand? then
+                    guards.add(operand);
+                fi
+            od
+
+            _absent_guards.add(guards);
+        si
+
+        // Whether control can reach the end of a block-bodied
+        // getter, whose fall-off return value would be an absent
+        // return no guard dominates. A statement that does not fall
+        // through ends every path through the list, so the list
+        // falls through only when every statement in it does.
+        // Over-approximates - anything not explicitly a divergence
+        // or a fully-covering branch structure falls through, which
+        // only declines the shape.
+        _falls_through(statements: Statements.LIST) -> bool is
+            for statement in statements do
+                if !_statement_falls_through(statement) then
+                    return false;
+                fi
+            od
+
+            return true;
+        si
+
+        _statement_falls_through(statement: Statements.Statement) -> bool is
+            if
+                isa Statements.RETURN(statement) \/
+                isa Statements.THROW(statement) \/
+                isa Statements.BREAK(statement) \/
+                isa Statements.CONTINUE(statement)
+            then
+                return false;
+            fi
+
+            if isa Statements.IF(statement) then
+                let `if = cast Statements.IF(statement);
+                let has_else mut = false;
+
+                for branch in `if.branches do
+                    if !branch.condition? /\ !branch.binding? then
+                        has_else = true;
+                    fi
+                od
+
+                if !has_else then
+                    return true;
+                fi
+
+                for branch in `if.branches do
+                    if _falls_through(branch.body) then
+                        return true;
+                    fi
+                od
+
+                return false;
+            fi
+
+            if isa Statements.CASE(statement) then
+                let `case = cast Statements.CASE(statement);
+                let has_else mut = false;
+
+                for match in `case.matches do
+                    if !match.expressions? /\ !match.pattern? then
+                        has_else = true;
+                    fi
+                od
+
+                if !has_else /\ !`case.is_exhaustive then
+                    return true;
+                fi
+
+                for match in `case.matches do
+                    if _falls_through(match.statements) then
+                        return true;
+                    fi
+                od
+
+                return false;
+            fi
+
+            if isa Statements.TRY(statement) then
+                let `try = cast Statements.TRY(statement);
+
+                if _falls_through(`try.body) then
+                    return true;
+                fi
+
+                for `catch in `try.catches do
+                    if _falls_through(`catch.body) then
+                        return true;
+                    fi
+                od
+
+                return false;
+            fi
+
+            return true;
+        si
+    si
+
+
+    // The per-compilation record of which getters hold the guarded-
+    // memoiser shape, filled by the infer-effects body walk and read
+    // by the post-solve consumers (the crossing judge and the
+    // reliance judge) to discharge a presence fact against a
+    // monotone memoiser's own call.
+    //
+    // Entries are noted per file and dropped when that file is
+    // re-walked, so a getter whose body stopped matching the shape
+    // on an edit cannot keep a stale classification. An entry with a
+    // null member records the decline, so re-walking a demoted
+    // getter overwrites its earlier classification.
+    class MONOTONE_MEMOISER is
+        _entries: Collections.MAP[Function, MONOTONE_MEMOISER_ENTRY] static;
+        _dispatch: STORE_FREE_FIXPOINT static;
+
+        init() static is
+            _entries = Collections.MAP[Function, MONOTONE_MEMOISER_ENTRY]();
+            _dispatch = STORE_FREE_FIXPOINT();
+        si
+
+        note_getter(getter: Function, member: Symbol?, file_name: string) static is
+            let root = cast Function?(getter.root_specialized_from);
+
+            if !root? then
+                return;
+            fi
+
+            _entries[root] = MONOTONE_MEMOISER_ENTRY(member, file_name);
+        si
+
+        clear_file(file_name: string) static is
+            let stale = Collections.LIST[Function]();
+
+            for entry in _entries do
+                if entry.value.file_name =~ file_name then
+                    stale.add(entry.key);
+                fi
+            od
+
+            for key in stale do
+                _entries.remove(key);
+            od
+        si
+
+        // Whether a presence fact read through `property` survives
+        // the getter's own call: the body holds the guarded-memoiser
+        // shape, nothing the getter can reach writes an absent value
+        // to the memoised member, and dispatch cannot reach a getter
+        // that fails either question.
+        is_presence_monotone(property: Semantic.Symbols.Property) -> bool static is
+            let getter = property.read_function;
+
+            if !getter? then
+                return false;
+            fi
+
+            let root = cast Function?(getter.root_specialized_from);
+
+            if !root? then
+                return false;
+            fi
+
+            if !_entries.contains_key(root) then
+                return false;
+            fi
+
+            let entry = _entries[root];
+
+            if !entry.member? then
+                return false;
+            fi
+
+            if !EFFECTS.is_solved then
+                return false;
+            fi
+
+            if EFFECTS.may_null(root, entry.member) then
+                return false;
+            fi
+
+            if _dispatch.is_openly_dispatchable(root) then
+                return false;
+            fi
+
+            let overriders = property.overriders;
+
+            if overriders? then
+                for overrider in overriders do
+                    if !isa Semantic.Symbols.Property(overrider) then
+                        return false;
+                    fi
+
+                    if !is_presence_monotone(cast Semantic.Symbols.Property(overrider)) then
+                        return false;
+                    fi
+                od
+            fi
+
+            return true;
+        si
+    si
+
+
+    class MONOTONE_MEMOISER_ENTRY(
+        member: Symbol?,
+        file_name: string
+    );
+si
