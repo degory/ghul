@@ -1,0 +1,203 @@
+namespace Syntax.Process is
+    use Logging.Logger;
+    use LOCATION = Source.LOCATION;
+    use Symbol = Semantic.Symbols.Symbol;
+
+    // One narrowing fact formed through a getter hop, recorded at
+    // the test site that formed it, alongside the narrowing
+    // introduction inlay the walk emitted there. `inlay_code` is the
+    // carrier's exact code — the complement edge of a two-edge test
+    // is a separate fact with its own carrier. `presence` /
+    // `type_narrow` say which fact kinds the test established.
+    class UNBACKED_FACT_CANDIDATE(
+        location: LOCATION,
+        inlay_code: string,
+        target: Symbol?,
+        path: ACCESS_PATH?,
+        presence: bool,
+        type_narrow: bool
+    );
+
+
+    // Getter-hop facts formed while walking conditions, held per file
+    // until the effect relations are solved and each can be asked
+    // whether the getter it reads through actually backs it. A fact
+    // whose getter is self-unstable for the fact's kind is dead at
+    // its first re-read — every use of the path re-invokes the getter
+    // and that call is an undischarged crossing — so it must never be
+    // presented as a narrowing: the post-solve report drops the
+    // introduction inlay at the test site and leaves a
+    // `narrowing-unavailable` hint there instead. The leaning-use
+    // errors are the reliance judge's regardless of this registry; it
+    // exists for the surfaces the judge never visits.
+    //
+    // The classification reuses the judge's own question —
+    // RELIANCES.first_unproven_getter asked of the fact's kind — so a
+    // monotone memoiser keeps backing presence facts here exactly as
+    // it discharges them there.
+    //
+    // Held state described by source text that can be re-walked, so
+    // it is dropped exactly where a file's other expression-level
+    // output is, with the kill candidates: an analysis-mode
+    // recompile of one file's expressions clears the file's entry
+    // before re-walking it, and a build clears every entry.
+    class UNBACKED_FACTS is
+        _candidates: Collections.MAP[string, Collections.LIST[UNBACKED_FACT_CANDIDATE]] static;
+
+        init() static is
+            _candidates = Collections.MAP[string, Collections.LIST[UNBACKED_FACT_CANDIDATE]]();
+        si
+
+        note(candidate: UNBACKED_FACT_CANDIDATE) static is
+            let path = candidate.location.file_name;
+
+            if !_candidates.contains_key(path) then
+                _candidates[path] = Collections.LIST[UNBACKED_FACT_CANDIDATE]();
+            fi
+
+            let entries = _candidates[path];
+
+            // A body the compile-expressions retry loop walks more
+            // than once re-forms its facts on every walk, and the
+            // fact-only pre-walk of a condition forms them once more
+            // without emitting inlays — one entry per carrier site is
+            // enough.
+            for entry in entries do
+                if entry.location =~ candidate.location /\ entry.inlay_code =~ candidate.inlay_code then
+                    return;
+                fi
+            od
+
+            entries.add(candidate);
+        si
+
+        clear_for(path: string) static is
+            _candidates.remove(path);
+        si
+
+        clear() static is
+            _candidates.clear();
+        si
+
+        // The test site that formed a fact on this target or path
+        // for a use at `use_location` — the reliance judge names it
+        // as the narrowing's origin in its related locations. The
+        // forming test is the last one recorded at or before the
+        // use: a later re-test of the same path cannot have formed
+        // a value an earlier use reads. Falls back to the last site
+        // recorded when none precedes the use.
+        test_location_for(
+            file_name: string,
+            target: Symbol?,
+            path: ACCESS_PATH?,
+            use_location: LOCATION
+        ) -> LOCATION? static is
+            if !_candidates.contains_key(file_name) then
+                return null;
+            fi
+
+            let before: LOCATION? mut = null;
+            let last: LOCATION? mut = null;
+
+            for entry in _candidates[file_name] do
+                let matches =
+                    if target? then
+                        entry.target? /\ entry.target.root_specialized_from == target.root_specialized_from
+                    elif path? then
+                        entry.path? /\ entry.path.equals(path)
+                    else
+                        false
+                    fi;
+
+                if !matches then
+                    continue;
+                fi
+
+                last = entry.location;
+
+                if _at_or_before(entry.location, use_location) /\
+                    (!before? \/ _at_or_before(before, entry.location)) then
+                    before = entry.location;
+                fi
+            od
+
+            return if before? then before else last fi;
+        si
+
+        _at_or_before(a: LOCATION, b: LOCATION) -> bool static =>
+            a.start_line < b.start_line \/
+            (a.start_line == b.start_line /\ a.start_column <= b.start_column);
+
+        // Classify every recorded fact against the relations just
+        // solved and report the unbacked ones: drop the carrier that
+        // announced the fact at its test site, and leave one
+        // editor-only hint per site naming the getter and the
+        // remedy. Runs in the reliance judge's round, inside the
+        // judging window, so a fresh round clears and re-reports
+        // what the previous one left.
+        report(logger: Logger) static is
+            if !EFFECTS.is_solved then
+                return;
+            fi
+
+            let hinted = Collections.SET[string]();
+
+            for file_entries in _candidates do
+                for candidate in file_entries.value do
+                    let unbacked_presence = candidate.presence /\
+                        RELIANCES.first_unproven_getter(candidate.target, candidate.path, true)?;
+
+                    let unbacked_type = candidate.type_narrow /\
+                        RELIANCES.first_unproven_getter(candidate.target, candidate.path, false)?;
+
+                    if !unbacked_presence /\ !unbacked_type then
+                        continue;
+                    fi
+
+                    logger.clear_inlays_at(
+                        candidate.location.file_name,
+                        candidate.inlay_code,
+                        candidate.location);
+
+                    let hint_key =
+                        "{candidate.location.file_name}:{candidate.location.start_line}:{candidate.location.start_column}";
+
+                    if hinted.contains(hint_key) then
+                        continue;
+                    fi
+
+                    if !logger.want_hint_for(candidate.location) then
+                        continue;
+                    fi
+
+                    // The type question is the stricter one — a
+                    // monotone memoiser passes the presence question
+                    // and fails it — so when the type fact is
+                    // unbacked the strict question is the one that
+                    // names the getter; the presence question does
+                    // when only the presence fact is unbacked.
+                    let unproven = RELIANCES.first_unproven_getter(
+                        candidate.target,
+                        candidate.path,
+                        !unbacked_type);
+
+                    if !unproven? then
+                        continue;
+                    fi
+
+                    // Only once the hint is actually emitted: a
+                    // bailed candidate must not silence the other
+                    // carriers recorded at the same site.
+                    hinted.add(hint_key);
+
+                    logger.hint(
+                        candidate.location,
+                        "narrowing-unavailable",
+                        "cannot narrow through '{unproven.name}': its getter is not provably stable; use 'if let' or copy the value into a local variable",
+                        unproven.location,
+                        "getter declared here");
+                od
+            od
+        si
+    si
+si
