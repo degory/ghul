@@ -291,7 +291,7 @@ entries | .each(((key, value): Collections.KeyValuePair[string, int]) =>
     write_line("{key}={value}"));
 ```
 
-Patterns nest and take discards, so `(((a, b), c)) => …` and `((_, b)) => …` both work. An asynchronous function literal cannot take one: its body compiles into a state machine whose locals are frame fields, which the pattern's names are not.
+Patterns nest and take discards, so `(((a, b), c)) => …` and `((_, b)) => …` both work, on plain and asynchronous function literals alike.
 
 A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing binding of that name, the same as any other reference. When that binding is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
 
