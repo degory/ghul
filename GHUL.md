@@ -1256,6 +1256,8 @@ trait Named is name: string; si
 greet[T: Named](x: T) => write_line("hello {x.name}");
 ```
 
+A parameter can carry several bounds, joined with `/\` — `[T: Named /\ Sized]`. The value then behaves as every one of them: a member of any bound is reachable, and the actual type argument has to satisfy each bound. The comma spelling declares separate type parameters and is not a way to write two bounds.
+
 A bound's *static* members are reachable through the type parameter itself, written `T.member(...)` — the mechanism .NET's generic-math interfaces (`IParsable[T]`, `INumber[T]`, `IBinaryInteger[T]`, ...) are built on:
 
 ```ghul
@@ -1290,6 +1292,7 @@ A bound can also be a **kind**: `class` for a reference type, `struct` for a val
 make[T: init]() -> T;
 find[T: class init](key: string) -> T;
 build[T: Named class init](name: string) -> T;
+build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
 The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS) when the constructor arguments alone don't pin every owner-generic slot:
