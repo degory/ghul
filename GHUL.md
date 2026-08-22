@@ -636,6 +636,8 @@ si
 
 `NAMED.name` is satisfied by the property auto-synthesised from the union's `name` primary parameter, and `NAMED.label` is inherited by every variant. A `NAMED` reference accepts any `COLOUR` value, with dispatch going through the union base class. The traits-only restriction is strict: a union may not declare a base class. Every trait member used through this header form must either be defaulted or be a property the union already supplies (typically through a primary parameter), since neither the union body nor its variants can carry method bodies; to give a union method implementations for a trait, use an [`impl` block](#partial-and-impl-blocks).
 
+A method or property accessor supplied to a union, or to one of its variants, through a [`partial` or `impl`](#partial-and-impl-blocks) block must be pure: declared `pure`, or provably store-free. One that stores draws an `impure-union-method` warning.
+
 ### enums
 
 An enum is a set of named integer constants, counting from 0 unless given explicit values, reached as `Suit.HEARTS`. The enum type takes a PascalCase name and its members UPPER_SNAKE_CASE; a trailing comma after the last member is allowed:
@@ -691,7 +693,7 @@ impl Printer for List[T] is
 si
 ```
 
-The interface's type parameters are the target's own, written on the target after `for` (`impl Printer for List[T]`). Inside the body `self` has the concrete target type, so a union's variants can be matched on directly. The target then satisfies the interface exactly as a header-declared one would - a `List[T]` passes wherever a `Printer` is expected, dispatching through the type's base. A self-relational interface takes the target as its own argument: `impl Eq[List[T]] for List[T]`. The interface must be a trait, and the target must be a same-assembly type - an imported type cannot be reopened.
+The interface's type parameters are the target's own, written on the target after `for` (`impl Printer for List[T]`). Inside the body `self` has the concrete target type, so a union's variants can be matched on directly. The target then satisfies the interface exactly as a header-declared one would - a `List[T]` passes wherever a `Printer` is expected, dispatching through the type's base. A self-relational interface takes the target as its own argument: `impl Eq[List[T]] for List[T]`. The interface must be a trait, and the target must be a same-assembly type - an imported type cannot be reopened. When the target is a union or a single variant, every method and property accessor the block supplies must be pure: see [unions](#unions).
 
 The target (and a `partial` block's target) can be a qualified name: a namespaced type (`impl Printer for Some.Namespace.TYPE`) or a specific union variant (`impl Printer for List.NIL`). Implementing an interface on a single variant attaches it to that variant alone - a value statically typed as the variant satisfies the interface, but the union as a whole does not unless it also implements it.
 
