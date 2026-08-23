@@ -88,7 +88,7 @@ for PASS in 1 2 3 4 ; do
 
     dotnet ghul-compiler
 
-    if [ "${PASS}" == "3" ] || [ "${PASS}" == "4" ] ; then
+    if [ "${PASS}" == "2" ] || [ "${PASS}" == "3" ] || [ "${PASS}" == "4" ] ; then
         cp bin/Release/net10.0/ghul.dll stage-${PASS}.dll
     fi
 
@@ -112,6 +112,21 @@ if ! cmp stage-3.dll stage-4.dll ; then
 fi
 
 echo "identical"
+
+echo
+
+# Passes 2 and 3 are the earliest pair that can be compared. Pass 1 emits
+# the previous release's code generation, so its assembly is not a
+# candidate whatever the compiler does. If passes 2 and 3 match, the pass 2
+# compiler is already a fixed point of compiling this source, every later
+# pass reproduces it, and the comparison above follows from it.
+echo "Compare the earliest comparable pair (reported, not enforced)..."
+
+if cmp stage-2.dll stage-3.dll ; then
+    echo "pass 2 and pass 3 are identical"
+else
+    echo "pass 2 and pass 3 differ"
+fi
 
 echo
 
