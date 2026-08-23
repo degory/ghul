@@ -1,6 +1,7 @@
 namespace Analysis.Tests is
     use Collections.Iterable;
     use Collections.LIST;
+    use Collections.MutableMap;
 
     use System.Text.StringBuilder;
 
@@ -24,25 +25,36 @@ namespace Analysis.Tests is
     // use-map entries, which is the state a single-file edit's rebuild
     // leaves anyway; the whole-project rebuild has no such halfway state
     // and runs to completion.
+    //
+    // Whether the walk notices the edit depends on the analyser's reader
+    // thread having parsed the edit off the pipe before the walk's final
+    // superseded check - scheduling on both sides, not behaviour - so the
+    // test below proves the walk is still running before writing the edit
+    // (an interleaved stats query is answered at the walk's per-file
+    // boundaries), gives the walk several files' worth of work, and
+    // retries the whole scenario a bounded number of times when the edit
+    // loses that race anyway. Losing it is not a failure of the mechanism:
+    // nothing was waiting when each file boundary looked.
     @TestClass()
     class COMPILE_ABORT_TESTS is
         init() is si
 
-        // Enough files, each with enough methods, that the walk takes long
-        // enough for an edit written straight behind the compile request to
-        // be queued before the walk reaches its second file.
+        // Enough files, each with enough methods, that the walk spans
+        // several file boundaries - the points where a queued edit is
+        // noticed and the walk abandoned.
         file_count: int static => 6;
         method_count: int static => 150;
 
         path_of(index: int) -> string static => "compile_abort_{index}.ghul";
 
         source_of(index: int) -> string static =>
-            source_of(index, false);
+            source_of(index, 0);
 
-        // `with_extra` appends a method, which changes the file's interface
-        // and so leaves every other file needing its expressions walked
-        // again - the state the compile under test is in.
-        source_of(index: int, with_extra: bool) -> string static is
+        // `extras` appends that many methods past the fixed method_count,
+        // which changes the file's interface. Each larger count than the
+        // file currently holds is an append against the retained tree,
+        // taking the incremental interface path.
+        source_of(index: int, extras: int) -> string static is
             let source = StringBuilder();
 
             source.append("namespace CompileAbort is\n");
@@ -57,10 +69,10 @@ namespace Analysis.Tests is
                 source.append("        si\n");
             od
 
-            if with_extra then
+            for e in 0..extras do
                 source.append("\n");
-                source.append("        extra() -> int => {index};\n");
-            fi
+                source.append("        extra_{e}() -> int => {index};\n");
+            od
 
             source.append("    si\n");
             source.append("si\n");
@@ -68,11 +80,11 @@ namespace Analysis.Tests is
             return source.to_string();
         si
 
-        // A file the abandoned walk will not reach, carrying an
-        // expression-level error - the kind a compile clears before
-        // recomputing, and so the kind an abandoned one can lose.
         erroring_path: string static => "compile_abort_erroring.ghul";
 
+        // A file the walk will reach carrying an expression-level error -
+        // the kind a compile clears before recomputing, and so the kind
+        // an abandoned one can lose.
         erroring_source() -> string static =>
             "namespace CompileAbort is\n"
             "    class ERRORING is\n"
@@ -104,6 +116,13 @@ namespace Analysis.Tests is
             return cast Response.DIAGNOSTICS(response);
         si
 
+        // How many times the test will set up, prove the walk running,
+        // write the superseding edit and read the outcome before giving
+        // up. An attempt misses when the analyser finishes its walk
+        // before its reader thread has queued the edit - scheduling,
+        // not behaviour - and each miss re-stales and goes again.
+        max_attempts: int static => 5;
+
         @Test()
         an_edit_written_during_a_compile_cuts_that_compile_short() is
             let use analyser = ANALYSER_PROCESS();
@@ -116,88 +135,144 @@ namespace Analysis.Tests is
 
             read_diagnostics(analyser, "for the initial edit");
 
-            // Interface-affecting, so every other file needs its
-            // expressions walked again and the compile below has work to
-            // be interrupted in the middle of.
-            analyser.send_edit(path_of(0), source_of(0, true));
+            let extras mut = 1;
 
-            let after_edit = read_diagnostics(analyser, "for the interface-affecting edit");
+            let after_stale = _stale_holder_files(analyser, extras);
 
             is_true(
-                after_edit.compile_needed,
+                after_stale.compile_needed,
                 "an interface-affecting edit should leave a compile needed\n"
                 "--- analyser stderr ---\n{analyser.stderr_capture}"
             );
 
-            let before = analyser.stat_counts();
+            extras = extras + 1;
 
-            analyser.send_compile();
-            analyser.send_edit(path_of(1), source_of(1, true));
+            let attempts mut = 0;
+            let observed mut = false;
 
-            let compile = read_diagnostics(analyser, "for the compile");
+            do
+                if attempts >= max_attempts then
+                    break;
+                fi
 
-            are_equal(
-                "full",
-                compile.phase,
-                "expected the compile's own response first\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                attempts = attempts + 1;
 
-            is_true(
-                compile.compile_needed,
-                "an abandoned compile should say a compile is still needed\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                let before = analyser.stat_counts();
 
-            // Files the walk never reached have had their expression
-            // diagnostics cleared and not recomputed, so reporting the
-            // paths it did check would clear their squiggles until the
-            // next compile puts them back. It reports none.
-            are_equal(
-                0,
-                compile.checked_paths.count,
-                "an abandoned compile should report no checked paths\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                analyser.send_compile();
 
-            let edit = read_diagnostics(analyser, "for the superseding edit");
+                // Interleavable queries are answered at the walk's
+                // per-file boundaries, so this response arriving before
+                // the compile's proves the walk was still running with
+                // most of its files ahead of it - the moment to write
+                // the superseding edit.
+                analyser.send_stats();
 
-            are_equal(
-                "partial",
-                edit.phase,
-                "expected the superseding edit's response second\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                let first = analyser.read_response();
 
-            // What the abandoned compile must not cost: a file its walk
-            // never reached is not reported as checked-and-clean by this
-            // frame either. Saying so would drop a squiggle the user can
-            // still see a problem for, which is the flicker the abort is
-            // meant to avoid rather than introduce.
-            is_false(
-                _claims_clean(edit, erroring_path),
-                "the superseding edit reported an unwalked file as clean\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                if !isa Response.STATS(first) then
+                    // The walk ended before the stats frame could be
+                    // serviced at a boundary - nothing was waiting when
+                    // each file boundary looked, so there was nothing to
+                    // abort. Timing rather than behaviour. The compile's
+                    // own diagnostics are the response just read; drain
+                    // the trailing stats response and go again.
+                    let trailing = analyser.read_response();
 
-            let after = analyser.stat_counts();
+                    assert isa Response.STATS(trailing) else
+                        "expected the trailing stats response, got {trailing.get_type().name}\n"
+                        "--- analyser stderr ---\n{analyser.stderr_capture}";
 
-            are_equal(
-                1,
-                _delta(before, after, "compile-superseded"),
-                "the analyser did not record abandoning the compile\n"
-                "--- analyser stderr ---\n{analyser.stderr_capture}"
-            );
+                    _stale_holder_files(analyser, extras);
+
+                    extras = extras + 1;
+
+                    continue;
+                fi
+
+                analyser.send_edit(path_of(1), source_of(1, extras));
+
+                extras = extras + 1;
+
+                let candidate = read_diagnostics(analyser, "for the compile");
+
+                if !candidate.compile_needed then
+                    // Even with the walk proven mid-flight the edit lost
+                    // the race to be queued before the walk ended. The
+                    // superseding edit's own response follows.
+                    read_diagnostics(analyser, "for the late superseding edit");
+
+                    _stale_holder_files(analyser, extras);
+
+                    extras = extras + 1;
+
+                    continue;
+                fi
+
+                observed = true;
+
+                are_equal(
+                    "full",
+                    candidate.phase,
+                    "expected the compile's own response first\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}"
+                );
+
+                are_equal(
+                    0,
+                    candidate.checked_paths.count,
+                    "an abandoned compile should report no checked paths\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}"
+                );
+
+                let superseding = read_diagnostics(analyser, "for the superseding edit");
+
+                are_equal(
+                    "partial",
+                    superseding.phase,
+                    "expected the superseding edit's response second\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}"
+                );
+
+                is_false(
+                    _claims_clean(superseding, erroring_path),
+                    "the superseding edit reported an unwalked file as clean\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}"
+                );
+
+                let after = analyser.stat_counts();
+
+                are_equal(
+                    1,
+                    _delta(before, after, "compile-superseded"),
+                    "the analyser did not record abandoning the compile\n"
+                    "--- analyser stderr ---\n{analyser.stderr_capture}"
+                );
+            od
+
+            assert observed else
+                "could not observe an abandoned compile in {max_attempts} attempts\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}";
         si
 
-        // Whether the frame tells the client this path was checked and
-        // came back with nothing against it.
-        _claims_clean(response: Response.DIAGNOSTICS, path: string) -> bool static is
-            let is_checked = response.checked_paths |> any(p => p.ends_with(path));
+        // One interface-affecting edit per HOLDER file, each awaited. Each
+        // invalidates just the file it edited - the incremental interface
+        // path splices the changed members without touching any other
+        // file - and each also keeps the erroring file stale, since a
+        // file holding errors is invalidated whenever any interface
+        // changes. The compile that follows therefore walks several
+        // files' expressions, giving an edit written mid-walk something
+        // to interrupt. Returns the last edit's response.
+        _stale_holder_files(analyser: ANALYSER_PROCESS, extras: int) -> Response.DIAGNOSTICS is
+            let last: Response.DIAGNOSTICS? mut = null;
 
-            let has_diagnostic = response.diagnostics |> any(d => d.path.ends_with(path));
+            for i in 0..file_count do
+                analyser.send_edit(path_of(i), source_of(i, extras));
 
-            return is_checked /\ !has_diagnostic;
+                last = read_diagnostics(analyser, "for the staling edit to {path_of(i)}");
+            od
+
+            return last!;
         si
 
         // Nothing waiting means nothing to defer to: the compile runs to
@@ -210,7 +285,9 @@ namespace Analysis.Tests is
 
             read_diagnostics(analyser, "for the initial edit");
 
-            analyser.send_edit(path_of(0), source_of(0, true));
+            let extras mut = 1;
+
+            analyser.send_edit(path_of(0), source_of(0, extras));
 
             read_diagnostics(analyser, "for the interface-affecting edit");
 
@@ -242,14 +319,24 @@ namespace Analysis.Tests is
             );
         si
 
+        // Whether the frame tells the client this path was checked and
+        // came back with nothing against it.
+        _claims_clean(response: Response.DIAGNOSTICS, path: string) -> bool static is
+            let is_checked = response.checked_paths |> any(p => p.ends_with(path));
+
+            let has_diagnostic = response.diagnostics |> any(d => d.path.ends_with(path));
+
+            return is_checked /\ !has_diagnostic;
+        si
+
         _delta(
-            before: Collections.MutableMap[string,int],
-            after: Collections.MutableMap[string,int],
+            before: MutableMap[string,int],
+            after: MutableMap[string,int],
             name: string
         ) -> int static =>
             _count(after, name) - _count(before, name);
 
-        _count(counts: Collections.MutableMap[string,int], name: string) -> int static is
+        _count(counts: MutableMap[string,int], name: string) -> int static is
             if counts.contains_key(name) then
                 return counts[name];
             fi
