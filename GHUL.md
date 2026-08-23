@@ -779,7 +779,7 @@ A `T?` over a value type or over an unconstrained type parameter compares the sa
 
 See <https://ghul.dev/control-flow.html>. Most control-flow statements delimit one or more blocks, and each block is a scope.
 
-`if` runs `if` ... `then` ... `fi`, with optional `elif` and `else` clauses, and is also an expression — every branch must then yield a compatible type:
+`if` runs `if` ... `then` ... `fi`, with optional `elif` and `else` clauses, and is also an expression — every branch must then yield a compatible type. Written without an `else`, the expression yields an optional of its branches' type instead: present when a branch runs, absent when control falls through, the same answer a loop expression gives exhaustion. A context expecting the non-optional type still requires the `else`, as does an `if` whose every branch diverges:
 
 ```ghul
 if x > 0 then
