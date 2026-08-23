@@ -262,9 +262,44 @@ namespace Syntax.Process is
         si
 
         visit(`do: Statements.DO) is
+            let loop = _loops.enter_loop(`do);
+
+            // Loop-as-expression: compile-expressions decided capture-
+            // vs-spill (a suspend point in the body routes the result
+            // through a frame field). Every exit converges at one
+            // label carrying the result — see _gen_loop_result.
+            let value_block: Values.BLOCK? mut = null;
+
+            if `do.want_value /\ `do.value? then
+                if isa Values.BLOCK(`do.value!) then
+                    value_block = cast Values.BLOCK(`do.value);
+                    loop.wants_value = true;
+                    loop.result_type = `do.value!.type;
+                fi
+            fi
+
+            let spiller = COMPOSITE_VALUE_SPILLER(self, `do, `do.value, _current_state_machine_frame());
+
+            spiller.enter();
+
+            // The brancher binds to the block current NOW — after the
+            // capture switch, so the loop's labels and branches land in
+            // the same stream as its body.
             let brancher = get_brancher_for_block();
 
-            let loop = _loops.enter_loop();
+            // Breaks emit during the body walk, so every label and
+            // slot they reach is allocated before it - mirroring how
+            // VAL_BLOCK pre-allocates its cross-try TEMP at block head.
+            if let vb = value_block, rt = loop.result_type then
+                if spiller.is_spilling then
+                    loop.spill_field = spiller.spill_field;
+                else
+                    loop.cross_try_temp = TEMP(vb, "loop_cross_try", rt);
+                    loop.cross_try_join = LABEL();
+                fi
+
+                loop.result_label = LABEL();
+            fi
 
             brancher.label(loop.start);
 
@@ -317,7 +352,13 @@ namespace Syntax.Process is
 
             brancher.label(loop.end);
 
+            if let vb = value_block, rt = loop.result_type then
+                _gen_loop_result(loop, rt!, spiller);
+            fi
+
             super.visit(`do);
+
+            spiller.leave();
 
             _loops.leave_loop();
         si
@@ -334,8 +375,11 @@ namespace Syntax.Process is
             // stages per element, instead of iterating the built pipe
             // objects. Not in a state machine, whose iterator must live
             // on the frame to survive yield/await re-entry - those fall
-            // through to the normal loop below.
+            // through to the normal loop below. A loop in expression
+            // position also takes the normal path: its result-value
+            // convergence hangs off this method's shape.
             if
+                !`for.want_value /\
                 `for.fusion? /\
                 !Semantic.Symbols.state_machine_for(current_function)? /\
                 !Semantic.Symbols.async_state_machine_for(current_function)?
@@ -349,8 +393,39 @@ namespace Syntax.Process is
                 return;
             fi
 
+            let loop = _loops.enter_loop(`for);
+
+            let value_block: Values.BLOCK? mut = null;
+
+            if `for.want_value /\ `for.value? then
+                if isa Values.BLOCK(`for.value!) then
+                    value_block = cast Values.BLOCK(`for.value);
+                    loop.wants_value = true;
+                    loop.result_type = `for.value!.type;
+                fi
+            fi
+
+            let spiller = COMPOSITE_VALUE_SPILLER(self, `for, `for.value, _current_state_machine_frame());
+
+            spiller.enter();
+
+            // The brancher binds to the block current NOW — after the
+            // capture switch, so the loop's labels and branches land in
+            // the same stream as its body.
             let brancher = get_brancher_for_block();
-            let loop = _loops.enter_loop();
+
+            // Breaks emit during the body walk, so every label and
+            // slot they reach is allocated before it.
+            if let vb = value_block, rt = loop.result_type then
+                if spiller.is_spilling then
+                    loop.spill_field = spiller.spill_field;
+                else
+                    loop.cross_try_temp = TEMP(vb, "loop_cross_try", rt);
+                    loop.cross_try_join = LABEL();
+                fi
+
+                loop.result_label = LABEL();
+            fi
 
             let expression = `for.expression!;
             let variable = `for.variable!;
@@ -424,7 +499,13 @@ namespace Syntax.Process is
 
             brancher.label(loop.end);
 
+            if let vb = value_block, rt = loop.result_type then
+                _gen_loop_result(loop, rt!, spiller);
+            fi
+
             super.visit(`for);
+
+            spiller.leave();
 
             _loops.leave_loop();
         si
@@ -555,6 +636,28 @@ namespace Syntax.Process is
         // the next element), then bind the loop variable and run the
         // body. The built MAP_PIPE / FilterPipe / INDEX_PIPE objects and
         // their per-element virtual dispatch are never emitted.
+        // Convergence for a loop used as an expression (see LOOP_
+        // LABELS): the natural exit yields absence; valued breaks
+        // arrive having pushed or stored their value; a cross-try
+        // join reloads the stashed temp. One result-typed value is
+        // available to the consumer afterwards. The result label was
+        // allocated at loop entry — breaks target it from inside the
+        // body walk.
+        _gen_loop_result(loop: LOOP_LABELS, result_type: Semantic.Types.Type, spiller: COMPOSITE_VALUE_SPILLER) is
+            let brancher = get_brancher_for_block();
+            let result = loop.result_label!;
+
+            spiller.emit_value(IR.Values.DEFAULT(result_type));
+            brancher.branch(result);
+
+            if loop.cross_try_used then
+                brancher.label(loop.cross_try_join!);
+                add(loop.cross_try_temp!.load());
+            fi
+
+            brancher.label(result);
+        si
+
         _visit_fused_for(`for: Statements.FOR) is
             let fusion = `for.fusion!;
             let source = fusion.source;
@@ -562,7 +665,7 @@ namespace Syntax.Process is
             let body = `for.body!;
 
             let brancher = get_brancher_for_block();
-            let loop = _loops.enter_loop();
+            let loop = _loops.enter_loop(`for);
 
             // Iterate the source directly - the wrapping pipe objects are
             // never built. read_iterator is null when the source is its
@@ -650,7 +753,7 @@ namespace Syntax.Process is
             let expression = `for.expression!;
 
             let brancher = get_brancher_for_block();
-            let loop = _loops.enter_loop();
+            let loop = _loops.enter_loop(`for);
 
             let bool_type = _innate_symbol_lookup.get_bool_type();
             let element_type = `for.read_current!.return_type!;
