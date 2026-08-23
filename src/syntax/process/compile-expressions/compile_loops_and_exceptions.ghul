@@ -1,6 +1,8 @@
 namespace Syntax.Process is
     use Logging;
 
+    use Semantic.LEAST_UPPER_BOUND_MAP;
+
     // Compiles `while` / `do` loops and `try` / `catch` statements,
     // and the flow-sensitive narrowing around them. Split out of
     // COMPILE_EXPRESSIONS, which delegates the matching pre / visit
@@ -341,6 +343,189 @@ namespace Syntax.Process is
             body.walk(finder);
 
             return finder.found;
+        si
+
+        // --- loop-as-expression value machinery ---
+
+        push_loop_value_frame(
+            node: Trees.Statements.Statement,
+            label_name: string?,
+            wants_value: bool,
+            expected_type: Semantic.Types.Type?,
+            expected_type_error_message: string?
+        ) is
+            let frame = LOOP_VALUE_FRAME(node, label_name, wants_value, expected_type, expected_type_error_message);
+
+            _visitor.loop_value_frames.add(frame);
+        si
+
+        // The innermost open loop frame that consumes a value — the
+        // target of a valued `break`. Intermediate loops that are not
+        // expressions are exited through: the value needs a taker, so
+        // the search skips frames whose loop discards its result.
+        // Null when no enclosing loop is an expression.
+        innermost_consuming_frame() -> LOOP_VALUE_FRAME? is
+            let frames = _visitor.loop_value_frames;
+
+            let i mut = frames.count - 1;
+
+            while i >= 0 do
+                let frame = frames[i];
+
+                if frame.wants_value then
+                    return frame;
+                fi
+
+                i = i - 1;
+            od
+
+            return null;
+        si
+
+        // The innermost open loop frame, for a `break` that names no
+        // label. Null outside any loop.
+        current_loop_frame() -> LOOP_VALUE_FRAME? is
+            let frames = _visitor.loop_value_frames;
+
+            if frames.count == 0 then
+                return null;
+            fi
+
+            return frames[frames.count - 1];
+        si
+
+        // The open loop frame whose label is `name`, innermost first.
+        // Null when no enclosing labelled loop carries that name.
+        find_labelled_loop_frame(name: string) -> LOOP_VALUE_FRAME? is
+            let frames = _visitor.loop_value_frames;
+
+            let i mut = frames.count - 1;
+
+            while i >= 0 do
+                let frame = frames[i];
+
+                if frame.label_name? /\ frame.label_name! =~ name then
+                    return frame;
+                fi
+
+                i = i - 1;
+            od
+
+            return null;
+        si
+
+        // Pops the innermost frame (which must be `node`'s) and settles
+        // the loop's expression value: the optional-wrapped LUB of every
+        // valued-break contribution. With an expected type and no
+        // contributions the loop yields absence everywhere, so the
+        // expected type stands. With neither, the type cannot be
+        // inferred.
+        pop_and_settle_loop_value(node: Trees.Statements.Statement) is
+            let frames = _visitor.loop_value_frames;
+
+            assert frames.count > 0 else "loop value frame underflow";
+
+            let frame = frames[frames.count - 1];
+
+            assert frame.node == node else "loop value frame head is not the loop being visited";
+
+            frames.remove_at(frames.count - 1);
+
+            // A valued break under a loop that consumes nothing was
+            // already reported at the break itself; nothing to settle.
+            if !frame.wants_value then
+                return;
+            fi
+
+            if frame.contributions.count == 0 then
+                if frame.expected_type? then
+                    node.compile_expressions_state.value = IR.Values.BLOCK(frame.expected_type!);
+                else
+                    _logger.error(node.location, "cannot infer the type of this loop; give the loop a type or break with a value");
+                fi
+
+                return;
+            fi
+
+            let lub = LEAST_UPPER_BOUND_MAP();
+
+            for t in frame.contributions do
+                if !t.is_error then
+                    lub.add(t);
+                fi
+            od
+
+            // No usable contributions fall back to the expected type;
+            // with neither, the loop's type cannot be inferred.
+            let settled = lub.get_result() ?? frame.expected_type;
+
+            if !settled? then
+                _logger.error(node.location, "cannot infer the type of this loop");
+                return;
+            fi
+
+            // Exhaustion contributes genuine absence, so the loop's
+            // result always widens: NULLABLE[T] for a value type,
+            // MAYBE[T] (where the runtime assembly is available) for an
+            // unconstrained type parameter, the flagged reference
+            // optional otherwise. An already-optional LUB stands.
+            let inner = settled!;
+            let result_type mut = inner;
+
+            if !inner.is_optional then
+                if inner.is_type_variable then
+                    result_type = _innate_symbol_lookup.get_maybe_type(inner) ?? inner.as_optional();
+                elif inner.is_value_type then
+                    result_type = _innate_symbol_lookup.get_optional_type(inner);
+                else
+                    result_type = inner.as_optional();
+                fi
+            fi
+
+            node.compile_expressions_state.value = IR.Values.BLOCK(result_type);
+
+            _visitor.declare_composite_spill_field_for(node, node.compile_expressions_state.value);
+        si
+    si
+
+    // One open loop's value bookkeeping: what its valued `break`s
+    // contribute, whether anything consumes the result, and the label
+    // name when the loop is written under a LABELLED wrapper. Lives on
+    // COMPILE_EXPRESSIONS.loop_value_frames for the walk's duration.
+    class LOOP_VALUE_FRAME is
+        node: Trees.Statements.Statement;
+        label_name: string?;
+        wants_value: bool;
+        expected_type: Semantic.Types.Type?;
+        expected_type_error_message: string?;
+        contributions: Collections.MutableList[Semantic.Types.Type];
+        has_valued_break: bool public;
+        valued_break_location: Source.LOCATION? public;
+
+        init(
+            node: Trees.Statements.Statement,
+            label_name: string?,
+            wants_value: bool,
+            expected_type: Semantic.Types.Type?,
+            expected_type_error_message: string?
+        ) is
+            self.node = node;
+            self.label_name = label_name;
+            self.wants_value = wants_value;
+            self.expected_type = expected_type;
+            self.expected_type_error_message = expected_type_error_message;
+            self.contributions = Collections.LIST[Semantic.Types.Type]();
+            self.has_valued_break = false;
+            self.valued_break_location = null;
+        si
+
+        note_contribution(type: Semantic.Types.Type, location: Source.LOCATION) is
+            contributions.add(type);
+
+            if !has_valued_break then
+                has_valued_break = true;
+                valued_break_location = location;
+            fi
         si
     si
 si

@@ -984,6 +984,48 @@ od
 
 A `break` or `continue` that names no enclosing labelled loop is a compile error.
 
+### loops as expressions
+
+Every loop form is also an expression of optional type `T?`. A `break E` exits the loop producing a value; falling off the end — a false condition, an exhausted iterator — produces the absent value:
+
+```ghul
+let found: int? = for x in xs do
+    if pred(x) then break x fi;
+od;
+
+if let hit: int = found then
+    write_line("found {hit}");
+fi
+```
+
+The loop's type is the least upper bound of every valued break, wrapped in `?`. Exhaustion and `break null` are indistinguishable, and a bare `break` exits without a value — all three yield absence:
+
+```ghul
+let name: string? = while remaining do
+    let line = read_line();
+
+    if !line? then break null fi;      // same as falling off the end
+    if is_interesting(line) then break line fi;
+od;
+```
+
+When the context already expects an optional — a typed `let`, a call argument, a return — the loop's element type comes from it, and break expressions infer against the unwrapped type like any other expression in that position.
+
+A valued `break` delivers to the innermost enclosing loop *that consumes a value*. Loops that are not expressions are exited through on the way, so one break can carry a value out of several nested loops to the loop whose value it feeds:
+
+```ghul
+let hit: (int, int)? =
+    for x in rows do
+        for y in cols do
+            if good(x, y) then break (x, y) fi;
+        od;
+    od;
+```
+
+A valued break with no consuming loop anywhere around it is a compile error, the same as returning a value from a void function.
+
+Labels belong to the statement forms: a loop carrying a `label:` prefix cannot also sit in expression position. For long-range exits out of deeply nested control flow, `val ... lav` with its targeted returns remains available.
+
 A `while` condition narrows the loop body the same way an `if` condition narrows its then-arm. `while xs? /\ i < xs.count do xs[i] …` reads `xs` at its non-optional type inside the body, and `while isa CAT(a) do a.purr() od` calls a `CAT`-only member without an inner cast.
 
 `while let` is the loop counterpart of `if let`: the loop runs while the refutable clause matches, with the declared names freshly in scope on each iteration. The same shapes work — bare presence (`while let line = reader.read_line() do …`), type ascription (`while let c: CAT = a do …`), destructure, `/\` guards (`while let c: CAT = a /\ c.has_whiskers do …`), and comma-separated multi-clause bindings (`while let x = a, y = b do …`) where every clause must succeed each iteration. Loop exit is whenever any clause's test or guard fails.
