@@ -819,7 +819,43 @@ write_line(pet.bark());   // pet is DOG here
 
 A null right-hand side contributes only the presence fact, a value-type right-hand side does not narrow (a wider slot holds the boxed value, not the bare struct), and a tuple-typed value keeps the declared spelling so named elements stay reachable. When branches assign different types, the views join back to the common ancestor after the `fi`.
 
-Narrowing applies to local variables (including a function's own parameters), to `self` - an `isa`, `if let`, or destructure on `self` narrows it in place, so a method (typically in an [`impl` block](#partial-and-impl-blocks)) can match its own concrete type or a union's variants without first copying `self` into a local; because `self` is never reassigned its narrow is never dropped by reassignment - to fields, to properties, and to member-access paths built from those pieces. Both the presence and type domains lift: after `if x.y? then`, a repeated `x.y` reads at its non-optional type; after `if isa CAT(x.y) then`, a repeated `x.y` reads at `CAT`, so `x.y.purr()` type-checks. `if let p: CAT = x.y` narrows the same way. The else edge narrows to the complement when the receiver is a closed hierarchy (a two-variant union collapses to the sibling variant; a closed class hierarchy eliminates the tested subclass from the in-set), so `if isa CAT(x.y) then x.y.purr() else x.y.bark() fi` type-checks on both arms when `x.y` is a closed `Animal`. Sibling / class-and-trait narrows on a path compose via intersection: after `if isa Purring(x.y)`, `x.y` exposes both `Animal` members and `Purring` members. Every hop must be a field or a property. The facts differ in how long they last. A local's narrow holds until the local is reassigned; the assignment then re-narrows to the new value's static type when that is strictly more specific, and otherwise leaves the local at its declared type. Direct stores are tracked precisely: a field's fact drops at an assignment to that same field through any receiver - the written receiver may alias the one the fact was proven on - a property's fact drops at any assignment to a field, property or element, because its getter may read anything the assignment changed, and a path fact drops at a store to anything it reads through, or when its root is reassigned.
+Narrowing applies to local variables (including a function's own parameters), except one a function literal assigns - see below - to `self` - an `isa`, `if let`, or destructure on `self` narrows it in place, so a method (typically in an [`impl` block](#partial-and-impl-blocks)) can match its own concrete type or a union's variants without first copying `self` into a local; because `self` is never reassigned its narrow is never dropped by reassignment - to fields, to properties, and to member-access paths built from those pieces. Both the presence and type domains lift: after `if x.y? then`, a repeated `x.y` reads at its non-optional type; after `if isa CAT(x.y) then`, a repeated `x.y` reads at `CAT`, so `x.y.purr()` type-checks. `if let p: CAT = x.y` narrows the same way. The else edge narrows to the complement when the receiver is a closed hierarchy (a two-variant union collapses to the sibling variant; a closed class hierarchy eliminates the tested subclass from the in-set), so `if isa CAT(x.y) then x.y.purr() else x.y.bark() fi` type-checks on both arms when `x.y` is a closed `Animal`. Sibling / class-and-trait narrows on a path compose via intersection: after `if isa Purring(x.y)`, `x.y` exposes both `Animal` members and `Purring` members. Every hop must be a field or a property. The facts differ in how long they last. A local's narrow holds until the local is reassigned; the assignment then re-narrows to the new value's static type when that is strictly more specific, and otherwise leaves the local at its declared type. Direct stores are tracked precisely: a field's fact drops at an assignment to that same field through any receiver - the written receiver may alias the one the fact was proven on - a property's fact drops at any assignment to a field, property or element, because its getter may read anything the assignment changed, and a path fact drops at a store to anything it reads through, or when its root is reassigned.
+
+One local is left out entirely: a local that a function literal
+assigns. Such a local does not live on the stack - the closure body
+and the enclosing scope share one cell - so invoking the closure
+rewrites it where the enclosing scope cannot see, and a narrowed view
+taken before the call would already be wrong. No fact is formed on
+one, in either domain, whether or not the closure is ever invoked: the
+value keeps its declared type throughout, so a presence test does not
+make it non-optional and an `isa` test does not reach a subtype's
+members. A local the enclosing scope alone assigns is unaffected -
+those writes are on the path the narrowing already follows.
+
+```ghul
+let s: string? mut = get();
+
+let clear = () -> void is
+    s = null;
+si;
+
+if s? then
+    clear();
+
+    write_line("{s.length}");    // warns: s may not hold a value here
+fi
+```
+
+To narrow such a value, name it: `if let` declares a fresh local,
+which no closure can reach, and that local narrows as any other does.
+
+```ghul
+if let present = s then
+    clear();
+
+    write_line("{present.length}");
+fi
+```
 
 Calls are handled optimistically. A call drops nothing: each call that could store to the heap is recorded against every heap fact live across it, and what is checked is each later *use* of the value - and only a use that actually leans on the fact. A use the un-narrowed type already satisfies leans on nothing and is never flagged: passing the value where the wider or optional type is accepted, interpolating it, comparing it. A use only the narrowed view supports is judged against the recorded calls, and when the compiler cannot prove a call left the fact alone, the report matches what the emitted code would do if the fact were false: passing the value where only the non-optional or narrower type is accepted is a compile error at the use site, naming the call, and reading a member through it draws the `null-deref` warning - the same hazard reading through an un-narrowed optional already carries. The fix is what the message says: test the value again, or copy it into a local variable before the call - a local is unreachable to any callee, so its facts survive every call. Re-observing the value is never flagged, whatever calls came before: a presence test, an unwrap `!`, a coalescing `?.`, an `isa` test and an `if let` all check the value at run time, and each re-establishes the fact it tests. For the same reason the redundancy warnings (`redundant-unwrap`, `redundant-presence-test`, `redundant-coalesce`) fire only when every recorded call is proven harmless - an `!` covering an unproven call is load-bearing, not redundant. So `if _f? /\ mutate() then` enters its branch with `_f` still narrowed but unproven: passing `_f` where a non-optional `string` is required there is an error, `_f.length` draws the warning, and `_f!.length` is silent.
 
