@@ -196,7 +196,7 @@ let p = primes[2];                      // indexing, 0-based
 
 The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, or a call argument's parameter type.
 
-Indexing with a **range** takes a window over the source rather than a single element. `..` and `::` count both endpoints from the start, as they do everywhere else; `..<` and `::<` count the end back from the end of the source, and `..<<` and `::<<` count both endpoints back. The number of `<` says how many endpoints are counted back, filling from the right. `<0` is the length, so `a..<0` runs from `a` to the end:
+Indexing with a **range** takes a slice of the source rather than a single element. `..` and `::` count both endpoints from the start, as they do everywhere else; `..<` and `::<` count the end back from the end of the source, and `..<<` and `::<<` count both endpoints back. The number of `<` says how many endpoints are counted back, filling from the right. `<0` is the length, so `a..<0` runs from `a` to the end:
 
 ```ghul
 let xs = [10, 20, 30, 40, 50];
@@ -207,7 +207,7 @@ xs[1..<0];       // 20, 30, 40, 50 — to the end
 xs[3..<<0];      // 30, 40, 50   — the last three
 ```
 
-The window is a `Collections.List[E]` over the source, so nothing is copied and a later change to a mutable source shows through. Arrays, strings and anything that satisfies `Collections.List[E]` can be indexed this way; a string gives back a string, since there is no non-copying substring to hand out. A range index is a read: there is no window to assign through. A type may also declare its own `[r: System.Range]` indexer, which is used in preference.
+The slice is a `Collections.List[E]` over the source, so nothing is copied and a later change to a mutable source shows through. Arrays, strings and anything that satisfies `Collections.List[E]` can be indexed this way; a string gives back a string, since there is no non-copying substring to hand out. A range index is a read: there is no slice to assign through. A type may also declare its own `[r: System.Range]` indexer, which is used in preference.
 
 The from-the-end operators build a `System.Range`, whose endpoints are only resolvable against a length, so unlike `..` and `::` they are not iterable — `for i in 1..<1 do` is rejected.
 
