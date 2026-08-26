@@ -56,6 +56,8 @@ A source file with no namespace declarations has its definitions placed in a com
 
 A namespace-less file may also carry bare statements at the file root. They run, in source order, as the program's entry point — so a short program needs no `entry` function — and may be interleaved with global definitions, which are visible regardless of where they appear. A file cannot both carry top-level statements and declare a namespace.
 
+The top-level statements are collected into a synthesised entry-point function, and a `let` among them declares a local variable of that function: visible to the top-level statements after it, but not inside a function defined in the same file, which is a separate scope. To share a value with functions, declare a global variable — a namespace-scope name and type, without `let` — and assign it from a top-level statement.
+
 The `use` statement brings names into scope so they can be referred to without qualification. Applied to a namespace it imports every public symbol; applied to a single symbol it imports just that one:
 
 ```ghul
