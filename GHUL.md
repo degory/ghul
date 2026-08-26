@@ -196,6 +196,21 @@ let p = primes[2];                      // indexing, 0-based
 
 The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, or a call argument's parameter type.
 
+Indexing with a **range** takes a window over the source rather than a single element. `..` and `::` count both endpoints from the start, as they do everywhere else; `..<` and `::<` count the end back from the end of the source, and `..<<` and `::<<` count both endpoints back. The number of `<` says how many endpoints are counted back, filling from the right. `<0` is the length, so `a..<0` runs from `a` to the end:
+
+```ghul
+let xs = [10, 20, 30, 40, 50];
+
+xs[1..3];        // 20, 30
+xs[1..<1];       // 20, 30, 40   — up to one back from the end
+xs[1..<0];       // 20, 30, 40, 50 — to the end
+xs[3..<<0];      // 30, 40, 50   — the last three
+```
+
+The window is a `Collections.List[E]` over the source, so nothing is copied and a later change to a mutable source shows through. Arrays, strings and anything that satisfies `Collections.List[E]` can be indexed this way; a string gives back a string, since there is no non-copying substring to hand out. A range index is a read: there is no window to assign through. A type may also declare its own `[r: System.Range]` indexer, which is used in preference.
+
+The from-the-end operators build a `System.Range`, whose endpoints are only resolvable against a length, so unlike `..` and `::` they are not iterable — `for i in 1..<1 do` is rejected.
+
 A **tuple** groups two or more values of possibly different types — a single-element tuple is rejected, and a tuple has at most 7 elements. Tuple types and literals both use parentheses; elements may be named, and an unnamed element is named with a backtick and its index. Tuples are immutable, compare by structural equality, nest, and can be destructured:
 
 ```ghul
@@ -1007,7 +1022,7 @@ for (key, value) in dictionary do
 od
 ```
 
-Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5).
+Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5). The from-the-end forms (`..<`, `::<`, `..<<`, `::<<`) are for indexing rather than iteration — see [arrays](#types-and-literals).
 
 Any loop (`for`, `while`, `do`) can be labelled by prefixing it with an identifier and a colon, and `break` and `continue` can then name the loop they act on, letting an inner loop exit or advance an outer one:
 
