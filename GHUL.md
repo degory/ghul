@@ -293,6 +293,8 @@ let apply_twice = (f: int -> int, i) => f(f(i));
 let factorial = n rec => if n == 0 then 1 else n * rec(n - 1) fi;
 ```
 
+A block-bodied function literal that declares its return type ends on a tail exactly as a named function does: a final statement written without its `;` is the value the literal returns on fall-through. A literal that leaves its return type to be inferred does not, and its last statement stays an ordinary statement, so such a literal returns through `return` alone.
+
 A function literal's parameter can be a destructure pattern too, written in its own parentheses inside the parameter list — the outer parentheses are the parameter list, the inner ones the pattern. It is one parameter, unpacked into the names the body uses, exactly as for a named function:
 
 ```ghul
@@ -1385,6 +1387,17 @@ total[T: INumber[T]](a: T, b: T) -> T => a + b;
 
 Without that `use` the operator is not in scope and `a + b` does not resolve, so nothing changes for code that does not ask for it — importing one does not displace the built-in operators either, and `3 + 4` still adds two `int`s the way it always did.
 
+A type parameter is not the only thing the import reaches. Any type that implements the interface can use the operator, so a concrete .NET numeric type with no built-in operator of its own gets one from the same `use`:
+
+```ghul
+use System.Int128;
+use System.Numerics.IAdditionOperators.`+;
+
+let two = Int128.one + Int128.one;
+```
+
+The same holds for a static member imported by name rather than reached through a type parameter, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on a concrete implementing type alike.
+
 The arithmetic operators `+`, `-`, `*`, `/` and `%` can be imported this way, and so can the bitwise and shift operators `&`, `|`, `^`, `\`, `<<`, `>>` and `>>>`. The comparison and equality operators cannot: a type says how it orders and compares by defining `<>` and `=~`, and those are what the operators are written in terms of. Each operator is imported from the interface that *declares* it, which for the shifts is `IShiftOperators` however the bound is spelled:
 
 ```ghul
@@ -1413,6 +1426,15 @@ let r: RESULT[int, string] = RESULT.OK(42);  // OK's arg pins T = int;
 ```
 
 When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
+
+A generic function or method named with its type arguments but no argument list is a *value* at that instantiation, the same way a non-generic name in value position is. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
+
+```ghul
+identity[T](x: T) -> T => x;
+
+let f = identity[int];              // (int) -> int
+let g: (string) -> string = identity[string];
+```
 
 ## type inference
 
