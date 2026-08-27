@@ -1390,10 +1390,10 @@ Without that `use` the operator is not in scope and `a + b` does not resolve, so
 A type parameter is not the only thing the import reaches. Any type that implements the interface can use the operator, so a concrete .NET numeric type with no built-in operator of its own gets one from the same `use`:
 
 ```ghul
-use System.Numerics.BigInteger;
+use System.Int128;
 use System.Numerics.IAdditionOperators.`+;
 
-let two = BigInteger.one + BigInteger.one;
+let two = Int128.one + Int128.one;
 ```
 
 The same holds for a static member imported by name rather than reached through a type parameter, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on a concrete implementing type alike.
