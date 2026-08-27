@@ -68,6 +68,33 @@ use Console = IO.Std;             // import under a different name
 
 A `use` applies only within the current namespace block — if a namespace is split across blocks or files, each block needs its own `use` statements.
 
+A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
+
+```ghul
+use IndexedString = (index: int, value: string);
+use Handler = (int) -> void;
+use Names = string[];
+use MaybeName = string?;
+use Numbers = Collections.LIST[int];
+```
+
+An alias is a spelling for the type it names, not a type of its own, so the two are interchangeable in both directions: a `(index: int, value: string)` value is an `IndexedString` and an `IndexedString` is accepted wherever the tuple type is. That holds for every kind of target, so nothing that already accepts the underlying type has to learn about the alias. Constructing through an alias constructs what it names, so `Numbers()` builds a `Collections.LIST[int]`.
+
+An alias can take type parameters, which its target uses like any other type parameter:
+
+```ghul
+use Pair[A, B] = (first: A, second: B);
+use StringMap[V] = Collections.MAP[string, V];
+
+swap[A, B](p: Pair[A, B]) -> Pair[B, A] => (first = p.second, second = p.first);
+```
+
+`StringMap` names `MAP` with its first type argument already supplied, which nothing else in the language can express. Aliases can be written in terms of each other (`use IntPair = Pair[int, int];`) in any order, since an alias is resolved wherever it is first named rather than where it is written.
+
+Because an alias is transparent, it cannot be defined in terms of itself — directly or through other aliases — since the type it stands for would have no end. Such a definition is reported as an error; a type that refers to itself is a `class` or a `union`, both of which are types in their own right.
+
+An alias is scoped like any other `use`: it belongs to the namespace block it is written in, and a block elsewhere that wants the same shorthand declares it again. Consumers are unaffected either way, since a signature written with an alias is a signature written in the type it names.
+
 ## variables
 
 See <https://ghul.dev/definitions.html#variables>.
