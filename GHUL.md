@@ -293,6 +293,8 @@ let apply_twice = (f: int -> int, i) => f(f(i));
 let factorial = n rec => if n == 0 then 1 else n * rec(n - 1) fi;
 ```
 
+A block-bodied function literal that declares its return type ends on a tail exactly as a named function does: a final statement written without its `;` is the value the literal returns on fall-through. A literal that leaves its return type to be inferred does not, and its last statement stays an ordinary statement, so such a literal returns through `return` alone.
+
 A function literal's parameter can be a destructure pattern too, written in its own parentheses inside the parameter list — the outer parentheses are the parameter list, the inner ones the pattern. It is one parameter, unpacked into the names the body uses, exactly as for a named function:
 
 ```ghul
