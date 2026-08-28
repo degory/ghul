@@ -14,6 +14,7 @@ namespace Syntax.Process is
         _symbol_table: Semantic.SYMBOL_TABLE;
         _symbol_use_locations: Semantic.SYMBOL_USE_LOCATIONS;
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup;
+        _alias_clauses: Collections.MAP[Semantic.Symbols.TYPE_ALIAS, Trees.Definitions.USE];
 
         init(
             logger: Logger,
@@ -29,9 +30,12 @@ namespace Syntax.Process is
             _symbol_table = symbol_table;
             _symbol_use_locations = symbol_use_locations;
             _innate_symbol_lookup = innate_symbol_lookup;
+            _alias_clauses = Collections.MAP[Semantic.Symbols.TYPE_ALIAS, Trees.Definitions.USE]();
         si
 
         apply(root: Trees.Node) is
+            _alias_clauses.clear();
+
             root.walk(self);
         si
 
@@ -48,10 +52,129 @@ namespace Syntax.Process is
             return false;
         si
 
+        // Registers the block's type alias clauses so that one named
+        // before its own clause is reached can be resolved on demand.
+        pre(`namespace: Trees.Definitions.NAMESPACE) -> bool is
+            let result = super.pre(`namespace);
+
+            for u in `namespace.body.uses do
+                if let u.alias_symbol? then
+                    _alias_clauses[alias_symbol] = u;
+                fi
+            od
+
+            return result;
+        si
+
+        // A type alias is resolved when the walk reaches its clause, or
+        // earlier if something names it first, so its type parameters are
+        // brought into scope here rather than by the ordinary walk.
+        pre(u: Trees.Definitions.USE) -> bool is
+            if u.is_alias then
+                _resolve_alias(u);
+            fi
+
+            return true;
+        si
+
+        _resolve_alias(u: Trees.Definitions.USE) is
+            if let alias = u.alias_symbol, target = u.target then
+                _resolve_alias_target(alias, target);
+            fi
+        si
+
+        _resolve_alias_target(
+            alias: Semantic.Symbols.TYPE_ALIAS,
+            target: Trees.TypeExpressions.TypeExpression
+        ) is
+            if alias.target_type? then
+                return;
+            fi
+
+            if alias.is_resolving then
+                _logger.error(target.location, "type alias {alias.name} is defined in terms of itself");
+
+                alias.set_target_type(Semantic.Types.ERROR());
+
+                return;
+            fi
+
+            alias.is_resolving = true;
+
+            try
+                enter_scope(alias);
+
+                try
+                    target.walk(self);
+                finally
+                    leave_scope(alias);
+                yrt
+            finally
+                alias.is_resolving = false;
+            yrt
+
+            alias.set_target_type(target.type ?? Semantic.Types.ERROR());
+        si
+
+        // Expands a name that resolved to a type alias. Returns the type
+        // the alias stands for, with a generic alias's own parameters
+        // substituted by the supplied arguments.
+        _expand_alias(
+            location: Source.LOCATION,
+            name: Trees.Identifiers.Identifier,
+            alias: Semantic.Symbols.TYPE_ALIAS,
+            arguments: Collections.List[Type]
+        ) -> Type is
+            _symbol_use_locations.add_symbol_use(name.right_location, alias);
+
+            let clause: Trees.Definitions.USE mut;
+
+            if _alias_clauses.try_get_value(alias, clause ref) then
+                _resolve_alias(clause);
+            fi
+
+            if alias.argument_count != arguments.count then
+                if alias.argument_count == 0 then
+                    _logger.error(location, "type alias {alias.name} takes no type arguments");
+                else
+                    _logger.error(
+                        location,
+                        "expected {alias.argument_count} type arguments but found {arguments.count}"
+                    );
+                fi
+
+                return Semantic.Types.ERROR();
+            fi
+
+            let target = alias.target_type;
+
+            if !target? then
+                return Semantic.Types.ERROR();
+            fi
+
+            if arguments.count == 0 then
+                return target;
+            fi
+
+            return target.specialize(alias.argument_map(arguments));
+        si
+
         visit(named: Trees.TypeExpressions.NAMED) is
             named.type = null;
 
             let symbol mut = find(named.name);
+
+            if isa Semantic.Symbols.TYPE_ALIAS(symbol) then
+                named.type =
+                    _expand_alias(
+                        named.name.location,
+                        named.name,
+                        symbol,
+                        Collections.LIST[Type](0)
+                    );
+
+                return;
+            fi
 
             let group = cast Semantic.Symbols.TYPE_GROUP?(symbol);
 
@@ -101,10 +224,36 @@ namespace Syntax.Process is
             element.type_expression.accept(self);
         si
 
+        _argument_types(generic: Trees.TypeExpressions.GENERIC) -> Collections.LIST[Type] is
+            let result = Collections.LIST[Type]();
+
+            for a in generic.arguments do
+                if a.type? then
+                    result.add(a.type);
+                else
+                    result.add(Semantic.Types.ERROR());
+                fi
+            od
+
+            return result;
+        si
+
         visit(generic: Trees.TypeExpressions.GENERIC) is
             generic.type = null;
 
             let symbol mut = find(generic.name);
+
+            if isa Semantic.Symbols.TYPE_ALIAS(symbol) then
+                generic.type =
+                    _expand_alias(
+                        generic.location,
+                        generic.name,
+                        symbol,
+                        _argument_types(generic)
+                    );
+
+                return;
+            fi
 
             let group = cast Semantic.Symbols.TYPE_GROUP?(symbol);
 
