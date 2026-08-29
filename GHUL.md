@@ -95,6 +95,19 @@ Because an alias is transparent, it cannot be defined in terms of itself — dir
 
 An alias is scoped like any other `use`: it belongs to the namespace block it is written in, and a block elsewhere that wants the same shorthand declares it again. Consumers are unaffected either way, since a signature written with an alias is a signature written in the type it names.
 
+## statement terminators
+
+Statements and simple declarations end with `;`, but the terminator can be left off at the end of a line: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred, and the compiler reports it under the `missing-semicolon` warning slug — suppress the slug in a project written in the terminator-free style, or write the terminators and never see it. Two statements on one line still need the `;` between them.
+
+A handful of rules keep multi-line expressions unambiguous, and they codify the conventional wrapping style rather than restricting it:
+
+- A line that opens with `.`, `|`, or `|>` continues the expression above it — member chains, pipes and thread-first chains hang exactly as they always have.
+- A line that opens with `(`, `[`, or an operator starts something new — a destructure assignment `(a, b) = …`, the next declaration, a prefix `!` — and never glues to the line above as a call, an index, or an infix operand. Wrapped operator expressions put the operator at the end of the line (`a +` then the newline, not the newline then `+ a`).
+- A bare `return` at the end of a line is a void return when the next line opens with a closing keyword (`fi`, `si`, `od`, …), and otherwise takes the next line's expression as its value. The two readings never compete: a statement written directly after a `return` in the same block would be unreachable, so a following line that starts an expression can only sensibly be the return's value, and a `return` that ends its branch is followed by the closing keyword, which keeps it void.
+- In a parenthesised group, a top-level `,` commits the tuple reading and an inferred boundary commits the block reading, exactly as a written `;` does. An operator-headed line after a compound statement keeps the expression reading, as it does with terminators written; give the block reading a `;` after the closing keyword.
+
+The terminator at the end of a body keeps its meaning from implicit tail returns: in a non-void body, a final statement written without `;` is the return value, and with `;` a discarded statement — inference never touches that position, so the choice stays the author's.
+
 ## variables
 
 See <https://ghul.dev/definitions.html#variables>.
