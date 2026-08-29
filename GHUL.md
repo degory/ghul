@@ -298,7 +298,7 @@ si
 
 A named function's signature is fully explicit: every argument has a written type, and so does the return — written after `->`, or the `->` left off to make the function `void`. The compiler infers no part of a named function's or method's signature.
 
-A block body produces its value with an explicit `return`, or by ending on a bare expression: a final statement that reaches the body's closing keyword without a terminating `;` is the function's return value on the fall-through path. An expression qualifies, and so do an `if`/`case` expression and a `val ... lav` block. The trailing `;` decides between the two readings, so a tail whose type does not match the declared return type is an error at the tail; writing the semicolon turns it back into an ordinary statement whose value is discarded. An asynchronous function accepts a bare-`T` value as its tail exactly where it accepts `return T`. A guard `if` without `else` delivers nothing on its fall-through path and cannot stand as a tail; appending the `;` there restores the statement reading, which falls off the end and draws a `definite-return` warning instead. Loops, `let`, assignments and `assert` never provide a tail value, and neither do labelled statements or `try` blocks (until `try` has an expression form). Reaching the end of a non-void function any other way returns the default value of the return type and draws a `definite-return` warning. Void bodies tolerate any tail: whatever is left standing at the end of a void method is discarded, whether or not it was terminated with a semicolon. Generators are exempt from all of this: their fall-through signals end of stream.
+A block body produces its value with an explicit `return`, or by ending on a bare expression: a final statement that reaches the body's closing keyword without a terminating `;` is the function's return value on the fall-through path. An expression qualifies, and so do an `if`/`case` expression and a parenthesised block. The trailing `;` decides between the two readings, so a tail whose type does not match the declared return type is an error at the tail; writing the semicolon turns it back into an ordinary statement whose value is discarded. An asynchronous function accepts a bare-`T` value as its tail exactly where it accepts `return T`. A guard `if` without `else` delivers nothing on its fall-through path and cannot stand as a tail; appending the `;` there restores the statement reading, which falls off the end and draws a `definite-return` warning instead. Loops, `let`, assignments and `assert` never provide a tail value, and neither do labelled statements or `try` blocks (until `try` has an expression form). Reaching the end of a non-void function any other way returns the default value of the return type and draws a `definite-return` warning. Void bodies tolerate any tail: whatever is left standing at the end of a void method is discarded, whether or not it was terminated with a semicolon. Generators are exempt from all of this: their fall-through signals end of stream.
 
 Functions are declared at namespace scope — there are no nested function definitions — and may be overloaded on their argument types. There are no default argument values. Execution of a program begins at a function named `entry`, or — in a file with no namespace — at the bare statements written at its file root, which are collected in source order into that entry point. An `entry` function takes either no parameters or a single `string[]` of the command-line arguments, and returns either nothing or an `int` exit status. It should not be asynchronous: an async `entry` returns a task rather than one of those, which draws a warning and leaves the program without an entry point — to run asynchronous work, read `.result` on the returned task. The name can be changed with `--entry <name>`, and an `@entry` pragma marks any function as the entry point regardless of name.
 
@@ -1113,7 +1113,7 @@ let hit: (int, int)? =
 
 A valued break with no consuming loop anywhere around it is a compile error, the same as returning a value from a void function.
 
-Labels belong to the statement forms: a loop carrying a `label:` prefix cannot also sit in expression position. For long-range exits out of deeply nested control flow, `val ... lav` with its targeted returns remains available.
+Labels belong to the statement forms: a loop carrying a `label:` prefix cannot also sit in expression position. For long-range exits out of deeply nested control flow, a parenthesised block with its targeted returns remains available.
 
 A `while` condition narrows the loop body the same way an `if` condition narrows its then-arm. `while xs? /\ i < xs.count do xs[i] …` reads `xs` at its non-optional type inside the body, and `while isa CAT(a) do a.purr() od` calls a `CAT`-only member without an inner cast.
 
@@ -1186,69 +1186,64 @@ A failing guard falls through to the next arm, exactly as if the pattern itself 
 
 An arm's narrowing works like `if let`'s: an ascribed `when v: T` narrows the scrutinee to `T` inside the arm body, and a guard's own test — a `?` presence test or an `isa` — narrows within the body too. Arm narrowing is local; nothing an arm proves reaches a sibling arm or the code after the `case`.
 
-### val ... lav
+### block expressions
 
-`val ... lav` is a block expression: a sequence of statements whose value is the value of the last statement. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
-
-```ghul
-let x = val let y = 5; y * 2 lav;          // x = 10
-let z = val let a = 3; let b = 4; a + b lav;  // z = 7
-let n = val write_line("setup"); 42 lav;   // n = 42
-```
-
-The same block can be written in parentheses: `(statement; statement; value)` is the parenthesised spelling of `val statement; statement; value lav`, and the two are interchangeable everywhere. A parenthesised group commits to the block reading at the first top-level `;` — or immediately, on a token that can only open a statement (`let`, `try`, `return`, ...) — and stays a tuple, a parenthesised expression, or a lambda's formal parameters otherwise. So `(a = f(x), b = g(y))` constructs a named tuple while `(a = f(x); b = g(y); a + b)` runs two assignments and yields the sum; the `,`/`;` is the whole difference, and the elements themselves can be any expression in both. A statement whose expression form already exists keeps it: `(let x = 5 in x * 2)` is the `let ... in` expression, unchanged, while `(let x = 5; x * 2)` is a block with a `let` statement and a tail.
+A parenthesised block `(statement; ...; value)` runs a sequence of statements and evaluates to the value of the last one. Use it in any position that accepts an expression — a `let` initializer, function argument, `=>` body, etc.
 
 ```ghul
 let x = (let y = 5; y * 2);                 // x = 10
+let z = (let a = 3; let b = 4; a + b);      // z = 7
 let n = (write_line("setup"); 42);          // n = 42
 
 let box = BOX();
 let m = (box.v = 7; box.v * 2);             // assignment statement, then the value
 ```
 
+A parenthesised group commits to the block reading at the first top-level `;` — or immediately, on a token that can only open a statement (`let`, `try`, `return`, ...) — and stays a tuple, a parenthesised expression, or a lambda's formal parameters otherwise. So `(a = f(x), b = g(y))` constructs a named tuple while `(a = f(x); b = g(y); a + b)` runs two assignments and yields the sum; the `,`/`;` is the whole difference, and the elements themselves can be any expression in both. A statement whose expression form already exists keeps it: `(let x = 5 in x * 2)` is the `let ... in` expression, unchanged, while `(let x = 5; x * 2)` is a block with a `let` statement and a tail.
+
 A common use is loop-as-expression — fold an iterable into a value with the loop body updating a `mut` accumulator and the tail expression handing back the result:
 
 ```ghul
-let sum_1_to_5 = val
+let sum_1_to_5 = (
     let acc mut = 0;
     for i in 1..6 do
         acc = acc + i;
     od;
     acc
-lav;
+);
 ```
 
 If the last statement does not provide a value (a `let`, `for`, `while`, `assert`, ...), the block is void. Void blocks are accepted in any context that tolerates void — an expression-statement, the `=>` body of a void-returning function. A value-required position (typed `let` initializer, function argument, `=>` body of a value-returning function) requires the last statement to be value-producing, *unless* every reachable path through the body diverges (via `return`, `throw`, or a divergent inner `if`/`case`/`try`) — then the trailing statement is unreachable and the block's value comes from the divergence sites instead.
 
-`return E` inside a `val ... lav` block in expression position exits the **block**, not the enclosing function. The block's value is the least-upper-bound of every `return E` inside it and the tail expression (if any), so an early return can short-circuit out of the block with a value while a different path falls through to the tail. A `null` among those contributions joins as optionality rather than as a type of its own: the other contributors' LUB widens to its optional carrier (`val let s = f(); return s; null lav` over a `string` return is `string?`), an all-null block settles at the type the surrounding context expects when there is one, and draws an error (`all val-block contributions are null`) when there is not. Nesting follows the innermost rule — a `return` inside an inner `val` exits only that inner block, leaving the outer block's walk to continue.
+`return E` inside a block in expression position exits the **block**, not the enclosing function. The block's value is the least-upper-bound of every `return E` inside it and the tail expression (if any), so an early return can short-circuit out of the block with a value while a different path falls through to the tail. A `null` among those contributions joins as optionality rather than as a type of its own: the other contributors' LUB widens to its optional carrier (`(let s = f(); return s; null)` over a `string` return is `string?`), an all-null block settles at the type the surrounding context expects when there is one, and draws an error (`all val-block contributions are null`) when there is not. Nesting follows the innermost rule — a `return` inside an inner block exits only that inner block, leaving the outer block's walk to continue.
 
-A `val ... lav` is fine as the *entire* body of an expression-bodied function/method/lambda (the `=> body`). The innermost-block rule still applies — `return` inside targets the val-block — but the val-block's value flows back out as the function's expression-body value, so observable behaviour matches `is ... si`. `try` / `catch` / `finally` composes the same way as in any function body, including `return` from inside a `try` (the finally fires before the value is delivered), and a body whose every reachable path returns needs no separate value-providing tail:
+A block is fine as the *entire* body of an expression-bodied function/method/lambda (the `=> body`). The innermost-block rule still applies — `return` inside targets the block — but the block's value flows back out as the function's expression-body value, so observable behaviour matches `is ... si`. `try` / `catch` / `finally` composes the same way as in any function body, including `return` from inside a `try` (the finally fires before the value is delivered), and a body whose every reachable path returns needs no separate value-providing tail:
 
 ```ghul
-sign_label(n: int) -> string =>
-    val
-        if n < 0 then
-            return "neg";
-        fi
-        if n == 0 then
-            return "zero";
-        fi
-        "pos"
-    lav;
+sign_label(n: int) -> string => (
+    if n < 0 then
+        return "neg";
+    fi;
+    if n == 0 then
+        return "zero";
+    fi;
+    "pos"
+);
 
-divide_or_default(n: int, d: int) -> int =>
-    val
-        try
-            return n / d;
-        catch e: System.DivideByZeroException
-            return 0;
-        finally
-            log("done");
-        yrt
-    lav;
+divide_or_default(n: int, d: int) -> int => (
+    try
+        return n / d;
+    catch e: System.DivideByZeroException
+        return 0;
+    finally
+        log("done");
+    yrt
+);
 ```
 
-Bare `return;` (no value) is accepted in a void val-block — same rule as `return;` in a void function — and acts as an early exit. In a value-required val-block it is an error.
+Bare `return;` (no value) is accepted in a void block — same rule as `return;` in a void function — and acts as an early exit. In a value-required block it is an error.
+
+`val ... lav` is the historical spelling of the same construct — `val statement; ...; value lav` and `(statement; ...; value)` are interchangeable everywhere — and is headed for removal; write the parenthesised form.
 
 ### exceptions
 
