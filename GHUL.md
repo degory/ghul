@@ -1323,6 +1323,20 @@ let evens = counting(6) | .filter(x => x % 2 == 0);
 
 The result is an ordinary `Pipe[T]`, so the pipe combinators chain straight onto it.
 
+`yield in E` yields every element of `E` in turn, where `E` is anything a `for` loop can iterate — a pipe, an array, a list, an iterator. The elements are pulled one at a time as the consumer asks for them, exactly as writing the loop out by hand would, which is what makes it the natural shape for a recursive generator:
+
+```ghul
+preorder[T](tree: Tree[T]) -> Ghul.Pipes.Pipe[T] is
+    if let (value, left, right): Tree.NODE = tree then
+        yield value;
+        yield in preorder(left);
+        yield in preorder(right);
+    fi
+si
+```
+
+`E`'s element type has to be assignable to the generator's, and a value that cannot be iterated is rejected the same way a `for` over it would be.
+
 A generator's return type has to be `Pipe[T]` — `yield` in a function declared otherwise is an error. A function cannot be both a generator and asynchronous. And as with `await`, `yield` is not yet supported inside a `catch` or `finally` handler.
 
 ## collections and pipes

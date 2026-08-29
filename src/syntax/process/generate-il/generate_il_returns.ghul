@@ -339,6 +339,133 @@ namespace Syntax.Process is
                 ".gen_state");
         si
 
+        // `yield in E` - hand on every element of E. E's iterator lives
+        // on the state-machine frame rather than in a CLR local, because
+        // it has to survive each suspend the same way a `for` loop's
+        // does; the loop that steps it is emitted here rather than in
+        // the tree, so the suspend sits directly in MoveNext's stream:
+        //
+        //     <E's IR>            // .get_iterator() where E is not
+        //     stfld _iterator     // already one
+        //     Label_start:
+        //     <iterator>.move_next()
+        //     brfalse Label_end
+        //     ldarg.0
+        //     <iterator>.current  // boxed-if-needed against the
+        //     stfld _current      // element type
+        //     <state stamp>
+        //     ldc.i4.1; ret       // or `leave`, from inside a .try
+        //     Label_N:            // resumption point
+        //     <state cleared>
+        //     br Label_start
+        //     Label_end:
+        visit(`yield: Statements.YIELD_ALL) is
+            super.visit(`yield);
+
+            let function = current_function;
+            let state_machine = Semantic.Symbols.state_machine_for(function);
+
+            if !state_machine? then
+                return;
+            fi
+
+            let frame = state_machine.frame;
+
+            assert frame? else "generator state machine has no frame at IL generation";
+
+            let move_next = `yield.move_next;
+            let read_current = `yield.read_current;
+            let iterator_field = `yield.iterator_field;
+
+            // compile-expressions reported whatever stopped it resolving
+            // the iterator surface, so emitting nothing is right here.
+            if !move_next? \/ !read_current? \/ !iterator_field? then
+                return;
+            fi
+
+            let expression = `yield.expression;
+            let no_arguments = Collections.LIST[Values.Value](0);
+
+            let iterator =
+                if let read_iterator = `yield.read_iterator then
+                    read_iterator.call(expression.location, expression.value!, no_arguments, null, _function_caller)
+                else
+                    expression.value!
+                fi;
+
+            add(_build_frame_field_store(frame, iterator_field, iterator));
+
+            let brancher = get_brancher_for_block();
+
+            let start = LABEL();
+            let end = LABEL();
+
+            brancher.label(start);
+
+            let has_next =
+                move_next.call(
+                    expression.location,
+                    _build_frame_field_load(frame, iterator_field),
+                    no_arguments,
+                    null,
+                    _function_caller
+                );
+
+            brancher.branch(BRANCH.Z, has_next, end);
+
+            let current = Values.BLOCK();
+
+            current.add(
+                _boxer.box_if_needed(
+                    read_current.call(
+                        expression.location,
+                        _build_frame_field_load(frame, iterator_field),
+                        no_arguments,
+                        null,
+                        _function_caller
+                    ),
+                    frame.element_type
+                )
+            );
+
+            add(_build_frame_field_store(frame, frame.current_field, current));
+
+            let state = state_machine.allocate_state();
+            let resume = LABEL();
+
+            state_machine.record_label(state, resume);
+
+            _register_resume_with_dispatch(state, resume);
+
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.Literal.NUMBER(state, _innate_symbol_lookup.get_int_type()),
+                ".gen_state");
+
+            if _async_dispatch_stack.count > 1 then
+                if !_current_generator_yield_return_label? then
+                    _current_generator_yield_return_label = LABEL();
+                fi
+                add(Values.BRANCH_TO(ILOpCode.LEAVE, _current_generator_yield_return_label));
+            else
+                add(Values.INSTRUCTION(ILOpCode.LDC_I4_1));
+                add(Values.RET());
+            fi
+
+            add(Values.MARK_LABEL(resume));
+
+            _emit_state_stamp(
+                frame,
+                frame.state_field,
+                Values.INSTRUCTION(ILOpCode.LDC_I4_M1),
+                ".gen_state");
+
+            brancher.branch(start);
+
+            brancher.label(end);
+        si
+
         // Write a state value to BOTH the CLR local cached at MoveNext
         // entry AND the state-machine frame's state field, so later
         // `leave`s out of `.try` blocks fire finally bodies that see
