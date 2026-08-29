@@ -5,15 +5,56 @@ namespace Syntax.Parsers.Expressions is
 
     use Ghul.Pipes;
 
+    // Parses a parenthesised group in expression position. The group's
+    // reading is decided by the token that follows what has already
+    // been parsed, never by speculating ahead:
+    //
+    //   `,` / `)` / `:`   — a tuple, a parenthesised expression, or a
+    //                       lambda's formal parameters (the enclosing
+    //                       parser rewrites on a following `=>`).
+    //   `;`               — a block expression `(statement; ...; value)`:
+    //                       the element already parsed becomes the first
+    //                       statement, and the rest of the group parses
+    //                       as a statement list. Same construct as
+    //                       `val ... lav`, in its parenthesised spelling.
+    //   `=` at top level  — an assignment statement opening a block
+    //                       expression; the parsed element is its target.
+    //
+    // A token that can only open a statement (`let`, `try`, `return`,
+    // ...) commits the group as a block immediately.
     class TUPLE(
         expression_list_parser: Parser[Trees.Expressions.LIST],
-        type_parser: Parser[Trees.TypeExpressions.TypeExpression]
-    ): Base[Trees.Expressions.TUPLE] is
+        type_parser: Parser[Trees.TypeExpressions.TypeExpression],
+        expression_parser: Parser[Trees.Expressions.Expression],
+        paren_statement_list_parser: Parser[Trees.Statements.LIST]
+    ): Base[Trees.Expressions.Expression] is
         description: string => "tuple";
+
+        // Tokens that open a statement but can never open a tuple
+        // element, so the group is a block from its first token. `let`
+        // and `assert` do have expression forms (`let ... in`,
+        // `assert ... in`); the statement parser produces exactly those
+        // expressions when the `in` is present, and the single-
+        // expression unwrap below hands them back unwrapped, so routing
+        // them here changes nothing for the existing forms.
+        _statement_only_tokens: Collections.LIST[Lexical.TOKEN];
 
         super();
 
-        parse(context: CONTEXT) -> Trees.Expressions.TUPLE is
+        init(..) is
+            _statement_only_tokens = Collections.LIST([
+                Lexical.TOKEN.LET,
+                Lexical.TOKEN.ASSERT,
+                Lexical.TOKEN.TRY,
+                Lexical.TOKEN.RETURN,
+                Lexical.TOKEN.THROW,
+                Lexical.TOKEN.BREAK,
+                Lexical.TOKEN.CONTINUE,
+                Lexical.TOKEN.YIELD
+            ]);
+        si
+
+        parse(context: CONTEXT) -> Trees.Expressions.Expression is
             let start = context.location;
 
             // Parsing the elements runs the enclosing list loop again,
@@ -24,12 +65,42 @@ namespace Syntax.Parsers.Expressions is
 
             context.next_token(Lexical.TOKEN.PAREN_OPEN, syntax_error_message);
 
+            if _statement_only_tokens.contains(context.current.token) then
+                return _parse_block(context, start, null);
+            fi
+
             let expressions: Trees.Expressions.LIST mut;
 
             if context.current.token != Lexical.TOKEN.PAREN_CLOSE then
                 expressions = expression_list_parser.parse(context)!;
             else
                 expressions = Trees.Expressions.LIST(context.location, Collections.LIST[Trees.Expressions.Expression]());
+            fi
+
+            if expressions.expressions.count == 1 then
+                if context.current.token == Lexical.TOKEN.SEMICOLON then
+                    return _parse_block(context, start, _statement_from_element(context, expressions.expressions[0]));
+                elif context.current.token == Lexical.TOKEN.ASSIGN then
+                    // A top-level `=` whose target is not a simple name
+                    // (`x.y = e`, `xs[i] = e`): a simple name's `=` was
+                    // consumed into a VARIABLE element already, so only
+                    // an assignment statement reads this way.
+                    let left = expressions.expressions[0];
+
+                    context.next_token();
+
+                    let right = expression_parser.parse(context)!;
+
+                    return _parse_block(
+                        context,
+                        start,
+                        Trees.Statements.ASSIGNMENT(
+                            left.location::right.location,
+                            left.rewrite_as_assignment_left(),
+                            right
+                        )
+                    );
+                fi
             fi
 
             expressions.rewrite_as_tuple_elements();
@@ -71,6 +142,98 @@ namespace Syntax.Parsers.Expressions is
             if type_expression? then
                 result.set_type_expression(type_expression);
             fi
+
+            return result;
+        si
+
+        // The already-parsed first element of a group that a `;` has
+        // just committed as a block, recast as the block's first
+        // statement. A compound statement parsed in expression position
+        // arrives wrapped (`Expressions.STATEMENT`); unwrap it rather
+        // than wrapping twice. A `name = e` element parsed as a
+        // VARIABLE was an assignment all along.
+        _statement_from_element(context: CONTEXT, element: Trees.Expressions.Expression) -> Trees.Statements.Statement is
+            if isa Trees.Expressions.STATEMENT(element) then
+                return element.statement;
+            fi
+
+            if isa Trees.Expressions.VARIABLE(element) then
+                if let initializer = element.initializer /\ isa Trees.TypeExpressions.INFER(element.type_expression) then
+                    return Trees.Statements.ASSIGNMENT(
+                        element.location,
+                        Trees.Expressions.IDENTIFIER(element.name.location, element.name).rewrite_as_assignment_left(),
+                        initializer
+                    );
+                fi
+
+                // `x: T = e;` or `x: T;` — a typed declaration needs `let`.
+                context.error(element.location, "a local variable definition needs let");
+
+                return Trees.Statements.EXPRESSION(
+                    element.location,
+                    Trees.Expressions.Literals.NONE(element.location)
+                );
+            fi
+
+            return Trees.Statements.EXPRESSION(element.location, element);
+        si
+
+        // Parse the remainder of the group as statements through to the
+        // `)`, then deliver: the single already-parsed expression
+        // unwrapped where the group turned out to be an ordinary
+        // parenthesised expression after all (`(let x = e in b)`), a
+        // VAL_BLOCK otherwise.
+        _parse_block(
+            context: CONTEXT,
+            start: LOCATION,
+            first: Trees.Statements.Statement?
+        ) -> Trees.Expressions.Expression is
+            // Statements are a fresh context: an enclosing argument
+            // list's element flag must not leak into their expressions.
+            context.allow_tuple_element = false;
+
+            let rest = paren_statement_list_parser.parse(context)!;
+
+            let end = context.location;
+
+            context.next_token(Lexical.TOKEN.PAREN_CLOSE, syntax_error_message);
+
+            if !first? /\ (rest.statements | .count()) == 1 /\ !rest.last_was_terminated then
+                // A statement-only opener that parsed to a single
+                // unterminated expression statement is that expression,
+                // parenthesised: `(let x = e in b)`, `(assert c in v)`.
+                // Handing it back unwrapped keeps the tree those forms
+                // have always produced.
+                if let statement: Trees.Statements.EXPRESSION = rest.last then
+                    return statement.expression;
+                fi
+            fi
+
+            let statements = Collections.LIST[Trees.Statements.Statement]();
+
+            if first? then
+                statements.add(first);
+            fi
+
+            for statement in rest.statements do
+                statements.add(statement);
+            od
+
+            let body = Trees.Statements.LIST(start::end, statements);
+
+            // An empty remainder means the first statement was followed
+            // directly by `;)` or `)`: nothing unterminated remains, so
+            // the block has no tail value.
+            body.last_was_terminated =
+                if rest.is_empty then
+                    true
+                else
+                    rest.last_was_terminated
+                fi;
+
+            let result = Trees.Expressions.VAL_BLOCK(start::end, body);
+
+            result.is_parenthesised = true;
 
             return result;
         si

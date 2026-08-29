@@ -1196,6 +1196,16 @@ let z = val let a = 3; let b = 4; a + b lav;  // z = 7
 let n = val write_line("setup"); 42 lav;   // n = 42
 ```
 
+The same block can be written in parentheses: `(statement; statement; value)` is the parenthesised spelling of `val statement; statement; value lav`, and the two are interchangeable everywhere. A parenthesised group commits to the block reading at the first top-level `;` — or immediately, on a token that can only open a statement (`let`, `try`, `return`, ...) — and stays a tuple, a parenthesised expression, or a lambda's formal parameters otherwise. So `(a = f(x), b = g(y))` constructs a named tuple while `(a = f(x); b = g(y); a + b)` runs two assignments and yields the sum; the `,`/`;` is the whole difference, and the elements themselves can be any expression in both. A statement whose expression form already exists keeps it: `(let x = 5 in x * 2)` is the `let ... in` expression, unchanged, while `(let x = 5; x * 2)` is a block with a `let` statement and a tail.
+
+```ghul
+let x = (let y = 5; y * 2);                 // x = 10
+let n = (write_line("setup"); 42);          // n = 42
+
+let box = BOX();
+let m = (box.v = 7; box.v * 2);             // assignment statement, then the value
+```
+
 A common use is loop-as-expression — fold an iterable into a value with the loop body updating a `mut` accumulator and the tail expression handing back the result:
 
 ```ghul
