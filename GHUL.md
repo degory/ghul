@@ -1462,7 +1462,7 @@ build[T: Named class init](name: string) -> T;
 build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
-The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot:
+The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, and — for a generic function referred to as a value — from the function type of the slot it goes into:
 
 ```ghul
 print_something(1234);                       // T inferred as int
@@ -1475,14 +1475,19 @@ takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
 
 When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
 
-A generic function or method named with its type arguments but no argument list is a *value* at that instantiation, the same way a non-generic name in value position is. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
+A generic function or method named with no argument list is a *value*, the same way a non-generic name in value position is. Written with its type arguments it is the value at that instantiation; written bare, the type arguments are inferred from the function type of the slot it goes into — from the parameter positions, and from the return slot for a variable that appears only there. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
 
 ```ghul
 identity[T](x: T) -> T => x;
 
-let f = identity[int];              // (int) -> int
-let g: (string) -> string = identity[string];
+zero_of[T](ignored: int) -> T => _[T];
+
+let f = identity[int];                    // (int) -> int, explicit
+let g: (string) -> string = identity;     // inferred from the slot
+let h: (int) -> string = zero_of;         // T pinned by the return slot
 ```
+
+With no slot type in scope there is nothing to infer from, and the bare name is an error (`cannot infer type here`) — give the type arguments explicitly.
 
 ## type inference
 
