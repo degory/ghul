@@ -1457,13 +1457,15 @@ build[T: Named class init](name: string) -> T;
 build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
-The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS) when the constructor arguments alone don't pin every owner-generic slot:
+The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, and from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot:
 
 ```ghul
 print_something(1234);                       // T inferred as int
 let b = BOX("hello");                        // BOX[string]
 let r: RESULT[int, string] = RESULT.OK(42);  // OK's arg pins T = int;
                                              // the LHS pins S = string
+takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
+                                             // the slot pins T = int
 ```
 
 When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
