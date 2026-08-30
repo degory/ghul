@@ -108,7 +108,7 @@ A handful of rules keep multi-line expressions unambiguous, and they codify the 
 - A bare `return` at the end of a line is a void return when the next line opens with a closing keyword (`fi`, `si`, `od`, …), and otherwise takes the next line's expression as its value. The two readings never compete: a statement written directly after a `return` in the same block would be unreachable, so a following line that starts an expression can only sensibly be the return's value, and a `return` that ends its branch is followed by the closing keyword, which keeps it void.
 - In a parenthesised group, a top-level `,` commits the tuple reading and an inferred boundary commits the block reading, exactly as a written `;` does. An operator-headed line after a compound statement keeps the expression reading, as it does with terminators written; give the block reading a `;` after the closing keyword.
 
-Statement terminators carry no meaning beyond the boundary: in particular, whether a body's final statement ends with `;` never changes what the body returns — the tail is judged by its type (see functions below).
+Statement terminators carry no meaning beyond the boundary: in particular, whether a body's final statement ends with `;` never changes what the body returns — the tail is judged by its type (see functions below). The one boundary only a written `;` can make is between two string literals, which otherwise chain into a single literal across the line break (see the string-literal section below).
 
 ## variables
 
@@ -224,7 +224,13 @@ An interpolated expression can carry an alignment and a format specifier, as in 
 let padded = "[{value,12:F3}]";     // [    1500.000]
 ```
 
-Adjacent string literals concatenate, so a long string can be split across lines — plain and interpolated literals mix freely.
+Adjacent string literals concatenate, so a long string can be split across lines — plain and interpolated literals mix freely. Only whitespace can separate the fragments: a comment between two literals ends the chain, and so does a `;`. That `;` is the one statement terminator that carries meaning — where a statement ends on a string literal and the next begins with one, it keeps them from chaining into a single literal, so `redundant-semicolon` never reports it:
+
+```ghul
+let band = "top";
+"{band} band"        // a new statement — without the `;` the two
+                     // literals chain, and band is not defined yet
+```
 
 Inside the braces you are in *expression* context, so a nested string literal is written normally — `"{format("hello")}"` needs no escaping of its inner quotes. To write a literal brace, double it: `"{{"` and `"}}"`. The escapes are `\t`, `\n`, `\r` and `\\`, plus a run of octal digits for an arbitrary character code — so an escape character is `"\33"`. Any other character after a `\` stands for itself, which is what makes `\"` a quote.
 
