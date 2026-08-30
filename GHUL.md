@@ -1404,6 +1404,8 @@ let e = 5 |> $();                // the same call, written out
 
 The operator and the `|>` have to be separated by a space. A run of operator characters scans as a single token, so `5 |>$` is one operator named `|>$` rather than two.
 
+A `|>` at the end of a line carries the chain onto the next one, which is how a long chain is wrapped. Only a name continues it that way, so a line beginning with anything else leaves the `|>` without a right side and is reported as one — the next statement is never read as the call.
+
 ## generics
 
 See <https://ghul.dev/generics.html>.

@@ -31,6 +31,7 @@ The `COMPILER` class (see `src/compiler/compiler.ghul`) runs these in order:
 
 - **definition_virtuality.ghul** – announces each declaration's place in the dispatch hierarchy (abstract, overriding, overridden, overridable beyond the assembly) as an editor-only inlay. Runs after `resolve_overrides` so every file's override links are in place, and emits nothing outside analysis mode.
 - **completer.ghul** – walks a tree to gather completion suggestions at a location.
+- **thread_first_candidate_filter.ghul** – reduces those suggestions, in the right-hand side of a `|>`, to the names the threaded subject can be passed to.
 - **signature_help.ghul** – determines overload information for function calls.
 - **printer/** – visitors that pretty-print trees for debugging.
 
