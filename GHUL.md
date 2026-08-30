@@ -97,7 +97,7 @@ An alias is scoped like any other `use`: it belongs to the namespace block it is
 
 ## statement terminators
 
-Statements and simple declarations end with `;`, but the terminator can be left off at the end of a line: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. Two statements on one line still need the `;` between them.
+Statements and simple declarations end with `;`, but the terminator can be left off at the end of a line: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either. Two statements on one line still need the `;` between them.
 
 Two warnings police the choice of style, and both are off by default — either style compiles silently. `--warn missing-semicolon` reports every inferred boundary, for a project that wants its terminators written out; `--warn redundant-semicolon` reports a written `;` the line break would infer anyway — every end-of-line terminator, with no exemptions, since nothing reads the terminator for meaning: a body's tail is judged by its type, and a trailing `|` closes as a pipe-wrap when the next line does not carry the chain on. Once enabled with `--warn`, a slug responds to `--warn-as-error` and the other severity flags like any other.
 
