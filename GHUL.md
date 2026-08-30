@@ -1357,6 +1357,8 @@ si
 
 `E`'s element type has to be assignable to the generator's, and a value that cannot be iterated is rejected the same way a `for` over it would be.
 
+A bare `return` ends the stream early, exactly as falling off the end of the body does. It carries no value: the declared `Pipe[T]` describes the stream the generator produces, not something a `return` inside it hands back.
+
 A generator's return type has to be `Pipe[T]` — `yield` in a function declared otherwise is an error. A function cannot be both a generator and asynchronous. And as with `await`, `yield` is not yet supported inside a `catch` or `finally` handler.
 
 ## collections and pipes
