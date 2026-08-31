@@ -224,7 +224,7 @@ An interpolated expression can carry an alignment and a format specifier, as in 
 let padded = "[{value,12:F3}]";     // [    1500.000]
 ```
 
-Adjacent string literals concatenate, so a long string can be split across lines — plain and interpolated literals mix freely. Only whitespace can separate the fragments: a comment between two literals ends the chain, and so does a `;`. That `;` is the one statement terminator that carries meaning — where a statement ends on a string literal and the next begins with one, it keeps them from chaining into a single literal, so `redundant-semicolon` never reports it:
+Adjacent string literals concatenate, so a long string can be split across lines — plain and interpolated literals mix freely. Comments count as the whitespace they sit in, so a commented fragment chains like an uncommented one; only a `;` separates two otherwise-adjacent literals. That `;` is the one statement terminator that carries meaning — where a statement ends on a string literal and the next begins with one, it keeps them from chaining into a single literal, so `redundant-semicolon` never reports it:
 
 ```ghul
 let band = "top";
