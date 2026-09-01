@@ -193,6 +193,16 @@ let greeting = "hello";        // string
 
 Digits may be grouped with `_`. An integer literal can carry a radix prefix (`0x`) and a type suffix built from two optional parts, both case-insensitive: a sign selector — `s` signed or `u` unsigned — followed by a size selector — `b` byte, `c` char, `s` short, `i` int, `l` long, `w` word. So `123b` is a `byte`, `0ub` a `ubyte`, `4567s` a `short`, `7890us` a `ushort`, `222i` an `int`, `0ul` a `ulong`, `123w` a `word`. A numeric character literal (`65c`) cannot be unsigned.
 
+The digits are read first and as far as they go, so a letter that is a digit of the literal's radix is one. In hex that covers `b` and `c`, which are size selectors as well as hex digits: `0x20AC` is the `int` 8364 and `0xAB` is the `int` 171, with no suffix in either. A suffix that would be read as a digit is attached with a backtick, which marks the boundary and is not part of the value:
+
+```ghul
+let euro = 0x20AC`c;       // char, 8364
+let byte_max = 0xFF`ub;    // ubyte, 255
+let wide = 0x20ACl;        // long — `l` is not a hex digit, so no backtick
+```
+
+Backtick is the same escape it is elsewhere: it says to read what follows as itself rather than as its default meaning. Decimal needs it nowhere, since no size selector is a decimal digit.
+
 A fractional literal is a `single` unless suffixed — `s` single, `d` double, `m` decimal, in either case. The `m` suffix is also accepted on a digit-only literal to write an integral decimal (`100m`). Exponent notation is accepted: `1.5e3`, `1.5E-3`.
 
 ghūl does not convert between scalar types implicitly — a mixed-type arithmetic expression is a compile-time error, and a `cast` is required. Upcasting is implicit: a value is assignment-compatible with any ancestor type, so a `string` can be assigned to an `object` with no cast.
@@ -235,7 +245,9 @@ let band = "top";
                      // literals chain, and band is not defined yet
 ```
 
-Inside the braces you are in *expression* context, so a nested string literal is written normally — `"{format("hello")}"` needs no escaping of its inner quotes. To write a literal brace, double it: `"{{"` and `"}}"`. The escapes are `\t`, `\n`, `\r` and `\\`, plus a run of octal digits for an arbitrary character code — so an escape character is `"\33"`. Any other character after a `\` stands for itself, which is what makes `\"` a quote.
+Inside the braces you are in *expression* context, so a nested string literal is written normally — `"{format("hello")}"` needs no escaping of its inner quotes. To write a literal brace, double it: `"{{"` and `"}}"`. The escapes are `\t`, `\n`, `\r`, `\\`, and `\u` followed by exactly four hex digits for an arbitrary character code — so the euro sign is `"\u20AC"` and an escape character is `"\u001B"`. Four digits is one UTF-16 code unit, which is one `char`; a code point above `U+FFFF` is written as its surrogate pair, so `"\uD83D\uDE00"` is one grinning face and two `char` values. The width is fixed so that the escape never reaches into the text after it — `"\u0041cat"` is `Acat`. Any other character after a `\` stands for itself, which is what makes `\"` a quote.
+
+A run of octal digits after a `\` is the older spelling of a character code (`"\33"` for an escape character). It still works and still means the same thing, but it is deprecated — it is greedy and unbounded, so it also swallows the digits after it — and writing one draws a `deprecated-octal-escape` warning. Write `\u` instead.
 
 An **array** type is written `E[]`. Arrays are fixed-size and read-only — there is no assigning indexer. An array's length is its `count`. An array literal is a comma-separated list in square brackets, and its element type is inferred as the most specific type compatible with every element (`object` if there is no closer common ancestor):
 
