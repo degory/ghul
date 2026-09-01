@@ -97,9 +97,11 @@ An alias is scoped like any other `use`: it belongs to the namespace block it is
 
 ## statement terminators
 
-Statements and simple declarations end with `;`, but the terminator can be left off at the end of a line: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either. Two statements on one line still need the `;` between them.
+A `;` separates two statements or simple declarations written on one line. At the end of a line it is not needed: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either.
 
-Two warnings police the choice of style, and both are off by default — either style compiles silently. `--warn missing-semicolon` reports every inferred boundary, for a project that wants its terminators written out; `--inlay terminator` shows the same boundaries as editor inlay hints instead, a `∘︎` at each inferred boundary, where the missing-semicolon warning would fire — the read-only view of the same information, and off by default too. `--warn redundant-semicolon` reports a written `;` the line break would infer anyway — every end-of-line terminator except a `;` separating two string literals (see below), since nothing else reads the terminator for meaning: a body's tail is judged by its type, and a trailing `|` closes as a pipe-wrap when the next line does not carry the chain on. Once enabled with `--warn`, a slug responds to `--warn-as-error` and the other severity flags like any other.
+That is the whole of what a `;` does, and the one place it carries meaning is between two string literals (see below). Nothing else reads it: a body's tail is judged by its type, and a trailing `|` closes as a pipe-wrap when the next line does not carry the chain on. So a written end-of-line `;` adds nothing, and `--warn redundant-semicolon` reports one, for a project moving its terminators out. It is off by default, and once enabled with `--warn` it responds to `--warn-as-error` and the other severity flags like any other slug, so a project that wants the boundaries pointed out without being pestered can take it as a hint instead.
+
+`--inlay terminator` shows the boundaries as editor inlay hints, a `∘︎` wherever a statement ends without a written `;`. It marks exactly the places `redundant-semicolon` would report one at, so the two are complements. Off by default.
 
 A handful of rules keep multi-line expressions unambiguous, and they codify the conventional wrapping style rather than restricting it:
 
