@@ -1515,7 +1515,7 @@ let g: (string) -> string = identity;     // inferred from the slot
 let h: (int) -> string = zero_of;         // T pinned by the return slot
 ```
 
-With no slot type in scope there is nothing to infer from, and the bare name is an error (`cannot infer type here`) — give the type arguments explicitly.
+With no slot type in scope there is nothing to infer from, and the bare name is an error (`cannot infer the type arguments`) — give the type arguments explicitly.
 
 ## type inference
 
