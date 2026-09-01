@@ -99,13 +99,13 @@ An alias is scoped like any other `use`: it belongs to the namespace block it is
 
 A `;` separates two statements or simple declarations written on one line. At the end of a line it is not needed: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either.
 
-That is the whole of what a `;` does, and the one place it carries meaning is between two string literals (see below). Nothing else reads it: a body's tail is judged by its type, and a trailing `|` closes as a pipe-wrap when the next line does not carry the chain on. So a written end-of-line `;` adds nothing, and `--warn redundant-semicolon` reports one, for a project moving its terminators out. It is off by default, and once enabled with `--warn` it responds to `--warn-as-error` and the other severity flags like any other slug, so a project that wants the boundaries pointed out without being pestered can take it as a hint instead.
+That is the whole of what a `;` does, and the one place it carries meaning is between two string literals (see below). Nothing else reads it: a body's tail is judged by its type. So a written end-of-line `;` adds nothing, and `--warn redundant-semicolon` reports one, for a project moving its terminators out. It is off by default, and once enabled with `--warn` it responds to `--warn-as-error` and the other severity flags like any other slug, so a project that wants the boundaries pointed out without being pestered can take it as a hint instead.
 
 `--inlay terminator` shows the boundaries as editor inlay hints, a `∘︎` wherever a statement ends without a written `;`. It marks exactly the places `redundant-semicolon` would report one at, so the two are complements. Off by default.
 
 A handful of rules keep multi-line expressions unambiguous, and they codify the conventional wrapping style rather than restricting it:
 
-- A line that opens with `.`, `|`, or `|>` continues the expression above it — member chains, pipes and thread-first chains hang exactly as they always have. That is also what decides a trailing `|`: a line break after one closes it as the postfix pipe-wrap (`xs |` is `pipe(xs)`) unless the next line carries the chain on, so `xs |` followed by `.map(f)` is one chain while `xs |` followed by a new statement is a wrap.
+- A line that opens with `.` or `|>` continues the expression above it — member chains and thread-first chains hang exactly as they always have.
 - A line that opens with `(`, `[`, or an operator starts something new — a destructure assignment `(a, b) = …`, an array literal, a prefix `!` — and never glues to the line above as a call, an index, or an infix operand. Wrapped operator expressions put the operator at the end of the line (`a +` then the newline, not the newline then `+ a`).
 - A postfix marker attaches on the same line as what it marks, never from the line below: a line-start modifier (`pure`, `static`, …) belongs to the next definition rather than the header above, and a line-start `rec` is the recursive self-reference call, never a rec-lambda marker — the marker sits on the line with its formal parameters.
 - A bare `return` at the end of a line is a void return when the next line opens with a closing keyword (`fi`, `si`, `od`, …), and otherwise takes the next line's expression as its value. The two readings never compete: a statement written directly after a `return` in the same block would be unreachable, so a following line that starts an expression can only sensibly be the return's value, and a `return` that ends its branch is followed by the closing keyword, which keeps it void.
@@ -363,7 +363,7 @@ A function literal's parameter can be a destructure pattern too, written in its 
 ```ghul
 let pairs = [(1, 2), (3, 4)];
 
-pairs | .map(((a, b)) => a + b);           // element types inferred from the sequence
+pairs |> map(((a, b)) => a + b);          // element types inferred from the sequence
 ```
 
 The bare single-parameter shorthand (`x => …`) can't carry a pattern any more than it can carry a type annotation — both need the parentheses. Unlike a named function the aggregate type is usually inferred, from the sequence or slot the literal is written into, or from how the parameter is used; write it explicitly when there is nothing to infer from. As with a named function, the aggregate can be any positionally-destructurable type, so per-element types and the aggregate ascription both take the full type syntax:
@@ -371,7 +371,7 @@ The bare single-parameter shorthand (`x => …`) can't carry a pattern any more 
 ```ghul
 let add = ((a, b): (int, int)) => a + b;
 
-entries | .each(((key, value): Collections.KeyValuePair[string, int]) =>
+entries |> each(((key, value): Collections.KeyValuePair[string, int]) =>
     write_line("{key}={value}"));
 ```
 
@@ -1359,7 +1359,7 @@ for n in counting(4) do
     write_line("{n}");
 od
 
-let evens = counting(6) | .filter(x => x % 2 == 0);
+let evens = counting(6) |> filter(x => x % 2 == 0);
 ```
 
 The result is an ordinary `Pipe[T]`, so the pipe combinators chain straight onto it.
@@ -1394,18 +1394,18 @@ scores.add("alice", 1);
 let total = scores["alice"];
 ```
 
-The pipe operator `|` chains sequence operations: an expression, then `| .method(...)`. ghūl provides the usual combinators, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array`, `count`, `find`, `find_map`, `first`, `only`, `has`, `any`, `all`, `each`, `join`, `append_to`.
+The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array`, `count`, `find`, `find_map`, `first`, `only`, `has`, `any`, `all`, `each`, `join`, `append_to`.
 
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
-let evens = numbers | .filter(x => x % 2 == 0);
-let doubled = numbers | .map(x => x * 2);
-let sum = numbers | .reduce(0, (acc, x) => acc + x);
+let evens = numbers |> filter(x => x % 2 == 0);
+let doubled = numbers |> map(x => x * 2);
+let sum = numbers |> reduce(0, (acc, x) => acc + x);
 ```
 
 Lazy and infinite sequences are built with `Ghul.Pipes.stream(initial, advance)`, where `advance` steps from the current state to the next element and state. Nothing forces `advance` to be free of side effects, but it is called lazily and on demand, so it is much easier to reason about when it is. The `||` infix is the step expression — `value || next_state`. A `stream(...)` is an ordinary `Pipe[T]`, so the pipe combinators chain straight onto it. See <https://ghul.dev/functional-programming.html#lazy-sequences>.
 
-The thread-first operator `|>` calls a function with the left value threaded in as its first argument: `x |> f(a)` is `f(x, a)`, and `x |> f()` is `f(x)`. The right-hand side is resolved exactly as an ordinary call, so it can be a free function, a method on an explicit receiver (`x |> box.combine(a)` is `box.combine(x, a)`), or a generic whose type argument is inferred from the left value. Chains associate left to right, so `x |> f(a) |> g(b)` is `g(f(x, a), b)`. Unlike `|`, which wraps its operand in a `Pipe[T]` and calls pipe combinators on it, `|>` is a plain call, and its right-hand side must be a function call or the name of a function spelled as an operator:
+The thread-first operator `|>` calls a function with the left value threaded in as its first argument: `x |> f(a)` is `f(x, a)`, and `x |> f()` is `f(x)`. The right-hand side is resolved exactly as an ordinary call, so it can be a free function, a method on an explicit receiver (`x |> box.combine(a)` is `box.combine(x, a)`), or a generic whose type argument is inferred from the left value. Chains associate left to right, so `x |> f(a) |> g(b)` is `g(f(x, a), b)`. It is a plain call, and its right-hand side must be a function call or the name of a function spelled as an operator:
 
 ```ghul
 double(x: int) -> int => x * 2;

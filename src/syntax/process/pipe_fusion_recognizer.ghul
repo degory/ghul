@@ -190,9 +190,7 @@ namespace Syntax.Process is
     // by an already-pinned default op returning a closed built-in pipe -
     // MAP_PIPE / FilterPipe / INDEX_PIPE / TAKE_PIPE / SKIP_PIPE).
     //
-    // The base must be a `pipe(SOURCE)` wrap (the postfix `|` operator,
-    // carrying `is_pipe_wrap`) whose SOURCE is not itself statically a
-    // Pipe. Two cases:
+    // The SOURCE is not itself statically a Pipe. Two cases:
     //
     // - SOURCE is sealed (a value type or an array): its dynamic type is
     //   exactly its static type, so it cannot secretly be a user pipe with
@@ -210,21 +208,10 @@ namespace Syntax.Process is
         recognize(`for: Trees.Statements.FOR) -> PIPE_FUSION? =>
             recognize_any(`for.expression)
 
-        // Peel either chain shape off `expression`: a `Pipe[T]` method
-        // chain (`pipe(xs).map(f)`) or a chain of `Ghul.Pipes` free
-        // functions (`xs |> map(f)`, desugared at parse time into ordinary
-        // calls - see recognize_free_function_chain). Used both by the
-        // `for`-loop path and by consumer fusion, since a terminal
-        // consumer's receiver can be written in either form.
-        recognize_any(expression: Trees.Expressions.Expression?) -> PIPE_FUSION? is
-            let chain = recognize_chain(expression)
-
-            if chain? then
-                return chain
-            fi
-
-            return recognize_free_function_chain(expression)
-        si
+        // Peel a chain of `Ghul.Pipes` free functions off `expression`.
+        // Used both by the `for`-loop path and by consumer fusion.
+        recognize_any(expression: Trees.Expressions.Expression?) -> PIPE_FUSION? =>
+            recognize_free_function_chain(expression)
 
         // Peel a `... |> map(f) |> filter(p)` chain of `Ghul.Pipes` free
         // functions off an arbitrary expression. `|>` is desugared entirely
@@ -335,194 +322,6 @@ namespace Syntax.Process is
             fi
 
             return null
-        si
-
-        // Peel a `pipe(SOURCE).map(f).filter(p).index()...` chain off an
-        // arbitrary expression - the iterated expression of a `for` loop, or
-        // the receiver of a terminal consumer (`.collect()`, `.find(p)`, ...).
-        recognize_chain(expression: Trees.Expressions.Expression?) -> PIPE_FUSION? is
-            let pipe_type = _innate_symbol_lookup.get_unspecialized_pipe_type()
-
-            if !pipe_type? then
-                return null
-            fi
-
-            if !expression? then
-                return null
-            fi
-
-            let stages = LIST[PIPE_FUSION_STAGE]()
-
-            let current mut = expression
-
-            // Peel `map`/`filter` layers off the outside of the chain.
-            while isa Trees.Expressions.CALL(current) do
-                let call = cast Trees.Expressions.CALL(current)
-
-                if !isa Trees.Expressions.MEMBER(call.function) then
-                    break
-                fi
-
-                let member = cast Trees.Expressions.MEMBER(call.function)
-                let name = member.identifier.name
-
-                let is_filter = name =~ "filter"
-                let is_map = name =~ "map"
-                let is_index = name =~ "index"
-                let is_take = name =~ "take"
-                let is_skip = name =~ "skip"
-                let is_memo = name =~ "memo"
-
-                if !(is_filter \/ is_map \/ is_index \/ is_take \/ is_skip \/ is_memo) then
-                    break
-                fi
-
-                // The receiver must be statically a Pipe[T]. On a trait
-                // static type overload resolution binds the default op, so
-                // this identifies the default map/filter/index/take/skip.
-                if !_is_pipe_expression(member.left, pipe_type) then
-                    break
-                fi
-
-                if is_take \/ is_skip then
-                    if call.arguments.expressions.count != 1 then
-                        break
-                    fi
-
-                    stages.add(PIPE_FUSION_STAGE(is_take, is_skip, call.arguments.expressions[0]))
-                elif is_memo then
-                    // Elided rather than fused - the chain fuses as though
-                    // the memo were absent (see PIPE_FUSION_STAGE).
-                    if call.arguments.expressions.count != 0 then
-                        break
-                    fi
-                elif is_index then
-                    // Only the no-argument `index()` (start 0) is fused;
-                    // `index(start)` is left to the class-based pipe.
-                    if call.arguments.expressions.count != 0 then
-                        break
-                    fi
-
-                    let stage = PIPE_FUSION_STAGE(0)
-
-                    // The call's type is Pipe[INDEXED_VALUE[element]];
-                    // extract INDEXED_VALUE[element] for the loop to build.
-                    let call_value = call.value
-
-                    if !call_value? \/ !call_value.type? then
-                        break
-                    fi
-
-                    stage.indexed_value_type = Semantic.Symbols.TYPE_ARGUMENT_EXTRACTOR.extract(call_value.type, pipe_type)
-
-                    if !stage.indexed_value_type? then
-                        break
-                    fi
-
-                    stages.add(stage)
-                else
-                    if call.arguments.expressions.count != 1 then
-                        break
-                    fi
-
-                    stages.add(PIPE_FUSION_STAGE(is_filter, call.arguments.expressions[0]))
-                fi
-
-                current = member.left
-            od
-
-            // A chain with no map/filter/take/skip/index stages still fuses:
-            // a bare `pipe(SOURCE)` fed to a `for` loop or a terminal
-            // consumer iterates SOURCE directly, so the wrapping ADAPTOR_PIPE
-            // (and, for a sealed value-type source, the box) is never built.
-            // The `is_pipe_wrap` base check below remains the real gate - a
-            // non-pipe expression never reaches here.
-
-            // The base must be a `pipe(SOURCE)` wrap.
-            if !isa Trees.Expressions.CALL(current) then
-                return null
-            fi
-
-            let base_call = cast Trees.Expressions.CALL(current)
-
-            if !base_call.is_pipe_wrap then
-                return null
-            fi
-
-            if base_call.arguments.expressions.count != 1 then
-                return null
-            fi
-
-            let source = base_call.arguments.expressions[0]
-            let source_value = source.value
-
-            if !source_value? \/ !source_value.type? then
-                return null
-            fi
-
-            let source_type = source_value.type
-
-            let classification = classify_source_type(source_type, pipe_type)
-
-            if !classification? then
-                return null
-            fi
-
-            let needs_guard = classification
-
-            // The guarded loop re-emits SOURCE's value (once for the `isa`
-            // test, again for iteration), so its IR must be safe to emit
-            // more than once: store-free (no repeated side effect) and not
-            // a BLOCK (the one single-shot IR value - `is_emitted` aborts a
-            // second gen). Real sources are plain field/local loads, which
-            // satisfy both.
-            if needs_guard /\ (source_value.is_state_changing_call \/ isa IR.Values.BLOCK(source_value)) then
-                return null
-            fi
-
-            // A guarded loop also emits each take/skip count twice - once
-            // into the fused counter, once in the fallback pipe chain - so a
-            // count fed to a guarded fusion has the same emit-more-than-once
-            // requirement as the source. Counts are almost always literals,
-            // which satisfy it.
-            if needs_guard then
-                for stage in stages do
-                    if stage.is_countdown then
-                        let count_value = stage.argument!.value
-
-                        if !count_value? \/ count_value.is_state_changing_call \/ isa IR.Values.BLOCK(count_value) then
-                            return null
-                        fi
-                    fi
-                od
-            fi
-
-            return PIPE_FUSION(source, stages, needs_guard)
-        si
-
-        // Classify a fusion base by its static source type:
-        //
-        // - null: do not fuse. The source is statically a Pipe, so `pipe()`
-        //   short-circuits to it and runs its (possibly overridden)
-        //   map/filter - a runtime guard would always take the fallback, so
-        //   there is nothing to gain.
-        // - false: fuse unconditionally. A sealed source (value type or
-        //   array) has a dynamic type equal to its static type, so it cannot
-        //   secretly be a user Pipe with an override.
-        // - true: fuse behind the runtime `isa Pipe[element]` guard. Any
-        //   other source is only *statically* not a Pipe; its dynamic type
-        //   could be a user Pipe, and the guard mirrors `pipe()`'s own
-        //   short-circuit test.
-        classify_source_type(source_type: Types.Type, pipe_type: Types.Type) -> bool? is
-            if _is_pipe_type(source_type, pipe_type) then
-                return null
-            fi
-
-            if source_type.is_value_type \/ isa Semantic.Types.ARRAY(source_type) then
-                return false
-            fi
-
-            return true
         si
 
         _is_pipe_expression(expression: Trees.Expressions.Expression, pipe_type: Types.Type) -> bool is
