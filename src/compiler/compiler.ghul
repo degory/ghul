@@ -153,13 +153,21 @@ namespace Compiler is
                     // and check against the final relations.
                     run_combined_solve_rounds(source_files)
 
+                    let rounds_ms = if stopwatch? then stopwatch.elapsed_milliseconds else 0L fi
+
                     run_reliance_judge(source_files)
                     run_post_effects_purity_checks(source_files)
 
                     Syntax.Process.RETRY_STATS.report()
 
+                    if let dump = System.Environment.get_environment_variable("GHUL_KILL_DUMP") then
+                        let writer = IO.File.create_text(dump)
+                        Syntax.Process.KILL_LEDGER.dump(writer)
+                        writer.dispose()
+                    fi
+
                     if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? /\ stopwatch? then
-                        IO.Std.error.write_line("effects round: {stopwatch.elapsed_milliseconds} ms (walk {walk_ms} solve {solve_ms - walk_ms} judge {stopwatch.elapsed_milliseconds - solve_ms})")
+                        IO.Std.error.write_line("effects round: {stopwatch.elapsed_milliseconds} ms (walk {walk_ms} solve {solve_ms - walk_ms} rounds {rounds_ms - solve_ms} judge {stopwatch.elapsed_milliseconds - rounds_ms})")
                     fi
                 si
             ).advances_milestone = false
@@ -262,6 +270,12 @@ namespace Compiler is
             container.symbol_use_locations.clear()
             container.symbol_definition_locations.clear()
             Semantic.Symbols.STORE_FREE_BITS.clear()
+
+            // The solved effect relations name the abandoned symbols too. Kept,
+            // every callee of the next build is unknown to them and the walk
+            // kills at every crossing; dropped, the walk keeps every fact and
+            // the solve after it finds the bodies where one has to die.
+            Syntax.Process.EFFECTS.clear()
 
             // The emitter's rows and reference caches name symbols that
             // have just been abandoned, and analysis rebuilds on every
@@ -584,6 +598,60 @@ namespace Compiler is
             Syntax.Process.PURE_SLOTS.clear_for(source_file.file_name)
 
             compile_expressions_only(source_file)
+        si
+
+        // Re-walk one definition's body against the current symbol table
+        // and the current effect relations: what the previous walk of that
+        // body left behind - its node state, its expression-level
+        // diagnostics and inlays, its ledger records and candidates - is
+        // dropped, and compile-expressions is driven over that body
+        // alone. The interface, and every other body in the file, is
+        // untouched.
+        recompile_body_expressions(source_file: SOURCE_FILE, function: Syntax.Trees.Definitions.FUNCTION) is
+            let file_name = source_file.file_name
+            let span = function.location
+
+            Syntax.Process.KILL_LEDGER.clear_for(function)
+
+            if let body = function.body then
+                Syntax.Process.CLEAR_STATE_VISITOR(true).apply(body)
+            fi
+
+            logger.clear_expression_diagnostics_within(file_name, span)
+            Syntax.Process.RELIANCES.clear_kill_candidates_within(file_name, span)
+            Syntax.Process.UNBACKED_FACTS.clear_within(file_name, span)
+            Syntax.Process.PURE_SLOTS.clear_within(file_name, span)
+
+            let only = Collections.SET[Syntax.Trees.Definitions.FUNCTION]()
+            only.add(function)
+
+            logger.set_is_compiling_expressions(true)
+
+            container.compile_expressions.reset_between_walks()
+
+            let symbol_table = container.symbol_table
+            let mark = symbol_table.mark_scope_stack()
+
+            let rewalker = Syntax.Process.BODY_REWALKER(
+                logger,
+                symbol_table,
+                container.namespaces,
+                container.compile_expressions,
+                only
+            )
+
+            try
+                source_file.definition.walk(rewalker)
+            catch e: Exception
+                logger.exception(function.location, e, "caught exception re-walking body in {source_file}")
+            finally
+                symbol_table.release_scope_stack(mark)
+                container.namespaces.pop_all_namespaces()
+
+                logger.set_is_compiling_expressions(false)
+            yrt
+
+            container.compile_expressions.report_field_assignments()
         si
 
         // Declare, resolve and compile just the definitions an append-only
@@ -1132,25 +1200,55 @@ namespace Compiler is
             let max_rounds = 16
 
             while round <= max_rounds do
-                let inexact = Syntax.Process.KILL_LEDGER.take_inexact_files()
+                let inexact = Syntax.Process.KILL_LEDGER.take_inexact()
 
-                if inexact.count == 0 then
+                if inexact.is_empty then
                     break
                 fi
 
-                if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
-                    IO.Std.error.write_line("combined solve round {round}: {inexact.count} file(s) inexact")
+                // Whole-file re-walks, for comparing against the per-body form.
+                if System.Environment.get_environment_variable("GHUL_SOLVE_FILEWISE")? then
+                    for function in inexact.bodies do
+                        inexact.files.add(function.location.file_name)
+                    od
+
+                    inexact.bodies.clear()
                 fi
 
-                for file_name in inexact do
+                let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+                let sw = System.Diagnostics.Stopwatch.start_new()
+
+                let rewalked = Collections.SET[SOURCE_FILE]()
+
+                // A file re-walked whole covers its inexact bodies too.
+                for file_name in inexact.files do
                     let source_file: SOURCE_FILE mut
 
                     if by_name.try_get_value(file_name, source_file ref) then
                         recompile_file_expressions(source_file)
+                        rewalked.add(source_file)
                     fi
                 od
 
-                _run_effects_round(files)
+                for function in inexact.bodies do
+                    let source_file: SOURCE_FILE mut
+
+                    if by_name.try_get_value(function.location.file_name, source_file ref) then
+                        if !inexact.files.contains(source_file.file_name) then
+                            recompile_body_expressions(source_file, function)
+                        fi
+
+                        rewalked.add(source_file)
+                    fi
+                od
+
+                let recompile_ms = sw.elapsed_milliseconds
+
+                _run_partial_effects_round(rewalked)
+
+                if timing then
+                    IO.Std.error.write_line("combined solve round {round}: recompile {recompile_ms} ms, effects {sw.elapsed_milliseconds - recompile_ms} ms")
+                fi
 
                 round = round + 1
             od
@@ -1181,6 +1279,30 @@ namespace Compiler is
 
             container.infer_store_free.set_resolved_mode(true)
             container.infer_store_free.start_run()
+
+            for source_file in files do
+                infer_effects_pass(source_file)
+            od
+
+            container.infer_store_free.solve_effects()
+            container.infer_store_free.set_resolved_mode(false)
+
+            Syntax.Process.EFFECT_FACTS.collecting = false
+        si
+
+        // A round over only the files whose bodies were re-walked: their
+        // facts are dropped and re-derived, every other file's are kept
+        // from the previous round, and the relations are solved over
+        // the union. The previous round left the facts in place for
+        // exactly this.
+        _run_partial_effects_round(files: Collections.Iterable[SOURCE_FILE]) is
+            Syntax.Process.EFFECT_FACTS.collecting = true
+
+            container.infer_store_free.set_resolved_mode(true)
+
+            for source_file in files do
+                container.infer_store_free.drop_file(source_file.file_name)
+            od
 
             for source_file in files do
                 infer_effects_pass(source_file)
