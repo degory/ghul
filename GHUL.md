@@ -1360,7 +1360,22 @@ struct PAUSE: ICriticalNotifyCompletion is
 si
 ```
 
-An `await` over a value that does not follow the pattern is reported, naming the first missing member. The function itself still has to return `Tasks.TASK` or `Tasks.TASK[T]`: the pattern says what can be awaited, not what an asynchronous function produces.
+An `await` over a value that does not follow the pattern is reported, naming the first missing member.
+
+What an asynchronous function *produces* is not fixed to `Tasks.TASK` / `Tasks.TASK[T]` either. Any type carrying .NET's `AsyncMethodBuilderAttribute` is a *task-like* return type: the attribute names a builder type, and the compiler drives that builder instead of the Task one. `Tasks.ValueTask[T]` and `Tasks.ValueTask` work this way, and so does a type declared in ghūl source, which is how a library gives its coroutines a return type of their own rather than a Task:
+
+```ghul
+@System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(COROUTINE_BUILDER))
+class COROUTINE[T] is
+    value: T public;
+
+    init() is si
+si
+```
+
+A builder written in ghūl declares its members under their ghūl names: a static `create()`, a `start` taking the state machine by reference and calling its `move_next`, a readable `task` property returning the task-like, a `set_result` taking the result (or nothing, for a task-like with no result), a `set_exception` taking `System.Exception`, and `await_on_completed` / `await_unsafe_on_completed` each taking the awaiter by reference. That is the same shape .NET's own builders use.
+
+An `async` function declared `-> COROUTINE[int]` awaits, suspends and returns a bare `int` exactly as a `Tasks.TASK[int]` one does. A generic task-like has exactly one type argument and it is the result type, matching `Task` and `ValueTask`; a non-generic one carries no result. A builder missing one of the required members, or declaring one without the by-reference parameter the lowering passes, is reported at the function that returns its task-like, and a return type that is not a task-like is reported too.
 
 `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch`/`finally` around awaiting code works as expected, including a `return` from inside the `try`; what is not yet supported is an `await` inside a `catch` or `finally` *handler*. Reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 

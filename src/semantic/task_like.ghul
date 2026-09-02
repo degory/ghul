@@ -1,0 +1,161 @@
+namespace Semantic is
+    use Source.LOCATION
+
+    use Types.Type
+
+    // What an async function returns, in the shape the lowering needs:
+    // the result its body produces (the type the builder's `set_result`
+    // delivers, void for a task-like with no type argument), and the
+    // unspecialized builder an async function returning the task-like
+    // drives.
+    //
+    // A task-like is a type carrying AsyncMethodBuilderAttribute naming
+    // its builder - `Tasks.TASK[T]` / `Tasks.ValueTask[T]` from the BCL,
+    // or a type declared in ghūl source. The convention, matching the
+    // BCL's own task-likes: a generic task-like has exactly one type
+    // argument and it is the result type; a non-generic one carries no
+    // result.
+    class TASK_LIKE is
+        task_type: Type
+        result_type: Type?
+        builder_type: Type
+
+        is_void_like: bool => !result_type?
+
+        // The one home for locating a builder member: an overload of the
+        // name taking exactly `arity` arguments. Both the completeness
+        // check above and the emission-time member resolution route
+        // through here, so the contract they enforce is the same one.
+        member_of_arity(type: Type, name: string, arity: int) -> Symbols.Function? static is
+            if let group: Symbols.FUNCTION_GROUP = type.find_member(name) then
+                for f in group.functions do
+                    if f.arguments.count == arity then
+                        return f
+                    fi
+                od
+            fi
+
+            return null
+        si
+
+        init(task_type: Type, result_type: Type?, builder_type: Type) is
+            self.task_type = task_type
+            self.result_type = result_type
+            self.builder_type = builder_type
+        si
+    si
+
+    // Recognises a task-like return type. The builder is read from the
+    // type's symbol: for an imported type, `Classy.async_builder` was
+    // populated at import from the attribute; for a source-declared
+    // type, from its attribute pragma during resolve-type-expressions -
+    // both before any body is compiled, so the answer does not depend
+    // on file order.
+    class TASK_LIKE_RESOLVER(_logger: Logging.Logger) is
+        resolve(location: LOCATION, return_type: Type?) -> TASK_LIKE? is
+            if !return_type? \/ return_type.is_error then
+                return null
+            fi
+
+            let classy = cast Symbols.Classy?(return_type.symbol.unspecialized_symbol)
+
+            if !classy? then
+                return null
+            fi
+
+            if classy.is_generic then
+                // Only the single-argument convention is supported; a
+                // generic whose argument is not the result type has no
+                // way to say which argument is.
+                if !isa Types.GENERIC(return_type) then
+                    return null
+                fi
+
+                let generic = cast Types.GENERIC(return_type)
+
+                if generic.arguments.count != 1 then
+                    _logger.error(
+                        location,
+                        "a generic task-like type must have exactly one type argument, but {return_type} has {generic.arguments.count}"
+                    )
+                    return null
+                fi
+            fi
+
+            let builder_type = classy.async_builder
+
+            if !builder_type? then
+                return null
+            fi
+
+            let result_type: Type? =
+                if isa Types.GENERIC(return_type) then
+                    (cast Types.GENERIC(return_type)).arguments[0]
+                else
+                    null
+                fi
+
+            if !_builder_is_complete(location, builder_type, result_type) then
+                return null
+            fi
+
+            return TASK_LIKE(return_type, result_type, builder_type)
+        si
+
+        // The members the async lowering drives a builder through. Every
+        // one is checked here so a malformed builder is reported at the
+        // function that returns its task-like, not as an emission-time
+        // contract failure.
+        _builder_is_complete(location: LOCATION, builder_type: Type, result_type: Type?) -> bool is
+            let set_result_arity: int = if result_type? then 1 else 0 fi
+
+            let required: Collections.List[(string, int)] =
+                Collections.LIST[(string, int)]([
+                    ("create", 0),
+                    ("start", 1),
+                    ("set_result", set_result_arity),
+                    ("set_exception", 1),
+                    ("await_on_completed", 2),
+                    ("await_unsafe_on_completed", 2)
+                ])
+
+            let task_property = cast Symbols.Property?(builder_type.find_member("task"))
+
+            if !(task_property? /\ task_property.read_function?) then
+                _logger.error(
+                    location,
+                    "builder {builder_type} for a task-like return type has no readable task property")
+                return false
+            fi
+
+            for (name, arity) in required do
+                let member = TASK_LIKE.member_of_arity(builder_type, name, arity)
+
+                if !member? then
+                    _logger.error(
+                        location,
+                        "builder {builder_type} for a task-like return type has no {name} method taking {arity} argument(s)")
+                    return false
+                fi
+
+                // The members the lowering passes by address: `start`
+                // receives the state machine by reference, and both
+                // await registrations receive the awaiter by reference.
+                // An arity match alone would let a by-value declaration
+                // through, and the emission always passes the address.
+                if
+                    name =~ "start" \/ name.starts_with("await_")
+                then
+                    if !isa Types.REFERENCE(member.arguments[0]) then
+                        _logger.error(
+                            location,
+                            "builder {builder_type} for a task-like return type: {name} must take its first argument by reference")
+                        return false
+                    fi
+                fi
+            od
+
+            return true
+        si
+    si
+si
