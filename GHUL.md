@@ -1566,6 +1566,27 @@ let h: (int) -> string = zero_of;         // T pinned by the return slot
 
 With no slot type in scope there is nothing to infer from, and the bare name is an error (`cannot infer the type arguments`) — give the type arguments explicitly.
 
+A name can be declared at more than one generic arity in the same namespace — `class BOX` and `class BOX[T]` are two types, as `Tasks.TASK` and `Tasks.TASK[T]` are. Written with type arguments the name picks the sibling of that arity, and written bare it picks the one taking none.
+
+That leaves the generic sibling with no bare spelling, which matters in a `typeof`: an *open* generic — the type before any type argument is supplied — is a thing only reflection can hold, and a bare `BOX` in a `typeof` names the sibling taking no type arguments. `BOX[_]` names the open generic, with one `_` for each type argument it takes:
+
+```ghul
+let plain = typeof BOX;         // the sibling taking no type arguments
+let open = typeof BOX[_];       // BOX[T], with no argument supplied
+let closed = typeof BOX[int];   // BOX[int]
+
+typeof PAIR[_, _];              // a two-argument open generic
+```
+
+`open` is the type `closed.get_generic_type_definition()` returns. Because nothing but reflection can hold such a type, `FOO[_]` is accepted only as the whole operand of a `typeof` — not as a declared type, not nested inside another type argument, and not with some arguments supplied and others left as `_`.
+
+The main use for it is an attribute that names a generic type, where the type it names shares its name with a sibling — a task-like whose builder is generic, for instance (see [asynchronous code](#asynchronous-code)):
+
+```ghul
+@System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(COROUTINE_BUILDER[_]))
+class COROUTINE[T] is ... si
+```
+
 ## type inference
 
 See <https://ghul.dev/type-inference.html>.
