@@ -1342,6 +1342,26 @@ si
 
 The source reads top-to-bottom even though execution suspends at each `await`. `await e;` on its own is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T`; the compiler delivers the value to the completed task, wrapping it as `Tasks.TASK.from_result(...)` where the body lowers without a suspension.
 
+The operand of `await` need not be a task. Anything following .NET's awaiter pattern is accepted: a type with a parameterless `get_awaiter()` whose result has a `bool` property `is_completed`, a parameterless `get_result()`, and implements `System.Runtime.CompilerServices.INotifyCompletion` (or `ICriticalNotifyCompletion`). The `await` expression takes the type `get_result` returns, void included. `Tasks.ValueTask[T]`, `Tasks.TASK.yield()` and `task.configure_await(false)` all qualify, and so does a type written in ghūl - a struct awaitable that hands its continuation to a scheduler is how cooperative multitasking is built without allocating a task per suspension:
+
+```ghul
+use System.Runtime.CompilerServices.ICriticalNotifyCompletion;
+
+struct PAUSE: ICriticalNotifyCompletion is
+    _ready: Collections.Queue[() -> void];
+
+    init(ready: Collections.Queue[() -> void]) is _ready = ready; si
+
+    get_awaiter() -> PAUSE => self;
+    is_completed: bool => false;
+    get_result() is si
+    on_completed(continuation: () -> void) is _ready.enqueue(continuation); si
+    unsafe_on_completed(continuation: () -> void) is _ready.enqueue(continuation); si
+si
+```
+
+An `await` over a value that does not follow the pattern is reported, naming the first missing member. The function itself still has to return `Tasks.TASK` or `Tasks.TASK[T]`: the pattern says what can be awaited, not what an asynchronous function produces.
+
 `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch`/`finally` around awaiting code works as expected, including a `return` from inside the `try`; what is not yet supported is an `await` inside a `catch` or `finally` *handler*. Reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 
 ### generators
