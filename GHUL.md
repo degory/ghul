@@ -1367,12 +1367,13 @@ What an asynchronous function *produces* is not fixed to `Tasks.TASK` / `Tasks.T
 ```ghul
 use System.Runtime.CompilerServices.IAsyncStateMachine;
 use System.Runtime.CompilerServices.ICriticalNotifyCompletion;
+use System.Runtime.CompilerServices.INotifyCompletion;
 
 @System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(COROUTINE_BUILDER))
 class COROUTINE[T] is
-    value: T;
+    value: T public;
 
-    init(value: T) is self.value = value; si
+    init() is si
 si
 
 class COROUTINE_BUILDER[T] is
@@ -1387,21 +1388,24 @@ class COROUTINE_BUILDER[T] is
         state_machine!.move_next();
     si
 
-    task: COROUTINE[T] =>
+    task: COROUTINE[T] is
         if !_coroutine? then
             _coroutine = COROUTINE[T]();
         fi
-        _coroutine;
-
-    set_result(v: T) is
-        _result = v;
-        if let c = _coroutine then
-            c.value = v;
+        if _result? then
+            _coroutine.value = _result;
         fi
+        return _coroutine;
     si
+
+    set_result(v: T) is _result = v; si
 
     set_exception(e: System.Exception) is
         throw System.Exception("coroutine failed", e);
+    si
+
+    await_on_completed[A: INotifyCompletion](awaiter: A ref, state_machine: IAsyncStateMachine) is
+        awaiter.on_completed(state_machine.move_next);
     si
 
     await_unsafe_on_completed[A: ICriticalNotifyCompletion](awaiter: A ref, state_machine: IAsyncStateMachine) is
