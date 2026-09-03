@@ -1392,7 +1392,7 @@ let handle = scheduler.spawn(s is
 si);                                   // COROUTINE[int], through spawn[T]
 ```
 
-An asynchronous function whose return type carries no result - `Tasks.TASK`, or a task-like with no type argument - completes when its body falls off the end, so it needs no `return` and draws no `definite-return` warning for lacking one. One whose return type carries a result still warns, as any value-returning function does.
+An asynchronous function whose return type carries no result - `Tasks.TASK`, or a task-like with no type argument - completes when its body falls off the end, so it needs no `return` and draws no `definite-return` warning for lacking one. One whose return type carries a result still warns, as any value-returning function does. A `Tasks.TASK` function completes this way whether or not its body awaits - the declaration alone makes it asynchronous - and a bare `return;` in one is sugar for the same completed task. A task-like other than Task completes through its builder, so a body declaring one completes at fall-through only when it awaits; an await-free body declaring one still warns, since nothing drives the builder.
 
 `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch`/`finally` around awaiting code works as expected, including a `return` from inside the `try`; what is not yet supported is an `await` inside a `catch` or `finally` *handler*. Reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 
