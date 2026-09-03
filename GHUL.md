@@ -1377,6 +1377,23 @@ A builder written in ghūl declares its members under their ghūl names: a stati
 
 An `async` function declared `-> COROUTINE[int]` awaits, suspends and returns a bare `int` exactly as a `Tasks.TASK[int]` one does. A generic task-like has exactly one type argument and it is the result type, matching `Task` and `ValueTask`; a non-generic one carries no result. A builder missing one of the required members, or declaring one without the by-reference parameter the lowering passes, is reported at the function that returns its task-like, and a return type that is not a task-like is reported too.
 
+A function literal is asynchronous on the same terms. One that declares a task-like return type is driven through that type's builder, as a named function is. One that declares none takes its task-like from the slot it goes into - a typed local variable, a parameter, a return - and where the slot leaves the result type open, as `spawn[T](body: () -> COROUTINE[T])` does, the result is inferred from the body's returns. Where several overloads share the arity, the body settles which is meant: one that produces a value goes to a formal whose task-like carries a result, and one that produces none to a formal whose task-like does not. A literal with nothing to say otherwise returns `Tasks.TASK` or `Tasks.TASK[T]`.
+
+```ghul
+let tick = (name: string) -> COROUTINE is
+    write_line("{name} before");
+    await scheduler.pause();
+    write_line("{name} after");
+si;
+
+let handle = scheduler.spawn(s is
+    await s.pause();
+    return 42;
+si);                                   // COROUTINE[int], through spawn[T]
+```
+
+An asynchronous function whose return type carries no result - `Tasks.TASK`, or a task-like with no type argument - completes when its body falls off the end, so it needs no `return` and draws no `definite-return` warning for lacking one. One whose return type carries a result still warns, as any value-returning function does.
+
 `await` may appear inside the body of a `for` or `while` loop, and `return` from inside such a body propagates back through the loop. A `try`/`catch`/`finally` around awaiting code works as expected, including a `return` from inside the `try`; what is not yet supported is an `await` inside a `catch` or `finally` *handler*. Reading `.result` on a returned task surfaces a faulted task as a `System.AggregateException`.
 
 ### generators

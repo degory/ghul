@@ -22,6 +22,7 @@ namespace Syntax.Process is
         _symbol_loader: Semantic.SYMBOL_LOADER
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
         _task_conversion: Semantic.TASK_CONVERSION
+        _task_like_resolver: Semantic.TASK_LIKE_RESOLVER
         _closure_arg_resolver: Semantic.CLOSURE_ARG_RESOLVER
         _type_arg_placeholder_registry: Semantic.TYPE_ARG_PLACEHOLDER_REGISTRY
         _flow: NARROWING_FLOW
@@ -31,6 +32,7 @@ namespace Syntax.Process is
         _field_assignment_checker: FIELD_ASSIGNMENT_CHECKER
         _delegate_shape: Semantic.DELEGATE_SHAPE
         _attribute_resolver: ATTRIBUTE_RESOLVER
+        _composite_spill_state: COMPOSITE_SPILL_STORE
 
         init(
             logger: Logger,
@@ -44,7 +46,8 @@ namespace Syntax.Process is
             flow: NARROWING_FLOW,
             build_flags: Compiler.GLOBAL_BUILD_FLAGS,
             visitor: ScopedVisitor,
-            attribute_resolver: ATTRIBUTE_RESOLVER
+            attribute_resolver: ATTRIBUTE_RESOLVER,
+            composite_spill_state: COMPOSITE_SPILL_STORE
         ) is
             super.init()
 
@@ -54,6 +57,7 @@ namespace Syntax.Process is
             _symbol_loader = symbol_loader
             _innate_symbol_lookup = innate_symbol_lookup
             _task_conversion = task_conversion
+            _task_like_resolver = Semantic.TASK_LIKE_RESOLVER(logger)
             _closure_arg_resolver = closure_arg_resolver
             _type_arg_placeholder_registry = type_arg_placeholder_registry
             _flow = flow
@@ -61,6 +65,7 @@ namespace Syntax.Process is
             _visitor = visitor
             _field_assignment_checker = FIELD_ASSIGNMENT_CHECKER(logger)
             _attribute_resolver = attribute_resolver
+            _composite_spill_state = composite_spill_state
             _delegate_shape = Semantic.DELEGATE_SHAPE()
         si
 
@@ -214,7 +219,8 @@ namespace Syntax.Process is
                     function_symbol.return_type? /\
                     !function_symbol.return_type.is_sentinel /\
                     !function_symbol.return_type.is_inferred /\
-                    !function_symbol.return_type.matches(_innate_symbol_lookup.get_void_type())
+                    !function_symbol.return_type.matches(_innate_symbol_lookup.get_void_type()) /\
+                    !_returns_result_less_task_like(function_symbol)
                 then
                     _logger.warn(function.location, "definite-return", "function may not return a value on all paths")
                 fi
@@ -284,6 +290,50 @@ namespace Syntax.Process is
             )
         si
 
+        // An asynchronous function whose return type carries no result
+        // - `Tasks.TASK`, or any task-like with no type argument - has
+        // nothing a fall-through could fail to return: the builder
+        // completes the handle either way.
+        _returns_result_less_task_like(function_symbol: Semantic.Symbols.Function) -> bool is
+            if !Semantic.Symbols.async_state_machine_for(function_symbol)? then
+                return false
+            fi
+
+            let return_type = function_symbol.return_type!
+
+            if let void_task = _innate_symbol_lookup.get_void_task_type() then
+                if return_type.matches(void_task) then
+                    return true
+                fi
+            fi
+
+            let task_like = _task_like_resolver.try_resolve(return_type)
+
+            return task_like? /\ task_like.is_void_like
+        si
+
+        // The task-like a closure's slot asks its async body to return,
+        // when the slot's return type names one other than Task. Task
+        // keeps its own path: the wrap-as-task pin and the from_result
+        // wrap both spell it directly.
+        _slot_task_like(slot_return_type: Type?) -> Semantic.TASK_LIKE? is
+            if !slot_return_type? then
+                return null
+            fi
+
+            let task_like = _task_like_resolver.try_resolve(slot_return_type)
+
+            if !task_like? then
+                return null
+            fi
+
+            if _task_conversion.is_task_type(slot_return_type) then
+                return null
+            fi
+
+            return task_like
+        si
+
         visit_function(function: Trees.Expressions.FUNCTION) is
             if !function.value? then
                 function.compile_expressions_state.value = IR.Values.WRAPPER()
@@ -293,9 +343,22 @@ namespace Syntax.Process is
 
             closure.map_type_arguments()
 
+            // Every walk of an async closure starts from a fresh
+            // state-machine frame: the return type this walk settles on
+            // decides the frame's builder and result, and nothing
+            // registered against an earlier walk's frame may survive.
+            if function.contains_let_await then
+                if let state_machine = Semantic.Symbols.async_state_machine_for(closure) then
+                    if let dropped = state_machine.reset() then
+                        _composite_spill_state.drop_owned_by(dropped)
+                    fi
+                fi
+            fi
+
             let implied_type: Type mut
             let implied_argument_types: Collections.List[Type]? mut = null
             let constraint_return_type: Type? mut = null
+            let slot_return_type: Type? mut = null
 
             // have we been passed expected arguments types? If so we'll use them
             // to argument types of any anonymous function literal arguments.
@@ -341,6 +404,8 @@ namespace Syntax.Process is
                             Semantic.SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(
                                 effective.arguments[argument_count - 1])
 
+                        slot_return_type = candidate
+
                         if Semantic.LAMBDA_RETURN_CONSTRAINT.should_push(candidate, closure) then
                             constraint_return_type = candidate
                         fi
@@ -365,18 +430,41 @@ namespace Syntax.Process is
                     closure.return_type_was_inferred = true
                 fi
 
-                // Body contains `await` → closure must eventually
-                // return `Tasks.TASK[?]`. Void-async (no value
-                // returns) pins to non-generic `Tasks.TASK`; value-
-                // async stays INFERRED_RETURN_TYPE and pins to
-                // `Tasks.TASK[T]` via the wrap-paths.
+                // Body contains `await` → the closure returns a
+                // task-like. A declared return type names it outright.
+                // Otherwise the slot's return type does, when it names
+                // one: adopted as-is when settled, and kept as the
+                // template the body's value is applied to when its
+                // result argument is still to be inferred. With neither,
+                // void-async (no value returns) pins to non-generic
+                // `Tasks.TASK` and value-async stays
+                // INFERRED_RETURN_TYPE, pinning to `Tasks.TASK[T]` via
+                // the wrap-paths.
                 if function.contains_let_await then
-                    if function.is_void_async then
+                    closure.is_void_async = false
+                    closure.wrap_inferred_return_as_task = false
+                    closure.async_task_like_template = null
+
+                    if function.type_expression.type? then
+                        let declared = _task_like_resolver.resolve(function.location, return_type)
+
+                        closure.is_void_async =
+                            if declared? then declared.is_void_like else function.is_void_async fi
+                    elif let slot_task_like = _slot_task_like(slot_return_type) then
+                        if constraint_return_type? /\ constraint_return_type.is_settled then
+                            return_type = constraint_return_type
+                            closure.return_type_was_inferred = false
+                            closure.is_void_async = slot_task_like.is_void_like
+                        else
+                            closure.wrap_inferred_return_as_task = true
+                            closure.async_task_like_template =
+                                cast Semantic.Symbols.Classy?(slot_task_like.task_type.symbol.unspecialized_symbol)
+                        fi
+                    elif function.is_void_async then
                         let void_task = _innate_symbol_lookup.get_void_task_type()
                         if void_task? then
                             return_type = void_task
                             closure.return_type_was_inferred = false
-                            closure.wrap_inferred_return_as_task = false
                             closure.is_void_async = true
                         fi
                     else
