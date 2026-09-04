@@ -59,6 +59,7 @@ if [ -d $CASE ] ; then
     promote $CASE/err.sort $CASE/err.expected
     promote $CASE/warn.sort $CASE/warn.expected
     promote $CASE/il.out $CASE/il.expected
+    promote $CASE/format.out $CASE/format.expected
 
     # A library has no entry point, so the runner never runs it and there
     # is no run output to promote - which is not the same as the build

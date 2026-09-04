@@ -63,6 +63,7 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 | `run.expected` | Expected stdout from running the compiled binary. |
 | `il.expected` | Expected IL disassembly output. |
 | `il.item` | If present, scopes the IL disassembly to one type or member (`Namespace.TYPE` or `Namespace.TYPE::member`). Without it the whole assembly is disassembled. |
+| `format.expected` | Expected output of running the formatter over the test's sources. When present, the runner also rebuilds and reruns the formatted copy and asserts it still builds and produces `run.expected`. Not supported under `--use-dotnet-build`. |
 | `ghul.json` | Configuration file pointing at the compiler (created from the template). |
 | `disabled*` | Any file beginning with `disabled` causes the test to be skipped. |
 | `tags` | Zero or more whitespace-separated tag names, used to select a subset of tests with `--tag`. See 'Tags' below. |
