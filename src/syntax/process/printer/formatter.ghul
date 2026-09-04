@@ -69,18 +69,122 @@ namespace Syntax.Process.Printer is
             let text = DOC_RENDERER(_width).render(_builder.build())
 
             // Strip trailing whitespace from every line (blank lines pick up
-            // indentation from the renderer) and end with a single newline.
+            // indentation from the renderer), then settle each terminator.
+            let lines = Collections.LIST[string]()
+
+            for line in text.split(['\n']) do
+                lines.add(line.trim_end())
+            od
+
+            _settle_terminators(lines)
+
             let result = System.Text.StringBuilder()
             let first mut = true
-            for line in text.split(['\n']) do
+            for line in lines do
                 if !first then
                     result.append('\n')
                 fi
-                result.append(line.trim_end())
+                result.append(line)
                 first = false
             od
 
             return "{result.to_string().trim_end()}\n"
+        si
+
+        // A statement terminator is written as this marker rather than as
+        // `;`, because whether it is needed depends on what follows it,
+        // which is not known when the statement is emitted.
+        // _settle_terminators resolves every one of them once the text has
+        // been laid out.
+        // A control character, so it cannot occur in the source being
+        // formatted. Held and searched for as a `char`: `index_of(string)`
+        // compares by culture, under which a control character has no
+        // collation weight and so matches at the start of any string at
+        // all, while the `char` overload compares ordinally.
+        TERMINATOR_MARKER: char static => cast char(1)
+
+        write_terminator() is
+            write(TERMINATOR_MARKER)
+            write_line()
+        si
+
+        // A line break stands in for a statement terminator, so a marker
+        // that nothing but a comment follows is dropped. The exception is
+        // the one terminator that carries meaning: adjacent string literals
+        // chain into a single literal across a line break, so a statement
+        // ending on one and followed by a statement starting with one keeps
+        // its `;`. A marker with code after it separates two statements on
+        // one line and is kept.
+        _settle_terminators(lines: Collections.LIST[string]) is
+            let i mut = 0
+
+            while i < lines.count do
+                let line = lines[i]
+                let at = line.index_of(TERMINATOR_MARKER)
+
+                if at >= 0 then
+                    let before = line[0..at]
+                    let after = line[at + 1..<0]
+
+                    let keep =
+                        !_is_only_a_comment(after) \/
+                            (_ends_with_string(before) /\
+                                _next_line_starts_with_string(lines, i))
+
+                    lines[i] = if keep then "{before};{after}" else "{before}{after}" fi
+                fi
+
+                i = i + 1
+            od
+        si
+
+        // Whether the rest of a line, after a terminator marker, is nothing
+        // but whitespace and a comment - in which case the line break is
+        // what ends the statement.
+        _is_only_a_comment(rest: string) -> bool is
+            let trimmed = rest.trim()
+
+            if trimmed.length == 0 \/ trimmed.starts_with("//") then
+                return true
+            fi
+
+            return
+                trimmed.starts_with("/*") /\
+                trimmed.ends_with("*/") /\
+                trimmed.index_of("*/") == trimmed.length - 2
+        si
+
+        _ends_with_string(line: string) -> bool is
+            let trimmed = line.trim_end()
+
+            return trimmed.length > 0 /\ trimmed[trimmed.length - 1] == cast char(34)
+        si
+
+        // Comments are transparent to string chaining, so a comment line
+        // between the two literals does not break the chain and is looked
+        // through here too - a block comment as well as a line comment.
+        //
+        // A line this cannot classify - the opening line of a block comment
+        // that runs on, say - is answered as though a literal followed.
+        // The two errors are not equal: a terminator written where none was
+        // needed costs a warning, while one dropped where it was needed
+        // merges two literals into one and changes what the program says.
+        _next_line_starts_with_string(lines: Collections.LIST[string], from: int) -> bool is
+            let i mut = from + 1
+
+            while i < lines.count do
+                let candidate = lines[i].trim()
+
+                if candidate.length == 0 \/ _is_only_a_comment(candidate) then
+                    i = i + 1
+                elif candidate.starts_with("/*") then
+                    return true
+                else
+                    return candidate[0] == cast char(34)
+                fi
+            od
+
+            return false
         si
 
         // --- output primitives, redirected into the DOC builder ---
@@ -168,6 +272,12 @@ namespace Syntax.Process.Printer is
 
         _has_trivia: bool => _trivia_index < _trivia.count
 
+        // Whether any unemitted trivia still sits before `limit` (a
+        // LOCATION.start value). A body with none can take a one-line
+        // rendering, since there is no comment to keep inside it.
+        _has_trivia_before(limit: int) -> bool =>
+            _has_trivia /\ _peek.location.start < limit
+
         _peek: TRIVIA => _trivia[_trivia_index]
 
         _consume() is
@@ -181,7 +291,13 @@ namespace Syntax.Process.Printer is
                 let t = _peek
 
                 if isa TRIVIA.BLANK_LINE(t) then
-                    if !_at_block_start then
+                    // A blank line written inside an expression the layout
+                    // joins onto one line has nowhere to go, and emitting it
+                    // here puts it after the whole construct instead - one
+                    // more blank line on every reformat. Its source line has
+                    // already been passed, which is what distinguishes it
+                    // from a blank line genuinely separating two constructs.
+                    if !_at_block_start /\ _peek.location.start_line > _last_line then
                         _builder.hard_line()
                     fi
                     _consume()
@@ -223,17 +339,59 @@ namespace Syntax.Process.Printer is
         _is_comment(t: TRIVIA) -> bool =>
             isa TRIVIA.LINE_COMMENT(t) \/ isa TRIVIA.BLOCK_COMMENT(t)
 
+        // The leading whitespace every non-blank continuation line of a
+        // block comment has in common.
+        _common_indent(lines: string[]) -> int is
+            let common mut = -1
+            let first mut = true
+
+            for line in lines do
+                if !first /\ line.trim().length > 0 then
+                    let indent = line.length - line.trim_start().length
+
+                    if common < 0 \/ indent < common then
+                        common = indent
+                    fi
+                fi
+
+                first = false
+            od
+
+            return if common < 0 then 0 else common fi
+        si
+
+        _strip_indent(line: string, amount: int) -> string is
+            let i mut = 0
+
+            while i < amount /\ i < line.length /\ char.is_white_space(line[i]) do
+                i = i + 1
+            od
+
+            return line[i..<0]
+        si
+
         emit_comment(t: TRIVIA) is
             note(t.location)
 
             if let bc: TRIVIA.BLOCK_COMMENT = t then
                 let lines = bc.text.split(['\n'])
+
+                // A continuation line carries the indentation it was
+                // written at, and the renderer indents it again, so
+                // re-emitting it verbatim moves the comment four columns
+                // right on every reformat. Strip what every continuation
+                // line shares and let the renderer supply it instead; the
+                // relative shape of the comment is preserved.
+                let common = _common_indent(lines)
+
                 let first mut = true
                 for line in lines do
                     if !first then
                         _builder.hard_line()
+                        _builder.text(_strip_indent(line, common))
+                    else
+                        _builder.text(line)
                     fi
-                    _builder.text(line)
                     first = false
                 od
             elif let lc: TRIVIA.LINE_COMMENT = t then
