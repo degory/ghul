@@ -49,9 +49,15 @@ namespace Compiler is
 
         _effects_stopwatch: System.Diagnostics.Stopwatch?
 
+        // Files with a body walked since the effect relations were last
+        // solved: what the next solve has to re-derive before it can
+        // answer for them.
+        _effects_stale_files: Collections.SET[string]
+
         init() is
             container = IoC.CONTAINER.instance
             logger = container.logger
+            _effects_stale_files = Collections.SET[string]()
 
             // Nothing has been compiled yet, so expression-level state is
             // certainly absent: a compile request against this fresh state
@@ -117,11 +123,17 @@ namespace Compiler is
 
             add_pass(build_passes, "mark-boxed-locals", (source_file) -> bool => mark_boxed_locals_pass(source_file))
 
-            _compile_expressions_pass = add_pass(build_passes, "compile-expressions", (source_file) -> bool => compile_expressions_pass(source_file))
+            _compile_expressions_pass = add_pass(
+                build_passes,
+                "compile-expressions",
+                () -> void is si,
+                (source_file) -> bool => compile_expressions_pass(source_file),
+                () -> void is si
+            )
 
             // Re-walks every body with the types compile-expressions
             // resolved, then solves the member-granular effect
-            // relations the reliance judge reads. Reports nothing a
+            // relations the crossing discharge reads. Reports nothing a
             // later pass consumes through the milestone, so it does not
             // advance it.
             add_pass(
@@ -141,21 +153,30 @@ namespace Compiler is
                     let stopwatch = _effects_stopwatch
                     let walk_ms = if stopwatch? then stopwatch.elapsed_milliseconds else 0L fi
 
-                    container.infer_store_free.solve_effects()
+                    let complete = _all_compiled_through_expressions(source_files)
+
+                    container.infer_store_free.solve_effects(complete)
                     container.infer_store_free.set_resolved_mode(false)
 
                     Syntax.Process.EFFECT_FACTS.collecting = false
 
                     let solve_ms = if stopwatch? then stopwatch.elapsed_milliseconds else 0L fi
 
-                    // With the effect relations installed, judge every
-                    // consumption of a value that was loaded through a
-                    // narrowing fact — see JUDGE_RELIANCES.
-                    run_reliance_judge(source_files)
+                    // Re-walk the files whose walk disagrees with the
+                    // relations until a solve finds none, then judge
+                    // and check against the final relations.
+                    run_combined_solve_rounds(source_files)
+
+                    let rounds_ms = if stopwatch? then stopwatch.elapsed_milliseconds else 0L fi
+
                     run_post_effects_purity_checks(source_files)
 
+                    Syntax.Process.RETRY_STATS.report()
+
+                    _dump_kills()
+
                     if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? /\ stopwatch? then
-                        IO.Std.error.write_line("effects round: {stopwatch.elapsed_milliseconds} ms (walk {walk_ms} solve {solve_ms - walk_ms} judge {stopwatch.elapsed_milliseconds - solve_ms})")
+                        IO.Std.error.write_line("effects round: {stopwatch.elapsed_milliseconds} ms (walk {walk_ms} solve {solve_ms - walk_ms} rounds {rounds_ms - solve_ms} judge {stopwatch.elapsed_milliseconds - rounds_ms})")
                     fi
                 si
             ).advances_milestone = false
@@ -251,12 +272,29 @@ namespace Compiler is
         si
 
         clear_symbols() is
+            clear_symbols(Collections.LIST[string]())
+        si
+
+        // Abandon the symbol tables ahead of a rebuild. Every source
+        // symbol is re-created; those of a file that was not edited are
+        // re-declared from its retained tree in the same order as
+        // before, and adopt the ids they had, so everything keyed by
+        // symbol id - the solved effect relations above all - carries
+        // over. Symbols of an edited file get fresh ids.
+        clear_symbols(edited_files: Collections.Iterable[string]) is
             are_tables_current = false
+
+            // The retained effect facts describe the symbols being
+            // abandoned, and what the solve reads off a symbol - its
+            // owner's openness, its overriders, its purity - can change
+            // with the rebuild; the next solve starts from every body.
+            container.infer_store_free.start_run()
+            _effects_stale_files.clear()
 
             container.symbol_table.clear()
             container.namespaces.clear()
             container.symbol_use_locations.clear()
-            container.symbol_definition_locations.clear()
+            container.symbol_definition_locations.clear_and_replay_ids(edited_files)
             Semantic.Symbols.STORE_FREE_BITS.clear()
 
             // The emitter's rows and reference caches name symbols that
@@ -387,10 +425,8 @@ namespace Compiler is
         build() is
             container.ghul_namespace_creator.create_namespaces()
 
-            Syntax.Process.RELIANCES.reset_counters()
-            Syntax.Process.RELIANCES.clear_kill_candidates()
-            Syntax.Process.UNBACKED_FACTS.clear()
             Syntax.Process.PURE_SLOTS.clear()
+            Syntax.Process.KILL_LEDGER.clear_all()
 
             _move_top_level_entry_file_first()
 
@@ -485,6 +521,7 @@ namespace Compiler is
         // interface change is pending.
         compile_expressions_only(source_file: SOURCE_FILE) is
             source_file.want_compile_expressions = true
+            _effects_stale_files.add(source_file.file_name)
 
             // This walk is the only pass a file the client opened after
             // the last full build ever gets: the build ran the
@@ -569,14 +606,69 @@ namespace Compiler is
         // Recompile one file's expressions against the current symbol
         // table, keeping its resolved interface, so every body rebinds.
         recompile_file_expressions(source_file: SOURCE_FILE) is
+            Syntax.Process.KILL_LEDGER.clear_for(source_file.file_name)
+
             invalidate_file_expressions(source_file)
 
             logger.clear_expression_diagnostics(source_file.file_name)
-            Syntax.Process.RELIANCES.clear_kill_candidates_for(source_file.file_name)
-            Syntax.Process.UNBACKED_FACTS.clear_for(source_file.file_name)
             Syntax.Process.PURE_SLOTS.clear_for(source_file.file_name)
 
             compile_expressions_only(source_file)
+        si
+
+        // Re-walk one definition's body against the current symbol table
+        // and the current effect relations: what the previous walk of that
+        // body left behind - its node state, its expression-level
+        // diagnostics and inlays, its ledger records and candidates - is
+        // dropped, and compile-expressions is driven over that body
+        // alone. The interface, and every other body in the file, is
+        // untouched.
+        recompile_body_expressions(source_file: SOURCE_FILE, function: Syntax.Trees.Definitions.FUNCTION) is
+            let file_name = source_file.file_name
+            let span = function.location
+
+            _effects_stale_files.add(file_name)
+
+            Syntax.Process.KILL_LEDGER.clear_for(function)
+
+            if let body = function.body then
+                Syntax.Process.CLEAR_STATE_VISITOR(true).apply(body)
+            fi
+
+            logger.clear_expression_diagnostics_within(file_name, span)
+            container.symbol_use_locations.drop_within(file_name, span)
+            Syntax.Process.PURE_SLOTS.clear_within(file_name, span)
+
+            let only = Collections.SET[Syntax.Trees.Definitions.FUNCTION]()
+            only.add(function)
+
+            logger.set_is_compiling_expressions(true)
+
+            container.compile_expressions.reset_between_walks()
+
+            let symbol_table = container.symbol_table
+            let mark = symbol_table.mark_scope_stack()
+
+            let rewalker = Syntax.Process.BODY_REWALKER(
+                logger,
+                symbol_table,
+                container.namespaces,
+                container.compile_expressions,
+                only
+            )
+
+            try
+                source_file.definition.walk(rewalker)
+            catch e: Exception
+                logger.exception(function.location, e, "caught exception re-walking body in {source_file}")
+            finally
+                symbol_table.release_scope_stack(mark)
+                container.namespaces.pop_all_namespaces()
+
+                logger.set_is_compiling_expressions(false)
+            yrt
+
+            container.compile_expressions.report_field_assignments()
         si
 
         // Declare, resolve and compile just the definitions an append-only
@@ -738,6 +830,9 @@ namespace Compiler is
         ) is
             source_file.want_compile_up_to_expressions = true
             source_file.want_compile_expressions = true
+            _effects_stale_files.add(source_file.file_name)
+
+            Syntax.Process.KILL_LEDGER.clear_for(source_file.file_name)
 
             // Definition reconciliation first — it classifies symbols by
             // their pre-edit location, before the use reconciliation moves
@@ -1097,6 +1192,105 @@ namespace Compiler is
             return false
         si
 
+        // The re-walk loop of the combined type + effect solve
+        // prototype. A body walked before any relations were solved,
+        // or against relations an edit has since changed, may disagree
+        // with the relations just solved: the judge reports facts it
+        // kept that are unbacked, and the ledger reports facts it
+        // dropped that are backed. Files with either are re-walked
+        // against the new relations, the relations are solved again,
+        // and the loop stops when a solve finds every file exact.
+        // Widening can only add callees and writes, and a re-walk
+        // only reads the relations, so the loop is bounded; the cap is
+        // a guard. See KILL_LEDGER.
+        run_combined_solve_rounds(files: Collections.Iterable[SOURCE_FILE]) is
+            if !Syntax.Process.EFFECTS.is_complete then
+                return
+            fi
+
+            let by_name = Collections.MAP[string, SOURCE_FILE]()
+
+            for source_file in files do
+                by_name[source_file.file_name] = source_file
+            od
+
+            let round mut = 1
+            let max_rounds = 16
+
+            while round <= max_rounds do
+                let inexact = Syntax.Process.KILL_LEDGER.take_inexact()
+
+                if inexact.is_empty then
+                    break
+                fi
+
+                // Whole-file re-walks, for comparing against the per-body form.
+                if System.Environment.get_environment_variable("GHUL_SOLVE_FILEWISE")? then
+                    for function in inexact.bodies do
+                        inexact.files.add(function.location.file_name)
+                    od
+
+                    inexact.bodies.clear()
+                fi
+
+                let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+                let sw = System.Diagnostics.Stopwatch.start_new()
+
+                Syntax.Process.KILL_LEDGER.in_descent = true
+
+                let rewalked = Collections.SET[SOURCE_FILE]()
+
+                // A file re-walked whole covers its inexact bodies too.
+                for file_name in inexact.files do
+                    let source_file: SOURCE_FILE mut
+
+                    if by_name.try_get_value(file_name, source_file ref) then
+                        recompile_file_expressions(source_file)
+                        rewalked.add(source_file)
+                    fi
+                od
+
+                for function in inexact.bodies do
+                    let source_file: SOURCE_FILE mut
+
+                    if by_name.try_get_value(function.location.file_name, source_file ref) then
+                        if !inexact.files.contains(source_file.file_name) then
+                            recompile_body_expressions(source_file, function)
+                        fi
+
+                        rewalked.add(source_file)
+                    fi
+                od
+
+                Syntax.Process.KILL_LEDGER.in_descent = false
+
+                let recompile_ms = sw.elapsed_milliseconds
+
+                let names = Collections.LIST[string]()
+
+                for source_file in rewalked do
+                    names.add(source_file.file_name)
+                od
+
+                _run_partial_effects_round(files, names)
+
+                if timing then
+                    IO.Std.error.write_line("combined solve round {round}: recompile {recompile_ms} ms, effects {sw.elapsed_milliseconds - recompile_ms} ms")
+                fi
+
+                round = round + 1
+            od
+        si
+
+        _dump_kills() is
+            if let dump = System.Environment.get_environment_variable("GHUL_KILL_DUMP") then
+                let writer = IO.File.append_text(dump)
+                writer.write_line("=== solve")
+                Syntax.Process.KILL_LEDGER.dump(writer)
+                writer.dispose()
+            fi
+        si
+
         // The infer-effects pass as a directly callable round, for the
         // analysis-mode COMPILE paths that recompile expressions
         // without running the pass list: re-walk every file's bodies
@@ -1105,6 +1299,93 @@ namespace Compiler is
         // a reliance recorded on an incremental path would never be
         // reported.
         run_effects_pass(files: Collections.Iterable[SOURCE_FILE]) is
+            let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+            let sw = System.Diagnostics.Stopwatch.start_new()
+
+            _restart_descent(files)
+
+            let t_restart = sw.elapsed_milliseconds
+
+            // Only the files walked since the last solve can have
+            // changed what it reads; everything else's facts are
+            // retained. That needs a complete solve to build on, and
+            // for every such file to have been compiled through
+            // expressions, or the round is the full one.
+            let stale = Collections.LIST[string]()
+
+            for file_name in _effects_stale_files do
+                stale.add(file_name)
+            od
+
+            if _can_solve_partially(files, stale) then
+                _run_partial_effects_round(files, stale)
+            else
+                _run_effects_round(files)
+            fi
+
+            let t_round = sw.elapsed_milliseconds
+
+            run_combined_solve_rounds(files)
+
+            let t_rounds = sw.elapsed_milliseconds
+
+            _dump_kills()
+
+            run_post_effects_purity_checks(files)
+
+            if timing then
+                IO.Std.error.write_line("effects pass: restart {t_restart} round {t_round - t_restart} descent {t_rounds - t_round} purity {sw.elapsed_milliseconds - t_rounds} ms")
+            fi
+        si
+
+        // The answer is defined as the descent from every fact kept, which
+        // is what a batch build does. An edit path walks a body against
+        // the last complete solve instead, which is fast but starts the
+        // descent lower than the top, and from there it can settle short
+        // of the batch answer. So a COMPILE after any such walk first
+        // re-walks the bodies that killed outside a descent with kills
+        // suspended; every other body walked as it would have from the
+        // top already.
+        _restart_descent(files: Collections.Iterable[SOURCE_FILE]) is
+            Syntax.Process.KILL_LEDGER.kills_suspended = false
+
+            if !Syntax.Process.KILL_LEDGER.needs_restart then
+                return
+            fi
+
+            let by_name = Collections.MAP[string, SOURCE_FILE]()
+
+            for source_file in files do
+                by_name[source_file.file_name] = source_file
+            od
+
+            let bodies = Syntax.Process.KILL_LEDGER.take_restart_bodies()
+            let sw = System.Diagnostics.Stopwatch.start_new()
+
+            Syntax.Process.KILL_LEDGER.kills_suspended = true
+
+            for function in bodies do
+                let source_file: SOURCE_FILE mut
+
+                if by_name.try_get_value(function.location.file_name, source_file ref) then
+                    recompile_body_expressions(source_file, function)
+                fi
+            od
+
+            Syntax.Process.KILL_LEDGER.kills_suspended = false
+            Syntax.Process.KILL_LEDGER.needs_restart = false
+
+            if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
+                IO.Std.error.write_line("descent restarted from the top: {bodies.count} body(ies) re-walked in {sw.elapsed_milliseconds} ms")
+            fi
+        si
+
+        // One walk-and-solve round of the effects pass. The judge and
+        // the purity checks run once, against the relations the last
+        // round solved.
+        _run_effects_round(files: Collections.Iterable[SOURCE_FILE]) is
+            _effects_stale_files.clear()
+
             Syntax.Process.EFFECT_FACTS.collecting = true
             Syntax.Process.EFFECT_FACTS.begin_generation("infer-effects")
 
@@ -1115,13 +1396,117 @@ namespace Compiler is
                 infer_effects_pass(source_file)
             od
 
-            container.infer_store_free.solve_effects()
+            container.infer_store_free.solve_effects(_all_compiled_through_expressions(files))
             container.infer_store_free.set_resolved_mode(false)
 
             Syntax.Process.EFFECT_FACTS.collecting = false
+        si
 
-            run_reliance_judge(files)
-            run_post_effects_purity_checks(files)
+        // Whether every one of these files has had its expressions
+        // compiled, which is what makes a solve over them complete.
+        _all_compiled_through_expressions(files: Collections.Iterable[SOURCE_FILE]) -> bool is
+            let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+            let complete mut = true
+
+            for source_file in files do
+                if !is_compiled_through_expressions(source_file) then
+                    if timing then
+                        IO.Std.error.write_line("effects: solve incomplete, not compiled through expressions: {source_file.file_name} (compiled_through {source_file.compiled_through?.description ?? "none"})")
+                    fi
+
+                    complete = false
+                fi
+            od
+
+            return complete
+        si
+
+        // Whether the stale files can be solved as a partial round over
+        // the retained facts: the relations in use were solved from
+        // them, and every stale file still present is compiled through
+        // expressions.
+        _can_solve_partially(files: Collections.Iterable[SOURCE_FILE], stale: Collections.List[string]) -> bool is
+            if !container.infer_store_free.solved_over_facts then
+                return false
+            fi
+
+            let names = Collections.SET[string]()
+
+            for file_name in stale do
+                names.add(file_name)
+            od
+
+            for source_file in files do
+                if names.contains(source_file.file_name) /\ !is_compiled_through_expressions(source_file) then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
+        // A round over only the files whose bodies were re-walked: their
+        // facts are dropped and re-derived, every other file's are kept
+        // from the previous round, and the relations are solved over
+        // the union. The previous round left the facts in place for
+        // exactly this.
+        _run_partial_effects_round(files: Collections.Iterable[SOURCE_FILE], names: Collections.List[string]) is
+            _effects_stale_files.clear()
+
+            Syntax.Process.EFFECT_FACTS.collecting = true
+
+            container.infer_store_free.set_resolved_mode(true)
+
+            let by_name = Collections.MAP[string, SOURCE_FILE]()
+
+            for source_file in files do
+                by_name[source_file.file_name] = source_file
+            od
+
+            // The re-walk usually re-derives exactly what it replaces: a
+            // kill widens a receiver, and the widened dispatch reaches the
+            // same callees and writes the same members; an edit that
+            // touches no call or store leaves them alone too. Then the
+            // installed relations already answer for the facts and the
+            // solve is skipped.
+            let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+            let sw = System.Diagnostics.Stopwatch.start_new()
+
+            let snapshot = container.infer_store_free.snapshot_inputs(names)
+
+            for file_name in names do
+                container.infer_store_free.drop_file(file_name)
+            od
+
+            for file_name in names do
+                let source_file: SOURCE_FILE mut
+
+                if by_name.try_get_value(file_name, source_file ref) then
+                    infer_effects_pass(source_file)
+                fi
+            od
+
+            if timing then
+                IO.Std.error.write_line("effects: partial round snapshot, drop and re-walk {sw.elapsed_milliseconds} ms")
+            fi
+
+            let changed = container.infer_store_free.changed_inputs(names, snapshot)
+
+            if changed.count == 0 then
+                if timing then
+                    IO.Std.error.write_line("effects: partial round over {names.count} file(s) changed no solve input, relations kept")
+                fi
+            else
+                if timing then
+                    IO.Std.error.write_line("effects: partial round over {names.count} file(s) changed the inputs of {changed.count} function(s), re-solving")
+                fi
+
+                container.infer_store_free.resolve_effects_for(changed)
+            fi
+
+            container.infer_store_free.set_resolved_mode(false)
+
+            Syntax.Process.EFFECT_FACTS.collecting = false
         si
 
         // The two purity checks that need a body's own store-freedom:
@@ -1144,55 +1529,6 @@ namespace Compiler is
             od
 
             logger.set_is_compiling_expressions(false)
-        si
-
-        // A reliance error belongs to the body that leaned on the
-        // fact, so it is logged as an expression-level diagnostic:
-        // the next expression clear for its file must drop it, or a
-        // fixed error would stick across analysis-mode recompiles.
-        run_reliance_judge(files: Collections.Iterable[SOURCE_FILE]) is
-            logger.set_is_compiling_expressions(true)
-
-            let judge = Syntax.Process.JUDGE_RELIANCES(
-                container.logger,
-                container.symbol_table,
-                container.namespaces,
-                container.variable_left_state,
-                container.innate_symbol_lookup.get_exception_type())
-
-            // Consumptions are re-derived and re-reported against this
-            // round's solve for every file, recompiled or not, so the
-            // round owns its diagnostics: drop the previous round's and
-            // stamp this round's. The kill report stays outside the
-            // window — its candidates are taken once, so its output
-            // must persist the way any other expression diagnostic
-            // does.
-            logger.clear_reliance_diagnostics()
-            logger.set_is_judging_reliances(true)
-
-            for source_file in files do
-                if source_file.want_compile_up_to_expressions then
-                    judge.apply(source_file.definition)
-                fi
-            od
-
-            // Inside the judging window so the retracted inlays'
-            // replacement hints are cleared and re-reported with the
-            // rest of the round's reliance diagnostics.
-            Syntax.Process.UNBACKED_FACTS.report(logger)
-
-            logger.set_is_judging_reliances(false)
-
-            judge.report_narrowing_kills()
-
-            logger.set_is_compiling_expressions(false)
-
-            if Syntax.Process.NARROWING_STUDY.enabled then
-                IO.Std.error.write_line(
-                    "reliance: {Syntax.Process.RELIANCES.loads_consulted} heap-fact loads, "
-                    "{Syntax.Process.RELIANCES.loads_stamped} stamped, "
-                    "{Syntax.Process.RELIANCES.consumptions_reported} reported")
-            fi
         si
 
         infer_effects_pass(source_file: SOURCE_FILE) -> bool is

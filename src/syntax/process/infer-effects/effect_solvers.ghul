@@ -3,13 +3,35 @@ namespace Syntax.Process is
     use Symbol = Semantic.Symbols.Symbol
     use Semantic.Symbols.STORE_FREE_IMPORTS
 
-    // Solves the whole-program effect relations the reliance judge
+    // Solves the whole-program effect relations the crossing discharge
     // reads, over the same per-function facts STORE_FREE_FIXPOINT
     // consumes: member-granular may-write and may-write-null sets, the
     // store-free set, and member read closures. Nothing here writes a
     // store-free bit; the solved sets are installed into EFFECTS.
+    // One solve's rows, keyed on the functions, kept so the next solve
+    // can start from them: a row whose inputs did not change, directly
+    // or through anything it absorbs, is the same row.
+    class EFFECT_SOLUTION(
+        write_sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+        write_unbounded: Collections.SET[Function],
+        null_sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+        null_unbounded: Collections.SET[Function],
+        store_free: Collections.SET[Function],
+        constructs_store_free: Collections.SET[Function],
+        read_sets: Collections.MutableMap[Function, Collections.SET[Symbol]],
+        read_unbounded: Collections.SET[Function],
+        reads_elements: Collections.SET[Function],
+        writes_elements: Collections.SET[Function]
+    )
+
     class EFFECT_SOLVERS is
         _facts: Collections.MutableMap[Function, STORE_FREE_FACTS]
+
+        // Set to solve from a previous solution: only the rows in
+        // `_affected` are re-derived, every other row is taken from
+        // `_previous` as it stands.
+        _previous: EFFECT_SOLUTION?
+        _affected: Collections.SET[Function]?
 
         // Functions that invoke a function-typed parameter, directly
         // or by forwarding one to something that does. Their write
@@ -17,8 +39,90 @@ namespace Syntax.Process is
         // to them at any recorded call site.
         _param_invokers: Collections.SET[Function]?
 
+        _dependants: EFFECT_DEPENDANTS?
+
         init(facts: Collections.MutableMap[Function, STORE_FREE_FACTS]) is
             _facts = facts
+        si
+
+        dependants: EFFECT_DEPENDANTS is
+            if _dependants? then
+                return _dependants
+            fi
+
+            let result = EFFECT_DEPENDANTS(_facts, param_invokers)
+
+            _dependants = result
+
+            return result
+        si
+
+        // Solve from `previous`, re-deriving only the rows of the
+        // functions whose own inputs changed and of everything that
+        // absorbs one of them, directly or through a chain. A row
+        // outside that closure has exactly the inputs it had, so it
+        // keeps its previous value.
+        seed_from(previous: EFFECT_SOLUTION, changed: Collections.Iterable[Function]) is
+            let affected = Collections.SET[Function]()
+            let frontier = Collections.LIST[Function]()
+
+            for function in changed do
+                if affected.add(function) then
+                    frontier.add(function)
+                fi
+            od
+
+            let i mut = 0
+
+            while i < frontier.count do
+                let target = frontier[i]
+                i = i + 1
+
+                for functions in [dependants.dependants_of(target), dependants.dependants_through_unwalked(target)] do
+                    if !functions? then
+                        continue
+                    fi
+
+                    for function in functions do
+                        if affected.add(function) then
+                            frontier.add(function)
+                        fi
+                    od
+                od
+            od
+
+            _previous = previous
+            _affected = affected
+        si
+
+        // The functions whose rows this solve derives: every walked
+        // function, or the affected ones when seeded.
+        affected_count: int => if let affected = _affected then affected.count else _facts.count fi
+
+        // Whether `function`'s row is derived here rather than kept.
+        _is_derived(function: Function) -> bool is
+            if !_previous? \/ !_affected? then
+                return true
+            fi
+
+            return _affected.contains(function)
+        si
+
+        // The rows derived by this solve, in a stable order.
+        _derived: Collections.Iterable[Function] is
+            if let affected = _affected then
+                let result = Collections.LIST[Function]()
+
+                for function in affected do
+                    if _facts.contains_key(function) then
+                        result.add(function)
+                    fi
+                od
+
+                return result
+            fi
+
+            return _facts.keys
         si
 
         param_invokers: Collections.SET[Function] is
@@ -75,7 +179,7 @@ namespace Syntax.Process is
             store_free: Collections.SET[Function],
             constructs_store_free: Collections.SET[Function]
         ) is
-            let solved = STORE_FREE_FIXPOINT().solve(_facts)
+            let solved = STORE_FREE_FIXPOINT().solve(_facts, dependants, _previous, _affected)
 
             let safe = Collections.SET[Function]()
             let construction_safe = Collections.SET[Function]()
@@ -110,7 +214,19 @@ namespace Syntax.Process is
             let unbounded = Collections.SET[Function]()
             let shadow = STORE_FREE_FIXPOINT()
 
+            let previous = _previous
+
             for function in _facts.keys do
+                if !_is_derived(function) /\ previous? /\ previous.write_sets.contains_key(function) then
+                    sets[function] = previous.write_sets[function]
+
+                    if previous.write_unbounded.contains(function) then
+                        unbounded.add(function)
+                    fi
+
+                    continue
+                fi
+
                 let set = Collections.SET[Symbol]()
                 let record = EFFECT_FACTS.record_for(function)
 
@@ -137,28 +253,48 @@ namespace Syntax.Process is
                 sets[function] = set
             od
 
-            let changed mut = true
+            // Every row absorbs all its targets once; from then on a
+            // target is re-absorbed only into the rows that depend on
+            // it, and only when its own row changed. A row's set only
+            // grows and its unbounded flag only sets, so a target that
+            // has not changed since it was absorbed has nothing new to
+            // contribute.
+            let changed = Collections.SET[Function]()
 
-            while changed do
-                changed = false
+            for function in _derived do
+                let before = sets[function].count
 
-                for function in _facts.keys do
-                    let set = sets[function]
-                    let before = set.count
-                    let was_unbounded = unbounded.contains(function)
+                if _absorb(function, sets, unbounded, trust_imports) \/ sets[function].count != before then
+                    changed.add(function)
+                fi
+            od
 
-                    if _absorb(function, sets, unbounded, trust_imports) then
-                        changed = true
+            let dirty mut = changed
+
+            while dirty.count > 0 do
+                let next = Collections.SET[Function]()
+
+                for target in dirty do
+                    let dependants = self.dependants.dependants_of(target)
+
+                    if !dependants? then
+                        continue
                     fi
 
-                    if !was_unbounded /\ unbounded.contains(function) then
-                        changed = true
-                    fi
+                    for function in dependants do
+                        if unbounded.contains(function) then
+                            continue
+                        fi
 
-                    if set.count != before then
-                        changed = true
-                    fi
+                        let before = sets[function].count
+
+                        if _absorb_target(function, target, sets, unbounded, trust_imports) \/ sets[function].count != before then
+                            next.add(function)
+                        fi
+                    od
                 od
+
+                dirty = next
             od
 
             return (sets = sets, unbounded = unbounded)
@@ -303,7 +439,19 @@ namespace Syntax.Process is
             let unbounded = Collections.SET[Function]()
             let shadow = STORE_FREE_FIXPOINT()
 
+            let previous = _previous
+
             for function in _facts.keys do
+                if !_is_derived(function) /\ previous? /\ previous.null_sets.contains_key(function) then
+                    sets[function] = previous.null_sets[function]
+
+                    if previous.null_unbounded.contains(function) then
+                        unbounded.add(function)
+                    fi
+
+                    continue
+                fi
+
                 let set = Collections.SET[Symbol]()
                 let record = EFFECT_FACTS.record_for(function)
 
@@ -329,16 +477,38 @@ namespace Syntax.Process is
                 sets[function] = set
             od
 
-            let changed mut = true
+            let changed = Collections.SET[Function]()
 
-            while changed do
-                changed = false
+            for function in _derived do
+                if _absorb_nulling(function, sets, unbounded, trust_imports) then
+                    changed.add(function)
+                fi
+            od
 
-                for function in _facts.keys do
-                    if _absorb_nulling(function, sets, unbounded, trust_imports) then
-                        changed = true
+            let dirty mut = changed
+
+            while dirty.count > 0 do
+                let next = Collections.SET[Function]()
+
+                for target in dirty do
+                    let dependants = self.dependants.dependants_of(target)
+
+                    if !dependants? then
+                        continue
                     fi
+
+                    for function in dependants do
+                        if unbounded.contains(function) then
+                            continue
+                        fi
+
+                        if _absorb_nulling_target(function, target, sets, unbounded, trust_imports) then
+                            next.add(function)
+                        fi
+                    od
                 od
+
+                dirty = next
             od
 
             return (sets = sets, unbounded = unbounded)
@@ -460,7 +630,7 @@ namespace Syntax.Process is
         // The member read closure: which members each function - or
         // anything it can dispatch to or invoke - may read, plus
         // whether it may read or write collection/array elements.
-        // Consumed by the reliance judge for facts read through a
+        // Consumed by the crossing discharge for facts read through a
         // getter: a crossing callee whose write set is disjoint from
         // the getter's read closure provably leaves the getter's
         // answer alone. An unwalked callee makes the reads
@@ -479,7 +649,27 @@ namespace Syntax.Process is
             let writes_elements = Collections.SET[Function]()
             let shadow = STORE_FREE_FIXPOINT()
 
+            let previous = _previous
+
             for function in _facts.keys do
+                if !_is_derived(function) /\ previous? /\ previous.read_sets.contains_key(function) then
+                    sets[function] = previous.read_sets[function]
+
+                    if previous.read_unbounded.contains(function) then
+                        unbounded.add(function)
+                    fi
+
+                    if previous.reads_elements.contains(function) then
+                        reads_elements.add(function)
+                    fi
+
+                    if previous.writes_elements.contains(function) then
+                        writes_elements.add(function)
+                    fi
+
+                    continue
+                fi
+
                 let set = Collections.SET[Symbol]()
                 let record = EFFECT_FACTS.record_for(function)
 
@@ -511,16 +701,36 @@ namespace Syntax.Process is
                 sets[function] = set
             od
 
-            let changed mut = true
+            let changed = Collections.SET[Function]()
 
-            while changed do
-                changed = false
+            for function in _derived do
+                if _absorb_reads(function, sets, unbounded, reads_elements, writes_elements) then
+                    changed.add(function)
+                fi
+            od
 
-                for function in _facts.keys do
-                    if _absorb_reads(function, sets, unbounded, reads_elements, writes_elements) then
-                        changed = true
+            let dirty mut = changed
+
+            // An unbounded row is not skipped here: the element flags
+            // propagate through it regardless of its closure.
+            while dirty.count > 0 do
+                let next = Collections.SET[Function]()
+
+                for target in dirty do
+                    let dependants = self.dependants.dependants_of(target)
+
+                    if !dependants? then
+                        continue
                     fi
+
+                    for function in dependants do
+                        if _absorb_reads_target(function, target, sets, unbounded, reads_elements, writes_elements) then
+                            next.add(function)
+                        fi
+                    od
                 od
+
+                dirty = next
             od
 
             return (sets = sets, unbounded = unbounded, reads_elements = reads_elements, writes_elements = writes_elements)

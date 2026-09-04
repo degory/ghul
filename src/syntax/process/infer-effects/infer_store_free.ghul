@@ -112,6 +112,45 @@ namespace Syntax.Process is
 
         start_run() is
             _facts = Collections.MAP[Function, STORE_FREE_FACTS]()
+            _solved_over_facts = false
+            _last_solution = null
+            function_values.clear()
+            _typer.reset()
+            _current = null
+            _current_function = null
+        si
+
+        // Drop what the walk of one file derived - its functions' facts
+        // and the function values its locals held - ahead of walking
+        // that file again. Facts for every other file stay, so a round
+        // that re-walks a few files solves over the union of what it
+        // re-derived and what it kept. A lambda's facts are keyed on
+        // its closure symbol, whose location is the literal's, so they
+        // drop with the file too.
+        // Whether the relations in use were solved, completely, from
+        // the facts retained here - what a partial round builds on. A
+        // rebuild that walks only some files solves incompletely and
+        // installs nothing, leaving relations no retained fact backs.
+        _solved_over_facts: bool
+
+        solved_over_facts: bool => _solved_over_facts /\ _facts.count > 0
+
+        drop_file(file_name: string) is
+            let stale = Collections.LIST[Function]()
+
+            for function in _facts.keys do
+                if function.location.file_name =~ file_name then
+                    stale.add(function)
+                fi
+            od
+
+            for function in stale do
+                _facts.remove(function)
+            od
+
+            EFFECT_FACTS.drop_file(file_name)
+            function_values.drop_file(file_name)
+
             _typer.reset()
             _current = null
             _current_function = null
@@ -164,12 +203,6 @@ namespace Syntax.Process is
             _resolved_mode = on
 
             if on then
-                // A fresh round is starting: drop the previous round's
-                // local-value record before the walk re-derives it, so
-                // the judge that runs after the solve reads only what
-                // this round's bodies actually hold.
-                function_values.clear()
-
                 // Before the walk, so a call to one of these is a
                 // trusted leaf rather than a callee edge that poisons
                 // its caller.
@@ -179,16 +212,61 @@ namespace Syntax.Process is
 
         _resolved_mode: bool
 
+        // The overload-site count is measurement only, read once so the
+        // walk pays nothing for it when it is not asked for.
+        _measure_overload_sites: bool static
+
+        init() static is
+            _measure_overload_sites = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+        si
+
         // Solve the effect relations over this run's facts and install
-        // them for the reliance judge. Called by the infer-effects
+        // them for the crossing discharge. Called by the infer-effects
         // pass's finish hook, after the resolved-mode walk of every
         // file. A failure leaves the registry cleared, which every
-        // query answers conservatively.
-        solve_effects() is
+        // query answers conservatively. The facts are kept: a later
+        // round that re-walks only some files drops theirs and solves
+        // over the rest unchanged.
+        solve_effects(complete: bool) is
+            _solve_effects(complete, null)
+        si
+
+        // Re-solve after a partial round changed the inputs of
+        // `changed`: from the last solution, re-deriving only the rows
+        // that can differ from it. Only meaningful over relations
+        // solved from these facts.
+        resolve_effects_for(changed: Collections.SET[Function]) is
+            _solve_effects(true, changed)
+        si
+
+        // The last complete solve's rows, for the next solve to start
+        // from.
+        _last_solution: EFFECT_SOLUTION?
+
+        _solve_effects(complete: bool, changed: Collections.SET[Function]?) is
+            // A round that walked no bodies - a rebuild with no file open
+            // compiles no expressions - has nothing to say; installing its
+            // empty relations would replace ones that do.
+            if _facts.count == 0 then
+                if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
+                    IO.Std.error.write_line("effects: no bodies walked, relations kept")
+                fi
+
+                return
+            fi
+
             try
                 let study = EFFECT_SOLVERS(_facts)
 
                 let sw = System.Diagnostics.Stopwatch.start_new()
+
+                if changed? /\ _solved_over_facts then
+                    if let previous = _last_solution then
+                        study.seed_from(previous, changed)
+                    fi
+                fi
+
+                let t_d = sw.elapsed_milliseconds
                 let writes = study.write_sets(false, false)
                 let t_w = sw.elapsed_milliseconds
                 let nulls = study.may_null_sets(false, false)
@@ -199,16 +277,37 @@ namespace Syntax.Process is
                 let reads = study.read_sets()
                 let t_r = sw.elapsed_milliseconds
 
-                if NARROWING_STUDY.enabled then
-                    IO.Std.error.write_line("solve phases: writes {t_w} nulls {t_n - t_w} store-free {t_s - t_n} reads {t_r - t_s}")
-                fi
-
                 EFFECTS.install(
                     writes.sets, writes.unbounded,
                     nulls.sets, nulls.unbounded,
                     store_free,
                     solved.constructs_store_free,
+                    reads.sets, reads.unbounded, reads.reads_elements, reads.writes_elements,
+                    complete)
+
+                let t_i = sw.elapsed_milliseconds
+
+                if NARROWING_STUDY.enabled \/ System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
+                    IO.Std.error.write_line("solve phases: seed {t_d} writes {t_w - t_d} nulls {t_n - t_w} store-free {t_s - t_n} reads {t_r - t_s} install {t_i - t_r}, {study.affected_count} of {_facts.count} rows derived")
+                fi
+
+                _solved_over_facts = complete
+
+                let solution = EFFECT_SOLUTION(
+                    writes.sets, writes.unbounded,
+                    nulls.sets, nulls.unbounded,
+                    store_free, solved.constructs_store_free,
                     reads.sets, reads.unbounded, reads.reads_elements, reads.writes_elements)
+
+                _last_solution = if complete then solution else null fi
+
+                if changed? /\ System.Environment.get_environment_variable("GHUL_EFFECTS_VERIFY")? then
+                    _verify_seeded_solve(solution)
+                fi
+
+                if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
+                    _report_overload_sites()
+                fi
 
                 // Mark what the solve proved back onto the symbols,
                 // where the display surfaces read it. Assigned both
@@ -235,13 +334,85 @@ namespace Syntax.Process is
                 fi
             catch ex: Exception
                 EFFECTS.clear()
+                _solved_over_facts = false
+                _last_solution = null
 
                 if NARROWING_STUDY.enabled then
                     IO.Std.error.write_line("effects: solve failed: {ex}")
                 fi
             yrt
+        si
 
-            start_run()
+        // Measurement only: solve everything again from scratch and
+        // report every row the seeded solve got differently.
+        _verify_seeded_solve(seeded: EFFECT_SOLUTION) is
+            let fresh = EFFECT_SOLVERS(_facts)
+            let writes = fresh.write_sets(false, false)
+            let nulls = fresh.may_null_sets(false, false)
+            let solved = fresh.solve()
+            let reads = fresh.read_sets()
+
+            let differences mut = 0
+
+            // an unbounded row's members are never read, and stop
+            // accumulating when the row becomes unbounded, so only
+            // bounded rows are compared
+            differences = differences + _differing_rows("write", seeded.write_sets, writes.sets, writes.unbounded)
+            differences = differences + _differing_functions("write-unbounded", seeded.write_unbounded, writes.unbounded)
+            differences = differences + _differing_rows("null", seeded.null_sets, nulls.sets, nulls.unbounded)
+            differences = differences + _differing_functions("null-unbounded", seeded.null_unbounded, nulls.unbounded)
+            differences = differences + _differing_functions("store-free", seeded.store_free, solved.store_free)
+            differences = differences + _differing_functions("constructs-store-free", seeded.constructs_store_free, solved.constructs_store_free)
+            differences = differences + _differing_rows("read", seeded.read_sets, reads.sets, reads.unbounded)
+            differences = differences + _differing_functions("read-unbounded", seeded.read_unbounded, reads.unbounded)
+            differences = differences + _differing_functions("reads-elements", seeded.reads_elements, reads.reads_elements)
+            differences = differences + _differing_functions("writes-elements", seeded.writes_elements, reads.writes_elements)
+
+            IO.Std.error.write_line("effects: seeded solve verified against a fresh one: {differences} difference(s)")
+        si
+
+        _differing_rows(
+            what: string,
+            seeded: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            fresh: Collections.MutableMap[Function, Collections.SET[Symbol]],
+            unbounded: Collections.SET[Function]
+        ) -> int is
+            let result mut = 0
+
+            for entry in fresh do
+                if unbounded.contains(entry.key) then
+                    continue
+                fi
+
+                let mine = if seeded.contains_key(entry.key) then seeded[entry.key] else null fi
+
+                if !mine? \/ mine.count != entry.value.count \/ entry.value |> Pipes.any(m => !mine.contains(m)) then
+                    IO.Std.error.write_line("  {what} row differs: {entry.key.qualified_name} seeded {mine?.count ?? -1} fresh {entry.value.count}")
+                    result = result + 1
+                fi
+            od
+
+            return result + if seeded.count != fresh.count then 1 else 0 fi
+        si
+
+        _differing_functions(what: string, seeded: Collections.SET[Function], fresh: Collections.SET[Function]) -> int is
+            let result mut = 0
+
+            for function in fresh do
+                if !seeded.contains(function) then
+                    IO.Std.error.write_line("  {what}: {function.qualified_name} fresh only")
+                    result = result + 1
+                fi
+            od
+
+            for function in seeded do
+                if !fresh.contains(function) then
+                    IO.Std.error.write_line("  {what}: {function.qualified_name} seeded only")
+                    result = result + 1
+                fi
+            od
+
+            return result
         si
 
         // Complete each effect record with the solve-side facts the

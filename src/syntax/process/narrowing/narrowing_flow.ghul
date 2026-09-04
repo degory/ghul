@@ -590,9 +590,9 @@ namespace Syntax.Process is
         // `MAP.add`, and every other member whose body can re-enter
         // user code - cannot be discharged, so narrowing there turns
         // an everyday initialization idiom into an error at the
-        // second call. That is the reliance judgement being
+        // second call. That is the crossing discharge being
         // imprecise rather than the narrow being wrong, so this
-        // waits on the judgement improving.
+        // waits on the discharge improving.
         _narrows_on_assignment(v: Symbol) -> bool =>
             v.is_local \/ isa Semantic.Symbols.GLOBAL_VARIABLE(v)
 
@@ -649,62 +649,120 @@ namespace Syntax.Process is
 
             let crossing = CROSSING(location, callee)
 
+            if KILL_LEDGER.can_kill_in_walk then
+                _apply_relations(crossing)
+            fi
+
             _current_env.note_crossing(crossing)
             _crossing_log.add(crossing)
-
-            _record_kill_candidates(crossing)
         si
 
-        // Editor-only: describe each heap fact the call was crossed
-        // over, so that once the effect relations are solved the ones
-        // the callee cannot be shown to have left alone can be marked
-        // at the call. Rendering happens here because the narrowed and
-        // declared types are only in scope while the environment still
-        // holds the fact - the same reason the kill reports below take
-        // their text at the point of the kill. The description is the
-        // fact alone; the report adds the wording, because several
-        // facts can share one call site and it renders them together.
-        _record_kill_candidates(crossing: CROSSING) is
-            if !_logger.want_hint_for(crossing.location) then
-                return
-            fi
+        // The in-walk kill transfer of the combined-solve prototype: a
+        // heap fact the solved relations cannot show the callee left
+        // alone dies at this call, the same question the reliance
+        // judge would otherwise ask of each later use. Each kill is
+        // recorded so a later solve can say whether it still holds.
+        // See KILL_LEDGER.
+        _apply_relations(crossing: CROSSING) is
+            let file_name = crossing.location.file_name
+            let details = Collections.LIST[string]()
 
-            // A store-free callee is cleared by the solved relations
-            // whatever the fact, so recording and rendering one would
-            // only be undone later.
-            let callee = crossing.callee
-
-            if callee? /\ callee.is_store_free then
-                return
-            fi
+            let doomed_narrows = Collections.LIST[Symbol]()
 
             for v in _current_env.heap_fact_variables do
-                let narrowed = _current_env.narrowed_type_of(v)
-                let declared = declared_type_of(v)
-
-                if narrowed? then
-                    RELIANCES.note_kill_candidate(
-                        KILL_CANDIDATE(crossing, v, null, false, "{v.name} ◄ {declared}"))
-                elif declared? /\ declared.is_optional then
-                    // A presence bit on a non-optional declaration
-                    // carries nothing over the declaration itself, so
-                    // marking it would point at a narrowing that never
-                    // said anything.
-                    RELIANCES.note_kill_candidate(
-                        KILL_CANDIDATE(crossing, v, null, true, "{v.name} ◄ {declared}"))
+                if
+                    _current_env.narrowed_type_of(v)? /\
+                    !RELIANCES.crossing_discharged(crossing, v, null, false)
+                then
+                    doomed_narrows.add(v)
                 fi
             od
 
+            for v in doomed_narrows do
+                details.add("{v.name}\n    ◄ {declared_type_of(v)}")
+                _current_env.drop_narrow(v)
+
+                let declared = declared_type_of(v)
+
+                if declared? then
+                    _set_symbol_type(v, declared)
+                fi
+
+                KILL_LEDGER.record(KILL(file_name, crossing, v, null, false, true))
+            od
+
+            let doomed_presence = Collections.LIST[Symbol]()
+
+            for v in _current_env.heap_fact_variables do
+                if
+                    _current_env.is_non_null(v) /\
+                    !RELIANCES.crossing_discharged(crossing, v, null, true)
+                then
+                    doomed_presence.add(v)
+                fi
+            od
+
+            for v in doomed_presence do
+                let declared = declared_type_of(v)
+
+                // a presence bit on a non-optional declaration carried
+                // nothing over the declaration, so its loss is not shown
+                if declared? /\ declared.is_optional /\ !doomed_narrows.contains(v) then
+                    details.add("{v.name}\n    ◄ {declared}")
+                fi
+
+                _current_env.drop_non_null(v)
+
+                KILL_LEDGER.record(KILL(file_name, crossing, v, null, true, true))
+            od
+
+            let doomed_paths = Collections.LIST[ACCESS_PATH]()
+
             for p in _current_env.heap_fact_paths do
-                // A member-access path has no single declared type to
-                // name as the revert target, so the description is the
-                // path alone.
                 let is_presence = !_current_env.narrowed_type_of_path(p)?
 
-                RELIANCES.note_kill_candidate(
-                    KILL_CANDIDATE(crossing, null, p, is_presence, "{p}"))
+                if !RELIANCES.crossing_discharged(crossing, null, p, is_presence) then
+                    doomed_paths.add(p)
+                fi
             od
+
+            for p in doomed_paths do
+                let is_presence = !_current_env.narrowed_type_of_path(p)?
+
+                details.add("{p}")
+                _current_env.drop_path(p)
+
+                KILL_LEDGER.record(KILL(file_name, crossing, null, p, is_presence, true))
+            od
+
+            _report_kills_at(crossing, details)
         si
+
+        // One sigil per call site however many facts die there.
+        _report_kills_at(crossing: CROSSING, details: Collections.List[string]) is
+            if details.count == 0 \/ !_logger.want_hint_for(crossing.location) then
+                return
+            fi
+
+            let callee = crossing.callee
+            let reason = if callee? then "the call to '{callee.name}()' may change it" else "a call here may change it" fi
+
+            if details.count == 1 then
+                _logger.inlay(crossing.location, "narrowing-killed", "◄", "{details[0]}\n\n{reason}")
+                return
+            fi
+
+            let out = System.Text.StringBuilder(if callee? then "the call to '{callee.name}()' may change:" else "a call here may change:" fi)
+
+            for detail in details do
+                out.append("\n    ")
+                out.append(detail)
+            od
+
+            _logger.inlay(crossing.location, "narrowing-killed", "◄", out.to_string())
+        si
+        // fact alone; the report adds the wording, because several
+        // facts can share one call site and it renders them together.
 
         // Position marker into the call-crossing log, paired with the
         // adopt_crossings_* methods below: an environment derived
@@ -786,7 +844,7 @@ namespace Syntax.Process is
             _drop_property_facts(location, "a store here may change it")
         si
 
-        // ==== reliance judgement ====
+        // ==== kill ledger records ====
         //
         // A use that leans on a heap fact — a load compiled at the
         // narrowed type, or an optional read compiled as present — is
@@ -855,100 +913,126 @@ namespace Syntax.Process is
             return kept
         si
 
-        // Provenance for a load of `v`'s in-force facts, or null when
-        // no fact carries a crossing the inline tiers cannot
-        // discharge. `wide_type` is the value's un-narrowed type, so
-        // the consumption judge can tell a use the wide type already
-        // satisfies from one that leans on the fact.
-        provenance_for_symbol(location: LOCATION, v: Symbol, wide_type: Type?) -> RELIANCE_PROVENANCE? is
-            if !wide_type? then
-                return null
+        // Record a heap-fact load of `v` for the kill ledger. Locals are
+        // filtered here - their facts take no crossings - except one a
+        // closure body assigns, which lives in a shared heap cell and is
+        // recorded exactly as a field is.
+        record_load_of_symbol(location: LOCATION, v: Symbol) is
+            if !isa Semantic.Symbols.Field(v) /\ !isa Semantic.Symbols.Property(v) /\ !NARROW_ENV.is_closure_assigned(v) then
+                return
             fi
-
-            // Locals are filtered here - their facts take no crossings
-            // - except one a closure body assigns, which lives in a
-            // shared heap cell and is judged exactly as a field is.
-            if
-                !isa Semantic.Symbols.Field(v) /\
-                !isa Semantic.Symbols.Property(v) /\
-                !NARROW_ENV.is_closure_assigned(v)
-            then
-                return null
-            fi
-
-            RELIANCES.loads_consulted = RELIANCES.loads_consulted + 1
 
             let getter = isa Semantic.Symbols.Property(v)
             let narrow_in_force = _current_env.contains(v)
             let presence_in_force = _current_env.is_non_null(v)
 
             if !narrow_in_force /\ !presence_in_force then
-                return null
+                return
             fi
 
-            let narrow_crossings =
-                if narrow_in_force then
-                    _undischarged_crossings(_current_env.narrow_crossings_of(v), getter)
-                else
-                    null
-                fi
-
-            let presence_crossings =
-                if presence_in_force then
-                    _undischarged_crossings(_current_env.non_null_crossings_of(v), getter)
-                else
-                    null
-                fi
-
-            let getter_unproven = !_getter_proven_inline(v)
-
-            if !narrow_crossings? /\ !presence_crossings? /\ !getter_unproven then
-                return null
-            fi
-
-            RELIANCES.loads_stamped = RELIANCES.loads_stamped + 1
-
-            return RELIANCE_PROVENANCE(location, v.name, v, null, wide_type, narrow_in_force, presence_in_force, narrow_crossings, presence_crossings, getter_unproven)
+            _record_load(
+                location,
+                v,
+                null,
+                narrow_in_force,
+                presence_in_force,
+                if narrow_in_force then _undischarged_crossings(_current_env.narrow_crossings_of(v), getter) else null fi,
+                if presence_in_force then _undischarged_crossings(_current_env.non_null_crossings_of(v), getter) else null fi)
         si
+        // The same, for a member-access path: a path fact is recorded
+        // with the crossings it was kept across and, for each getter
+        // hop, the hop's own call.
 
-        provenance_for_path(location: LOCATION, path: ACCESS_PATH, wide_type: Type?) -> RELIANCE_PROVENANCE? is
-            if !wide_type? then
-                return null
-            fi
-
-            RELIANCES.loads_consulted = RELIANCES.loads_consulted + 1
-
+        record_load_of_path(location: LOCATION, path: ACCESS_PATH) is
             let getter = path.has_getter_hop
             let narrow_in_force = _current_env.narrowed_type_of_path(path)?
             let presence_in_force = _current_env.is_non_null_path(path)
 
             if !narrow_in_force /\ !presence_in_force then
-                return null
+                return
             fi
 
-            let narrow_crossings =
-                if narrow_in_force then
-                    _undischarged_crossings(_current_env.path_narrow_crossings_of(path), getter)
-                else
-                    null
-                fi
+            _record_load(
+                location,
+                null,
+                path,
+                narrow_in_force,
+                presence_in_force,
+                if narrow_in_force then _undischarged_crossings(_current_env.path_narrow_crossings_of(path), getter) else null fi,
+                if presence_in_force then _undischarged_crossings(_current_env.path_presence_crossings_of(path), getter) else null fi)
+        si
 
-            let presence_crossings =
-                if presence_in_force then
-                    _undischarged_crossings(_current_env.path_presence_crossings_of(path), getter)
-                else
-                    null
-                fi
 
-            let getter_unproven = !_path_getters_proven_inline(path)
+        // The ledger's record of a load through a fact: every crossing
+        // the fact was kept across, and the getter's own call for a
+        // fact read through a getter the inline tiers cannot prove.
+        // Each is the walk's decision to keep the fact, re-asked of
+        // the relations after the next solve. See KILL_LEDGER.
+        _record_load(
+            location: LOCATION,
+            target: Symbol?,
+            path: ACCESS_PATH?,
+            narrow_in_force: bool,
+            presence_in_force: bool,
+            narrow_crossings: Collections.LIST[CROSSING]?,
+            presence_crossings: Collections.LIST[CROSSING]?
+        ) is
 
-            if !narrow_crossings? /\ !presence_crossings? /\ !getter_unproven then
-                return null
+            let file_name = location.file_name
+
+            if narrow_crossings? then
+                for c in narrow_crossings do
+                    KILL_LEDGER.record(KILL(file_name, c, target, path, false, false))
+                od
             fi
 
-            RELIANCES.loads_stamped = RELIANCES.loads_stamped + 1
+            if presence_crossings? then
+                for c in presence_crossings do
+                    KILL_LEDGER.record(KILL(file_name, c, target, path, true, false))
+                od
+            fi
 
-            return RELIANCE_PROVENANCE(location, "{path}", null, path, wide_type, narrow_in_force, presence_in_force, narrow_crossings, presence_crossings, getter_unproven)
+            for is_presence in [presence_in_force, !narrow_in_force] do
+                if is_presence /\ !presence_in_force then
+                    continue
+                fi
+
+                if !is_presence /\ !narrow_in_force then
+                    continue
+                fi
+
+                // Every getter the fact reads through is a crossing of
+                // its own, kept here; the re-ask after a solve decides
+                // whether it backs the fact.
+                for hop in _getter_hops(target, path) do
+                    if let read = hop.read_function then
+                        KILL_LEDGER.record(KILL(file_name, CROSSING(hop.location, read), target, path, is_presence, false))
+                    fi
+                od
+            od
+        si
+
+
+        _getter_hops(target: Symbol?, path: ACCESS_PATH?) -> Collections.LIST[Semantic.Symbols.Property] is
+            let result = Collections.LIST[Semantic.Symbols.Property]()
+
+            if let property: Semantic.Symbols.Property = target then
+                result.add(property)
+            fi
+
+            if path? then
+                if let property: Semantic.Symbols.Property = path.root then
+                    result.add(property)
+                fi
+
+                for m in path.members do
+                    if let property: Semantic.Symbols.Property = m then
+                        result.add(property)
+                    fi
+                od
+            fi
+
+            return result
         si
 
 
