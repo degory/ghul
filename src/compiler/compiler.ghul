@@ -49,9 +49,15 @@ namespace Compiler is
 
         _effects_stopwatch: System.Diagnostics.Stopwatch?
 
+        // Files with a body walked since the effect relations were last
+        // solved: what the next solve has to re-derive before it can
+        // answer for them.
+        _effects_stale_files: Collections.SET[string]
+
         init() is
             container = IoC.CONTAINER.instance
             logger = container.logger
+            _effects_stale_files = Collections.SET[string]()
 
             // Nothing has been compiled yet, so expression-level state is
             // certainly absent: a compile request against this fresh state
@@ -277,6 +283,13 @@ namespace Compiler is
         // over. Symbols of an edited file get fresh ids.
         clear_symbols(edited_files: Collections.Iterable[string]) is
             are_tables_current = false
+
+            // The retained effect facts describe the symbols being
+            // abandoned, and what the solve reads off a symbol - its
+            // owner's openness, its overriders, its purity - can change
+            // with the rebuild; the next solve starts from every body.
+            container.infer_store_free.start_run()
+            _effects_stale_files.clear()
 
             container.symbol_table.clear()
             container.namespaces.clear()
@@ -508,6 +521,7 @@ namespace Compiler is
         // interface change is pending.
         compile_expressions_only(source_file: SOURCE_FILE) is
             source_file.want_compile_expressions = true
+            _effects_stale_files.add(source_file.file_name)
 
             // This walk is the only pass a file the client opened after
             // the last full build ever gets: the build ran the
@@ -612,6 +626,8 @@ namespace Compiler is
         recompile_body_expressions(source_file: SOURCE_FILE, function: Syntax.Trees.Definitions.FUNCTION) is
             let file_name = source_file.file_name
             let span = function.location
+
+            _effects_stale_files.add(file_name)
 
             Syntax.Process.KILL_LEDGER.clear_for(function)
 
@@ -814,6 +830,7 @@ namespace Compiler is
         ) is
             source_file.want_compile_up_to_expressions = true
             source_file.want_compile_expressions = true
+            _effects_stale_files.add(source_file.file_name)
 
             Syntax.Process.KILL_LEDGER.clear_for(source_file.file_name)
 
@@ -1249,7 +1266,13 @@ namespace Compiler is
 
                 let recompile_ms = sw.elapsed_milliseconds
 
-                _run_partial_effects_round(rewalked)
+                let names = Collections.LIST[string]()
+
+                for source_file in rewalked do
+                    names.add(source_file.file_name)
+                od
+
+                _run_partial_effects_round(files, names)
 
                 if timing then
                     IO.Std.error.write_line("combined solve round {round}: recompile {recompile_ms} ms, effects {sw.elapsed_milliseconds - recompile_ms} ms")
@@ -1278,7 +1301,22 @@ namespace Compiler is
         run_effects_pass(files: Collections.Iterable[SOURCE_FILE]) is
             _restart_descent(files)
 
-            _run_effects_round(files)
+            // Only the files walked since the last solve can have
+            // changed what it reads; everything else's facts are
+            // retained. That needs a complete solve to build on, and
+            // for every such file to have been compiled through
+            // expressions, or the round is the full one.
+            let stale = Collections.LIST[string]()
+
+            for file_name in _effects_stale_files do
+                stale.add(file_name)
+            od
+
+            if _can_solve_partially(files, stale) then
+                _run_partial_effects_round(files, stale)
+            else
+                _run_effects_round(files)
+            fi
 
             run_combined_solve_rounds(files)
 
@@ -1333,6 +1371,8 @@ namespace Compiler is
         // the purity checks run once, against the relations the last
         // round solved.
         _run_effects_round(files: Collections.Iterable[SOURCE_FILE]) is
+            _effects_stale_files.clear()
+
             Syntax.Process.EFFECT_FACTS.collecting = true
             Syntax.Process.EFFECT_FACTS.begin_generation("infer-effects")
 
@@ -1368,43 +1408,79 @@ namespace Compiler is
             return complete
         si
 
+        // Whether the stale files can be solved as a partial round over
+        // the retained facts: the relations in use were solved from
+        // them, and every stale file still present is compiled through
+        // expressions.
+        _can_solve_partially(files: Collections.Iterable[SOURCE_FILE], stale: Collections.List[string]) -> bool is
+            if !container.infer_store_free.solved_over_facts then
+                return false
+            fi
+
+            let names = Collections.SET[string]()
+
+            for file_name in stale do
+                names.add(file_name)
+            od
+
+            for source_file in files do
+                if names.contains(source_file.file_name) /\ !is_compiled_through_expressions(source_file) then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
         // A round over only the files whose bodies were re-walked: their
         // facts are dropped and re-derived, every other file's are kept
         // from the previous round, and the relations are solved over
         // the union. The previous round left the facts in place for
         // exactly this.
-        _run_partial_effects_round(files: Collections.Iterable[SOURCE_FILE]) is
+        _run_partial_effects_round(files: Collections.Iterable[SOURCE_FILE], names: Collections.List[string]) is
+            _effects_stale_files.clear()
+
             Syntax.Process.EFFECT_FACTS.collecting = true
 
             container.infer_store_free.set_resolved_mode(true)
 
-            let names = Collections.LIST[string]()
+            let by_name = Collections.MAP[string, SOURCE_FILE]()
 
             for source_file in files do
-                names.add(source_file.file_name)
+                by_name[source_file.file_name] = source_file
             od
 
             // The re-walk usually re-derives exactly what it replaces: a
             // kill widens a receiver, and the widened dispatch reaches the
-            // same callees and writes the same members. Then the installed
-            // relations already answer for the facts and the solve is
-            // skipped.
+            // same callees and writes the same members; an edit that
+            // touches no call or store leaves them alone too. Then the
+            // installed relations already answer for the facts and the
+            // solve is skipped.
             let snapshot = container.infer_store_free.snapshot_inputs(names)
-            let passed = container.infer_store_free.passed_table_sizes()
 
-            for source_file in files do
-                container.infer_store_free.drop_file(source_file.file_name)
+            for file_name in names do
+                container.infer_store_free.drop_file(file_name)
             od
 
-            for source_file in files do
-                infer_effects_pass(source_file)
+            for file_name in names do
+                let source_file: SOURCE_FILE mut
+
+                if by_name.try_get_value(file_name, source_file ref) then
+                    infer_effects_pass(source_file)
+                fi
             od
 
-            if container.infer_store_free.inputs_unchanged(names, snapshot, passed) then
-                if System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")? then
-                    IO.Std.error.write_line("effects: re-walk changed no solve input, relations kept")
+            let timing = System.Environment.get_environment_variable("GHUL_EFFECTS_TIMING")?
+
+            if container.infer_store_free.inputs_unchanged(names, snapshot) then
+                if timing then
+                    IO.Std.error.write_line("effects: partial round over {names.count} file(s) changed no solve input, relations kept")
                 fi
             else
+                if timing then
+                    IO.Std.error.write_line("effects: partial round over {names.count} file(s) changed a solve input, re-solving")
+                fi
+
                 container.infer_store_free.solve_effects(true)
             fi
 
