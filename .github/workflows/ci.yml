@@ -16,11 +16,22 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# A pull request from a fork runs in *this* repository's context, so it would
-# otherwise spend this repository's Ubicloud runners. Each test job's `runs-on`
-# therefore sends a fork's pull request to a GitHub-hosted runner instead, which
-# is free on a public repository. `github.event.pull_request` is absent on a
-# push, so the expression falls through to the Ubicloud runner for `main`.
+# Every job but the bootstrap runs on a GitHub-hosted runner, which is free on
+# a public repository and has no practical cap on how many run at once. The
+# suites that a bigger machine used to carry are divided into shards instead,
+# so their wall time falls with the number of runners rather than with the size
+# of any one of them.
+#
+# The bootstrap is the exception: it is four sequential compiler passes that do
+# not parallelise, so it is bound by single-core speed, which a paid runner
+# genuinely improves (95s against 121s, measured). It is one 2 vCPU job, so the
+# bill for it is small.
+#
+# `version` picks that runner, and sends two cases to a GitHub-hosted one
+# instead. A pull request from a fork runs in *this* repository's context and
+# would otherwise spend this repository's Ubicloud credit. A Renovate pull
+# request is routine dependency churn that does not warrant paid capacity -
+# slower, and no less thorough.
 #
 # This is a default for well-meant contributions, not a control. A `pull_request`
 # run uses the workflow file from the pull request itself, so a contributor can
@@ -47,6 +58,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       package: ${{ steps.version.outputs.package }}
       compiler: ${{ steps.compiler_version.outputs.compiler }}
+      runner_bootstrap: ${{ steps.runners.outputs.bootstrap }}
 
     permissions:
       contents: read
@@ -54,6 +66,18 @@ jobs:
       pull-requests: read
 
     steps:
+    - name: Choose runners
+      id: runners
+      env:
+        HOSTED: ${{ github.event.pull_request.head.repo.fork
+                    || startsWith(github.head_ref, 'renovate/') }}
+      run: |
+        if [ "$HOSTED" = true ]; then
+          echo "bootstrap=ubuntu-latest" >> "$GITHUB_OUTPUT"
+        else
+          echo "bootstrap=ubicloud-standard-2" >> "$GITHUB_OUTPUT"
+        fi
+
     - uses: actions/checkout@v7
       with:
         fetch-depth: '0'
@@ -154,9 +178,9 @@ jobs:
   unit_tests:
     name: Run unit tests
     needs: [version, bootstrap]
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-2' }}
+    runs-on: ubuntu-latest
 
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@v7
@@ -213,7 +237,7 @@ jobs:
 
     # Four sequential compiler passes, and the compiler does not
     # parallelise its source walk, so cores past the second buy nothing.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-2' }}
+    runs-on: ${{ needs.version.outputs.runner_bootstrap }}
 
     timeout-minutes: 30
 
@@ -284,18 +308,29 @@ jobs:
         path: ./analysis-protocol/nupkg/ghul.analysis.protocol.${{ needs.version.outputs.package }}.nupkg
 
 
-  integration_tests:
+  # The suite is far larger than one runner can hold: on 4 vCPU it takes
+  # around eight minutes end to end. `--shard` divides it between runners
+  # instead, striped by discovery order so no shard collects a whole
+  # directory of like-cost tests. Each shard reports its share of the
+  # discovered tests, so the log shows none was dropped.
+  #
+  # This job is not the required status check - `integration_tests` below
+  # is, and its name is what branch protection lists. Changing the shard
+  # count is therefore a change to this file alone.
+  integration_shards:
     needs: [version, bootstrap]
-    name: Run integration tests
+    name: Integration shard
 
-    # The ghul-test harness spawns cpu*3/2 worker processes for >6 cores
-    # (test-queue.ghul:38-52), each running dotnet ghul-compiler. 16 vCPU
-    # → 24 parallel workers, the headline parallel-throughput win.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-16' }}
+    runs-on: ubuntu-latest
 
-    # A GitHub-hosted runner is 4 vCPU, so a fork's pull request gets 6 workers
-    # rather than 24 and needs a budget sized for that, not for the big runner.
-    timeout-minutes: ${{ github.event.pull_request.head.repo.fork && 25 || 5 }}
+    timeout-minutes: 15
+
+    strategy:
+      # One shard failing says nothing about the others, and a rerun to find
+      # out costs another bootstrap.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
 
     steps:
     - uses: actions/checkout@v7
@@ -340,12 +375,40 @@ jobs:
     - name: Run integration tests
       env:
         GHUL_RUNTIME_DLL: ${{ github.workspace }}/bootstrap-tool/ghul-runtime.dll
-      run: bash -c "set -o pipefail ; dotnet ghul-test integration-tests | tee test-results.txt"
+      run: bash -c "set -o pipefail ; dotnet ghul-test --shard ${{ matrix.shard }}/5 integration-tests | tee test-results.txt"
 
     - uses: actions/upload-artifact@v7
       with:
-        name: test-results
+        name: test-results-${{ matrix.shard }}
         path: test-results.txt
+
+
+  # The required status check. A shard's own job carries the matrix leg in
+  # its name, so the name changes whenever the shard count does; this job's
+  # does not, which keeps the shard count out of branch protection.
+  #
+  # `always()` is load-bearing. Without it a failed bootstrap skips the
+  # shards, which skips this job, and a skipped job satisfies a required
+  # check - so the pull request would show this green over a compiler that
+  # never built. With it the job runs regardless and judges the result
+  # itself.
+  integration_tests:
+    needs: [integration_shards]
+    name: Run integration tests
+
+    if: always()
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+    - name: Check every shard passed
+      env:
+        RESULT: ${{ needs.integration_shards.result }}
+      run: |
+        echo "shards: $RESULT"
+        [ "$RESULT" = success ]
 
 
   # Drives --analyse, which emits nothing. It still needs the emission
@@ -362,12 +425,12 @@ jobs:
     # core count; bumping past 8 yields no wall-time win, so 8 it is. If this
     # job's wall time becomes painful, the lever is xunit's parallelism
     # settings / the harness, not the runner SKU.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-8' }}
+    runs-on: ubuntu-latest
 
     # Halving the cores should cost little here, per the measurements above, but
     # a fork's pull request runs on a smaller and slower machine than any of
     # them, so give it room rather than have it time out on a cold cache.
-    timeout-minutes: ${{ github.event.pull_request.head.repo.fork && 15 || 5 }}
+    timeout-minutes: 15
 
     steps:
     - uses: actions/checkout@v7
@@ -424,9 +487,9 @@ jobs:
     needs: [version, bootstrap]
     name: Run formatter round trip
 
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-4' }}
+    runs-on: ubuntu-latest
 
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
     - uses: actions/checkout@v7
@@ -478,9 +541,9 @@ jobs:
     # ghul-test harness runs each .ghulproj in parallel and each `dotnet
     # build` is itself multithreaded. In practice the suite is small enough
     # that the work step finishes in ~5s on 4 vCPU; sized accordingly.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-4' }}
+    runs-on: ubuntu-latest
 
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@v7
@@ -583,9 +646,9 @@ jobs:
     needs: [version, bootstrap]
     name: Run runtime tests
 
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-2' }}
+    runs-on: ubuntu-latest
 
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     # Build ghul-runtime (latest main, no version pin) against the
     # bootstrapped compiler and run its unit tests. Same symmetry
@@ -678,9 +741,9 @@ jobs:
     needs: [version, bootstrap]
     name: Run examples tests
 
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-4' }}
+    runs-on: ubuntu-latest
 
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     # Build ghul-examples (latest main, no version pin) against the
     # bootstrapped compiler. ghul-examples has its own CI gating its
@@ -767,13 +830,20 @@ jobs:
       working-directory: ghul-examples
       run: dotnet ghul-test --use-dotnet-build integration-tests
 
-  rosetta_tests:
+  # Sharded, and gated by `rosetta_tests` below, for the reasons given on
+  # the integration shards.
+  rosetta_shards:
     needs: [version, bootstrap]
-    name: Run Rosetta Code tests
+    name: Rosetta Code shard
 
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'ubicloud-standard-4' }}
+    runs-on: ubuntu-latest
 
     timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     # Build and run every ghul-rosetta-code task (latest main) against the
     # bootstrapped compiler. The tasks are the largest corpus of top-level
@@ -843,7 +913,27 @@ jobs:
 
     - name: Run Rosetta Code integration tests
       working-directory: ghul-rosetta-code
-      run: dotnet ghul-test --use-dotnet-build tasks
+      run: dotnet ghul-test --use-dotnet-build --shard ${{ matrix.shard }}/3 tasks
+
+
+  # The required status check; see the note on `integration_tests`.
+  rosetta_tests:
+    needs: [rosetta_shards]
+    name: Run Rosetta Code tests
+
+    if: always()
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+    - name: Check every shard passed
+      env:
+        RESULT: ${{ needs.rosetta_shards.result }}
+      run: |
+        echo "shards: $RESULT"
+        [ "$RESULT" = success ]
 
   code_review:
     name: Code review
