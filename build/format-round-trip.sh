@@ -9,10 +9,11 @@
 # still ghul. This runs the whole compiler through it and builds what
 # comes out, which is the check the tool actually exists to pass.
 #
-# It also formats the formatted source a second time and requires the two
-# to agree. A formatter that is not a fixpoint rewrites files that were
-# already formatted, so every reformat shows up as a diff and the tool
-# cannot be run on save.
+# It also requires the formatter to be a fixpoint on its own output: a
+# formatter that is not rewrites files that were already formatted, so
+# every reformat shows up as a diff and the tool cannot be run on save.
+# The first pass is allowed to change things, since it is normalising
+# source a person wrote; it is the second pass onwards that must not.
 
 set -euo pipefail
 
@@ -51,7 +52,10 @@ echo "Checking the formatter is a fixpoint ..."
 cp -r "$work/pass1" "$work/pass2"
 dotnet "$compiler" --format-in-place "$work/pass2/src" "$work/pass2/analysis-protocol"
 
-if ! diff -rq "$work/pass1" "$work/pass2" > "$work/fixpoint.diff"; then
+cp -r "$work/pass2" "$work/pass3"
+dotnet "$compiler" --format-in-place "$work/pass3/src" "$work/pass3/analysis-protocol"
+
+if ! diff -rq "$work/pass2" "$work/pass3" > "$work/fixpoint.diff"; then
     echo "formatting already-formatted source changed it:" >&2
     cat "$work/fixpoint.diff" >&2
     exit 1
@@ -67,8 +71,8 @@ restore() {
 }
 trap 'restore; rm -rf "$work"' EXIT
 
-cp -r "$work/pass1/src/." src/
-cp -r "$work/pass1/analysis-protocol/." analysis-protocol/
+cp -r "$work/pass2/src/." src/
+cp -r "$work/pass2/analysis-protocol/." analysis-protocol/
 
 dotnet build -verbosity:quiet -nologo
 
