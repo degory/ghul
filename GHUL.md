@@ -1464,7 +1464,7 @@ od
 let evens = counting(6) |> filter(x => x % 2 == 0);
 ```
 
-The result is an ordinary `Pipe[T]`, so the pipe combinators chain onto it with `|>`.
+The result is an ordinary `Pipe[T]`, so the pipe combinators chain onto it with `|>`, and it behaves as any pipe does: read part way it carries on, and once it has run out it rewinds itself - restoring the arguments the generator was called with - so the next read starts it over.
 
 `yield in E` yields every element of `E` in turn, where `E` is anything a `for` loop can iterate — a pipe, an array, a list, an iterator. The elements are pulled one at a time as the consumer asks for them, exactly as writing the loop out by hand would, which is what makes it the natural shape for a recursive generator:
 
@@ -1504,6 +1504,8 @@ let evens = numbers |> filter(x => x % 2 == 0);
 let doubled = numbers |> map(x => x * 2);
 let sum = numbers |> reduce(0, (acc, x) => acc + x);
 ```
+
+A pipe is a cursor over its source. Read part way and then read again — by the same consumer or another, through `for`, a combinator, a terminal or interpolation — it carries on from wherever the last read stopped; nothing distinguishes those cases. Once it has run out it rewinds itself, so the next read starts from the beginning: `for x in p` twice sees every element twice, and `p |> count()` followed by `p |> only()` walks the whole sequence both times. A stage reaching its own end counts as the end of everything below it, so `p |> take(2)` yields the first two elements every time it is read, and `skip` is how to page. The rewind is in place, so every holder of the pipe sees it start over. `p.reset()` rewinds early. Nothing disposes on its own: `p.dispose()` on a combinator chain releases every iterator its stages hold, file readers included, while a generator's `dispose()` releases nothing - it does not run the body's `finally` clauses or dispose an iterator the body is walking with `yield in`. `memo` is the one stage whose rewind never asks its source again — it replays what it cached.
 
 Lazy and infinite sequences are built with `Ghul.Pipes.stream(initial, advance)`, where `advance` steps from the current state to the next element and state. Nothing forces `advance` to be free of side effects, but it is called lazily and on demand, so it is much easier to reason about when it is. The `||` infix is the step expression — `value || next_state`. A `stream(...)` is an ordinary `Pipe[T]`, so the pipe combinators chain onto it with `|>`. See <https://ghul.dev/functional-programming.html#lazy-sequences>.
 
