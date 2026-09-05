@@ -71,8 +71,10 @@ Never commit a manifest pinned to a `0.0.0-*` local version - it breaks the
 build for everyone else.
 
 `./build/bootstrap.sh` is the check that self-hosting still works. It builds the
-compiler with itself four times over and compares the output of the last two
-passes, which must be identical.
+compiler with itself three times over and compares the assemblies passes 2 and 3
+produced, which must be identical. Where they differ it runs a fourth pass and
+compares that with pass 3 instead, which is what a source change that fixes the
+compiler's own emission looks like.
 
 ## Testing
 
