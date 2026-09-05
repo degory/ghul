@@ -1,0 +1,277 @@
+namespace Syntax.Process is
+    use Source.LOCATION
+    use Trees
+
+    use Logging.Logger
+
+    use Semantic.Symbols.Function
+
+    // Picks the assembly's entry point out of every candidate the project
+    // declares, before generate-il runs.
+    //
+    // Three kinds of declaration can name one, and they rank against each
+    // other rather than competing first-come:
+    //
+    //   1. an `@entry` (or `@IL.entrypoint`) pragma
+    //   2. a function named by `--entry`, or `entry` when that is not given
+    //   3. the entry synthesised from a file's top-level statements
+    //
+    // The highest rank any candidate reaches wins, and two candidates at
+    // that rank are the duplicate-entrypoint error - except at rank 3,
+    // where several files each carrying top-level statements is a project
+    // shape rather than a mistake: none of them is selected, each is told
+    // its statements will not run, and an executable build that ends up
+    // with no entry point at all reports that separately.
+    //
+    // Ranking matters most for rank 3. A synthesised entry is a file-private
+    // definition like any other, so a project may hold any number of them -
+    // an umbrella project globbing a directory of one-file examples, say -
+    // and naming the real entry point with `--entry` is what tells them
+    // apart. `--entry` also takes rank 3 out of the running entirely: a
+    // build that asks for an entry point by name does not want statements
+    // from some other file instead.
+    class SELECT_ENTRY_POINT: Visitor is
+        UNRUN_STATEMENTS: string static => "top-level-statements-not-run"
+
+        _PRAGMA_RANK: int static => 0
+        _NAMED_RANK: int static => 1
+        _TOP_LEVEL_RANK: int static => 2
+
+        _logger: Logger
+        _symbol_table: Semantic.SYMBOL_TABLE
+        _ir_context: IR.CONTEXT
+
+        _candidates: Collections.LIST[ENTRY_POINT_CANDIDATE]
+        _pending_entry_pragma: bool
+
+        // Whether the project carries top-level statements that no build
+        // will run. Read by the compiler so an executable build with no
+        // entry point can say which of the two shapes it is in.
+        left_top_level_statements_unrun: bool public
+
+        init(logger: Logger, symbol_table: Semantic.SYMBOL_TABLE, ir_context: IR.CONTEXT) is
+            super.init()
+
+            _logger = logger
+            _symbol_table = symbol_table
+            _ir_context = ir_context
+            _candidates = Collections.LIST[ENTRY_POINT_CANDIDATE]()
+        si
+
+        start() is
+            _candidates.clear()
+            _pending_entry_pragma = false
+            left_top_level_statements_unrun = false
+        si
+
+        apply(source_file: Compiler.SOURCE_FILE) is
+            _pending_entry_pragma = false
+
+            source_file.definition.walk(self)
+        si
+
+        pre(pragma: Definitions.PRAGMA) -> bool is
+            let name = pragma.pragma.name.to_string()
+
+            if name =~ "entry" \/ name =~ "IL.entrypoint" then
+                _pending_entry_pragma = true
+            fi
+
+            return false
+        si
+
+        pre(function: Definitions.FUNCTION) -> bool is
+            let is_pragma_marked = _pending_entry_pragma
+
+            _pending_entry_pragma = false
+
+            let symbol = _function_for(function)
+
+            // Only the two kinds the runtime can enter at: a global
+            // function or a static method. An instance method named
+            // `entry` is an ordinary member.
+            if !symbol? \/ !(isa Semantic.Symbols.GLOBAL_FUNCTION(symbol) \/ isa Semantic.Symbols.STATIC_METHOD(symbol)) then
+                return false
+            fi
+
+            if function.is_top_level_entry then
+                _candidates.add(
+                    ENTRY_POINT_CANDIDATE(
+                        _TOP_LEVEL_RANK,
+                        symbol,
+                        _first_statement_location(function),
+                        true))
+
+                return false
+            fi
+
+            let name = function.name
+            let declared_at = if name? then name.location else function.location fi
+
+            if is_pragma_marked then
+                _candidates.add(ENTRY_POINT_CANDIDATE(_PRAGMA_RANK, symbol, declared_at, false))
+
+                return false
+            fi
+
+            if name? /\ name.name =~ _ir_context.entry_point_name /\ _has_entry_point_signature(symbol) then
+                _candidates.add(ENTRY_POINT_CANDIDATE(_NAMED_RANK, symbol, declared_at, false))
+            fi
+
+            return false
+        si
+
+        finish() is
+            let chosen = _choose()
+
+            if let selected = chosen then
+                selected.symbol.is_entry_point = true
+            fi
+
+            for candidate in _candidates do
+                if !candidate.is_top_level \/ (chosen? /\ candidate.symbol == chosen.symbol) then
+                    continue
+                fi
+
+                left_top_level_statements_unrun = true
+
+                _warn_unrun(candidate, chosen)
+            od
+        si
+
+        // The winner, or absent when nothing is declared or when the top
+        // rank is a tie the project is allowed to have.
+        _choose() -> ENTRY_POINT_CANDIDATE? is
+            let best: ENTRY_POINT_CANDIDATE? mut = null
+
+            for candidate in _candidates do
+                if candidate.rank == _TOP_LEVEL_RANK /\ _ir_context.entry_point_name_is_explicit then
+                    continue
+                fi
+
+                if !best? \/ candidate.rank < best.rank then
+                    best = candidate
+                fi
+            od
+
+            if !best? then
+                return null
+            fi
+
+            let winners = Collections.LIST[ENTRY_POINT_CANDIDATE]()
+
+            for candidate in _candidates do
+                if candidate.rank == best.rank /\
+                    !(candidate.rank == _TOP_LEVEL_RANK /\ _ir_context.entry_point_name_is_explicit)
+                then
+                    winners.add(candidate)
+                fi
+            od
+
+            if winners.count == 1 then
+                return winners[0]
+            fi
+
+            // Two files each carrying top-level statements is a shape an
+            // umbrella project has on purpose, so it selects nothing and
+            // says so per file rather than failing here.
+            if best.rank != _TOP_LEVEL_RANK then
+                for i in 1..winners.count do
+                    _logger.error(
+                        winners[i].location,
+                        "duplicate entrypoint",
+                        winners[0].location,
+                        "entry point already declared here")
+                od
+
+                return winners[0]
+            fi
+
+            return null
+        si
+
+        _warn_unrun(candidate: ENTRY_POINT_CANDIDATE, chosen: ENTRY_POINT_CANDIDATE?) is
+            if let selected = chosen then
+                _logger.warn(
+                    candidate.location,
+                    UNRUN_STATEMENTS,
+                    "top-level statements will not run: the entry point is {selected.symbol.name}",
+                    selected.location,
+                    "entry point declared here")
+            else
+                _logger.warn(
+                    candidate.location,
+                    UNRUN_STATEMENTS,
+                    "top-level statements will not run: more than one file carries them and none is named with --entry")
+            fi
+        si
+
+        // The checks that made a name match decline before: an entry point
+        // takes no arguments or one `string[]`, and returns `int` or `void`.
+        // A return type the walk has not settled yet - analysis mode leaves
+        // an unopened file's body uncompiled - is taken on trust rather than
+        // silently dropping the candidate.
+        _has_entry_point_signature(symbol: Function) -> bool is
+            if symbol.arguments.count > 1 then
+                return false
+            fi
+
+            let return_type = symbol.return_type
+
+            if !return_type? then
+                return true
+            fi
+
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            if !return_type.matches(lookup.get_int_type()) /\ !return_type.matches(lookup.get_void_type()) then
+                _logger.warn(
+                    symbol.location,
+                    "non-entrypoint",
+                    "not an entrypoint because return type is not int or void")
+
+                return false
+            fi
+
+            if symbol.arguments.count == 1 /\
+                !symbol.arguments[0].matches(lookup.get_array_type(lookup.get_string_type()))
+            then
+                _logger.warn(
+                    symbol.location,
+                    "non-entrypoint",
+                    "not an entrypoint because argument type is not string[]")
+
+                return false
+            fi
+
+            return true
+        si
+
+        _first_statement_location(function: Definitions.FUNCTION) -> LOCATION is
+            if let block = cast Bodies.BLOCK?(function.body) then
+                for statement in block.statements do
+                    return statement.location
+                od
+            fi
+
+            return function.location
+        si
+
+        _function_for(node: Trees.Node) -> Function? is
+            let scope = _symbol_table.scope_for(node)
+
+            if !scope? then
+                return null
+            fi
+
+            return cast Function?(scope.underlying_scope)
+        si
+    si
+
+    class ENTRY_POINT_CANDIDATE(
+        rank: int,
+        symbol: Function,
+        location: LOCATION,
+        is_top_level: bool
+    ) is si
+si
