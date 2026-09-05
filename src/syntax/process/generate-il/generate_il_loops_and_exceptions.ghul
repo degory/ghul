@@ -14,7 +14,7 @@ namespace Syntax.Process is
     use Ghul.Pipes
 
 
-    // Loop and exception IL: try, catch, do and for walks, and the fused and guarded for loops.
+    // Loop and exception IL: try, catch, do and for walks, and the fused for loop.
     partial GENERATE_IL is
         pre(`try: Statements.TRY) -> bool is
             super.pre(`try)
@@ -384,11 +384,7 @@ namespace Syntax.Process is
                 !Semantic.Symbols.state_machine_for(current_function)? /\
                 !Semantic.Symbols.async_state_machine_for(current_function)?
             then
-                if `for.fusion!.needs_guard then
-                    _visit_guarded_for(`for)
-                else
-                    _visit_fused_for(`for)
-                fi
+                _visit_fused_for(`for)
 
                 return
             fi
@@ -514,8 +510,7 @@ namespace Syntax.Process is
         // filling `stage_delegates` / `stage_counters` parallel to the
         // stages (null where a slot does not apply): an inlined stage's
         // parameter local, a delegate stage's hoisted function value, an
-        // index stage's running counter initialised to its start. Shared by
-        // the pure and guarded fused-loop emitters.
+        // index stage's running counter initialised to its start.
         _setup_fused_stages(
             fusion: Syntax.Process.PIPE_FUSION,
             stage_delegates: Collections.LIST[TEMP?],
@@ -550,8 +545,7 @@ namespace Syntax.Process is
         // Before the loop pulls an element, leave via `take_exit` when any
         // take stage has spent its count: a fused take then pulls exactly
         // the elements it yields, as the TAKE_PIPE it replaces does, and
-        // never advances the source past them. Shared by the pure and
-        // guarded fused-loop emitters.
+        // never advances the source past them.
         _gen_fused_take_guards(
             fusion: Syntax.Process.PIPE_FUSION,
             stage_counters: Collections.List[TEMP?],
@@ -575,7 +569,6 @@ namespace Syntax.Process is
         // leaves via `take_exit` - `loop_end` unless the caller has a source
         // to reset first; an index stage builds
         // INDEXED_VALUE(counter++, current) directly.
-        // Shared by the pure and guarded fused-loop emitters.
         _apply_fused_stages(
             fusion: Syntax.Process.PIPE_FUSION,
             element: Value,
@@ -762,176 +755,6 @@ namespace Syntax.Process is
             fi
 
             brancher.label(loop.end)
-
-            super.visit(`for)
-
-            _loops.leave_loop()
-        si
-
-        // Lower a fusible chain whose source could dynamically be a user
-        // Pipe with an overridden map/filter (any non-sealed source). The
-        // chain is fused behind a per-site guard that tests the source the
-        // same way pipe() does: `source isa Pipe[element]` true means
-        // pipe() would short-circuit to the source and run its own
-        // map/filter, so take the ordinary pipe-object loop; false means
-        // pipe() wraps the source in the built-in default pipe, so the
-        // fused loop is equivalent. Guard and pipe() agree by construction,
-        // so this is sound with no runtime-library change.
-        //
-        // Both paths share ONE copy of the loop body: generate_il emits
-        // precomputed IR and IR.Values.BLOCK is single-shot, so a
-        // val-block in the body could not be walked twice. Instead a
-        // loop-invariant `use_fused` flag selects the advance mechanism per
-        // element (a perfectly predictable branch). Never reached inside a
-        // state machine - visit(FOR)'s dispatch keeps generator/async loops
-        // on the normal lowering, whose iterator lives on the frame to
-        // survive yield/await.
-        _visit_guarded_for(`for: Statements.FOR) is
-            let fusion = `for.fusion!
-            let source = fusion.source
-            let variable = `for.variable!
-            let body = `for.body!
-            let expression = `for.expression!
-
-            let brancher = get_brancher_for_block()
-            let loop = _loops.enter_loop(`for)
-
-            let bool_type = _innate_symbol_lookup.get_bool_type()
-            let element_type = `for.read_current!.return_type!
-
-            variable.walk(self)
-
-            // Shared mutable locals, declared once before the guard branch.
-            // `use_fused` is set once (loop-invariant); `element_slot`
-            // carries the per-element value into the shared bind + body.
-            let use_fused = TEMP(current_block, "guard_use_fused", bool_type)
-            let element_slot = TEMP(current_block, "guard_element", element_type)
-
-            // Fallback iterator (the built pipe chain's) and fused iterator
-            // (the source's own). Each is stored in only one branch; the
-            // other stays default and is never read on that path.
-            let pipe_iterator_type =
-                if `for.read_iterator? then
-                    `for.read_iterator.return_type!
-                else
-                    expression.value!.type!
-                fi
-
-            let source_iterator_type =
-                if fusion.source_read_iterator? then
-                    fusion.source_read_iterator.return_type!
-                else
-                    source.value!.type!
-                fi
-
-            let pipe_iterator = TEMP(current_block, "guard_pipe_iterator", pipe_iterator_type)
-            let source_iterator = TEMP(current_block, "guard_source_iterator", source_iterator_type)
-
-            // Per-stage setup for the fused path (shared with the pure
-            // fused loop): declared before the guard branch. On the fallback
-            // path these stay unused - a hoisted delegate is simply built
-            // and not read.
-            let stage_delegates = Collections.LIST[TEMP?]()
-            let stage_counters = Collections.LIST[TEMP?]()
-
-            _setup_fused_stages(fusion, stage_delegates, stage_counters)
-
-            let fused_setup = LABEL()
-            let after_setup = LABEL()
-
-            // if source isa Pipe[element] then fall back else fuse.
-            let is_pipe = cast Value(IR.Values.ISA(bool_type, fusion.guard_isa_type!, source.value!))
-
-            brancher.branch(BRANCH.Z, is_pipe, fused_setup, "pipe-guard")
-
-            // Fallback setup: build the pipe chain and iterate it, exactly
-            // as the normal for loop would.
-            use_fused.store(Literal.NUMBER(0, bool_type))
-
-            let pipe_iterator_value =
-                if `for.read_iterator? then
-                    `for.read_iterator.call(expression.location, expression.value!, Collections.LIST[Value](0), null, _function_caller)
-                else
-                    expression.value!
-                fi
-
-            pipe_iterator.store(pipe_iterator_value)
-
-            brancher.branch(after_setup)
-
-            // Fused setup: drive the source's own iterator directly - the
-            // pipe objects are never built.
-            brancher.label(fused_setup)
-
-            use_fused.store(Literal.NUMBER(1, bool_type))
-
-            let source_iterator_value =
-                if fusion.source_read_iterator? then
-                    fusion.source_read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller)
-                else
-                    source.value!
-                fi
-
-            source_iterator.store(source_iterator_value)
-
-            brancher.label(after_setup)
-
-            // --- Merged loop over one shared body. ---
-            brancher.label(loop.start)
-
-            let fused_advance = LABEL()
-            let bind = LABEL()
-
-            brancher.branch(BRANCH.NZ, use_fused.load(), fused_advance, "use-fused")
-
-            // Fallback advance: pull from the pipe chain's iterator.
-            let fallback_has_next = `for.move_next!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller)
-
-            brancher.branch(BRANCH.Z, fallback_has_next, loop.end)
-
-            let fallback_current = `for.read_current!.call(expression.location, pipe_iterator.load(), Collections.LIST[Value](0), null, _function_caller)
-
-            element_slot.store(fallback_current)
-
-            brancher.branch(bind)
-
-            // Fused advance: pull from the source, apply stages inline.
-            brancher.label(fused_advance)
-
-            _gen_fused_take_guards(fusion, stage_counters, brancher, loop.end)
-
-            let has_next = fusion.source_move_next!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller)
-
-            brancher.branch(BRANCH.Z, has_next, loop.end)
-
-            let element = fusion.source_read_current!.call(source.location, source_iterator.load(), Collections.LIST[Value](0), null, _function_caller)
-
-            let current_value = _apply_fused_stages(fusion, element, stage_delegates, stage_counters, brancher, loop.start, loop.end, loop.end)
-
-            element_slot.store(current_value)
-
-            // --- Shared bind + body (walked once). ---
-            brancher.label(bind)
-
-            gen_destructuring_initialize(variable.left, element_slot.load())
-
-            body.walk(self)
-
-            brancher.branch(loop.start)
-
-            brancher.label(loop.end)
-
-            // Emit the nested closure method bodies (the map/filter lambdas
-            // and anything inside the source) exactly once. The fallback
-            // path's pipe chain and the fused path's delegate temps both
-            // reference these methods; a second walk would redefine them.
-            source.walk(self)
-
-            for stage in fusion.stages_outermost_first do
-                if stage.argument? then
-                    stage.argument.walk(self)
-                fi
-            od
 
             super.visit(`for)
 
