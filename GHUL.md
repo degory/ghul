@@ -1577,16 +1577,9 @@ total[T: INumber[T]](a: T, b: T) -> T => a + b;
 
 Without that `use` the operator is not in scope and `a + b` does not resolve, so nothing changes for code that does not ask for it — importing one does not displace the built-in operators either, and `3 + 4` still adds two `int`s the way it always did.
 
-A type parameter is not the only thing the import reaches. Any type that implements the interface can use the operator, so a concrete .NET numeric type with no built-in operator of its own gets one from the same `use`:
+A concrete type needs no import for its own operators. A public static operator a .NET type declares for itself is a candidate wherever a value of that type is either operand (see [.NET interop](#net-interop)), so `Int128.one + Int128.one` resolves as it stands. The import is for a bounded type parameter, whose operators come from the interface rather than from any one type.
 
-```ghul
-use System.Int128;
-use System.Numerics.IAdditionOperators.`+;
-
-let two = Int128.one + Int128.one;
-```
-
-The same holds for a static member imported by name rather than reached through a type parameter, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on a concrete implementing type alike.
+A static member imported by name reaches a concrete type as well as a bounded one, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on `Int128` alike.
 
 The arithmetic operators `+`, `-`, `*`, `/` and `%` can be imported this way, and so can the bitwise and shift operators `&`, `|`, `^`, `\`, `<<`, `>>` and `>>>`. The comparison and equality operators cannot: a type says how it orders and compares by defining `<>` and `=~`, and those are what the operators are written in terms of. Each operator is imported from the interface that *declares* it, which for the shifts is `IShiftOperators` however the bound is spelled:
 
@@ -1704,9 +1697,11 @@ a. =~(b)
 a.`=~(b)
 ```
 
-Both are the same call, and both are a plain method call rather than another spelling of the operator. Where the two differ, they differ quietly. The null handling around `a =~ b` is written around the *operator*, so the member call receives an absent operand instead of being answered before it is reached. And an operator that lowers to an IL instruction has no member behind it: on the scalar types the arithmetic and relational operators are instructions, so `a. +(b)` on an `int` reports that `+` is not a member — while `=~` and `<>` on those types, and on `string`, do reach the .NET method the name maps to, which is not the same thing the operator does. Member syntax is fine to use on a type whose operators you wrote; it is not a general substitute for writing the operator.
+Both are the same call, and both are a plain method call rather than another spelling of the operator. Where the two differ, they differ quietly. The null handling around `a =~ b` is written around the *operator*, so the member call receives an absent operand instead of being answered before it is reached. And an operator that lowers to an IL instruction has no .NET method behind it: on the scalar types the arithmetic operators are instructions, declared as static members of the type, so `a. +(b)` on an `int` finds no overload taking one operand, and `int.`+(a, b)` is the call — while `=~` and `<>` on those types, and on `string`, do reach the .NET method the name maps to, which is not the same thing the operator does. Member syntax is fine to use on a type whose operators you wrote; it is not a general substitute for writing the operator.
 
 A static property or field takes `snake_case` however constant-like it reads, since only enum members become `MACRO_CASE` — `CancellationToken.None` is `System.Threading.CancellationToken.none`.
+
+A type's own **operators** are reached by writing the operator. A public static operator method a .NET type declares — `op_Addition` and the rest, on `System.Numerics.BigInteger`, `System.DateTime`, `System.TimeSpan` and any other type that has them — is a candidate wherever a value of that type is either operand, and both operand types contribute, so `step * 2.0D` and `2.0D * step` find the same operator on `TimeSpan`. The same goes for a static operator declared on a ghūl class or struct: `+(a: VECTOR, b: VECTOR) -> VECTOR static` applies to `v + w` from anywhere `VECTOR` is visible, not only inside its own body. The arithmetic, bitwise, shift and unary operators are reached this way; comparison and equality come from `<>` and `=~` as elsewhere, so a reflected `op_LessThan` or `op_Equality` is not. The scalar types are the exception: their operators are the language's own, so `decimal`'s reflected `op_Addition` is not a second candidate beside the built-in `+`.
 
 An **indexer** is the one member reached only through its own syntax. .NET does not fix its name — the property carries whatever its declaring language chose, and the type nominates the real one, so `System.String` and `System.Text.StringBuilder` both call theirs `Chars` — but the name never has to be written: `[` and `]` find it whatever it is.
 
