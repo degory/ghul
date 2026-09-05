@@ -31,9 +31,10 @@ Don't flag:
 - Hypothetical concerns ("could this race…?" without a concrete path).
 - "Consider…" suggestions that don't identify a real defect.
 - Compiler tool-version bumps in `.config/dotnet-tools.json` going out without an explanation. CI resolves the bootstrap compiler at run time, so the pin only affects local dev; the worst case from a bump is a rebuild against the latest published compiler, which is never unacceptable. Routine. Don't ask why.
-- Anything you're not confident about.
 
-Silence on a low-confidence finding is better than noise. The reviewer's job is high-signal feedback, not exhaustive enumeration.
+This is a list of what counts as a finding in *this* repo, on top of the confidence scale and the not-a-finding list the shared notes supply. Those still decide what gets posted: something on the flag list that scores below 80 is not posted either.
+
+The PR description conventions are checked mechanically by the `description_lint` job before you run, so the format violations are already caught. What is left for you is the part a grep cannot see: whether the description describes what the diff actually does.
 
 ## Contracts the test suite doesn't fully cover
 

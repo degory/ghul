@@ -170,8 +170,8 @@ and the release-notes entry**. It is the one part of a pull request that lasts,
 and it is worth more care than the individual commit messages.
 
 Write it for someone reading `git log` in a few years with no other context.
-Open directly with one or more of these sections - they are plain text, not
-markdown headings:
+Use one or more of these sections - they are plain text, not markdown
+headings:
 
 ```plaintext
 Enhancements:
@@ -187,12 +187,23 @@ Technical:
 Use only the sections you have content for, and keep every bullet to one line.
 A typical description is under fifteen lines in total.
 
+A brief introductory paragraph before the first section is allowed, and is the
+right shape when the bullets are individually unremarkable but add up to
+something worth saying in a sentence. Two or three sentences at most. It is
+held to the same standard as everything else here: written for the changelog
+reader, not for the reviewer. Read it back with the pull request forgotten - if
+it only makes sense as one half of a conversation with a reviewer, it belongs
+in a comment instead.
+
 What does **not** go in the description:
 
 - `## Summary`, `## Overview`, `## Test plan` or `## Testing` headings. The
   description is the summary, and passing CI is implied.
 - Justification. State what changed; don't argue that it was right.
-- A prose preamble explaining the problem. The bullet says it in one line.
+- A preamble that walks a reviewer through the problem, or that takes a
+  paragraph to say what a bullet says in one line.
+- Measurements or evidence offered to show the change was warranted. That is an
+  argument for the reviewer, and it ships whether or not they read it.
 - Links that won't outlive the pull request.
 
 Anything a reviewer needs but a changelog reader does not - why this approach
