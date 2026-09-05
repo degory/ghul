@@ -832,9 +832,12 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 - primitive scalars, `char`, `bool`, `decimal` and enum members, comparing by value
 - `string`, comparing by characters
 - any type that declares `=~` as a member — a class, struct or trait of your own, and any imported .NET type implementing `IEquatable[T]`, which is how `System.DateTime` and `System.Version` get one
+- any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
 - a union, through the operator synthesized for it — see [unions](#unions)
 - a tuple, element by element, each element through its own type's equality, however deep it nests
 - a bare type parameter, through the runtime's comparer for whatever it is instantiated at
+
+Where more than one of those could answer, the nearest declaration wins: a member operator first, then a global one, and the element-wise or comparer-based comparison only where nothing is declared.
 
 It is not defined everywhere. A class or struct that declares no `=~` of its own does not get one — the operator does not resolve, rather than falling back to identity — and neither `object` nor an array has one. Writing `=~` where nothing defines it is a compile error naming the operand types.
 
@@ -842,7 +845,7 @@ Defining `=~` on a type means defining `get_hash_code` alongside it: the two are
 
 `=~` is also null-safe, in a way `==` has no need to be: two absent values are equal, an absent and a present one are not, and neither case reaches an operator body. See [optional types](#optional-types).
 
-That holds wherever `=~` is defined at all: `a =~ b` resolves over `T?` exactly when it resolves over `T`, and answers the same for two present values. So an optional enum, an optional tuple and an optional `T` compare like any other optional, with no narrowing first.
+That holds wherever `=~` is defined at all: `a =~ b` resolves over `T?` exactly when it resolves over `T`, and answers the same for two present values. So an optional enum, an optional tuple and an optional `T` compare like any other optional, with no narrowing first — and declaring `=~(a: T, b: T) -> bool` is enough to make `T? =~ T?` work, whether that declaration is a member or a global.
 
 So on scalars and enums the two agree, and everywhere else they either differ or only one of them is defined. `=~` is the one that means what "equal" usually means; `==` is worth reaching for when identity is the actual question, or when the cost of the comparison is.
 
@@ -902,7 +905,9 @@ An absent value on the left is always answered this way, whatever the operator d
 
 A `T?` over a value type or over an unconstrained type parameter compares the same way, with one difference: an absent one of those is always answered by the null checks, never handed to the operator, because a value operand has no absent form to pass.
 
-Not every type reaches its equality through an operator it declares — an enum's is an opcode, and a tuple and a bare type parameter have none at all (see [equality](#equality)). Those get the same null checks around whatever compares them, so an optional one behaves exactly like an optional of a type that does declare an operator. The rule is that `a =~ b` over `T?` resolves whenever it resolves over `T`.
+The same applies to a global `=~`. One declaring non-optional parameters gets the null checks written around it, so its body is only handed present values; one declaring optional parameters is answering for absence itself and is called as written.
+
+Not every type reaches its equality through an operator at all — an enum's is an opcode, and a tuple and a bare type parameter have none (see [equality](#equality)). Those get the same null checks around whatever compares them, so an optional one behaves exactly like an optional of a type that does declare an operator. The rule is that `a =~ b` over `T?` resolves whenever it resolves over `T`.
 
 ## control flow
 
