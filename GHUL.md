@@ -274,7 +274,7 @@ The slice is a `Collections.List[E]` over the source, so nothing is copied and a
 
 The from-the-end operators build a `System.Range`, whose endpoints are only resolvable against a length, so unlike `..` and `::` they are not iterable — `for i in 1..<1 do` is rejected.
 
-A **tuple** groups two or more values of possibly different types — a single-element tuple is rejected, and a tuple has at most 7 elements. Tuple types and literals both use parentheses; elements may be named, and an unnamed element is named with a backtick and its index. Tuples are immutable, compare by structural equality, nest, and can be destructured:
+A **tuple** groups two or more values of possibly different types — a single-element tuple is rejected, and a tuple has at most 7 elements. Tuple types and literals both use parentheses; elements may be named, and an unnamed element is named with a backtick and its index. Tuples are immutable, nest, and can be destructured. They compare element by element through `=~`; `==` is rejected on one, as it is on any other struct (see [equality](#equality)):
 
 ```ghul
 let pair = (10, "hello");                  // (int, string)
@@ -416,7 +416,7 @@ class PERSON is
 si
 ```
 
-A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; to give a type structural equality, define `=~`, which maps to .NET's `Equals`.
+A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; to give a type structural equality, define `=~`, which maps to .NET's `Equals`. See [equality](#equality).
 
 A member whose type says it always holds a value has to be given one. A constructor that leaves one or more such members unassigned on some path out draws a single `field-definite-assignment` warning on the constructor's own name, naming every member it misses, since the object it produces holds null in a slot that cannot be written null anywhere else. Each missed member also carries a related location pointing at its declaration — on the property, not the hidden backing field, when the member is an auto-property — which a capable editor renders as a jump-to link. A constructor is credited with what it assigns itself, and with what the methods it cannot avoid calling on `self` assign in turn — a call reached on only one branch of an `if`, a call on another object, and a call to a method a subclass could override all credit nothing, because none of them is bound to happen. Members of optional type and of value type are not checked: neither has a null to be caught holding. Suppress via `@suppress("field-definite-assignment")` per file, with `--suppress field-definite-assignment` project-wide, or on the constructor itself.
 
@@ -490,7 +490,7 @@ struct POINT is
 si
 ```
 
-A struct gets no equality operator of its own — define `=~` explicitly if the type needs one. `==` and `!=` compare only primitive scalars, enums, `decimal`, tuples and references; on any other struct operand — ghūl-declared or imported, `System.DateTime` for example — they are compile errors directing to `=~` / `!~`. A type parameter keeps both operators — the comparison is scalar or reference equality per instantiation.
+A struct gets no equality operator of its own — define `=~` explicitly if the type needs one; until you do, neither operator is available on it. `==` and `!=` are rejected on every struct operand — a tuple, an imported `System.DateTime`, one of your own — because the single comparison they lower to reads the value's bytes rather than its fields. `=~` is what compares a struct by value, wherever the type defines it. See [equality](#equality).
 
 A bare member declaration like `x: double;` is an auto-**property**, not a field, and a struct's property getter hands back a *copy*. That matters when a struct is held in a heap object: mutating it through the property mutates the copy and the write is lost, so the compiler rejects a store through one. Declare a real field with the `field` modifier where a struct member is to be mutated in place:
 
@@ -740,7 +740,7 @@ enum Status is
 si
 ```
 
-Enum values compare with the relational operators as well as for equality (`=~` and `==`), so they order by their underlying integer. `=~` over an optional enum is not supported; narrow the value first. An individual member can be imported by name — `use Some.Namespace.Suit.HEARTS;` — as well as reached through the type.
+Enum values compare with the relational operators as well as for equality (`=~` and `==`), so they order by their underlying integer. `=~` works over an optional enum too, as it does over any other optional. An individual member can be imported by name — `use Some.Namespace.Suit.HEARTS;` — as well as reached through the type.
 
 ### partial and impl blocks
 
@@ -803,6 +803,52 @@ si
 
 Methods are functions declared inside a class, struct, or trait; they have an implicit `self`. A constructor is a method named `init`. Methods are public unless their name starts with `_`, which makes them non-public under the `--underscore-access` policy — by default visible only to the declaring class. The compiler enforces that gate.
 
+## equality
+
+ghūl has two equality operators, and they ask different questions.
+
+`==` and `!=` ask whether two values are *the same thing*: identical bits for a scalar, the same object for a reference. They lower to a single machine comparison, and every other property of them follows from that. No type can overload or override `==`, so what it does never depends on which type reaches it. It never recurses into a value's contents, so it never depends on how deeply one nests. It never calls anything, so it never throws — comparing two absent optionals compares two nulls rather than dereferencing them. And it never walks a structure, so it costs the same on a megabyte-long string as on an `int`. `a == b` carries exactly one instruction's worth of meaning, and it can be read without knowing anything about the types involved.
+
+The price of that is a narrow domain. `==` and `!=` accept only:
+
+- primitive scalars — the integer types, `single`, `double`, `decimal`, `bool`, `char`
+- enum members
+- references — `string`, `object`, any class, any trait, and `null` against one of those
+- a bare type parameter, where the instantiation decides which of the above it is
+
+Every other operand is a compile error pointing at `=~`. On a struct — a tuple, an imported `System.DateTime`, one of your own — the single comparison would read the value's bytes rather than its fields, which is silently wrong rather than merely limited: a reference field would compare by identity, and padding would compare at all.
+
+**`==` on a `string` is reference identity, and stays that way.** Two strings with the same characters are `==` only when they are the same object, which for two literals they generally are and for anything computed they generally are not. That surprises people, and it is still the right definition, because it is the only one that keeps the four properties above. Compare characters with `=~`.
+
+`=~` and `!~` ask whether two values *mean the same*, and that is a question each type answers for itself:
+
+```ghul
+"hello" =~ "{"hel"}{"lo"}"      // true - same characters
+"hello" == "{"hel"}{"lo"}"      // false - different objects
+```
+
+`=~` resolves on:
+
+- primitive scalars, `char`, `bool`, `decimal` and enum members, comparing by value
+- `string`, comparing by characters
+- any type that declares `=~` as a member — a class, struct or trait of your own, and any imported .NET type implementing `IEquatable[T]`, which is how `System.DateTime` and `System.Version` get one
+- any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
+- a union, through the operator synthesized for it — see [unions](#unions)
+- a tuple, element by element, each element through its own type's equality, however deep it nests
+- a bare type parameter, through the runtime's comparer for whatever it is instantiated at
+
+Where more than one of those could answer, the nearest declaration wins: a member operator first, then a global one, and the element-wise or comparer-based comparison only where nothing is declared.
+
+It is not defined everywhere. A class or struct that declares no `=~` of its own does not get one — the operator does not resolve, rather than falling back to identity — and neither `object` nor an array has one. Writing `=~` where nothing defines it is a compile error naming the operand types.
+
+Defining `=~` on a type means defining `get_hash_code` alongside it: the two are a pair, and .NET's collections consult the hash first. [.NET interop](#net-interop) covers the `Ghul.Equatable[T]` contract, the `Equals` bridge, and why the hash cannot be generated for you.
+
+`=~` is also null-safe, in a way `==` has no need to be: two absent values are equal, an absent and a present one are not, and neither case reaches an operator body. See [optional types](#optional-types).
+
+That holds wherever `=~` is defined at all: `a =~ b` resolves over `T?` exactly when it resolves over `T`, and answers the same for two present values. So an optional enum, an optional tuple and an optional `T` compare like any other optional, with no narrowing first — and declaring `=~(a: T, b: T) -> bool` is enough to make `T? =~ T?` work, whether that declaration is a member or a global.
+
+So on scalars and enums the two agree, and everywhere else they either differ or only one of them is defined. `=~` is the one that means what "equal" usually means; `==` is worth reaching for when identity is the actual question, or when the cost of the comparison is.
+
 ## optional types
 
 See <https://ghul.dev/language-basics.html#optional-types>.
@@ -858,6 +904,10 @@ absent !~ also_absent;      // false
 An absent value on the left is always answered this way, whatever the operator declares: there is no receiver to call a method on. What the operator's declaration decides is the *right* operand. Declared non-optional, an absent one is answered here too and the body is only ever handed present values. Declared optional — as `Ghul.Equatable[T]`'s example below writes it — the body is handed the absent value and answers for it itself.
 
 A `T?` over a value type or over an unconstrained type parameter compares the same way, with one difference: an absent one of those is always answered by the null checks, never handed to the operator, because a value operand has no absent form to pass.
+
+The same applies to a global `=~`. One declaring non-optional parameters gets the null checks written around it, so its body is only handed present values; one declaring optional parameters is answering for absence itself and is called as written.
+
+Not every type reaches its equality through an operator at all — an enum's is an opcode, and a tuple and a bare type parameter have none (see [equality](#equality)). Those get the same null checks around whatever compares them, so an optional one behaves exactly like an optional of a type that does declare an operator. The rule is that `a =~ b` over `T?` resolves whenever it resolves over `T`.
 
 ## control flow
 
@@ -1637,6 +1687,8 @@ Defining `=~` also settles how .NET itself compares the type, provided `get_hash
 Both halves are needed because .NET requires values that compare equal to hash equal, and a hash-based collection consults the hash first. A type that defines neither is consistent as it stands, comparing and hashing by identity, so defining only `=~` is reported as `equality-without-hash` and leaves the type alone rather than breaking that pair. The hash is not generated for you: an operator is free to ignore some of the fields it reads, and a memberwise hash would then disagree with it.
 
 `a =~ b` on a bare, unconstrained type parameter compiles by going through `EqualityComparer[T].Default.Equals`, the same route .NET collections use for a generic instantiation. That reaches the `Equals(object)` bridge above, so the comparison follows whatever the actual type argument does: a type declaring `=~` and `get_hash_code` answers through its own operator, a class declaring neither compares by reference, and a struct, enum, or scalar gets the runtime's ordinary value equality for that type. A bound that itself declares `=~` (`[T: Named]` where `Named` declares the operator) resolves the bound's operator directly and never reaches the comparer.
+
+A tuple takes the same route. `EqualityComparer[T].Default` for a `ValueTuple` is the tuple's own element-wise equality, so each element is compared by the default comparer for *its* type — and so, by the same chain, through a user-written `=~` where the element type declares one.
 
 A member `=~` or `<>` must be `pure` — declared or provably store-free — a compile error otherwise. Both operators are trusted on an operand whose type isn't known until later — a lambda parameter, for instance — and `=~` is trusted again through the `EqualityComparer[T].Default` route above. Nothing at either of those call sites can check what the implementation actually does, so an implementation that could store would make that trust unsound rather than merely unproven. Most bodies — field and property comparisons, delegating to another type's `=~`/`<>` — are provably store-free without any annotation; add `pure` when the body itself is more than the analysis can trace (a loop, a call the analysis doesn't otherwise bound). Overriding a pure `=~`/`<>` requires the override to be pure too, the same rule that governs overriding any other [pure function](#type-narrowing).
 
