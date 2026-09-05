@@ -21,6 +21,46 @@ a large project.
 
 If the compiler reported an internal error, include the whole message.
 
+## How bugs are prioritised
+
+Every open bug carries one of `P0`, `P1`, `P2` or `P3`. The band is about how a
+bug reaches you, not how hard it is to fix or how much of the compiler it
+touches: a one-line fix to something that silently miscompiles outranks a large
+piece of work on something that fails loudly.
+
+**P0 - silently wrong, or destroys work.** Nothing tells you anything is wrong,
+so the damage is already done by the time you find out. Code that compiles clean
+and emits an assembly that will not load, or that throws when a type is first
+touched. Code that compiles clean, loads, runs, and computes the wrong answer.
+Tooling that damages the source it was pointed at - a rename that breaks the
+program, a format-in-place that produces something the compiler rejects. A
+released change that breaks working code without a major version bump and
+without saying so.
+
+**P1 - blocks work loudly, or the editor is wrong.** You can see that something
+is wrong, and you are stopped or misled until it is fixed. A program that should
+compile and does not, especially where the diagnostic does not point at the
+cause, or where the compiler reports an internal error. An analyser crash.
+Analysis mode giving wrong answers about a code pattern, and incremental
+analysis disagreeing with a full build - incremental analysis is on by default
+and nearly every edit goes through it, so a wrong answer there is the normal
+case rather than an edge one.
+
+**P2 - a real defect, with a way around it.** The behaviour is wrong or missing,
+and there is something you can do instead in the meantime. Analysis mode
+declining to answer at all for some pattern belongs here rather than in P1: no
+answer is visibly no answer, where a wrong one gets acted on. Build noise,
+stray artefacts and diagnostics that are unhelpful but not misleading also sit
+here.
+
+**P3 - everything else.** Cosmetic problems, and bugs parked behind larger work.
+
+Two of these orderings are deliberate and are worth stating outright. Wrong
+output outranks no output, in the compiler and in the analyser alike, because
+silence is legible and a wrong answer is not. And tooling that damages source
+sits at the top with miscompilation rather than below it, because both destroy
+work that was correct when it was written.
+
 ## Asking about the language
 
 If you are not sure whether something is a bug or the language working as
