@@ -12,10 +12,14 @@ delete this comment. Every bullet is one line. Fifteen lines is a lot.
 
 Close an issue with `(closes #1234)` at the end of the bullet that addresses it.
 
-Please don't add: a `## Summary` or `## Test plan` heading, a paragraph
-explaining the problem, or an argument for why the change is right. Anything a
-reviewer needs but a changelog reader does not is genuinely useful - post it as
-a comment on this pull request, where it won't end up in the commit message.
+A brief intro paragraph above the first section is fine when the bullets need
+framing - two or three sentences, written for the changelog reader.
+
+Please don't add: a `## Summary` or `## Test plan` heading, a preamble that
+walks a reviewer through the problem, or an argument for why the change is
+right. Anything a reviewer needs but a changelog reader does not is genuinely
+useful - post it as a comment on this pull request, where it won't end up in
+the commit message.
 -->
 
 Enhancements:

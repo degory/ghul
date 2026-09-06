@@ -7,8 +7,8 @@ namespace Syntax.Process is
     //
     // - map (is_filter false, is_index false): `argument` is the mapper.
     // - filter (is_filter true): `argument` is the predicate.
-    // - index (is_index true): no argument; the loop keeps a running
-    //   counter starting at `index_start` and emits
+    // - index (is_index true): `argument` is the start, or null to start
+    //   at zero; the loop keeps a running counter and emits
     //   `INDEXED_VALUE[element](counter, current)` per element.
     //   compile-expressions fills `indexed_value_type` (the constructed
     //   `INDEXED_VALUE[element]` struct) and `indexed_value_constructor`.
@@ -42,12 +42,18 @@ namespace Syntax.Process is
         is_take: bool public
         is_skip: bool public
 
-        // The stage's argument: a map/filter lambda or delegate, or the int
-        // count of a take/skip stage. Null for an index stage.
+        // The stage's argument: a map/filter lambda or delegate, the int
+        // count of a take/skip stage, or an index stage's start. Null for
+        // an index stage that starts at zero.
         argument: Trees.Expressions.Expression? public
 
-        // Index stage only.
-        index_start: int public
+        // Index stage only. `chain_type` is the `index` call's own type,
+        // `Pipe[INDEXED_VALUE[E]]`, from which compile-expressions reads
+        // the INDEXED_VALUE the loop builds per element and resolves its
+        // constructor. `argument`, when present, is the start the caller
+        // supplied, evaluated once into the running counter exactly as a
+        // take/skip count is; absent, the counter starts at zero.
+        chain_type: Semantic.Types.Type? public
         indexed_value_type: Semantic.Types.Type? public
         indexed_value_constructor: Semantic.Symbols.Function? public
 
@@ -69,9 +75,10 @@ namespace Syntax.Process is
             self.argument = argument
         si
 
-        init(index_start: int) is
+        init(chain_type: Semantic.Types.Type, start: Trees.Expressions.Expression?) is
             self.is_index = true
-            self.index_start = index_start
+            self.chain_type = chain_type
+            self.argument = start
         si
 
         init(is_take: bool, is_skip: bool, count: Trees.Expressions.Expression) is
@@ -131,19 +138,9 @@ namespace Syntax.Process is
     // inline per element. `stages`
     // are outermost-first (the order they wrap the source), so inline
     // application walks them in reverse.
-    class PIPE_FUSION(source: Trees.Expressions.Expression, stages_outermost_first: LIST[PIPE_FUSION_STAGE], needs_guard: bool) is
+    class PIPE_FUSION(source: Trees.Expressions.Expression, stages_outermost_first: LIST[PIPE_FUSION_STAGE]) is
         source: Trees.Expressions.Expression public
         stages_outermost_first: LIST[PIPE_FUSION_STAGE] public
-
-        // True when the source's dynamic type could be a user Pipe with an
-        // overridden map/filter (any non-sealed source - it is only
-        // statically not a Pipe). The fused loop is then emitted behind a
-        // per-site `if source isa Pipe[elem]` guard that mirrors what
-        // pipe() itself does (pipe.ghul: `elif isa Pipe[T](source)`): guard
-        // true falls back to the ordinary pipe-object loop, guard false
-        // fuses. False for sealed sources (value types, arrays) which
-        // cannot dynamically be a Pipe, so fuse unconditionally.
-        needs_guard: bool public
 
         // The source's own iterator members, resolved against its type
         // exactly as a plain `for x in source` would. read_iterator is
@@ -154,25 +151,20 @@ namespace Syntax.Process is
         source_move_next: Semantic.Symbols.Function? public
         source_read_current: Semantic.Symbols.Function? public
 
-        // The source's `reset`, resolved only when the loop drives the
-        // source's own cursor rather than an iterator it obtained for
-        // itself - a reference-typed source with `move_next` on it, so a
-        // Pipe. Whoever else holds that source sees every element the loop
-        // pulls, and a `take` stage running out leaves the loop with the
-        // cursor part way through where the unfused lowering would have
-        // reset it: the stage pipe resets its upstream at the moment its
-        // own pass ends. The fused loop resets the source at the same
-        // point. A fresh iterator, and a value-type source the loop holds
-        // a copy of, are nobody else's to restore. Filled by
-        // compile-expressions after recognition.
-        source_reset: Semantic.Symbols.Function? public
-
-        // The `Pipe[source-element]` type the runtime guard tests the
-        // source against (`source isa Pipe[T]`). T is the SOURCE's own
-        // element type - the same T `pipe()` uses when it decides whether
-        // to short-circuit - so guard and pipe() always agree. Filled by
-        // compile-expressions only when `needs_guard`.
-        guard_isa_type: Semantic.Types.Type? public
+        // `Pipe[E].reset` and the `Pipe[E]` it is declared on, for the
+        // guarded rewind a spent `take` owes the cursor. A stage pipe
+        // ends its pass by rewinding whatever it drew from, and rewinding
+        // asks at run time whether that cursor is a `Pipe[T]`: one is
+        // reset in place, and anything else is left where it stopped for
+        // whoever reads it next. The static type does not settle the
+        // question - a `Pipe` reaches the loop through an `Iterable`
+        // variable, and a type that is its own iterator need not be a
+        // pipe at all - so the loop asks the same question the same way.
+        // Null when the cursor is a value type, which the loop holds a
+        // copy of and owes nothing. Filled by compile-expressions after
+        // recognition.
+        pipe_type: Semantic.Types.Type? public
+        pipe_reset: Semantic.Symbols.Function? public
     si
 
     // Decides whether a `for x in <chain>` loop's expression is a
@@ -206,9 +198,8 @@ namespace Syntax.Process is
         // Soundness, dispatch: `Ghul.Pipes.map`/`filter`/`take`/`skip` are
         // global functions with no receiver, so a call to one is never a
         // member access and never reaches an overridden `Pipe[T].map`/
-        // `filter` - fused or not. There is no isa-based dispatch anywhere
-        // in the call for a guard to route around, so `needs_guard` is
-        // always false regardless of the source's static or dynamic type.
+        // `filter` - fused or not, whatever the source's static or
+        // dynamic type.
         //
         // A source that is itself a Pipe also fuses, because a
         // thread-first chain is routinely
@@ -259,18 +250,19 @@ namespace Syntax.Process is
                 return null
             fi
 
-            return PIPE_FUSION(source, stages, false)
+            return PIPE_FUSION(source, stages)
         si
 
         // Classify `call` as a fusible `Ghul.Pipes` free-function stage -
-        // map, filter, take or skip, or a `memo` stage that is recognised
-        // only to be elided - by comparing the resolved call target
-        // against the fusible-combinator symbols, so what fuses follows
-        // the function the call bound rather than how it spells itself.
-        // Returns null for any other function, which stops the peel loop
-        // and leaves the call as an ordinary, unfused expression - still
-        // correct, since an unrecognised stage drives its own result
-        // through its own iterator exactly as the unfused lowering would.
+        // map, filter, take, skip or index, or a `memo` stage that is
+        // recognised only to be elided - by comparing the resolved call
+        // target against the fusible-combinator symbols, so what fuses
+        // follows the function the call bound rather than how it spells
+        // itself. Returns null for any other function, which stops the
+        // peel loop and leaves the call as an ordinary, unfused
+        // expression - still correct, since an unrecognised stage drives
+        // its own result through its own iterator exactly as the unfused
+        // lowering would.
         _classify_free_function_stage(call: Trees.Expressions.CALL) -> PIPE_FUSION_STAGE? is
             let value = call.value
 
@@ -285,24 +277,42 @@ namespace Syntax.Process is
                 return null
             fi
 
+            let arguments = call.arguments.expressions
+
             if role =~ "memo" then
-                if call.arguments.expressions.count != 1 then
+                if arguments.count != 1 then
                     return null
                 fi
 
                 return PIPE_FUSION_STAGE()
             fi
 
-            if call.arguments.expressions.count != 2 then
+            // `index` comes in both arities: from zero, or from a start
+            // the caller supplies. The stage carries the call's own type,
+            // which is where the INDEXED_VALUE it builds per element is
+            // read from rather than reconstructed.
+            if role =~ "index" then
+                let chain_type = value.type
+
+                if arguments.count == 1 then
+                    return PIPE_FUSION_STAGE(chain_type, null)
+                elif arguments.count == 2 then
+                    return PIPE_FUSION_STAGE(chain_type, arguments[1])
+                fi
+
+                return null
+            fi
+
+            if arguments.count != 2 then
                 return null
             fi
 
             if role =~ "map" \/ role =~ "filter" then
-                return PIPE_FUSION_STAGE(role =~ "filter", call.arguments.expressions[1])
+                return PIPE_FUSION_STAGE(role =~ "filter", arguments[1])
             fi
 
             if role =~ "take" \/ role =~ "skip" then
-                return PIPE_FUSION_STAGE(role =~ "take", role =~ "skip", call.arguments.expressions[1])
+                return PIPE_FUSION_STAGE(role =~ "take", role =~ "skip", arguments[1])
             fi
 
             return null

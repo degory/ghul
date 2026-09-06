@@ -32,6 +32,11 @@ namespace IR.Values is
         counter_il_name: string public
         count_init: Value? public
 
+        // An index stage carries a running counter like a countdown does,
+        // but produces an output local as a map stage does: `apply` builds
+        // the INDEXED_VALUE from the counter and the incoming element.
+        is_index: bool public
+
         is_countdown: bool => is_take \/ is_skip
 
         init(is_filter: bool, delegate_il_name: string, delegate_type: Type, delegate_init: Value, apply: Value, output_il_name: string, output_type: Type?) is
@@ -50,6 +55,15 @@ namespace IR.Values is
             self.counter_il_name = counter_il_name
             self.count_init = count_init
         si
+
+        init(counter_il_name: string, start_init: Value, output_il_name: string, output_type: Type, apply: Value) is
+            self.is_index = true
+            self.counter_il_name = counter_il_name
+            self.count_init = start_init
+            self.output_il_name = output_il_name
+            self.output_type = output_type
+            self.apply = apply
+        si
     si
 
     // A terminal Pipe consumer (`count`, `any`, `all`, `each`, `reduce`,
@@ -58,17 +72,10 @@ namespace IR.Values is
     // element by calling each stage's hoisted delegate, runs the consumer's
     // per-element body, and leaves the consumer's result on the stack -
     // emitted in place of the consumer method call, so it flows through any
-    // expression context (like NULL_COALESCE_VALUE). A non-sealed source is
-    // guarded by `isa Pipe[element]`, falling back to the original call.
+    // expression context (like NULL_COALESCE_VALUE).
     class FUSED_CONSUMER: Value is
         _result_type: Type
 
-        // Guard: when guard_isa_type is non-null the source could
-        // dynamically be a user Pipe, so emit `if source isa Pipe then
-        // fallback else fused`. `source` is the value the `isa` tests.
-        guard_isa_type: Type? public
-        source: Value public
-        fallback: Value public
 
         // Loop skeleton, pre-built against the '.fc_iter.N' iterator local.
         // `iterator_init` produces the source's own iterator (or is the
@@ -81,10 +88,15 @@ namespace IR.Values is
         move_next: Value public
         read_current: Value public
 
-        // Set when the loop drives the source's own cursor: a spent take
-        // has to restore it, since whoever else holds the source would
-        // otherwise resume part way through the pass this loop made.
-        source_reset: Value? public
+        // The rewind a spent take owes the cursor. `pipe_cast` tests it
+        // for `Pipe[E]` into `pipe_il_name`, and `pipe_reset` resets that
+        // when it is one - exactly what a stage pipe rewinding its own
+        // cursor does. Unset when the cursor is a value type, which the
+        // loop holds a copy of and owes nothing.
+        pipe_cast: Value? public
+        pipe_reset: Value? public
+        pipe_il_name: string public
+        pipe_type: Type? public
 
         // The element local the innermost stage reads.
         element_il_name: string public
@@ -130,8 +142,6 @@ namespace IR.Values is
 
         init(
             result_type: Type,
-            source: Value,
-            fallback: Value,
             iterator_init: Value,
             has_iterator: bool,
             iterator_il_name: string,
@@ -148,9 +158,10 @@ namespace IR.Values is
         ) is
             super.init()
 
+            // Left empty unless a rewind is wired up; nothing else reads it.
+            pipe_il_name = ""
+
             self._result_type = result_type
-            self.source = source
-            self.fallback = fallback
             self.iterator_init = iterator_init
             self.has_iterator = has_iterator
             self.iterator_il_name = iterator_il_name
@@ -166,30 +177,8 @@ namespace IR.Values is
             self.result_il_name = result_il_name
         si
 
-        gen(context: IR.CONTEXT) is
-            if guard_isa_type? then
-                let fused_label = IR.LABEL()
-                let end_label = IR.LABEL()
-
-                // if source isa Pipe[element] then fall back else fuse
-                gen(source, context)
-
-                let body = context.current_srm_body_emitter!
-                    body.is_instance(context.resolve_type_token(guard_isa_type!))
-
-                _branch(context, "brfalse", System.Reflection.Metadata.ILOpCode.BRFALSE, fused_label)
-
-                gen(fallback, context)
-                _branch(context, "br", System.Reflection.Metadata.ILOpCode.BR, end_label)
-
-                _mark(context, fused_label)
-                _gen_fused_loop(context)
-
-                _mark(context, end_label)
-            else
-                _gen_fused_loop(context)
-            fi
-        si
+        gen(context: IR.CONTEXT) =>
+            _gen_fused_loop(context)
 
         is_void: bool => Syntax.Process.PIPE_CONSUMER_KIND.is_void(consumer_kind)
 
@@ -251,7 +240,7 @@ namespace IR.Values is
         _gen_fused_loop(context: IR.CONTEXT) is
             let loop_start = IR.LABEL()
             let loop_end = IR.LABEL()
-            let take_exit = if source_reset? then IR.LABEL() else loop_end fi
+            let take_exit = if pipe_reset? then IR.LABEL() else loop_end fi
 
             if !is_void then
                 _declare(context, result_il_name, _result_type)
@@ -269,7 +258,7 @@ namespace IR.Values is
             // take/skip stage instead seeds its running counter with the
             // count evaluated once.
             for stage in stages do
-                if stage.is_countdown then
+                if stage.is_countdown \/ stage.is_index then
                     _declare(
                         context,
                         stage.counter_il_name,
@@ -339,12 +328,22 @@ namespace IR.Values is
 
             _branch(context, "br", System.Reflection.Metadata.ILOpCode.BR, loop_start)
 
-            // The reset falls straight into the loop exit. Only a spent
-            // take reaches it: an exhausted source has already reset
+            // The rewind falls straight into the loop exit. Only a spent
+            // take reaches it: an exhausted source has already rewound
             // itself, and a consumer that stops at its first hit abandons
-            // the chain exactly as the unfused lowering does.
-            if let reset = source_reset then
+            // the chain exactly as the unfused lowering does. Whether the
+            // cursor is rewound at all is asked of it at run time, as a
+            // stage pipe rewinding its own cursor asks.
+            if let reset = pipe_reset, `cast = pipe_cast, cursor_type = pipe_type then
                 _mark(context, take_exit)
+
+                _declare(context, pipe_il_name, cursor_type)
+                gen(`cast, context)
+                _stloc(context, pipe_il_name)
+
+                _ldloc(context, pipe_il_name)
+                _branch(context, "brfalse", System.Reflection.Metadata.ILOpCode.BRFALSE, loop_end)
+
                 gen(reset, context)
             fi
 

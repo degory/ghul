@@ -58,6 +58,10 @@ A namespace-less file may also carry bare statements at the file root. They run,
 
 The top-level statements are collected into a synthesised entry-point function, and a `let` among them declares a global variable: readable inside the functions and types defined in the same file, as well as by the top-level statements after it. Its type is inferred exactly as a local variable's is. A bare `let` stays unassignable everywhere; a `let ... mut` can be reassigned from later top-level statements and from functions alike, so it is genuinely shared state. Reading or assigning one from a top-level statement above its `let` is an error — the statements run in order, so the value would not exist yet; a function may mention it wherever the function is defined, since the function runs only when called. A `let` inside a nested block among the top-level statements stays an ordinary local of that block. It shares the file's namespace with the file's other definitions, so a top-level `let` and a global function, global variable or type of the same name are a redefinition error.
 
+The synthesised entry point is a file-private definition like any other, so more than one file in a project may carry top-level statements — an umbrella project globbing a directory of one-file examples, say. Only one of them can be the program's entry point, and what picks it is the same thing that picks any other: an `@entry` pragma first, then a function the `--entry` name matches (`entry` when the flag is not given), then a file's top-level statements. Naming an entry point with `--entry` takes top-level statements out of the running altogether, since a build that asks for one by name does not want statements from some other file instead.
+
+Every file whose top-level statements are left unselected is told so, as a `top-level-statements-not-run` warning at its first statement — the statements do not run, so a `let` among them never initializes. Suppress it project-wide with `--suppress top-level-statements-not-run`, or take it as a hint with `--warn-as-hint`, in a project where several script files under one build is the intended shape. Where several files carry top-level statements and nothing names an entry point, none is chosen, every one of them warns, and an executable build reports that it has no entry point.
+
 The `use` statement brings names into scope so they can be referred to without qualification. Applied to a namespace it imports every public symbol; applied to a single symbol it imports just that one:
 
 ```ghul
@@ -174,6 +178,7 @@ ghūl exposes the .NET primitive types under lowercase names:
 
 - integers — `byte`, `ubyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `word`, `uword`
 - floating-point — `single`, `double`, and `decimal`
+- `bigint`, an integer of no fixed width
 - `bool`, `char`, `void`
 
 `string` and `object` are reference types from the .NET base class library.
@@ -188,11 +193,12 @@ let b = 99b;                   // byte
 let ratio = 123.456;           // single
 let precise = 123.456D;        // double
 let price = 19.99m;            // decimal
+let huge = 900719925474099n;   // bigint
 let letter = 'c';              // char
 let greeting = "hello";        // string
 ```
 
-Digits may be grouped with `_`. An integer literal can carry a radix prefix (`0x`) and a type suffix built from two optional parts, both case-insensitive: a sign selector — `s` signed or `u` unsigned — followed by a size selector — `b` byte, `c` char, `s` short, `i` int, `l` long, `w` word. So `123b` is a `byte`, `0ub` a `ubyte`, `4567s` a `short`, `7890us` a `ushort`, `222i` an `int`, `0ul` a `ulong`, `123w` a `word`. A numeric character literal (`65c`) cannot be unsigned.
+Digits may be grouped with `_`. An integer literal can carry a radix prefix (`0x`) and a type suffix built from two optional parts, both case-insensitive: a sign selector — `s` signed or `u` unsigned — followed by a size selector — `b` byte, `c` char, `s` short, `i` int, `l` long, `w` word. So `123b` is a `byte`, `0ub` a `ubyte`, `4567s` a `short`, `7890us` a `ushort`, `222i` an `int`, `0ul` a `ulong`, `123w` a `word`, `123n` a `bigint`. A numeric character literal (`65c`) cannot be unsigned, and neither can a `bigint` one (`123un`) — .NET has no unsigned counterpart to `System.Numerics.BigInteger`.
 
 The digits are read first and as far as they go, so a letter that is a digit of the literal's radix is one. In hex that covers `b` and `c`, which are size selectors as well as hex digits: `0x20AC` is the `int` 8364 and `0xAB` is the `int` 171, with no suffix in either. A suffix that would be read as a digit is attached with a backtick, which marks the boundary and is not part of the value:
 
@@ -204,6 +210,20 @@ let wide = 0x20ACl;        // long — `l` is not a hex digit, so no backtick
 
 Backtick is the same escape it is elsewhere: it says to read what follows as itself rather than as its default meaning. Decimal needs it nowhere, since no size selector is a decimal digit.
 
+`bigint` is `System.Numerics.BigInteger` under a built-in name, and only under that name — as `decimal` is `System.Decimal`. It is a name rather than a built-in type: its arithmetic and its ordering are its own static operators and its `IComparable` rather than anything the language supplies, so it has no width to overflow and no literal that is out of range.
+
+```ghul
+let factorial mut = 1n;
+
+for i in 1::30 do
+    factorial = factorial * bigint(i);
+od
+
+write_line("{factorial}");     // 265252859812191058636308480000000
+```
+
+Mixed operands stay an error, exactly as `1.0D + 1` is: `total * 2` is rejected where `total` is a `bigint`, and `total * 2n` is what to write. `==` is rejected on it as on every other struct; compare with `=~`.
+
 A fractional literal is a `single` unless suffixed — `s` single, `d` double, `m` decimal, in either case. The `m` suffix is also accepted on a digit-only literal to write an integral decimal (`100m`). Exponent notation is accepted: `1.5e3`, `1.5E-3`.
 
 ghūl does not convert between scalar types implicitly — a mixed-type arithmetic expression is a compile-time error, and a `cast` is required. Upcasting is implicit: a value is assignment-compatible with any ancestor type, so a `string` can be assigned to an `object` with no cast.
@@ -214,7 +234,7 @@ let b = 1.0D + cast double(1);   // ok, explicit cast
 let o: object = "hello";         // ok, string is an object
 ```
 
-The target type can be left out when the surrounding expression already determines it. `cast(v)` converts `v` to whatever type the position it sits in calls for — a typed `let` initializer, an assignment, a `return` or `=>` body, an argument, an operator's other formal, an index:
+The target type can be left out when the surrounding expression already determines it. `cast(v)` converts `v` to whatever type the position it sits in calls for — a typed `let` initializer, an assignment, a `return` or `=>` body, an argument, an operator's other formal, an index, or the callee of a call:
 
 ```ghul
 let total = cast(count) + average;   // count converts to double
@@ -224,6 +244,21 @@ values[cast(index)];                 // to whatever the indexer takes
 ```
 
 The type comes from the declaration the expression resolves against rather than from any other operand, so a `cast(v)` in an argument or operand position takes the type of the formal it lands on. That means resolution has to reach exactly one candidate: `cast(v)` is refused where the position supplies no type at all, and where more than one overload or operator would accept it. `cast(a) + cast(b)` is an error rather than a guess, as is a call whose overloads differ only in the parameter the `cast(v)` fills. Hover over the `cast` keyword shows the type it resolved to.
+
+A cast that is called supplies its own: the arguments give the parameter types and the surrounding context gives the return, so the target is the function type the call describes.
+
+```ghul
+let handler: object = read_handler();
+
+let result: int = cast(handler)(4);    // handler converts to int -> int
+```
+
+A parenthesised target reads two ways, and which is meant depends on what the name in it turns out to be. `cast (T)(v)` converts `v` to `T` where `T` names a type, and casts the value `T` and calls the result where it does not. A target that can only be a type — a tuple, a function type — is never read the second way, since a value of it could not be called.
+
+```ghul
+let widened = cast (double)(count);    // a type: count converts to double
+let called = cast (handler)(count);    // a value: handler is cast, then called
+```
 
 A **string literal** may interpolate expressions: `{` opens an expression and `}` closes it, and the expression's value is converted to a string in place. There is no `+` operator on `string`, so interpolation is how strings are joined:
 
@@ -335,7 +370,7 @@ si
 
 A named function's signature is fully explicit: every argument has a written type, and so does the return — written after `->`, or the `->` left off to make the function `void`. The compiler infers no part of a named function's or method's signature.
 
-A block body produces its value with an explicit `return`, or by ending on an expression: the final statement of a non-void body is the function's return value on the fall-through path whenever its type is assignable to the declared return type, terminated with `;` or not — the tail is judged by its type, never by its terminator. An expression qualifies, and so do an `if`/`case` expression and a parenthesised block. A tail of an incompatible non-void type is an error at the tail; to genuinely discard such a value, write `let _ = expr`. A void tail — an effect-only call, or an `if`/`case` whose arms diverge or do only effects — is the statement it is: the body falls off the end, returns the default value of the return type, and draws a `definite-return` warning. An asynchronous function accepts a bare-`T` value as its tail exactly where it accepts `return T`. Loops, `let`, assignments and `assert` never provide a tail value, and neither do labelled statements or `try` blocks (until `try` has an expression form). Void bodies tolerate any tail: whatever is left standing at the end of a void method is discarded. Generators are exempt from all of this: their fall-through signals end of stream.
+A block body produces its value with an explicit `return`, or by ending on an expression: the final statement of a non-void body is the function's return value on the fall-through path whenever its type is assignable to the declared return type, terminated with `;` or not — the tail is judged by its type, never by its terminator. An expression qualifies, and so do an `if`/`case` expression and a parenthesised block. A tail of an incompatible non-void type is an error at the tail; to genuinely discard such a value, write `let _ = expr`. A void tail — an effect-only call, or an `if`/`case` whose arms diverge or do only effects — is the statement it is: the body falls off the end, returns the default value of the return type, and draws a `definite-return` warning. An asynchronous function accepts a bare-`T` value as its tail exactly where it accepts `return T`. Loops, `let`, assignments and `assert` never provide a tail value, and neither do labelled statements or `try` blocks (until `try` has an expression form). Void bodies tolerate any tail: whatever is left standing at the end of a void method is discarded, and an expression body follows the same rule, so `f(x: int) -> void => g(x);` discards `g`'s result rather than returning it. Generators are exempt from all of this: their fall-through signals end of stream.
 
 Functions are declared at namespace scope — there are no nested function definitions — and may be overloaded on their argument types. There are no default argument values. Execution of a program begins at a function named `entry`, or — in a file with no namespace — at the bare statements written at its file root, which are collected in source order into that entry point. An `entry` function takes either no parameters or a single `string[]` of the command-line arguments, and returns either nothing or an `int` exit status. It should not be asynchronous: an async `entry` returns a task rather than one of those, which draws a warning and leaves the program without an entry point — to run asynchronous work, read `.result` on the returned task. The name can be changed with `--entry <name>`, and an `@entry` pragma marks any function as the entry point regardless of name.
 
@@ -357,7 +392,15 @@ let apply_twice = (f: int -> int, i) => f(f(i));
 let factorial = n rec => if n == 0 then 1 else n * rec(n - 1) fi;
 ```
 
-A block-bodied function literal that declares its return type ends on a tail exactly as a named function does: a final statement whose type is assignable to the declared return type is the value the literal returns on fall-through, terminated or not. A literal that leaves its return type to be inferred does not read a tail, and its last statement stays an ordinary statement, so such a literal returns through `return` alone.
+A block-bodied function literal ends on a tail exactly as a named function does: a final statement whose type is assignable to the return type is the value the literal returns on fall-through, terminated or not. Where the return type is written out, or comes from the slot the literal goes into, the tail is judged against it. Where it is left to be inferred and the body has no `return`, the tail is what settles it - a void tail settles nothing, so such a body is void and may end on a guard `if` like any other.
+
+A slot returning `void` settles the literal's return type as much as any other does, so a literal written into one discards whatever its body produces - by either body form. That is how a call whose result is not wanted is written where a function is expected:
+
+```ghul
+names |> each(name => seen.add(name));    // `add` returns a bool, discarded here
+```
+
+Where several overloads take a function at the same arity, a body that produces a value goes to the formal that asks for one, and a `void` formal is reached only when no candidate does. So a literal returning a `bool` still picks a `(T) -> bool` formal over a `(T) -> void` one, and writing the return type out (`name -> void => seen.add(name)`) picks the void formal outright.
 
 A function literal's parameter can be a destructure pattern too, written in its own parentheses inside the parameter list — the outer parentheses are the parameter list, the inner ones the pattern. It is one parameter, unpacked into the names the body uses, exactly as for a named function:
 
@@ -1388,7 +1431,7 @@ compute() -> Tasks.TASK[int] is
 si
 ```
 
-The source reads top-to-bottom even though execution suspends at each `await`. `await e;` on its own is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T`; the compiler delivers the value to the completed task, wrapping it as `Tasks.TASK.from_result(...)` where the body lowers without a suspension.
+The source reads top-to-bottom even though execution suspends at each `await`. `await e;` on its own is the value-less form — it waits for the task to complete and discards any result. A function declared `-> Tasks.TASK[T]` may `return` a bare `T`; the compiler delivers the value to the completed task, wrapping it as `Tasks.TASK.from_result(...)` where the body lowers without a suspension. It may also `return` a task, or anything else awaitable, whose result is a `T`. Where the body does not await, that task is what the caller receives. Where it does, the caller already holds the function's own task and a returned one can only complete it, so the return is taken as the task's awaited result - `return t` and `return await t` are the same program there. A void body accepts a task that awaits to nothing the same way.
 
 The operand of `await` need not be a task. Anything following .NET's awaiter pattern is accepted: a type with a parameterless `get_awaiter()` whose result has a `bool` property `is_completed`, a parameterless `get_result()`, and implements `System.Runtime.CompilerServices.INotifyCompletion` (or `ICriticalNotifyCompletion`). The `await` expression takes the type `get_result` returns, void included. `Tasks.ValueTask[T]`, `Tasks.TASK.yield()` and `task.configure_await(false)` all qualify, and so does a type written in ghūl - a struct awaitable that hands its continuation to a scheduler is how cooperative multitasking is built without allocating a task per suspension:
 
@@ -1577,16 +1620,9 @@ total[T: INumber[T]](a: T, b: T) -> T => a + b;
 
 Without that `use` the operator is not in scope and `a + b` does not resolve, so nothing changes for code that does not ask for it — importing one does not displace the built-in operators either, and `3 + 4` still adds two `int`s the way it always did.
 
-A type parameter is not the only thing the import reaches. Any type that implements the interface can use the operator, so a concrete .NET numeric type with no built-in operator of its own gets one from the same `use`:
+A concrete type needs no import for its own operators. A public static operator a .NET type declares for itself is a candidate wherever a value of that type is either operand (see [.NET interop](#net-interop)), so `Int128.one + Int128.one` resolves as it stands. The import is for a bounded type parameter, whose operators come from the interface rather than from any one type.
 
-```ghul
-use System.Int128;
-use System.Numerics.IAdditionOperators.`+;
-
-let two = Int128.one + Int128.one;
-```
-
-The same holds for a static member imported by name rather than reached through a type parameter, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on a concrete implementing type alike.
+A static member imported by name reaches a concrete type as well as a bounded one, so `use System.Numerics.INumber.max;` makes `max(a, b)` available on a bounded `T` and on `Int128` alike.
 
 The arithmetic operators `+`, `-`, `*`, `/` and `%` can be imported this way, and so can the bitwise and shift operators `&`, `|`, `^`, `\`, `<<`, `>>` and `>>>`. The comparison and equality operators cannot: a type says how it orders and compares by defining `<>` and `=~`, and those are what the operators are written in terms of. Each operator is imported from the interface that *declares* it, which for the shifts is `IShiftOperators` however the bound is spelled:
 
@@ -1704,9 +1740,11 @@ a. =~(b)
 a.`=~(b)
 ```
 
-Both are the same call, and both are a plain method call rather than another spelling of the operator. Where the two differ, they differ quietly. The null handling around `a =~ b` is written around the *operator*, so the member call receives an absent operand instead of being answered before it is reached. And an operator that lowers to an IL instruction has no member behind it: on the scalar types the arithmetic and relational operators are instructions, so `a. +(b)` on an `int` reports that `+` is not a member — while `=~` and `<>` on those types, and on `string`, do reach the .NET method the name maps to, which is not the same thing the operator does. Member syntax is fine to use on a type whose operators you wrote; it is not a general substitute for writing the operator.
+Both are the same call, and both are a plain method call rather than another spelling of the operator. Where the two differ, they differ quietly. The null handling around `a =~ b` is written around the *operator*, so the member call receives an absent operand instead of being answered before it is reached. And an operator that lowers to an IL instruction has no .NET method behind it: on the scalar types the arithmetic operators are instructions, declared as static members of the type, so `a. +(b)` on an `int` finds no overload taking one operand, and `int.`+(a, b)` is the call — while `=~` and `<>` on those types, and on `string`, do reach the .NET method the name maps to, which is not the same thing the operator does. Member syntax is fine to use on a type whose operators you wrote; it is not a general substitute for writing the operator.
 
 A static property or field takes `snake_case` however constant-like it reads, since only enum members become `MACRO_CASE` — `CancellationToken.None` is `System.Threading.CancellationToken.none`.
+
+A type's own **operators** are reached by writing the operator. A public static operator method a .NET type declares — `op_Addition` and the rest, on `bigint`, `System.DateTime`, `System.TimeSpan` and any other type that has them — is a candidate wherever a value of that type is either operand, and both operand types contribute, so `step * 2.0D` and `2.0D * step` find the same operator on `TimeSpan`. The same goes for a static operator declared on a ghūl class or struct: `+(a: VECTOR, b: VECTOR) -> VECTOR static` applies to `v + w` from anywhere `VECTOR` is visible, not only inside its own body. An operator none of whose operands is the declaring type is reached by importing it under its own name — ``use Lib.VECTOR_OPS.`*;`` — the same route the generic-math interface operators take. The arithmetic, bitwise, shift and unary operators are reached this way; comparison and equality come from `<>` and `=~` as elsewhere, so a reflected `op_LessThan` or `op_Equality` is not. The scalar types are the exception: their operators are the language's own, so `decimal`'s reflected `op_Addition` is not a second candidate beside the built-in `+`.
 
 An **indexer** is the one member reached only through its own syntax. .NET does not fix its name — the property carries whatever its declaring language chose, and the type nominates the real one, so `System.String` and `System.Text.StringBuilder` both call theirs `Chars` — but the name never has to be written: `[` and `]` find it whatever it is.
 
