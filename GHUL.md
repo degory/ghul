@@ -234,7 +234,7 @@ let b = 1.0D + cast double(1);   // ok, explicit cast
 let o: object = "hello";         // ok, string is an object
 ```
 
-The target type can be left out when the surrounding expression already determines it. `cast(v)` converts `v` to whatever type the position it sits in calls for — a typed `let` initializer, an assignment, a `return` or `=>` body, an argument, an operator's other formal, an index:
+The target type can be left out when the surrounding expression already determines it. `cast(v)` converts `v` to whatever type the position it sits in calls for — a typed `let` initializer, an assignment, a `return` or `=>` body, an argument, an operator's other formal, an index, or the callee of a call:
 
 ```ghul
 let total = cast(count) + average;   // count converts to double
@@ -244,6 +244,21 @@ values[cast(index)];                 // to whatever the indexer takes
 ```
 
 The type comes from the declaration the expression resolves against rather than from any other operand, so a `cast(v)` in an argument or operand position takes the type of the formal it lands on. That means resolution has to reach exactly one candidate: `cast(v)` is refused where the position supplies no type at all, and where more than one overload or operator would accept it. `cast(a) + cast(b)` is an error rather than a guess, as is a call whose overloads differ only in the parameter the `cast(v)` fills. Hover over the `cast` keyword shows the type it resolved to.
+
+A cast that is called supplies its own: the arguments give the parameter types and the surrounding context gives the return, so the target is the function type the call describes.
+
+```ghul
+let handler: object = read_handler();
+
+let result: int = cast(handler)(4);    // handler converts to int -> int
+```
+
+A parenthesised target reads two ways, and which is meant depends on what the name in it turns out to be. `cast (T)(v)` converts `v` to `T` where `T` names a type, and casts the value `T` and calls the result where it does not. A target that can only be a type — a tuple, a function type — is never read the second way, since a value of it could not be called.
+
+```ghul
+let widened = cast (double)(count);    // a type: count converts to double
+let called = cast (handler)(count);    // a value: handler is cast, then called
+```
 
 A **string literal** may interpolate expressions: `{` opens an expression and `}` closes it, and the expression's value is converted to a string in place. There is no `+` operator on `string`, so interpolation is how strings are joined:
 
