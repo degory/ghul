@@ -470,7 +470,7 @@ class PERSON is
 si
 ```
 
-A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; to give a type structural equality, define `=~`, which maps to .NET's `Equals`. See [equality](#equality).
+A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; `=~` is what compares two values by what they hold, and a class that inherits no equality is given one. See [equality](#equality).
 
 A member whose type says it always holds a value has to be given one. A constructor that leaves one or more such members unassigned on some path out draws a single `field-definite-assignment` warning on the constructor's own name, naming every member it misses, since the object it produces holds null in a slot that cannot be written null anywhere else. Each missed member also carries a related location pointing at its declaration — on the property, not the hidden backing field, when the member is an auto-property — which a capable editor renders as a jump-to link. A constructor is credited with what it assigns itself, and with what the methods it cannot avoid calling on `self` assign in turn — a call reached on only one branch of an `if`, a call on another object, and a call to a method a subclass could override all credit nothing, because none of them is bound to happen. Members of optional type and of value type are not checked: neither has a null to be caught holding. Suppress via `@suppress("field-definite-assignment")` per file, with `--suppress field-definite-assignment` project-wide, or on the constructor itself.
 
@@ -525,6 +525,46 @@ si
 ```
 
 The two modifiers are independent: `open` controls who can extend, `abstract` controls who can be instantiated. They can be combined (`class Animal abstract open is ... si` is an extensible abstract base) or stand alone.
+
+A class that declares no equality of its own, and inherits none, is given a `=~` and a matching `get_hash_code` over the members that hold its state — the same members a struct's are built from, each compared through its own type's equality:
+
+```ghul
+class POINT is
+    x: int;
+    y: int;
+
+    init(x: int, y: int) is
+        self.x = x;
+        self.y = y;
+    si
+si
+
+POINT(1, 2) =~ POINT(1, 2)      // true
+```
+
+The conditions a struct is held to hold here too: declaring `=~`, `<>`, `get_hash_code` or an `equals` over `object` opts the class out of both, and every member holding state must be public. A class holding no state at all is left alone, since an operator over nothing would answer equal for any two instances.
+
+Inheritance decides two more things. **A synthesized comparison requires the same runtime type**, so a base and a subclass are never equal in either direction, whichever side is asked. Without that the relation would be asymmetric: the base's comparison run against a subclass value would compare the base's members and answer true, while the subclass's own answered false.
+
+**Inheriting an operator the class did not get this way opts it out.** A class extending one that declares `=~`, or reaching one through a trait, keeps that operator: a second one at this class's own parameter type would be an overload against the inherited one rather than an override of it. A class over a base that has no equality at all is left alone too — the base's state is part of this class's values and the comparison could not read it, which is the same reason private state keeps a type out. A class over a *synthesized* base is the case that composes: it takes an operator of its own, at the base's parameter type, comparing the members declared here and then handing the base's own to the base.
+
+```ghul
+class POINT_3D: POINT is
+    z: int;
+
+    init(x: int, y: int, z: int) is
+        super.init(x, y);
+        self.z = z;
+    si
+si
+
+POINT_3D(1, 2, 3) =~ POINT_3D(1, 2, 3)               // true
+cast POINT(POINT_3D(1, 2, 3)) =~ POINT(1, 2)         // false - different types
+```
+
+A base taking type arguments is declined, and a subclass of one inherits the base's operator like any other consumer: the comparison then reads the base's members alone, which is coarse and still an equivalence relation.
+
+As with a struct, the synthesized pair settles how .NET itself compares the value, through the `Equals` bridge, so an all-public class becomes a dictionary key that finds an equal value rather than only the same object. A class that was relied on to compare by identity in a `MAP` or a `SET` declares its own `=~` and `get_hash_code` to keep that.
 
 A class is **implicitly abstract** when it has any user-written body-less instance method — `foo();` or `foo() -> int;` with no `is … si` body. The user clearly wrote the method as a contract for subclasses to satisfy, and a bare instance of the class would have nothing useful to do on calling it, so the constructor is rejected the same way `abstract` rejects it. Property accessors, `init`, and static methods are excluded — a write-only property leaves its synthesised getter body-less without making the enclosing class abstract.
 
@@ -750,7 +790,7 @@ Exhaustiveness also reaches through a destructure. A scrutinee that destructures
 
 A `case` whose scrutinee cannot be covered this way, and which has no `else` arm, fires `case-needs-else`: a warning on the statement form, where it just falls through; a warning on an expression form whose expected type has a default (value type or `T?`); and an error otherwise. A destructurable scrutinee left short of its combinations reports the same way, naming the combinations that are still open.
 
-Unions compare by structural equality through the `=~` operator — two union values are `=~` when they hold the same variant with memberwise-equal fields. Each field compares the way `=~` compares two values of its type anywhere else: through the field type's own `=~` where it defines one, through its `<>` read against zero where it defines only that, element by element for an array or a list, and through the runtime's default equality comparer otherwise — a class that overrides `equals` compares through it, one that declares neither compares by reference, and a struct or tuple field-by-field. A field of bare type-parameter type compares through the runtime's comparer for that type, which reaches whatever equality the type argument provides.
+Unions compare by structural equality through the `=~` operator — two union values are `=~` when they hold the same variant with memberwise-equal fields. Each field compares the way `=~` compares two values of its type anywhere else: through the field type's own `=~` where it defines one, through its `<>` read against zero where it defines only that, element by element for an array or a list, and through the runtime's default equality comparer otherwise — a class that overrides `equals` compares through it, one that neither declares nor is given an operator compares by reference, and a struct or tuple field-by-field. A field of bare type-parameter type compares through the runtime's comparer for that type, which reaches whatever equality the type argument provides.
 
 A field whose type is declared in ghūl source, could declare `=~` and does not, draws a `synthesized-equality-fallback` warning on the field's declaration: the union's structural equality compares that field with the default equality comparer rather than an operator. Types that cannot declare an operator — imported types, tuples, sets, maps, function types — fall back without a warning; an array or a list does not fall back at all, since it compares element by element. Suppress via `@suppress("synthesized-equality-fallback")` per declaration or per file, or with `--suppress synthesized-equality-fallback` project-wide.
 
@@ -909,6 +949,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 - any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
 - a union, through the operator synthesized for it — see [unions](#unions)
 - a struct whose state is entirely public and that declares no equality of its own, through the one synthesized for it: member by member, each member through its own type's equality — see [structs](#structs)
+- a class in the same position, which also inherits no equality, through the one synthesized for it: the same members, after a runtime-type test — see [classes](#classes)
 - a tuple, element by element, each element through its own type's equality, however deep it nests
 - an array, a `List[T]` or a `LIST[T]`, by count and then element by element, each element through its own type's equality - so `[[1, 2], [3]] =~ [[1, 2], [3]]` holds, and two lists of a type declaring `=~` compare through it. An element of a class that declares neither `=~` nor `<>` compares by reference here, although the same comparison written directly on two such values is an error: a list of them still has a sensible equality, where the two values alone have none to offer
 - a type that declares `<>` and no `=~`: an ordering defines equality with it, so `a =~ b` is `a <> b == 0`
@@ -916,7 +957,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 
 Where more than one of those could answer, the nearest declaration wins: a member operator first, then a global one, and the element-wise or comparer-based comparison only where nothing is declared.
 
-It is not defined everywhere. A class that declares neither `=~` nor `<>` does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`. Nor does a struct that holds any non-public state, or that declares `get_hash_code` or an `equals` over `object` without an operator to go with it: either leaves the struct as it was, with no `=~` until one is written for it. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
+It is not defined everywhere. A class holding non-public state, or holding none at all, does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`. Nor does a struct that holds any non-public state, or that declares `get_hash_code` or an `equals` over `object` without an operator to go with it: either leaves the struct as it was, with no `=~` until one is written for it. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
 
 Defining `=~` on a type means defining `get_hash_code` alongside it: the two are a pair, and .NET's collections consult the hash first. [.NET interop](#net-interop) covers the `Ghul.Equatable[T]` contract, the `Equals` bridge, and why the hash cannot be generated for you.
 
@@ -1783,7 +1824,7 @@ Defining `=~` also settles how .NET itself compares the type, provided `get_hash
 
 Both halves are needed because .NET requires values that compare equal to hash equal, and a hash-based collection consults the hash first. A type that defines neither is consistent as it stands, comparing and hashing by identity, so defining only `=~` is reported as `equality-without-hash` and leaves the type alone rather than breaking that pair. The hash is not generated for you: an operator is free to ignore some of the fields it reads, and a memberwise hash would then disagree with it.
 
-`a =~ b` on a bare, unconstrained type parameter compiles by going through `EqualityComparer[T].Default.Equals`, the same route .NET collections use for a generic instantiation. That reaches the `Equals(object)` bridge above, so the comparison follows whatever the actual type argument does: a type declaring `=~` and `get_hash_code` answers through its own operator, a class declaring neither compares by reference, and a struct, enum, or scalar gets the runtime's ordinary value equality for that type. A bound that itself declares `=~` (`[T: Named]` where `Named` declares the operator) resolves the bound's operator directly and never reaches the comparer.
+`a =~ b` on a bare, unconstrained type parameter compiles by going through `EqualityComparer[T].Default.Equals`, the same route .NET collections use for a generic instantiation. That reaches the `Equals(object)` bridge above, so the comparison follows whatever the actual type argument does: a type declaring `=~` and `get_hash_code` answers through its own operator, a class with neither declared nor synthesized compares by reference, and a struct, enum, or scalar gets the runtime's ordinary value equality for that type. A bound that itself declares `=~` (`[T: Named]` where `Named` declares the operator) resolves the bound's operator directly and never reaches the comparer.
 
 A tuple takes the same route. `EqualityComparer[T].Default` for a `ValueTuple` is the tuple's own element-wise equality, so each element is compared by the default comparer for *its* type — and so, by the same chain, through a user-written `=~` where the element type declares one.
 
