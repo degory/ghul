@@ -470,7 +470,34 @@ class PERSON is
 si
 ```
 
-A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; `=~` is what compares two values by what they hold, and a class that inherits no equality is given one. See [equality](#equality).
+A class can extend at most one superclass and implement any number of traits. `self` refers to the current instance. An instance is created with a constructor expression — the type name applied like a function — which selects the matching `init` overload (`PERSON("alice", 30)`). A class with no declared superclass extends `object`. `==` on a class is always reference identity and stays that way; to give a type structural equality, define `=~`, or ask for one with `@equality()`. See [equality](#equality).
+
+An `@equality()` pragma before a class asks the compiler to write its `=~` and matching `get_hash_code`, comparing the members that hold the class's state — each auto-property and `field`, in turn, through its own type's equality. A property with a body is derived from that state rather than part of it, and a static member belongs to the type, so neither takes part. Members that are not public take part like any other: the pragma is the author asking for the comparison, so what the members are visible to says nothing about whether they distinguish two values.
+
+Two values compare equal only when they have the same runtime type, so a base and a subclass are never equal in either direction, and the relation stays symmetric however it is written.
+
+```ghul
+@equality()
+class Shape abstract is
+    area() -> int;
+si
+
+class CIRCLE: Shape is
+    radius: int;
+
+    init(radius: int) is
+        self.radius = radius;
+    si
+
+    area() -> int => radius * radius * 3;
+si
+```
+
+The request cascades to every subclass, so each gets its own operator comparing what it adds on top of its base's. An abstract class with no state of its own still gets one, which is what lets a comparison written against the base type resolve — `a =~ b` over two `Shape` variables dispatches to whichever subclass the values actually are.
+
+A subclass that declares its own `=~` keeps it, and answers for itself. A subclass the compiler cannot write one for, and that declares none, is an error: left alone it would inherit an operator that reads its base and answers for state that operator cannot see. Asking for equality on a class that already declares `=~`, `<>`, `get_hash_code` or an `equals` over `object` is an error too, since the request contradicts what is written.
+
+A class without the pragma is unaffected: it has no `=~` at all, and comparing two of its values by `==` asks about identity as it always did. Structs and unions need no pragma, and are given equality wherever they declare none — a struct is a value, so two structs holding equal members already are the same value, and a union is compared by which variant it holds and what that variant carries.
 
 A member whose type says it always holds a value has to be given one. A constructor that leaves one or more such members unassigned on some path out draws a single `field-definite-assignment` warning on the constructor's own name, naming every member it misses, since the object it produces holds null in a slot that cannot be written null anywhere else. Each missed member also carries a related location pointing at its declaration — on the property, not the hidden backing field, when the member is an auto-property — which a capable editor renders as a jump-to link. A constructor is credited with what it assigns itself, and with what the methods it cannot avoid calling on `self` assign in turn — a call reached on only one branch of an `if`, a call on another object, and a call to a method a subclass could override all credit nothing, because none of them is bound to happen. Members of optional type and of value type are not checked: neither has a null to be caught holding. Suppress via `@suppress("field-definite-assignment")` per file, with `--suppress field-definite-assignment` project-wide, or on the constructor itself.
 
@@ -949,7 +976,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 - any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
 - a union, through the operator synthesized for it — see [unions](#unions)
 - a struct whose state is entirely public and that declares no equality of its own, through the one synthesized for it: member by member, each member through its own type's equality — see [structs](#structs)
-- a class in the same position, which also inherits no equality, through the one synthesized for it: the same members, after a runtime-type test — see [classes](#classes)
+- a class carrying an `@equality()` pragma, or descending from one, and that declares no equality of its own, through the one synthesized for it: member by member and then its base's, each member through its own type's equality — see [classes](#classes)
 - a tuple, element by element, each element through its own type's equality, however deep it nests
 - an array, a `List[T]` or a `LIST[T]`, by count and then element by element, each element through its own type's equality - so `[[1, 2], [3]] =~ [[1, 2], [3]]` holds, and two lists of a type declaring `=~` compare through it. An element of a class that declares neither `=~` nor `<>` compares by reference here, although the same comparison written directly on two such values is an error: a list of them still has a sensible equality, where the two values alone have none to offer
 - a type that declares `<>` and no `=~`: an ordering defines equality with it, so `a =~ b` is `a <> b == 0`
