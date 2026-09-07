@@ -534,7 +534,27 @@ struct POINT is
 si
 ```
 
-A struct gets no equality operator of its own — define `=~` explicitly if the type needs one; until you do, neither operator is available on it. `==` and `!=` are rejected on every struct operand — a tuple, an imported `System.DateTime`, one of your own — because the single comparison they lower to reads the value's bytes rather than its fields. `=~` is what compares a struct by value, wherever the type defines it. See [equality](#equality).
+`==` and `!=` are rejected on every struct operand — a tuple, an imported `System.DateTime`, one of your own — because the single comparison they lower to reads the value's bytes rather than its fields. `=~` is what compares a struct by value.
+
+A struct that declares neither `=~` nor `<>` is given a `=~` and a matching `get_hash_code`, comparing the members that hold its state: each auto-property and `field`, in turn, through its own type's equality. A property with a body is derived from that state rather than part of it, and a static member belongs to the type, so neither takes part.
+
+```ghul
+struct PAIR is
+    a: int;
+    b: string;
+
+    init(a: int, b: string) is
+        self.a = a;
+        self.b = b;
+    si
+si
+
+PAIR(1, "x") =~ PAIR(1, "x")      // true
+```
+
+Two conditions. Declaring either operator opts the type out of both, since a hand-written `=~` is the author's own answer, and a hand-written `get_hash_code` beside a synthesized operator could disagree with it. And every member holding state must be public: private state is an implementation detail whose part in equality only its author knows, and comparing the public members alone would answer equal for two values a private member distinguishes. A struct with any non-public state is left as it was, with no `=~` at all until one is written for it. `protected` counts as non-public here.
+
+A synthesized `=~` also settles how .NET itself compares the value, through the same `Equals` bridge a declared operator gets, so a struct is a working dictionary key. The hash reads what the comparison reads: a member compared element by element contributes its count, since two equal sequences are different objects, and a member whose comparison is finer than the hash it answers contributes nothing, so that equal values never hash differently. See [equality](#equality).
 
 A bare member declaration like `x: double;` is an auto-**property**, not a field, and a struct's property getter hands back a *copy*. That matters when a struct is held in a heap object: mutating it through the property mutates the copy and the write is lost, so the compiler rejects a store through one. Declare a real field with the `field` modifier where a struct member is to be mutated in place:
 
@@ -878,6 +898,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 - any type that declares `=~` as a member — a class, struct or trait of your own, and any imported .NET type implementing `IEquatable[T]`, which is how `System.DateTime` and `System.Version` get one
 - any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
 - a union, through the operator synthesized for it — see [unions](#unions)
+- a struct whose state is entirely public and that declares neither operator, through the one synthesized for it: member by member, each member through its own type's equality — see [structs](#structs)
 - a tuple, element by element, each element through its own type's equality, however deep it nests
 - an array, a `List[T]` or a `LIST[T]`, by count and then element by element, each element through its own type's equality - so `[[1, 2], [3]] =~ [[1, 2], [3]]` holds, and two lists of a type declaring `=~` compare through it. An element of a class that declares neither `=~` nor `<>` compares by reference here, although the same comparison written directly on two such values is an error: a list of them still has a sensible equality, where the two values alone have none to offer
 - a type that declares `<>` and no `=~`: an ordering defines equality with it, so `a =~ b` is `a <> b == 0`
@@ -885,7 +906,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 
 Where more than one of those could answer, the nearest declaration wins: a member operator first, then a global one, and the element-wise or comparer-based comparison only where nothing is declared.
 
-It is not defined everywhere. A class or struct that declares neither `=~` nor `<>` does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
+It is not defined everywhere. A class that declares neither `=~` nor `<>` does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`, nor a struct holding any non-public state. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
 
 Defining `=~` on a type means defining `get_hash_code` alongside it: the two are a pair, and .NET's collections consult the hash first. [.NET interop](#net-interop) covers the `Ghul.Equatable[T]` contract, the `Equals` bridge, and why the hash cannot be generated for you.
 

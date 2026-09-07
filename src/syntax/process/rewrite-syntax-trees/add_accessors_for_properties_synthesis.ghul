@@ -197,6 +197,8 @@ namespace Syntax.Process is
                 other_field
             )
 
+            field_equals.reports_fallback = true
+
             condition = Trees.Expressions.BINARY(
                 location,
                 Identifiers.Identifier(location, "/\\"),
@@ -349,38 +351,16 @@ namespace Syntax.Process is
         let combined: Trees.Expressions.Expression mut = seed
 
         for f in variant.fields do
-            // Cast the field to `object` so we can call
-            // `get_hash_code` on it regardless of T's static
-            // capabilities. Boxes value-type fields, no-op for
-            // reference fields. The equality body's comparisons go
-            // through the field type's own `=~` or the default
-            // equality comparer, both of which agree with a
-            // `get_hash_code` answered here.
-            let boxed_field = Trees.Expressions.CAST(
-                location,
-                TypeExpressions.NAMED(location, Identifiers.Identifier(location, "object")),
-                Trees.Expressions.MEMBER(
+            let field_hash =
+                get_member_hash_code(
                     location,
-                    Trees.Expressions.SELF(location),
-                    Identifiers.Identifier(location, f.name!.name),
-                    location
-                ),
-                false
-            )
-
-            let field_hash = Trees.Expressions.CALL(
-                location,
-                Trees.Expressions.MEMBER(
-                    location,
-                    boxed_field,
-                    Identifiers.Identifier(location, "get_hash_code"),
-                    location
-                ),
-                Trees.Expressions.LIST(
-                    location,
-                    Collections.LIST[Trees.Expressions.Expression]()
+                    Trees.Expressions.MEMBER(
+                        location,
+                        Trees.Expressions.SELF(location),
+                        Identifiers.Identifier(location, f.name!.name),
+                        location
+                    )
                 )
-            )
 
             // h = h * 31 + field_hash — standard multiply-and-add
             // hash combiner (ghūl has no XOR operator on int).
@@ -534,6 +514,251 @@ namespace Syntax.Process is
         )
 
         return init_function
+    si
+
+    // The declarations that hold a value's state, in source order: a
+    // member with neither accessor written, which is an auto-property
+    // or a `field`. A property that supplies a body is derived from
+    // that state rather than part of it, and a static member belongs
+    // to the type rather than to the value, so neither takes part in
+    // equality. Read before the property rewrite splits an
+    // auto-property into a backing variable and accessors, so members
+    // are still named as they were written.
+    get_state_members(body: Definitions.LIST) -> Collections.LIST[Definitions.PROPERTY] static is
+        let result = Collections.LIST[Definitions.PROPERTY]()
+
+        for definition in body do
+            if
+                isa Definitions.PROPERTY(definition) /\
+                definition.name? /\
+                !definition.is_poisoned /\
+                !definition.modifiers.is_static /\
+                !definition.read_body? /\
+                !definition.assign_body?
+            then
+                result.add(definition)
+            fi
+        od
+
+        return result
+    si
+
+    // How a state member is read from another value of the same type.
+    // An auto-property's backing field is read directly rather than
+    // through the getter it will be given: the getter of a struct
+    // property hands back a copy, and the comparison wants the value
+    // itself. A `field` member is already the storage and keeps its
+    // own name.
+    get_state_member_read_name(member: Definitions.PROPERTY) -> string static =>
+        if member.modifiers.is_field then
+            member.name!.name
+        else
+            "${member.name!.name}"
+        fi
+
+    // Whether every declaration holding the type's state is part of
+    // the type's public contract. Private state is an implementation
+    // detail that only its author knows the equality significance of,
+    // and comparing the public members alone would answer equal for
+    // two values a private member distinguishes, so a type with any
+    // is left without a synthesized operator. `protected` counts as
+    // non-public: it is readable inside the assembly but is no part of
+    // what consumers see.
+    has_only_public_state(body: Definitions.LIST) -> bool static is
+        for member in get_state_members(body) do
+            if
+                member.name!.name.starts_with('_') \/
+                member.modifiers.is_private \/
+                member.modifiers.is_protected
+            then
+                return false
+            fi
+        od
+
+        return true
+    si
+
+    // Whether the type gets a synthesized `=~` and `get_hash_code`.
+    // Declaring either operator opts out of both: a hand-written `=~`
+    // is the author's own answer, and a hand-written `get_hash_code`
+    // beside a synthesized operator could disagree with it, which is
+    // the pair invariant `equality-without-hash` exists to protect.
+    // `<>` opts out too, since equality is already derived from it.
+    wants_synthesized_equality(body: Definitions.LIST) -> bool static =>
+        !declares_function(body, "=~") /\
+        !declares_function(body, "<>") /\
+        !declares_function(body, "get_hash_code") /\
+        !declares_object_equals(body) /\
+        has_only_public_state(body)
+
+    // A struct compares memberwise. The parameter is the struct's own
+    // type and a struct value has no absent form, so the body needs no
+    // guard: every operand it is handed is a value of exactly this
+    // type. Each member is compared by a FIELD_EQUALS node rather than
+    // a `=~` operator, because which comparison to run is not knowable
+    // here - only once the member's static type has resolved.
+    get_memberwise_equals_for_struct(`struct: Definitions.STRUCT) -> Definitions.FUNCTION is
+        let location = LOCATION.internal
+
+        let other_argument = Variables.VARIABLE(
+            location,
+            Identifiers.Identifier(location, "other"),
+            get_classy_type_expression(`struct),
+            false,
+            false,
+            null
+        )
+
+        let condition: Trees.Expressions.Expression mut =
+            Trees.Expressions.Literals.BOOLEAN(location, "true")
+
+        for member in get_state_members(`struct.body) do
+            // The member's own declaration, so that a report about how
+            // this member compares lands where the member was written.
+            let member_location = member.location
+            let read_name = get_state_member_read_name(member)
+
+            let self_member = Trees.Expressions.MEMBER(
+                member_location,
+                Trees.Expressions.SELF(member_location),
+                Identifiers.Identifier(member_location, read_name),
+                member_location
+            )
+
+            let other_member = Trees.Expressions.MEMBER(
+                member_location,
+                Trees.Expressions.IDENTIFIER(
+                    member_location,
+                    Identifiers.Identifier(member_location, "other")
+                ),
+                Identifiers.Identifier(member_location, read_name),
+                member_location
+            )
+
+            condition = Trees.Expressions.BINARY(
+                location,
+                Identifiers.Identifier(location, "/\\"),
+                "/\\",
+                condition,
+                Trees.Expressions.FIELD_EQUALS(member_location, self_member, other_member)
+            )
+        od
+
+        // Store-free by construction - member reads and one comparison
+        // each - but the effects solve does not cover synthesized
+        // functions, so the declaration is what satisfies the operator
+        // store-free mandate, as it does for a union's variants.
+        let modifiers = Modifiers.LIST(location, null, null)
+        modifiers.is_pure = true
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "=~"),
+            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]([other_argument])),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
+            modifiers,
+            Trees.Bodies.EXPRESSION(location, condition)
+        )
+    si
+
+    // One member's contribution to a synthesized `get_hash_code`,
+    // read through `object?` so that a member of any kind answers:
+    // boxing a value type, reaching a bare type parameter's own hash,
+    // and giving an absent optional a hash rather than a cast that
+    // would throw on it. What is hashed is a HASH_OPERAND rather than
+    // the member itself, since a member compared element-wise, or one
+    // compared more finely than its own hash answers for, cannot be
+    // hashed as it stands without two equal values hashing
+    // differently.
+    get_member_hash_code(
+        location: LOCATION,
+        member_read: Trees.Expressions.Expression
+    ) -> Trees.Expressions.Expression static is
+        let boxed = Trees.Expressions.CAST(
+            location,
+            TypeExpressions.OPTIONAL(
+                location,
+                TypeExpressions.NAMED(location, Identifiers.Identifier(location, "object"))
+            ),
+            Trees.Expressions.HASH_OPERAND(location, member_read),
+            false
+        )
+
+        let hash_member = Trees.Expressions.MEMBER(
+            location,
+            boxed,
+            Identifiers.Identifier(location, "get_hash_code"),
+            location
+        )
+
+        hash_member.is_coalesce = true
+
+        return Trees.Expressions.BINARY(
+            location,
+            Identifiers.Identifier(location, "??"),
+            "??",
+            Trees.Expressions.CALL(
+                location,
+                hash_member,
+                Trees.Expressions.LIST(
+                    location,
+                    Collections.LIST[Trees.Expressions.Expression]()
+                )
+            ),
+            Trees.Expressions.Literals.INTEGER(location, "0")
+        )
+    si
+
+    // The hash the memberwise comparison implies: every member the
+    // comparison reads, mixed by multiply-and-add. Each is read
+    // through `object?` so that a member of any kind answers - boxing
+    // a value type, and giving an absent optional a hash of its own
+    // rather than a cast that would throw on it.
+    get_memberwise_hash_code(body: Definitions.LIST) -> Definitions.FUNCTION is
+        let location = LOCATION.internal
+
+        let combined: Trees.Expressions.Expression mut =
+            Trees.Expressions.Literals.INTEGER(location, "0")
+
+        for member in get_state_members(body) do
+            let member_hash =
+                get_member_hash_code(
+                    location,
+                    Trees.Expressions.MEMBER(
+                        location,
+                        Trees.Expressions.SELF(location),
+                        Identifiers.Identifier(location, get_state_member_read_name(member)),
+                        location
+                    )
+                )
+
+            let mul = Trees.Expressions.BINARY(
+                location,
+                Identifiers.Identifier(location, "*"),
+                "*",
+                combined,
+                Trees.Expressions.Literals.INTEGER(location, "31")
+            )
+
+            combined = Trees.Expressions.BINARY(
+                location,
+                Identifiers.Identifier(location, "+"),
+                "+",
+                mul,
+                member_hash
+            )
+        od
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "get_hash_code"),
+            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]()),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "int")),
+            Modifiers.LIST(location, null, null),
+            Trees.Bodies.EXPRESSION(location, combined)
+        )
     si
 
     // A TypeExpression naming the type itself, mirroring its own type
