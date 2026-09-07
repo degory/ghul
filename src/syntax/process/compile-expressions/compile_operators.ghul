@@ -751,12 +751,11 @@ namespace Syntax.Process is
 
                 binary.compile_expressions_state.value = value
             else
-                // `a =~ b` where both operands are the same bare type
-                // parameter: no member operator can exist to resolve, so
-                // the comparison goes through the runtime's comparer.
-                // Checked here rather than ahead of resolution so a bound
-                // declaring `=~` still resolves its own operator.
-                let comparison = _try_comparer_equality(binary, left_value, right_value)
+                // `a =~ b` where no operator resolved but the operands
+                // still compare: a bare type parameter or a tuple through
+                // the runtime's comparer, two sequences element by
+                // element, or a `<>` read against zero.
+                let comparison = _try_lowered_equality(binary, left_value, right_value)
 
                 if comparison? then
                     let value = if binary.actual_operation =~ "!~" then NOT(comparison) else comparison fi
@@ -834,16 +833,16 @@ namespace Syntax.Process is
             fi
         si
 
-        // `a =~ b` where both operands are the same bare type parameter,
-        // or the same tuple type. Neither can declare a member
-        // operator, so resolution always fails on them; the comparison
-        // goes through `EqualityComparer[T].Default`, which reaches a
-        // user-written `=~` through the synthesized `Equals` bridge and
-        // otherwise answers with the runtime's own value equality - for
-        // a tuple, `ValueTuple`'s element-wise equality, which applies
-        // the same rule again to each element. Returns null when either
-        // operand is anything else.
-        _try_comparer_equality(
+        // `a =~ b` where no operator resolved: the operands may still
+        // compare through a lowering that is not an operator at all -
+        // the runtime's comparer for a tuple or a bare type parameter,
+        // element by element for two sequences, or a `<>` read against
+        // zero. Identity is not offered here: two references of a class
+        // declaring neither operator stay an error when written out,
+        // and only compare by identity as a member of something that
+        // synthesizes its own. Checked after resolution so a bound
+        // declaring `=~` still resolves its own operator.
+        _try_lowered_equality(
             binary: Trees.Expressions.BINARY,
             left_value: Value,
             right_value: Value
@@ -852,8 +851,22 @@ namespace Syntax.Process is
                 return null
             fi
 
-            return _comparer_equality(left_value, right_value)
+            let left_type = left_value.type
+            let right_type = right_value.type
+
+            if !left_type? \/ !right_type? then
+                return null
+            fi
+
+            let lowering = _choose_equality(left_type, right_type, binary.location)
+
+            if !lowering? \/ isa EqualityLowering.OPERATOR(lowering) \/ isa EqualityLowering.IDENTITY(lowering) then
+                return null
+            fi
+
+            return _build_equality(lowering, left_value, right_value, binary.location)
         si
+
 
         // A reflected tuple type answers is_value_tuple; the
         // source-path type is Types.TUPLE directly.
@@ -865,34 +878,390 @@ namespace Syntax.Process is
         _compares_through_comparer(type: Semantic.Types.Type) -> bool =>
             type.is_type_variable \/ _is_tuple(type)
 
-        _comparer_equality(left_value: Value, right_value: Value) -> Value? is
-            let left_type = left_value.type
-            let right_type = right_value.type
-
-            if !left_type? \/ !right_type? then
+        // Which comparison two present values of the given static types
+        // get, decided once here for every place an equality is built.
+        //
+        // In order: an operator the left type declares or inherits, or
+        // the innate or global one a scalar, string or enum carries; a
+        // `<>` the type declares, read against zero; the runtime's
+        // comparer, for a tuple or a bare type parameter that can
+        // declare nothing; a sequence, element by element at the
+        // element's own static type; and reference identity for a class
+        // that declares neither operator. Null when nothing compares
+        // them - a struct declaring neither, or a sequence of one, where
+        // the bitwise or identity answer .NET would give is wrong rather
+        // than merely weak.
+        _choose_equality(
+            left_type: Type,
+            right_type: Type,
+            location: Source.LOCATION
+        ) -> EqualityLowering? is
+            if left_type.is_error \/ right_type.is_error then
                 return null
             fi
 
-            if !_compares_through_comparer(left_type) then
+            let member = _find_member_equals_operator(left_type, right_type, location)
+
+            if member? then
+                return EqualityLowering.OPERATOR(member)
+            fi
+
+            let global_function = _find_global_equals_operator(left_type, right_type, location)
+
+            if
+                global_function? /\
+                NULL_SAFE_EQUALITY_GATE.accepts_global_operator(
+                    global_function,
+                    _innate_symbol_lookup.get_bool_type())
+            then
+                return EqualityLowering.OPERATOR(global_function)
+            fi
+
+            let order = _find_order_operator(left_type, right_type, location)
+
+            if order? then
+                return EqualityLowering.ORDER(order)
+            fi
+
+            if _compares_through_comparer(left_type) /\ left_type.matches(right_type) then
+                let comparer_type = _innate_symbol_lookup.get_equality_comparer_type(left_type)
+
+                if comparer_type? then
+                    return EqualityLowering.COMPARER(comparer_type)
+                fi
+            fi
+
+            let left_element = _sequence_element_type(left_type)
+            let right_element = _sequence_element_type(right_type)
+
+            if left_element? /\ right_element? /\ left_element.matches(right_element) then
+                let element = _choose_equality(left_element, right_element, location)
+
+                if element? then
+                    return EqualityLowering.SEQUENCE(left_element, element)
+                fi
+
                 return null
             fi
 
-            if !left_type.matches(right_type) then
-                return null
+            if
+                isa Semantic.Types.NAMED(left_type) /\
+                !left_type.is_value_type /\
+                left_type.matches(right_type)
+            then
+                return EqualityLowering.IDENTITY
             fi
 
-            let comparer_type = _innate_symbol_lookup.get_equality_comparer_type(left_type)
-
-            if !comparer_type? then
-                return null
-            fi
-
-            return EQUALITY_COMPARISON(
-                left_value,
-                right_value,
-                comparer_type,
-                _innate_symbol_lookup.get_bool_type())
+            return null
         si
+
+        // A `=~` the left type declares or inherits that takes the right
+        // type, reached with the left operand as its receiver. Hidden
+        // members - string's static op_Equality - are left to the global
+        // operator that stands in for them.
+        _find_member_equals_operator(
+            left_type: Type,
+            right_type: Type,
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function? is
+            let member_symbol = left_type.find_member("=~")
+
+            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
+                return null
+            fi
+
+            let group = cast Semantic.Symbols.FUNCTION_GROUP(member_symbol)
+
+            if HIDDEN_OPERATOR_MEMBERS.is_hidden(group) then
+                return null
+            fi
+
+            let overload_result =
+                _resolve_silently(location, group, Collections.LIST[Type]([right_type]), true)
+
+            if !overload_result? then
+                return null
+            fi
+
+            let function = overload_result.function
+
+            if
+                !NULL_SAFE_EQUALITY_GATE.accepts_operator(
+                    function,
+                    _innate_symbol_lookup.get_bool_type())
+            then
+                return null
+            fi
+
+            return function
+        si
+
+        // A `<>` the left type declares or inherits that takes the right
+        // type and answers int, so it can be read against zero.
+        _find_order_operator(
+            left_type: Type,
+            right_type: Type,
+            location: Source.LOCATION
+        ) -> Semantic.Symbols.Function? is
+            let member_symbol = left_type.find_member("<>")
+
+            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
+                return null
+            fi
+
+            let group = cast Semantic.Symbols.FUNCTION_GROUP(member_symbol)
+
+            if HIDDEN_OPERATOR_MEMBERS.is_hidden(group) then
+                return null
+            fi
+
+            let overload_result =
+                _resolve_silently(location, group, Collections.LIST[Type]([right_type]), true)
+
+            if !overload_result? then
+                return null
+            fi
+
+            let function = overload_result.function
+
+            if
+                !(function.is_instance \/ isa Semantic.Symbols.INNATE_METHOD(function)) \/
+                function.is_hidden_from_operator_resolution \/
+                function.arguments.count != 1
+            then
+                return null
+            fi
+
+            let return_type = function.return_type
+
+            if !return_type? \/ !return_type.matches(_innate_symbol_lookup.get_int_type()) then
+                return null
+            fi
+
+            return function
+        si
+
+        // The element type of an array or list, and null for anything
+        // that is neither. A string is not one: it satisfies neither
+        // `List[char]` nor an array, and it has its own operator anyway.
+        _sequence_element_type(type: Type) -> Type? is
+            if let array: Semantic.Types.ARRAY = type then
+                return array.arguments[0]
+            fi
+
+            let list = _innate_symbol_lookup.get_unspecialized_list_type()
+
+            return _list_element_type(type, list.symbol.unspecialized_symbol)
+        si
+
+        // The type argument at which `type` instantiates `List`, found
+        // through the specialised ancestors: a closed instantiation's
+        // own `ancestors` are the unspecialised symbol's and name its
+        // type parameter rather than the argument supplied for it.
+        _list_element_type(type: Type, list_symbol: Semantic.Symbols.Symbol) -> Type? is
+            if !isa Semantic.Types.NAMED(type) then
+                return null
+            fi
+
+            let symbol = type.symbol
+
+            if symbol.unspecialized_symbol == list_symbol then
+                if type.arguments.count == 0 then
+                    return null
+                fi
+
+                return type.arguments[0]
+            fi
+
+            for i in 0..symbol.ancestors.count do
+                let element = _list_element_type(symbol.get_ancestor(i), list_symbol)
+
+                if element? then
+                    return element
+                fi
+            od
+
+            return null
+        si
+
+        // The comparison a lowering describes, over two present values.
+        _build_equality(
+            lowering: EqualityLowering,
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value is
+            let bool_type = _innate_symbol_lookup.get_bool_type()
+
+            case lowering
+            when operator: EqualityLowering.OPERATOR then
+                return _build_operator_call(operator.function, "=~", left_value, right_value, location)
+            when order: EqualityLowering.ORDER then
+                let call = _build_operator_call(order.function, "<>", left_value, right_value, location)
+
+                return COMPARE_ORDER_TO_ZERO(call, "==", bool_type)
+            when comparer: EqualityLowering.COMPARER then
+                return EQUALITY_COMPARISON(left_value, right_value, comparer.comparer_type, bool_type)
+            when sequence: EqualityLowering.SEQUENCE then
+                return _build_sequence_equality(sequence, left_value, right_value, location)
+            else
+                return REFERENCE_EQUALITY(left_value, right_value, bool_type)
+            esac
+        si
+
+        // A call of an operator over two present operands. A declared
+        // operator takes the left operand as its receiver; an innate or
+        // a global one takes both as arguments. An innate lowers to an
+        // opcode and has to be told which spelling it stands in for -
+        // the positive one always, since `!~` negates the whole result.
+        _build_operator_call(
+            function: Semantic.Symbols.Function,
+            spelling: string,
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value is
+            _symbol_use_locations.add_symbol_use(location, function)
+
+            let value =
+                if function.is_instance then
+                    function.call(
+                        location,
+                        left_value,
+                        Collections.LIST[Value]([right_value]),
+                        null,
+                        _function_caller
+                    )
+                else
+                    function.call(
+                        location,
+                        null,
+                        Collections.LIST[Value]([left_value, right_value]),
+                        null,
+                        _function_caller
+                    )
+                fi
+
+            if isa Call.INNATE(value) then
+                let innate_value = value
+
+                innate_value.actual_operation = spelling
+
+                return innate_value.lower()
+            fi
+
+            return value
+        si
+
+        // Two sequences compared by count and then element by element.
+        // Each operand is read once per element and its count twice, so
+        // both are spilled; the element comparison is built against a
+        // load of the index local the loop node declares, at the element
+        // lowering already chosen.
+        _build_sequence_equality(
+            sequence: EqualityLowering.SEQUENCE,
+            left_value: Value,
+            right_value: Value,
+            location: Source.LOCATION
+        ) -> Value is
+            let bool_type = _innate_symbol_lookup.get_bool_type()
+            let int_type = _innate_symbol_lookup.get_int_type()
+
+            let block = IR.Values.BLOCK(bool_type)
+
+            let load_left = left_value.get_temp_copier(block, "sequence_left")
+            let load_right = right_value.get_temp_copier(block, "sequence_right")
+
+            let left_count = _load_property(load_left(), "count", location)
+            let right_count = _load_property(load_right(), "count", location)
+
+            if !left_count? \/ !right_count? then
+                _logger.error(location, "cannot compare {left_value.type} element-wise: it has no count")
+
+                return DUMMY(Semantic.Types.ERROR(), location)
+            fi
+
+            let left_count_temp = IR.TEMP(block, "sequence_left_count", left_count)
+            let right_count_temp = IR.TEMP(block, "sequence_right_count", right_count)
+
+            let index_name = ".sequence_index.{IR.TEMP.get_next_id()}"
+
+            let left_element = _index_element(load_left(), IR.Values.Load.TEMP(index_name, int_type), location)
+            let right_element = _index_element(load_right(), IR.Values.Load.TEMP(index_name, int_type), location)
+
+            if !left_element? \/ !right_element? then
+                _logger.error(location, "cannot compare {left_value.type} element-wise: it has no indexer")
+
+                return DUMMY(Semantic.Types.ERROR(), location)
+            fi
+
+            let element_equals = _build_equality(sequence.element, left_element, right_element, location)
+
+            block.add(
+                SEQUENCE_EQUALITY(
+                    left_count_temp.load(),
+                    right_count_temp.load(),
+                    index_name,
+                    int_type,
+                    element_equals,
+                    bool_type))
+
+            block.close()
+
+            return block
+        si
+
+        // A read of a named property on a receiver, or null when the
+        // receiver's type has no property of that name.
+        _load_property(receiver: Value, name: string, location: Source.LOCATION) -> Value? is
+            let type = receiver.type
+
+            if !type? then
+                return null
+            fi
+
+            let symbol = type.find_member(name)
+
+            if let property: Semantic.Symbols.Property = symbol then
+                return property.load(location, receiver, IoC.CONTAINER.instance.symbol_loader)
+            fi
+
+            return null
+        si
+
+        // `receiver[index]` through the receiver type's read indexer, or
+        // null when none takes the index.
+        _index_element(receiver: Value, index: Value, location: Source.LOCATION) -> Value? is
+            let type = receiver.type
+
+            if !type? \/ !index.type? then
+                return null
+            fi
+
+            let symbol = type.find_member(Semantic.Symbols.INDEXER_NAMES.read)
+
+            if !symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
+                return null
+            fi
+
+            let overload_result =
+                _resolve_silently(
+                    location,
+                    cast Semantic.Symbols.FUNCTION_GROUP(symbol),
+                    Collections.LIST[Type]([index.type!]),
+                    true)
+
+            if !overload_result? then
+                return null
+            fi
+
+            let function = overload_result.function
+
+            _symbol_use_locations.add_symbol_use(location, function)
+
+            return function.call(location, receiver, Collections.LIST[Value]([index]), null, _function_caller)
+        si
+
 
         // A field comparison in a synthesized union `=~`. The operands
         // are plain member loads compiled by the ordinary walk; what is
@@ -916,13 +1285,14 @@ namespace Syntax.Process is
                 _compile_field_equals(left_value, right_value, field_equals.location)
         si
 
-        // The field type's own `=~` where one resolves — a member
-        // operator on the type, or a global innate (scalars, strings) —
-        // the runtime comparer for a bare type parameter or a tuple,
-        // and, when none answers, the default equality comparer with a warning
-        // at the field's declaration: the union's structural equality
-        // compares that field with .NET's `Equals` rather than an
-        // operator the type declared.
+        // The comparison a synthesized `=~` runs for one field: the
+        // lowering the field's static type gets anywhere else, with the
+        // null checks written around it where the field is optional.
+        //
+        // Where nothing compares the type, the runtime's comparer is the
+        // only answer left, and a type declared in ghūl source is told
+        // so at the field: it could declare `=~` and does not. Imported
+        // types cannot, so for those the fallback stays silent.
         _compile_field_equals(
             left_value: Value,
             right_value: Value,
@@ -933,12 +1303,6 @@ namespace Syntax.Process is
 
             if !left_type? \/ !right_type? then
                 return DUMMY(Semantic.Types.ERROR(), location)
-            fi
-
-            let comparer_comparison = _comparer_equality(left_value, right_value)
-
-            if comparer_comparison? then
-                return comparer_comparison
             fi
 
             if left_type.is_optional \/ right_type.is_optional then
@@ -958,16 +1322,14 @@ namespace Syntax.Process is
                     return null_safe
                 fi
             else
-                let member_value = _try_member_equals_operator(left_value, right_value, location)
+                let lowering = _choose_equality(left_type, right_type, location)
 
-                if member_value? then
-                    return member_value
-                fi
+                if lowering? then
+                    if isa EqualityLowering.IDENTITY(lowering) then
+                        _warn_equality_fallback(left_type, location)
+                    fi
 
-                let global_value = _try_global_equals_operator(left_value, right_value, location)
-
-                if global_value? then
-                    return global_value
+                    return _build_equality(lowering, left_value, right_value, location)
                 fi
             fi
 
@@ -979,23 +1341,7 @@ namespace Syntax.Process is
                 return DUMMY(Semantic.Types.ERROR(), location)
             fi
 
-            // Reported only where the author could act: a type declared
-            // in ghūl source could declare `=~` and does not. Imported
-            // types, tuples, arrays, collection instantiations and
-            // function types cannot declare one, so for those the
-            // fallback is the only semantics available and a report
-            // would have no remedy to point at.
-            let inner = _non_optional(left_type) ?? left_type
-
-            if
-                isa Semantic.Symbols.Classy(inner.symbol) /\
-                !inner.symbol.is_reflected
-            then
-                _logger.warn(
-                    location,
-                    "synthesized-equality-fallback",
-                    "{left_type} defines no =~, so this field compares with the default equality comparer")
-            fi
+            _warn_equality_fallback(left_type, location)
 
             return EQUALITY_COMPARISON(
                 left_value,
@@ -1004,63 +1350,26 @@ namespace Syntax.Process is
                 _innate_symbol_lookup.get_bool_type())
         si
 
-        // A `=~` operator declared as a member of the field's type —
-        // a user-written operator, a nested union's synthesized one, or
-        // an operator an imported type gains through `Ghul.Equatable`.
-        // Returns null when the type declares no such operator or the
-        // declaration rejects these operands.
-        _try_member_equals_operator(
-            left_value: Value,
-            right_value: Value,
-            location: Source.LOCATION
-        ) -> Value? is
-            let member_symbol = left_value.type!.find_member("=~")
+        // Reported only where the author could act: a type declared in
+        // ghūl source could declare `=~` and does not. Imported types,
+        // tuples, arrays, collection instantiations and function types
+        // cannot declare one, so for those the fallback is the only
+        // semantics available and a report would have no remedy to
+        // point at.
+        _warn_equality_fallback(type: Type, location: Source.LOCATION) is
+            let inner = _non_optional(type) ?? type
 
-            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
-                return null
-            fi
-
-            let group = cast Semantic.Symbols.FUNCTION_GROUP(member_symbol)
-
-            if HIDDEN_OPERATOR_MEMBERS.is_hidden(group) then
-                return null
-            fi
-
-            let overload_result =
-                _resolve_silently(
+            if
+                isa Semantic.Symbols.Classy(inner.symbol) /\
+                !inner.symbol.is_reflected
+            then
+                _logger.warn(
                     location,
-                    group,
-                    Collections.LIST[Type]([right_value.type!]),
-                    left_value.is_consumable)
-
-            if !overload_result? then
-                return null
+                    "synthesized-equality-fallback",
+                    "{type} defines no =~, so this field compares with the default equality comparer")
             fi
-
-            let function = overload_result.function
-
-            if function.is_hidden_from_operator_resolution then
-                return null
-            fi
-
-            _symbol_use_locations.add_symbol_use(location, function)
-
-            if function.is_instance then
-                return function.call(
-                    location,
-                    left_value,
-                    Collections.LIST[Value]([right_value]),
-                    null,
-                    _function_caller)
-            fi
-
-            return function.call(
-                location,
-                null,
-                Collections.LIST[Value]([left_value, right_value]),
-                null,
-                _function_caller)
         si
+
 
         // A `=~` operator in scope as a global — the scalar and string
         // innates. Returns null when nothing in scope answers for these
@@ -1219,11 +1528,14 @@ namespace Syntax.Process is
             fi
 
             let guards_argument =
-                if let operator: NullSafeComparison.OPERATOR = comparison then
+                if let operator: EqualityLowering.OPERATOR = comparison then
                     NULL_SAFE_EQUALITY_GATE.guards_argument(operator.function)
+                elif let order: EqualityLowering.ORDER = comparison then
+                    NULL_SAFE_EQUALITY_GATE.guards_argument(order.function)
                 else
-                    // The comparer takes two present values, so an
-                    // absent one has to be answered out here.
+                    // The comparer, a sequence and identity all take
+                    // two present values, so an absent one has to be
+                    // answered out here.
                     true
                 fi
 
@@ -1278,7 +1590,7 @@ namespace Syntax.Process is
                 return null
             fi
 
-            let call = _call_null_safe_comparison(comparison, left_payload, right_payload, location)
+            let call = _build_equality(comparison, left_payload, right_payload, location)
 
             let result =
                 IR.Values.NULL_SAFE_EQUALITY(
@@ -1295,11 +1607,8 @@ namespace Syntax.Process is
             return block
         si
 
-        // Which comparison a null-safe `=~` wraps. The answer mirrors
-        // what a comparison of two present values of the inner types
-        // resolves to: an operator the left type declares (or an
-        // enum's innate one), a global one, and failing both the
-        // runtime comparer, for a tuple or a bare type parameter.
+        // Which comparison a null-safe `=~` wraps: the one two present
+        // values of the inner types get.
         //
         // An operator that accepts the operands as they stand is left
         // alone: declaring an optional parameter is how one says it
@@ -1313,134 +1622,25 @@ namespace Syntax.Process is
             left_inner: Type,
             right_inner: Type,
             location: Source.LOCATION
-        ) -> NullSafeComparison? is
-            let member_symbol = left_inner.find_member("=~")
-
-            if member_symbol? /\ isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
-                let overload_result =
-                    _resolve_silently(
-                        location,
-                        cast Semantic.Symbols.FUNCTION_GROUP(member_symbol),
-                        Collections.LIST[Type]([right_inner]),
-                        true
-                    )
-
-                if
-                    overload_result? /\
-                    NULL_SAFE_EQUALITY_GATE.accepts_operator(
-                        overload_result.function,
-                        _innate_symbol_lookup.get_bool_type())
-                then
-                    return NullSafeComparison.OPERATOR(overload_result.function)
-                fi
-            fi
-
-            // A global operator that takes the operands as they stand
-            // is written to answer for an absent one, so it is called
-            // as written rather than wrapped.
+        ) -> EqualityLowering? is
             if _find_global_equals_operator(left_type, right_type, location)? then
                 return null
             fi
 
-            // One that takes only present values needs the null checks
-            // written around it, the same as a declared member does.
-            let global_function =
-                _find_global_equals_operator(left_inner, right_inner, location)
+            let lowering = _choose_equality(left_inner, right_inner, location)
 
-            if global_function? then
-                if
-                    NULL_SAFE_EQUALITY_GATE.accepts_global_operator(
-                        global_function,
-                        _innate_symbol_lookup.get_bool_type())
-                then
-                    return NullSafeComparison.OPERATOR(global_function)
-                fi
-
+            // A reference of a class declaring neither operator is not
+            // compared by identity from a written `=~`, null-safe or
+            // not; a synthesized member reaches identity through the
+            // field path instead.
+            if lowering? /\ isa EqualityLowering.IDENTITY(lowering) then
                 return null
             fi
 
-            if !_compares_through_comparer(left_inner) \/ !left_inner.matches(right_inner) then
-                return null
-            fi
-
-            let comparer_type = _innate_symbol_lookup.get_equality_comparer_type(left_inner)
-
-            if !comparer_type? then
-                return null
-            fi
-
-            return NullSafeComparison.COMPARER(comparer_type)
+            return lowering
         si
 
-        // The comparison itself, given the two payloads the presence
-        // tests have projected out.
-        _call_null_safe_comparison(
-            comparison: NullSafeComparison,
-            left_payload: Value,
-            right_payload: Value,
-            location: Source.LOCATION
-        ) -> Value is
-            if let comparer: NullSafeComparison.COMPARER = comparison then
-                return EQUALITY_COMPARISON(
-                    left_payload,
-                    right_payload,
-                    comparer.comparer_type,
-                    _innate_symbol_lookup.get_bool_type())
-            fi
 
-            let function = cast NullSafeComparison.OPERATOR(comparison).function
-
-            _symbol_use_locations.add_symbol_use(location, function)
-
-            // A declared operator takes the left operand as its
-            // receiver. An enum's is an innate, which takes both
-            // operands as arguments instead - the same split the
-            // present-operand path makes.
-            let value =
-                if function.is_instance then
-                    function.call(
-                        location,
-                        left_payload,
-                        Collections.LIST[Value]([right_payload]),
-                        null,
-                        _function_caller
-                    )
-                else
-                    function.call(
-                        location,
-                        null,
-                        Collections.LIST[Value]([left_payload, right_payload]),
-                        null,
-                        _function_caller
-                    )
-                fi
-
-            // An innate lowers to an opcode and has to be told which
-            // spelling it stands in for. The positive one, always:
-            // `!~` negates the whole lowering, absent arms included.
-            if isa Call.INNATE(value) then
-                let innate_value = value
-
-                innate_value.actual_operation = "=~"
-
-                return innate_value.lower()
-            fi
-
-            return value
-        si
-
-        // Build a value-equality test between two operands the way `=~`
-        // (or `<>`, compared to zero) would, for `case` `when` labels.
-        // An optional operand first tries the null-safe path
-        // (_build_null_safe_equality) for instance `=~` operators that
-        // would dereference a null receiver; when that declines - most
-        // often because the operator is a static one already null-safe
-        // by nature, like string's op_Equality - it falls through to a
-        // direct `=~` call. Returns null when no member operator
-        // resolves, leaving the caller to fall back to a raw compare.
-        // `<>` answers int and is not null-safe, so it is only handled
-        // for non-optional operands; an optional scrutinee whose inner
-        // type has only `<>` falls back.
         _try_equality_test(
             left_value: Value,
             right_value: Value,
@@ -1469,16 +1669,16 @@ namespace Syntax.Process is
                     // from operator resolution) reaches the free-function
                     // `Ghul.=~`, which is null-safe over optionals - the
                     // same call the `=~` expression makes for these types.
-                    let free = _build_free_function_test("=~", left_value, right_value, location)
+                    return _try_global_equals_operator(left_value, right_value, location)
+                fi
 
-                    if free? then
-                        return free
-                    fi
+                let lowering = _choose_equality(left_type, right_type, location)
 
+                if !lowering? \/ isa EqualityLowering.IDENTITY(lowering) then
                     return null
                 fi
 
-                return _build_direct_operator_test(left_value, right_value, "=~", location)
+                return _build_equality(lowering, left_value, right_value, location)
             fi
 
             if op_name =~ "<>" then
@@ -1486,137 +1686,18 @@ namespace Syntax.Process is
                     return null
                 fi
 
-                return _build_direct_operator_test(left_value, right_value, "<>", location)
+                let order = _find_order_operator(left_type, right_type, location)
+
+                if !order? then
+                    return null
+                fi
+
+                return _build_equality(EqualityLowering.ORDER(order), left_value, right_value, location)
             fi
 
             return null
         si
 
-        // Resolve a free-function operator (`Ghul.=~`, reachable via
-        // scope as `=~`) against both operands and build the call. This
-        // is the path the `=~` expression takes for built-in types whose
-        // member operator is hidden from operator resolution (string's
-        // op_Equality): the free function is null-safe over optionals,
-        // so it is the right call for an optional scrutinee. Returns null
-        // when no free function resolves.
-        _build_free_function_test(
-            op_name: string,
-            left_value: Value,
-            right_value: Value,
-            location: Source.LOCATION
-        ) -> Value? is
-            let symbol = _visitor.find(op_name)
-
-            if !symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(symbol) then
-                return null
-            fi
-
-            let overload_result =
-                _resolve_silently(
-                    location,
-                    cast Semantic.Symbols.FUNCTION_GROUP(symbol),
-                    Collections.LIST[Type]([left_value.type!, right_value.type!]),
-                    false
-                )
-
-            if !overload_result? then
-                return null
-            fi
-
-            let function = overload_result.function
-
-            _symbol_use_locations.add_symbol_use(location, function)
-
-            let call =
-                function.call(
-                    location,
-                    null,
-                    Collections.LIST[Value]([left_value, right_value]),
-                    null,
-                    _function_caller
-                )
-
-            return call
-        si
-
-        // Resolve the left type's `=~` or `<>` member against the right
-        // operand and build the call directly (no null checks): the
-        // non-optional half of _try_equality_test. `<>`'s int result is
-        // reduced against zero. Returns null when no member resolves.
-        _build_direct_operator_test(
-            left_value: Value,
-            right_value: Value,
-            op_name: string,
-            location: Source.LOCATION
-        ) -> Value? is
-            let left_type = left_value.type
-
-            if !left_type? then
-                return null
-            fi
-
-            // Resolve against the non-optional inner type, matching the
-            // null-safe path: `find_member` on an optional type resolves
-            // a different (instance, optional-parameter) member than the
-            // inner type does, which would dispatch virtually and
-            // dereference a null receiver. The inner type's operator is
-            // the one `=~` resolves to for a present value.
-            let resolve_type = _non_optional(left_type) ?? left_type
-
-            let member_symbol = resolve_type.find_member(op_name)
-
-            if !member_symbol? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member_symbol) then
-                return null
-            fi
-
-            let right_inner = _non_optional(right_value.type!) ?? right_value.type!
-
-            let overload_result =
-                _resolve_silently(
-                    location,
-                    cast Semantic.Symbols.FUNCTION_GROUP(member_symbol),
-                    Collections.LIST[Type]([right_inner]),
-                    true
-                )
-
-            if !overload_result? then
-                return null
-            fi
-
-            let function = overload_result.function
-
-            _symbol_use_locations.add_symbol_use(location, function)
-
-            // Mirror the `=~` operator visitor: an instance operator
-            // takes the left operand as its receiver, a static one
-            // (string's op_Equality) takes both as arguments with no
-            // receiver. Passing a receiver for a static operator would
-            // emit a virtual call that dereferences a null receiver.
-            let call =
-                if function.is_instance then
-                    function.call(
-                        location,
-                        left_value,
-                        Collections.LIST[Value]([right_value]),
-                        null,
-                        _function_caller
-                    )
-                else
-                    function.call(
-                        location,
-                        null,
-                        Collections.LIST[Value]([left_value, right_value]),
-                        null,
-                        _function_caller
-                    )
-                fi
-
-            if op_name =~ "<>" then
-                return COMPARE_ORDER_TO_ZERO(call, "==", _innate_symbol_lookup.get_bool_type())
-            fi
-
-            return call
-        si
 
         _non_optional(type: Type) -> Type? =>
             if type.is_optional then
