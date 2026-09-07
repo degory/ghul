@@ -62,6 +62,16 @@ The synthesised entry point is a file-private definition like any other, so more
 
 Every file whose top-level statements are left unselected is told so, as a `top-level-statements-not-run` warning at its first statement — the statements do not run, so a `let` among them never initializes. Suppress it project-wide with `--suppress top-level-statements-not-run`, or take it as a hint with `--warn-as-hint`, in a project where several script files under one build is the intended shape. Where several files carry top-level statements and nothing names an entry point, none is chosen, every one of them warns, and an executable build reports that it has no entry point.
 
+An ordinary pragma wraps the one definition or statement written after it, which gives it nowhere to reach a warning reported at a top-level statement — there is no wrapping definition to attach to. `@@pragma(...)`, doubled at, is a **file-level** pragma: written before everything else in the file, one or more of them cover the whole file rather than one definition. `@@suppress("slug")` reaches every diagnostic in the file, top-level statements included; `@@precedence(...)` sets an operator's precedence for the rest of the file's parse, with no restore at the end the way the per-definition `@precedence` has. A `@@` pragma anywhere but the very start of the file — after a `use`, a definition, or a top-level statement — is an error:
+
+```ghul
+@@suppress("top-level-statements-not-run")
+
+use IO.Std.write_line;
+
+write_line("hello");
+```
+
 The `use` statement brings names into scope so they can be referred to without qualification. Applied to a namespace it imports every public symbol; applied to a single symbol it imports just that one:
 
 ```ghul
