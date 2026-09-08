@@ -1754,7 +1754,15 @@ e.subscribe((n, s) => write_line("{n} {s}"));
 e.raise(7, "seven");
 ```
 
-The marker reads only as a formal's own type, or as the parameter of its own function type. Written anywhere else — inside a bigger type, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+The marker can sit on the parameter of any function type along the formal's return spine, not only the outermost. `f: X -> T.. -> U` asks for a function the caller's own lambda returns, which is how a higher-order function takes an N-ary one:
+
+```ghul
+run[T.., U](make: (int) -> T.. -> U, v: T) -> U => make(10)(v);
+
+run(n => (a, b) => a + b + n, (1, 2));   // 13
+```
+
+The marker reads only as a formal's own type, or as the parameter of a function type on that type's return spine. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
 
 What each formal asks for survives into the assembly, so a pack declared in one assembly reads the same way from another.
 
