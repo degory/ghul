@@ -1776,6 +1776,18 @@ apply(double, 123);                      // T is int, as for any parameter
 
 A spread formal has to be the last one, since it leaves nothing for the arguments after it. One argument is the value itself rather than a one-element tuple, which is what makes `apply(double, 123)` read the way it does; two or more are the tuple they are spread into. Writing the tuple out goes into the same formal, so both spellings are available and the written-out one is what a caller reaches for when it already holds the tuple.
 
+The pack binds to whatever the call supplies, and the function written at its own formal is one of the things that supplies it — its parameters are the tuple. So a call that passes nothing but the function still infers, as long as the function says what its parameters are:
+
+```ghul
+n_ary[A.., B](f: A.. -> B) -> (A -> B) => f;
+
+add(a: int, b: int) -> int => a + b;
+
+n_ary(add);                        // A is (int, int)
+n_ary((a: int, b: int) => a + b);  // the same, written out
+n_ary((a, b) => a + b);            // error - nothing says what a and b are
+```
+
 Nothing about the parameter itself changes: `T` binds to whatever the call supplies, `f(v)` passes one value, and a consumer in another language sees a method taking a tuple. What the marker on `f` licenses is a **function of two or more parameters written where that formal expects one**. A function literal there is read as destructuring the tuple, and a function named there is wrapped so that it is. A one-parameter function needs no adaptation and is passed as it stands.
 
 `[T..]` is accepted on a class, struct, trait and union type parameter as well as a function or method one, and each formal opts in for itself — so a type declaring `EVENT[T..]` marks its handler formal and its value formal for the readings each wants:
