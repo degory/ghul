@@ -482,6 +482,7 @@ class Shape abstract is
     area() -> int;
 si
 
+@equality()
 class CIRCLE: Shape is
     radius: int;
 
@@ -493,9 +494,11 @@ class CIRCLE: Shape is
 si
 ```
 
-The request cascades to every subclass, so each gets its own operator comparing what it adds on top of its base's. An abstract class with no state of its own still gets one, which is what lets a comparison written against the base type resolve — `a =~ b` over two `Shape` variables dispatches to whichever subclass the values actually are.
+The pragma applies to the class it is written on and to no other, so each class in a hierarchy asks for its own. An abstract class with no state of its own can ask too, which is what lets a comparison written against the base type resolve — `a =~ b` over two `Shape` variables dispatches to whichever subclass the values actually are, and each subclass compares what it adds on top of its base's.
 
-A subclass that declares its own `=~` keeps it, and answers for itself. A subclass the compiler cannot write one for, and that declares none, is an error: left alone it would inherit an operator that reads its base and answers for state that operator cannot see. Asking for equality on a class that already declares `=~`, `<>`, `get_hash_code` or an `equals` over `object` is an error too, since the request contradicts what is written.
+A synthesized operator serves only the class it was written for: it admits operands of exactly that runtime type and reads only that class's members. So a subclass of a class that has one must supply its own, either by asking with `@equality()` or by declaring `=~` and `get_hash_code`, and a subclass that does neither is an error. That holds however little the subclass adds: the rule is uniform, so that every class in a hierarchy states its own position rather than its obligation depending on whether it happens to declare a field. A subclass whose base declares equality by hand is unaffected — what the author wrote is the author's to answer for.
+
+Asking for equality on a class that already declares `=~`, `<>`, `get_hash_code` or an `equals` over `object` is an error, since the request contradicts what is written. So is asking on an `open` class: enforcing the rule above needs every subclass in view, and an `open` class can be extended from another assembly.
 
 A class without the pragma is unaffected: it has no `=~` at all, and comparing two of its values by `==` asks about identity as it always did. Structs and unions need no pragma, and are given equality wherever they declare none — a struct is a value, so two structs holding equal members already are the same value, and a union is compared by which variant it holds and what that variant carries.
 
@@ -976,7 +979,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 - any type a global `=~` is declared for: `=~(a: T, b: T) -> bool` at namespace scope gives `T` the operator without reopening the type, which is the way to give one to a type you did not write, or to a tuple
 - a union, through the operator synthesized for it — see [unions](#unions)
 - a struct whose state is entirely public and that declares no equality of its own, through the one synthesized for it: member by member, each member through its own type's equality — see [structs](#structs)
-- a class carrying an `@equality()` pragma, or descending from one, and that declares no equality of its own, through the one synthesized for it: member by member and then its base's, each member through its own type's equality — see [classes](#classes)
+- a class carrying an `@equality()` pragma, through the one synthesized for it: member by member and then its base's, each member through its own type's equality — see [classes](#classes)
 - a tuple, element by element, each element through its own type's equality, however deep it nests
 - an array, a `List[T]` or a `LIST[T]`, by count and then element by element, each element through its own type's equality - so `[[1, 2], [3]] =~ [[1, 2], [3]]` holds, and two lists of a type declaring `=~` compare through it. An element of a class that declares neither `=~` nor `<>` compares by reference here, although the same comparison written directly on two such values is an error: a list of them still has a sensible equality, where the two values alone have none to offer
 - a type that declares `<>` and no `=~`: an ordering defines equality with it, so `a =~ b` is `a <> b == 0`
