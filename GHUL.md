@@ -1723,35 +1723,40 @@ When neither the arguments nor any later use pins a type argument, the construct
 
 A type parameter written with a trailing `..` is an **argument pack**: it stands for the arguments of a call, held as a positional tuple. The `..` is that parameter's bound — it says what `T` ranges over — so a type bound cannot be written alongside it.
 
-A formal argument then writes `..` on its own type to say which of the pack's readings it wants. `f: T.. -> U` takes the arguments spread out, as a function of as many parameters as the call supplies; a plain `T` is the tuple. So a function taking a function and the values to call it with declares one of each, and callers write the call out rather than assembling the tuple by hand:
+A formal argument then writes `..` on its own type to say which of the pack's readings it wants. `f: T.. -> U` takes the arguments spread out, as a function of as many parameters as the call supplies; `v: T..` takes them as the call's own remaining arguments; a plain `T` is the tuple. So a function taking a function and the values to call it with declares one of each, and callers write the call out rather than assembling the tuple by hand:
 
 ```ghul
-apply[T.., U](f: T.. -> U, v: T) -> U => f(v);
+apply[T.., U](f: T.. -> U, v: T..) -> U => f(v);
 
 concat(a: string, b: string) -> string => "{a}{b}";
 
-apply((a, b) => "{a}{b}", ("x", "y"));   // T is (string, string)
-apply(concat, ("x", "y"));               // the same, by name
+apply((a, b) => "{a}{b}", "x", "y");     // T is (string, string)
+apply(concat, "x", "y");                 // the same, by name
+apply(concat, ("x", "y"));               // the tuple, written out
 apply(double, 123);                      // T is int, as for any parameter
 ```
 
+A spread formal has to be the last one, since it leaves nothing for the arguments after it. One argument is the value itself rather than a one-element tuple, which is what makes `apply(double, 123)` read the way it does; two or more are the tuple they are spread into. Writing the tuple out goes into the same formal, so both spellings are available and the written-out one is what a caller reaches for when it already holds the tuple.
+
 Nothing about the parameter itself changes: `T` binds to whatever the call supplies, `f(v)` passes one value, and a consumer in another language sees a method taking a tuple. What the marker on `f` licenses is a **function of two or more parameters written where that formal expects one**. A function literal there is read as destructuring the tuple, and a function named there is wrapped so that it is. A one-parameter function needs no adaptation and is passed as it stands.
 
-`[T..]` is accepted on a class, struct, trait and union type parameter as well as a function or method one, and each formal opts in for itself — so a type declaring `EVENT[T..]` marks its handler formal and leaves its value formal plain:
+`[T..]` is accepted on a class, struct, trait and union type parameter as well as a function or method one, and each formal opts in for itself — so a type declaring `EVENT[T..]` marks its handler formal and its value formal for the readings each wants:
 
 ```ghul
 class EVENT[T..] is
     subscribe(handler: T.. -> void) is ... si
-    raise(v: T) is ... si
+    raise(v: T..) is ... si
 si
 
 let e = EVENT[(int, string)]();
 
 e.subscribe((n, s) => write_line("{n} {s}"));
-e.raise((7, "seven"));
+e.raise(7, "seven");
 ```
 
-The marker reads only as the parameter of a formal's own function type. Written anywhere else — on a value formal, inside a bigger type, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+The marker reads only as a formal's own type, or as the parameter of its own function type. Written anywhere else — inside a bigger type, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+
+What each formal asks for survives into the assembly, so a pack declared in one assembly reads the same way from another.
 
 
 A generic function or method named with no argument list is a *value*, the same way a non-generic name in value position is. Written with its type arguments it is the value at that instantiation; written bare, the type arguments are inferred from the function type of the slot it goes into — from the parameter positions, and from the return slot for a variable that appears only there. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
