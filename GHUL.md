@@ -909,6 +909,44 @@ si
 
 Methods are functions declared inside a class, struct, or trait; they have an implicit `self`. A constructor is a method named `init`. Methods are public unless their name starts with `_`, which makes them non-public under the `--underscore-access` policy — by default visible only to the declaring class. The compiler enforces that gate.
 
+## operators
+
+See <https://ghul.dev/definitions.html#functions>.
+
+An operator is a run of operator characters, scanned as a single token. The ASCII operator characters are `! $ % ^ & * - + = | : @ ~ # \ < > . ? /`, and so is any non-ASCII character Unicode classifies as a symbol, which puts `×`, `÷`, `∪`, `⊕` and `≠` on exactly the same footing as `*` and `+`. An operator can therefore be spelled with the notation it stands for rather than with an ASCII approximation of it.
+
+A function whose name is an operator is used as one. Declared as a member it takes its left operand as `self` and the right as its argument; declared at namespace scope it takes both as arguments, which is how an operator is given to a type you did not write:
+
+```ghul
+struct N(v: int) is
+    ⊕(other: N) -> N => N(v + other.v);
+si
+
+⊗(a: N, b: N) -> N => N(a.v * b.v);
+```
+
+Precedence comes from the operator's first character rather than from anything written on the declaration, so an operator that reads as arithmetic binds as arithmetic. From tightest to loosest:
+
+| level | characters |
+|-------|------------|
+| multiplication | `*` `/` `%` `×` `÷` `✕` `⊗` `⊘` `⊙` `⋅` `∗` |
+| addition | `+` `-` `⊕` `⊖` `±` `∓` |
+| bitwise | `&` `\|` `¦` `^` `∩` `∪` `⊻` `⊼` `⊽` |
+| shift | `<` or `>` doubled |
+| range | `..` `::` |
+| relational | `=` `!` `~` `<` `>` `≠` `≤` `≥` `≈` `≉` `≡` `≢` `∈` `∉` `∋` `⊂` `⊃` `⊆` `⊇` |
+| boolean | `∧` `∨`, and `/\` and `\/` |
+
+An operator opening with `?` sits looser than all of those, and everything the table does not name sits between shift and bitwise. Associativity is left, except for an operator opening with `?`, which is right so that a chain of them stays open to the one after it.
+
+Where the first character does not say what is meant, a `@precedence` pragma places the operator explicitly. It takes the operator and a level: one of the eight `user-1` to `user-8`, which interleave with the levels above, or one of those levels by name. The pragma written before a definition covers that definition; the file-level `@@precedence` covers the rest of the file.
+
+```ghul
+@@precedence("∘", "user-8")
+
+∘(f: (int) -> int, g: (int) -> int) -> (int) -> int => x => f(g(x));
+```
+
 ## equality
 
 ghūl has two equality operators, and they ask different questions.
