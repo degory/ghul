@@ -1711,7 +1711,7 @@ e.subscribe((n, s) => write_line("{n} {s}"));
 e.raise((7, "seven"));
 ```
 
-A pack binds to a tuple, which satisfies no bound, so writing one on a pack is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+A pack always binds to a tuple, so a bound written on one is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
 
 A generic function or method named with no argument list is a *value*, the same way a non-generic name in value position is. Written with its type arguments it is the value at that instantiation; written bare, the type arguments are inferred from the function type of the slot it goes into — from the parameter positions, and from the return slot for a variable that appears only there. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
 
