@@ -1688,6 +1688,31 @@ takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
 
 When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
 
+A type parameter written with a trailing `..` is an **argument pack**: it stands for the arguments of a call, held as a positional tuple. A function that takes a function and the values to call it with routes both through one such parameter, and callers write the call out rather than assembling the tuple by hand:
+
+```ghul
+apply[T.., U](f: T -> U, v: T) -> U => f(v);
+
+concat(a: string, b: string) -> string => "{a}{b}";
+
+apply((a, b) => "{a}{b}", ("x", "y"));   // T is (string, string)
+apply(concat, ("x", "y"));               // the same, by name
+apply(double, 123);                      // T is int, as for any parameter
+```
+
+Nothing about the parameter itself changes: `T` binds to whatever the call supplies, `f(v)` passes one value, and a consumer in another language sees a method taking a tuple. What the marker licenses is a **function of two or more parameters going into a slot typed over the pack**. A function literal written there is read as destructuring the tuple, and a function named there is wrapped so that it is. Arity decides: a one-parameter function binds the parameter to its own parameter type, tuple or not, exactly as an unmarked parameter does.
+
+The marker is accepted on a class, struct, trait and union type parameter as well as a function or method one, and the adaptation applies per slot — so a type declaring `EVENT[T..]` with `subscribe(handler: T -> void)` and `raise(v: T)` gets it in both:
+
+```ghul
+let e = EVENT[(int, string)]();
+
+e.subscribe((n, s) => write_line("{n} {s}"));
+e.raise((7, "seven"));
+```
+
+A pack binds to a tuple, which satisfies no bound, so writing one on a pack is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+
 A generic function or method named with no argument list is a *value*, the same way a non-generic name in value position is. Written with its type arguments it is the value at that instantiation; written bare, the type arguments are inferred from the function type of the slot it goes into — from the parameter positions, and from the return slot for a variable that appears only there. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
 
 ```ghul
