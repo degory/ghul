@@ -1318,6 +1318,524 @@ namespace Syntax.Process is
         // decided here is which comparison they run, which depends on
         // the field's static type and so was not knowable when the body
         // was built.
+        // The whole body of a synthesized `=~`, emitted here rather
+        // than built as a tree where the members were named. What the
+        // comparison does depends on the owner's kind, on what its
+        // ancestors contribute and on each member's static type, none
+        // of which exist where a body would have to be written.
+        //
+        // Three guards, one per kind of owner. A struct has no other
+        // runtime type to be confused with, so it needs none. A union
+        // variant tests `isa` against itself: its parameter is the
+        // union, and no other variant can pass. A class compares
+        // runtime types, because a subclass value passes an `isa` for
+        // its base and the two must not compare equal.
+        visit_memberwise_equals(memberwise: Trees.Expressions.MEMBERWISE_EQUALS) is
+            memberwise.compile_expressions_state.value = null
+
+            let bool_type = _innate_symbol_lookup.get_bool_type()
+            let location = memberwise.location
+
+            let owner = _visitor.current_instance_context
+
+            if !owner? \/ !isa Semantic.Symbols.Classy(owner) then
+                memberwise.compile_expressions_state.value =
+                    DUMMY(Semantic.Types.ERROR(), location)
+
+                return
+            fi
+
+            let owner_classy = cast Semantic.Symbols.Classy(owner)
+
+            let self_value = _load_self(owner_classy, location)
+            let other_value = _load_other(location)
+
+            if !self_value? \/ !other_value? then
+                memberwise.compile_expressions_state.value =
+                    DUMMY(Semantic.Types.ERROR(), location)
+
+                return
+            fi
+
+            let inherited = _inherited_memberwise_equals(owner_classy)
+
+            let operands = Collections.LIST[Value]()
+
+            let guard = _memberwise_guard(owner_classy, self_value, other_value, location)
+
+            if guard? then
+                operands.add(guard)
+            fi
+
+            // Read through the owner's own type: a class parameter is
+            // the type the whole chain overrides at, which is a base
+            // of this one wherever this class is not the root.
+            let other_as_owner = _narrow_to_owner(other_value, owner_classy, location)
+
+            for i in 0..memberwise.members.count do
+                let member = memberwise.members[i]
+
+                // The member's own declaration, so that a report about
+                // how it compares lands where it was written.
+                let member_location = memberwise.member_locations[i]
+
+                let left = _load_member(self_value, owner_classy, member, member_location)
+                let right = _load_member(other_as_owner, owner_classy, member, member_location)
+
+                if !left? \/ !right? then
+                    continue
+                fi
+
+                operands.add(
+                    _compile_field_equals(
+                        left,
+                        right,
+                        member_location,
+                        memberwise.reports_fallback
+                    )
+                )
+
+                _note_memberwise_callees(
+                    memberwise.called_functions,
+                    left.type,
+                    right.type,
+                    member_location
+                )
+            od
+
+            // Whatever the base holds is compared by the base's own
+            // operator, reached non-virtually so that it answers for
+            // its own members rather than dispatching back to this
+            // one. A base that compares nothing is not called at all:
+            // its operator is reference identity, which would answer
+            // false for two distinct values this class holds equal.
+            if inherited? then
+                memberwise.called_functions.add(inherited)
+
+                operands.add(
+                    IR.Values.Call.INSTANCE(
+                        IR.Values.Load.SUPER(owner_classy),
+                        inherited,
+                        Collections.LIST[Value]([other_value]),
+                        bool_type
+                    )
+                )
+            fi
+
+            memberwise.compile_expressions_state.value = ALL_OF(operands, bool_type)
+        si
+
+        // `self`, at the owner's own type. A value type is loaded by
+        // address, as it is anywhere else it is read from.
+        _load_self(owner: Semantic.Symbols.Classy, location: Source.LOCATION) -> Value? is
+            let type = _own_instance_type(owner, location)
+
+            if owner.is_value_type then
+                return IR.Values.Load.VALUE_SELF(owner, type)
+            fi
+
+            return IR.Values.Load.REFERENCE_SELF(owner, type)
+        si
+
+        // The type a value of the owner has inside its own body. A
+        // generic owner is its own instantiation at its own parameters,
+        // as reading `self` builds it: the unspecialized symbol's type
+        // would name the open form, and a field read through that is
+        // not a field of any type that exists.
+        _own_instance_type(
+            owner: Semantic.Symbols.Classy,
+            location: Source.LOCATION
+        ) -> Semantic.Types.Type? is
+            if owner.argument_names.count == 0 then
+                return owner.type
+            fi
+
+            let arguments = Collections.LIST[Type]()
+
+            for name in owner.argument_names do
+                let argument = owner.find_member(name)
+                let argument_type = if argument? then argument.type else null fi
+
+                if argument? /\ argument.is_type_variable /\ argument_type? then
+                    arguments.add(argument_type)
+                fi
+            od
+
+            if arguments.count != owner.argument_names.count then
+                return owner.type
+            fi
+
+            return Semantic.Types.GENERIC(location, owner, arguments)
+        si
+
+        // The operator's own parameter, found by the name the
+        // synthesis gave it.
+        _load_other(location: Source.LOCATION) -> Value? is
+            let symbol = _visitor.try_find(Trees.Identifiers.Identifier(location, "other"))
+
+            if !symbol? then
+                return null
+            fi
+
+            return IR.Values.Load.LOCAL_ARGUMENT(symbol)
+        si
+
+        // What the comparison tests before it reads a member. A struct
+        // has no other runtime type to be handed, so it needs nothing.
+        // A variant's parameter is its union, and testing `isa` against
+        // itself turns away every other variant. A class needs the
+        // runtime types to agree: a subclass value passes an `isa` for
+        // its base, and a base and a subclass must not compare equal.
+        _memberwise_guard(
+            owner: Semantic.Symbols.Classy,
+            self_value: Value,
+            other_value: Value,
+            location: Source.LOCATION
+        ) -> Value? is
+            let bool_type = _innate_symbol_lookup.get_bool_type()
+
+            if owner.is_value_type then
+                return null
+            fi
+
+            if owner.is_variant then
+                return IR.Values.ISA(bool_type, _own_instance_type(owner, location)!, other_value)
+            fi
+
+            let self_type = _load_runtime_type(self_value, location)
+            let other_type = _load_runtime_type(other_value, location)
+
+            if !self_type? \/ !other_type? then
+                return null
+            fi
+
+            return REFERENCE_EQUALITY(self_type, other_type, bool_type)
+        si
+
+        // `value.get_type()`, the runtime type of a value.
+        _load_runtime_type(value: Value, location: Source.LOCATION) -> Value? is
+            let object_type = _innate_symbol_lookup.get_object_type()
+            let group = object_type.find_member("get_type")
+
+            if !group? \/ !isa Semantic.Symbols.FUNCTION_GROUP(group) then
+                return null
+            fi
+
+            let functions = (cast Semantic.Symbols.FUNCTION_GROUP(group)).functions
+
+            for function in functions do
+                if function.arguments.count == 0 then
+                    return IR.Values.Call.INSTANCE(
+                        value,
+                        function,
+                        Collections.LIST[Value](),
+                        function.return_type
+                    )
+                fi
+            od
+
+            return null
+        si
+
+        // The parameter read as the owner. Where the owner is a class
+        // below the one the chain overrides at, or a variant of a
+        // union, the parameter is that wider type and the members
+        // declared here are reached through a cast the guard has
+        // already made safe.
+        _narrow_to_owner(
+            other_value: Value,
+            owner: Semantic.Symbols.Classy,
+            location: Source.LOCATION
+        ) -> Value is
+            let owner_type = _own_instance_type(owner, location)
+
+            if !owner_type? then
+                return other_value
+            fi
+
+            let value_type = other_value.type
+
+            if value_type? /\ value_type.matches(owner_type) then
+                return other_value
+            fi
+
+            // The guard has already established the runtime type, so
+            // the cast cannot fail where it is reached.
+            return IR.Values.CAST(owner_type, other_value, false)
+        si
+
+        // One member, read off a value of the owner. The name is the
+        // one a value is read by rather than the one it was declared
+        // under, so an auto-property arrives here as its backing field.
+        _load_member(
+            receiver: Value,
+            owner: Semantic.Symbols.Classy,
+            name: string,
+            location: Source.LOCATION
+        ) -> Value? is
+            let symbol = owner.find_member(name)
+
+            if !symbol? \/ !symbol.is_field then
+                return null
+            fi
+
+            return IR.Values.Load.INSTANCE_FIELD(receiver, symbol)
+        si
+
+        // The base's own operator, where calling it is what compares
+        // the members this class does not declare. Null when there is
+        // nothing to delegate: a struct or a variant has no base to
+        // ask, and a base whose chain holds no members compares by
+        // reference, which would answer false for two distinct values
+        // this class holds equal.
+        _inherited_memberwise_equals(
+            owner: Semantic.Symbols.Classy
+        ) -> Semantic.Symbols.Function? is
+            if owner.is_value_type \/ owner.is_variant then
+                return null
+            fi
+
+            let base = _base_classy(owner)
+
+            if !base? \/ !_holds_members(base, 0) then
+                return null
+            fi
+
+            let group = base.find_member("=~")
+
+            if !group? \/ !isa Semantic.Symbols.FUNCTION_GROUP(group) then
+                return null
+            fi
+
+            for function in (cast Semantic.Symbols.FUNCTION_GROUP(group)).functions do
+                if function.arguments.count == 1 /\ !function.is_abstract then
+                    return function
+                fi
+            od
+
+            return null
+        si
+
+        _base_classy(owner: Semantic.Symbols.Classy) -> Semantic.Symbols.Classy? is
+            for ancestor in owner.ancestors do
+                if !ancestor.is_class then
+                    continue
+                fi
+
+                let symbol = ancestor.symbol
+
+                if isa Semantic.Symbols.Classy(symbol) then
+                    return cast Semantic.Symbols.Classy(symbol)
+                fi
+            od
+
+            return null
+        si
+
+        // Whether a type, or anything it extends, holds state a
+        // comparison could read.
+        _holds_members(owner: Semantic.Symbols.Classy, depth: int) -> bool is
+            if depth > 64 then
+                return false
+            fi
+
+            for member in owner.symbols do
+                if member.is_field /\ member.is_instance then
+                    return true
+                fi
+            od
+
+            let base = _base_classy(owner)
+
+            return base? /\ _holds_members(base, depth + 1)
+        si
+
+        // Every function a member's comparison can reach, taken from
+        // the same chooser that decides the comparison. A synthesized
+        // body stores nothing itself, so these are exactly what it can
+        // do, and the effects solve is handed them rather than left to
+        // read them back out of emitted values.
+        //
+        // Asking the chooser a second time costs a resolution and
+        // keeps the answer a total match over a closed union, which
+        // reading the built value back would not be: a value kind
+        // nobody thought of would contribute nothing and the body
+        // would look purer than it is.
+        _note_memberwise_callees(
+            into: Collections.LIST[Semantic.Symbols.Function],
+            left_type: Type?,
+            right_type: Type?,
+            location: Source.LOCATION
+        ) is
+            if !left_type? \/ !right_type? then
+                return
+            fi
+
+            let left_inner = _non_optional(left_type) ?? left_type
+            let right_inner = _non_optional(right_type) ?? right_type
+
+            let lowering = _choose_equality(left_inner, right_inner, location)
+
+            if !lowering? then
+                return
+            fi
+
+            _note_lowering_callees(into, lowering)
+        si
+
+        _note_lowering_callees(
+            into: Collections.LIST[Semantic.Symbols.Function],
+            lowering: EqualityLowering
+        ) is
+            case lowering
+            when operator: EqualityLowering.OPERATOR then
+                into.add(operator.function)
+            when order: EqualityLowering.ORDER then
+                into.add(order.function)
+            when sequence: EqualityLowering.SEQUENCE then
+                _note_lowering_callees(into, sequence.element)
+            when _: EqualityLowering.COMPARER then
+                // The runtime's comparer reaches whatever the type
+                // argument implements, which is not knowable here and
+                // is not a function this body names.
+            else
+            esac
+        si
+
+        // The whole body of a synthesized `get_hash_code`, hashing the
+        // members its `=~` compares and folding them together. What
+        // each member contributes is decided by the same rule the
+        // comparison is: a member compared element by element hashes
+        // by its count, and one compared more finely than its own hash
+        // answers for contributes nothing.
+        visit_memberwise_hash(memberwise: Trees.Expressions.MEMBERWISE_HASH) is
+            memberwise.compile_expressions_state.value = null
+
+            let int_type = _innate_symbol_lookup.get_int_type()
+            let location = memberwise.location
+
+            let owner = _visitor.current_instance_context
+
+            if !owner? \/ !isa Semantic.Symbols.Classy(owner) then
+                memberwise.compile_expressions_state.value =
+                    DUMMY(Semantic.Types.ERROR(), location)
+
+                return
+            fi
+
+            let owner_classy = cast Semantic.Symbols.Classy(owner)
+
+            let self_value = _load_self(owner_classy, location)
+            let get_hash_code = _object_get_hash_code()
+
+            if !self_value? \/ !get_hash_code? then
+                memberwise.compile_expressions_state.value =
+                    DUMMY(Semantic.Types.ERROR(), location)
+
+                return
+            fi
+
+            let operands = Collections.LIST[Value]()
+
+            for i in 0..memberwise.members.count do
+                let member = memberwise.members[i]
+                let member_location = memberwise.member_locations[i]
+
+                let load = _load_member(self_value, owner_classy, member, member_location)
+
+                if !load? then
+                    continue
+                fi
+
+                let operand = _compile_hash_operand(load, member_location)
+
+                // Boxed unconditionally where the member is a value
+                // type: the hash is read through `object`, so an int
+                // field reaches it as a box rather than as a bare
+                // value the call would treat as a reference.
+                operands.add(
+                    if operand.is_value_type then
+                        IR.Values.BOX(operand)
+                    else
+                        operand
+                    fi
+                )
+
+                _note_memberwise_callees(
+                    memberwise.called_functions,
+                    load.type,
+                    load.type,
+                    member_location
+                )
+            od
+
+            let inherited = _inherited_memberwise_hash(owner_classy)
+
+            let seed =
+                if let f = inherited then
+                    memberwise.called_functions.add(f)
+
+                    IR.Values.Call.INSTANCE(
+                        IR.Values.Load.SUPER(owner_classy),
+                        f,
+                        Collections.LIST[Value](),
+                        int_type
+                    )
+                else
+                    null
+                fi
+
+            memberwise.compile_expressions_state.value =
+                IR.Values.HASH_COMBINE(operands, get_hash_code, seed, int_type)
+        si
+
+        _object_get_hash_code() -> Semantic.Symbols.Function? is
+            let group = _innate_symbol_lookup.get_object_type().find_member("get_hash_code")
+
+            if !group? \/ !isa Semantic.Symbols.FUNCTION_GROUP(group) then
+                return null
+            fi
+
+            for function in (cast Semantic.Symbols.FUNCTION_GROUP(group)).functions do
+                if function.arguments.count == 0 then
+                    return function
+                fi
+            od
+
+            return null
+        si
+
+        // The base's own hash, where the base holds members this type
+        // does not declare - the partner of the comparison delegating
+        // to the base's operator.
+        _inherited_memberwise_hash(
+            owner: Semantic.Symbols.Classy
+        ) -> Semantic.Symbols.Function? is
+            if owner.is_value_type \/ owner.is_variant then
+                return null
+            fi
+
+            let base = _base_classy(owner)
+
+            if !base? \/ !_holds_members(base, 0) then
+                return null
+            fi
+
+            let group = base.find_member("get_hash_code")
+
+            if !group? \/ !isa Semantic.Symbols.FUNCTION_GROUP(group) then
+                return null
+            fi
+
+            for function in (cast Semantic.Symbols.FUNCTION_GROUP(group)).functions do
+                if function.arguments.count == 0 /\ !function.is_abstract then
+                    return function
+                fi
+            od
+
+            return null
+        si
+
         visit_field_equals(field_equals: Trees.Expressions.FIELD_EQUALS) is
             field_equals.compile_expressions_state.value = null
 

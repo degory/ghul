@@ -125,109 +125,19 @@ namespace Syntax.Process is
         variant: Definitions.VARIANT,
         `union: Definitions.UNION
     ) -> Definitions.FUNCTION is
-        // Nothing here stands for anything the user wrote, so an internal
-        // location keeps the synthesised members out of hover, find-references
-        // and rename of the variant they belong to.
-        let location = LOCATION.internal
-
-        let other_arg = Variables.VARIABLE(
-            location,
-            Identifiers.Identifier(location, "other"),
-            get_union_type_expression(`union),
-            false,
-            false,
-            null
-        )
-
-        let arguments = Variables.LIST(
-            location,
-            Collections.LIST[Variables.VARIABLE]([other_arg])
-        )
-
-        // For a unit variant, runtime-type identity is the answer:
-        //   isa Self_Variant(other)
-        // For a non-unit variant, also compare each field. The
-        // comparison is a FIELD_EQUALS node rather than a `=~`
-        // operator: which comparison to run is not knowable here, only
-        // once the field's static type has resolved. compile-expressions
-        // lowers it to the field type's own `=~` where the type defines
-        // one, and to the default equality comparer otherwise, warning
-        // at the field declaration in that case.
-        let isa_check = Trees.Expressions.ISA(
-            location,
-            get_variant_type_expression(variant, `union),
-            Trees.Expressions.IDENTIFIER(
-                location,
-                Identifiers.Identifier(location, "other")
-            )
-        )
-
-        let condition: Trees.Expressions.Expression mut = isa_check
+        let names = Collections.LIST[string]()
+        let locations = Collections.LIST[LOCATION]()
 
         for f in variant.fields do
-            let field_location = f.location
-
-            let other_cast = Trees.Expressions.CAST(
-                field_location,
-                get_variant_type_expression(variant, `union),
-                Trees.Expressions.IDENTIFIER(
-                    field_location,
-                    Identifiers.Identifier(field_location, "other")
-                ),
-                false
-            )
-
-            let other_field = Trees.Expressions.MEMBER(
-                field_location,
-                other_cast,
-                Identifiers.Identifier(field_location, f.name!.name),
-                field_location
-            )
-
-            let self_field = Trees.Expressions.MEMBER(
-                field_location,
-                Trees.Expressions.SELF(field_location),
-                Identifiers.Identifier(field_location, f.name!.name),
-                field_location
-            )
-
-            let field_equals = Trees.Expressions.FIELD_EQUALS(
-                field_location,
-                self_field,
-                other_field
-            )
-
-            field_equals.reports_fallback = true
-
-            condition = Trees.Expressions.BINARY(
-                location,
-                Identifiers.Identifier(location, "/\\"),
-                "/\\",
-                condition,
-                field_equals
-            )
+            names.add(f.name!.name)
+            locations.add(f.location)
         od
 
-        let body = Trees.Bodies.EXPRESSION(location, condition)
-
-        // The generated comparison is store-free by construction — an
-        // isa check, one operator call per field, and the default
-        // equality comparer for fields without an operator — but the
-        // effects solve does not cover synthesized functions (the same
-        // reason an auto-property getter carries a backing-read trust
-        // mark instead), so the `pure` declaration is what satisfies
-        // the operator store-free mandate here.
-        let modifiers = Modifiers.LIST(location, null, null)
-        modifiers.is_pure = true
-
-        return Definitions.FUNCTION(
-            location,
-            Identifiers.Identifier(location, "=~"),
-            TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
-            arguments,
-            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
-            modifiers,
-            body
+        return get_memberwise_equals(
+            get_union_type_expression(`union),
+            names,
+            locations,
+            true
         )
     si
 
@@ -548,9 +458,15 @@ namespace Syntax.Process is
     // through the getter it will be given: the getter of a struct
     // property hands back a copy, and the comparison wants the value
     // itself. A `field` member is already the storage and keeps its
-    // own name.
+    // own name, and so is one the accessor rewrite leaves alone - a
+    // non-public member never becomes an auto-property, so there is
+    // no backing field behind it to reach.
     get_state_member_read_name(member: Definitions.PROPERTY) -> string static =>
-        if member.modifiers.is_field then
+        if
+            member.modifiers.is_field \/
+            member.modifiers.is_private \/
+            member.name!.name.starts_with('_')
+        then
             member.name!.name
         else
             "${member.name!.name}"
@@ -585,11 +501,18 @@ namespace Syntax.Process is
     // the pair invariant `equality-without-hash` exists to protect.
     // `<>` opts out too, since equality is already derived from it.
     wants_synthesized_equality(body: Definitions.LIST) -> bool static =>
+        declares_no_equality(body) /\
+        has_only_public_state(body)
+
+    // A class is synthesized for only where an `@equality` pragma
+    // asked, so the state it holds is state the author meant to
+    // compare and its visibility says nothing about that. What still
+    // opts out is an equality already written.
+    declares_no_equality(body: Definitions.LIST) -> bool static =>
         !declares_function(body, "=~") /\
         !declares_function(body, "<>") /\
         !declares_function(body, "get_hash_code") /\
-        !declares_object_equals(body) /\
-        has_only_public_state(body)
+        !declares_object_equals(body)
 
     // A struct compares memberwise. The parameter is the struct's own
     // type and a struct value has no absent form, so the body needs no
@@ -598,69 +521,57 @@ namespace Syntax.Process is
     // a `=~` operator, because which comparison to run is not knowable
     // here - only once the member's static type has resolved.
     get_memberwise_equals_for_struct(`struct: Definitions.STRUCT) -> Definitions.FUNCTION is
-        let location = LOCATION.internal
-
-        let other_argument = Variables.VARIABLE(
-            location,
-            Identifiers.Identifier(location, "other"),
+        return get_memberwise_equals(
             get_classy_type_expression(`struct),
-            false,
-            false,
-            null
-        )
-
-        let condition: Trees.Expressions.Expression mut =
-            Trees.Expressions.Literals.BOOLEAN(location, "true")
-
-        for member in get_state_members(`struct.body) do
-            // The member's own declaration, so that a report about how
-            // this member compares lands where the member was written.
-            let member_location = member.location
-            let read_name = get_state_member_read_name(member)
-
-            let self_member = Trees.Expressions.MEMBER(
-                member_location,
-                Trees.Expressions.SELF(member_location),
-                Identifiers.Identifier(member_location, read_name),
-                member_location
-            )
-
-            let other_member = Trees.Expressions.MEMBER(
-                member_location,
-                Trees.Expressions.IDENTIFIER(
-                    member_location,
-                    Identifiers.Identifier(member_location, "other")
-                ),
-                Identifiers.Identifier(member_location, read_name),
-                member_location
-            )
-
-            condition = Trees.Expressions.BINARY(
-                location,
-                Identifiers.Identifier(location, "/\\"),
-                "/\\",
-                condition,
-                Trees.Expressions.FIELD_EQUALS(member_location, self_member, other_member)
-            )
-        od
-
-        // Store-free by construction - member reads and one comparison
-        // each - but the effects solve does not cover synthesized
-        // functions, so the declaration is what satisfies the operator
-        // store-free mandate, as it does for a union's variants.
-        let modifiers = Modifiers.LIST(location, null, null)
-        modifiers.is_pure = true
-
-        return Definitions.FUNCTION(
-            location,
-            Identifiers.Identifier(location, "=~"),
-            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
-            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]([other_argument])),
-            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
-            modifiers,
-            Trees.Bodies.EXPRESSION(location, condition)
+            get_member_read_names(`struct.body),
+            get_member_locations(`struct.body),
+            false
         )
     si
+
+    // A class compares by runtime type and then memberwise. The
+    // runtime-type test comes first because a base's comparison run
+    // against a subclass value would otherwise compare the base's
+    // fields and answer true, while the subclass's own override
+    // answered false, leaving the relation asymmetric.
+    //
+    // The parameter is the class's own type here. Where the class
+    // turns out to extend one that is itself synthesized, the pass
+    // that resolves that retypes it to the base's parameter type, so
+    // that the two are one virtual slot rather than two overloads.
+    // The members are read straight off `other`, which is this class
+    // here. Where the parameter is retyped, the pass that does it
+    // prefixes an `isa` to narrow it back.
+    get_memberwise_equals_for_class(`class: Definitions.CLASS) -> Definitions.FUNCTION is
+        let equals =
+            get_memberwise_equals(
+                get_classy_type_expression(`class),
+                get_member_read_names(`class.body),
+                get_member_locations(`class.body),
+                false
+            )
+
+        return equals
+    si
+
+    // `expression.get_type()`, the runtime type of a value.
+    get_runtime_type(
+        location: LOCATION,
+        expression: Trees.Expressions.Expression
+    ) -> Trees.Expressions.Expression static =>
+        Trees.Expressions.CALL(
+            location,
+            Trees.Expressions.MEMBER(
+                location,
+                expression,
+                Identifiers.Identifier(location, "get_type"),
+                location
+            ),
+            Trees.Expressions.LIST(
+                location,
+                Collections.LIST[Trees.Expressions.Expression]()
+            )
+        )
 
     // One member's contribution to a synthesized `get_hash_code`,
     // read through `object?` so that a member of any kind answers:
@@ -718,38 +629,6 @@ namespace Syntax.Process is
     get_memberwise_hash_code(body: Definitions.LIST) -> Definitions.FUNCTION is
         let location = LOCATION.internal
 
-        let combined: Trees.Expressions.Expression mut =
-            Trees.Expressions.Literals.INTEGER(location, "0")
-
-        for member in get_state_members(body) do
-            let member_hash =
-                get_member_hash_code(
-                    location,
-                    Trees.Expressions.MEMBER(
-                        location,
-                        Trees.Expressions.SELF(location),
-                        Identifiers.Identifier(location, get_state_member_read_name(member)),
-                        location
-                    )
-                )
-
-            let mul = Trees.Expressions.BINARY(
-                location,
-                Identifiers.Identifier(location, "*"),
-                "*",
-                combined,
-                Trees.Expressions.Literals.INTEGER(location, "31")
-            )
-
-            combined = Trees.Expressions.BINARY(
-                location,
-                Identifiers.Identifier(location, "+"),
-                "+",
-                mul,
-                member_hash
-            )
-        od
-
         return Definitions.FUNCTION(
             location,
             Identifiers.Identifier(location, "get_hash_code"),
@@ -757,8 +636,87 @@ namespace Syntax.Process is
             Variables.LIST(location, Collections.LIST[Variables.VARIABLE]()),
             TypeExpressions.NAMED(location, Identifiers.Identifier(location, "int")),
             Modifiers.LIST(location, null, null),
-            Trees.Bodies.EXPRESSION(location, combined)
+            Trees.Bodies.EXPRESSION(
+                location,
+                Trees.Expressions.MEMBERWISE_HASH(
+                    location,
+                    get_member_read_names(body),
+                    get_member_locations(body)
+                )
+            )
         )
+    si
+
+    // The `=~` a type is given: one parameter at the type the whole
+    // chain compares at, and a body that stands for the comparison
+    // rather than spelling it. What it does - which guard, how each
+    // member compares, what a base contributes - is settled where
+    // those are known, which is not here.
+    get_memberwise_equals(
+        parameter_type: TypeExpressions.TypeExpression,
+        members: Collections.LIST[string],
+        member_locations: Collections.LIST[LOCATION],
+        reports_fallback: bool
+    ) -> Definitions.FUNCTION is
+        let location = LOCATION.internal
+
+        let other_argument = Variables.VARIABLE(
+            location,
+            Identifiers.Identifier(location, "other"),
+            parameter_type,
+            false,
+            false,
+            null
+        )
+
+        let body = Trees.Expressions.MEMBERWISE_EQUALS(location, members, member_locations)
+
+        body.reports_fallback = reports_fallback
+
+        // Declared rather than left to be proven, and not because the
+        // body needs covering: it reads members and compares them, and
+        // the effects walk is told which comparisons it reaches. What
+        // the declaration buys is the contract over dispatch. An `open`
+        // class can be subclassed in another assembly, so no analysis
+        // here can prove what an override does, and the mandate that
+        // makes a member `=~` trustworthy is what binds every override
+        // to the same rule. A user writing the operator on an open
+        // class declares it for the same reason.
+        let modifiers = Modifiers.LIST(location, null, null)
+        modifiers.is_pure = true
+
+        return Definitions.FUNCTION(
+            location,
+            Identifiers.Identifier(location, "=~"),
+            TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+            Variables.LIST(location, Collections.LIST[Variables.VARIABLE]([other_argument])),
+            TypeExpressions.NAMED(location, Identifiers.Identifier(location, "bool")),
+            modifiers,
+            Trees.Bodies.EXPRESSION(location, body)
+        )
+    si
+
+    // The members a value of the type is compared and hashed by, under
+    // the names it is read by: an auto-property through its backing
+    // field, a `field` member by its own name.
+    get_member_locations(body: Definitions.LIST) -> Collections.LIST[LOCATION] static is
+        let locations = Collections.LIST[LOCATION]()
+
+        for member in get_state_members(body) do
+            locations.add(member.location)
+        od
+
+        return locations
+    si
+
+    get_member_read_names(body: Definitions.LIST) -> Collections.LIST[string] static is
+        let names = Collections.LIST[string]()
+
+        for member in get_state_members(body) do
+            names.add(get_state_member_read_name(member))
+        od
+
+        return names
     si
 
     // A TypeExpression naming the type itself, mirroring its own type
@@ -777,6 +735,23 @@ namespace Syntax.Process is
                 Identifiers.Identifier(Source.LOCATION.internal, classy.name.name)
             )
         fi
+
+    // Whether the member of that name in the type's body is one the
+    // compiler put there.
+    declares_synthesized_function(body: Definitions.LIST, name: string) -> bool static is
+        for definition in body do
+            if
+                isa Definitions.FUNCTION(definition) /\
+                definition.is_synthesized /\
+                definition.name? /\
+                definition.name.name =~ name
+            then
+                return true
+            fi
+        od
+
+        return false
+    si
 
     // Whether a type's own body declares a member of the given name.
     // Only the body is consulted, so a member arriving from a
@@ -861,6 +836,9 @@ namespace Syntax.Process is
     // narrow, which is the one shape that holds for a struct as well
     // as a class, and which accepts either spelling of the operator's
     // own parameter.
+    // Marked synthesized as well as carrying an internal location:
+    // the class path takes the bridge back out with the operator it
+    // bridges to, and finds it by that mark.
     get_object_equals_bridge(
         location: LOCATION,
         type_expression: TypeExpressions.TypeExpression
@@ -948,7 +926,7 @@ namespace Syntax.Process is
             )
         )
 
-        return Definitions.FUNCTION(
+        let bridge = Definitions.FUNCTION(
             location,
             Identifiers.Identifier(location, "equals"),
             TypeExpressions.LIST(LOCATION.internal, Collections.LIST[TypeExpressions.TypeExpression](0)),
@@ -960,6 +938,10 @@ namespace Syntax.Process is
             Modifiers.LIST(location, null, null),
             body
         )
+
+        bridge.mark_synthesized()
+
+        return bridge
     si
 
 si

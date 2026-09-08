@@ -1,0 +1,417 @@
+namespace Syntax.Process is
+    use Source
+
+    // Settles the synthesized equality members a class was given
+    // before its ancestors were known.
+    //
+    // ADD_ACCESSORS_FOR_PROPERTIES answers eligibility from a class's
+    // own body, which is all it can see: at rewrite time a superclass
+    // is an unresolved name. What inheritance decides is settled here,
+    // once every file's ancestors have resolved and before argument
+    // types are stamped, so that a retyped parameter is stamped from
+    // the tree like any other.
+    //
+    // Two things are decided. A class that inherits an equality it did
+    // not get from here - one the author wrote, one reached through a
+    // trait, one imported - keeps that operator and loses the
+    // synthesized members: a second one at this class's own parameter
+    // type would be an overload against the inherited one rather than
+    // an override of it, and every use would be ambiguous. And a class
+    // whose base is synthesized too joins the base's operator instead
+    // of opening a second: its parameter is retyped to the base's, so
+    // the two are one virtual slot, and its comparison ends by
+    // delegating the base's own members to the base.
+    //
+    // A class over a base that has no equality at all also loses them.
+    // The base's state is part of this class's values and the operator
+    // could not read it, so a comparison over this class's members
+    // alone would answer equal for two values the base distinguishes -
+    // the same unsoundness that keeps a partly-private type out.
+    class SYNTHESIZE_CLASS_EQUALITY: Visitor is
+        _logger: Logging.Logger
+        _symbol_table: Semantic.SYMBOL_TABLE
+        _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
+
+        init(
+            logger: Logging.Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
+        ) is
+            super.init()
+
+            _logger = logger
+            _symbol_table = symbol_table
+            _innate_symbol_lookup = innate_symbol_lookup
+        si
+
+        apply(root: Trees.Node) is
+            root.walk(self)
+        si
+
+        pre(`class: Trees.Definitions.CLASS) -> bool is
+            _settle(`class)
+
+            return false
+        si
+
+        _settle(`class: Trees.Definitions.CLASS) is
+            let class_symbol = cast Semantic.Symbols.CLASS?(_symbol_table.scope_for(`class))
+
+            if !class_symbol? then
+                return
+            fi
+
+            let equals = _find_synthesized(`class.body, "=~")
+
+            if !equals? then
+                _report_uncomparable_state(`class, class_symbol)
+
+                return
+            fi
+
+            _ensure_return_type(equals)
+
+            // Enforcing the override requirement needs to see every
+            // subclass, and an open class can be extended from another
+            // assembly where nothing here is checked. The requirement
+            // would be silently unenforced there, and the operator it
+            // guards would answer for subclasses it cannot read.
+            if class_symbol.is_open then
+                _withdraw(`class, class_symbol)
+
+                _logger.error(
+                    `class.name.location,
+                    "{`class.name.name} is open, so equality cannot be synthesized for it: a subclass in another assembly cannot be held to supplying its own"
+                )
+
+                return
+            fi
+
+            if !_keeps_equality(class_symbol, 0) then
+                _withdraw(`class, class_symbol)
+
+                _report_uncomparable_state(`class, class_symbol)
+
+                return
+            fi
+
+            let base = _base_class_type(class_symbol)
+
+            if !base? \/ !_is_synthesized_equality(base) then
+                return
+            fi
+
+            _join_to_base(`class, equals)
+        si
+
+        // A class under one whose equality the compiler wrote. The
+        // inherited operator reads the base's members and compares by
+        // exact runtime type, so it answers for this class without
+        // ever seeing what this class adds. Every subclass therefore
+        // supplies its own, by asking for one or by writing it.
+        _report_uncomparable_state(
+            `class: Trees.Definitions.CLASS,
+            class_symbol: Semantic.Symbols.CLASS
+        ) is
+            // Answered from this class's own declarations: a member
+            // lookup on the symbol reaches inherited members, and
+            // what is inherited is the very thing being reported.
+            if declares_function(`class.body, "=~") then
+                return
+            fi
+
+            let owner = _synthesized_equality_ancestor(class_symbol, 0)
+
+            if !owner? then
+                return
+            fi
+
+            _logger.error(
+                `class.name.location,
+                "{`class.name.name} must declare =~ and get_hash_code",
+                owner.location,
+                "help: this equality applies only to {owner.name} - @equality() writes them for a subclass"
+            )
+        si
+
+        // The nearest ancestor carrying an operator the compiler
+        // wrote, so that the report can point at what is inherited.
+        _synthesized_equality_ancestor(
+            symbol: Semantic.Symbols.Classy,
+            depth: int
+        ) -> Semantic.Symbols.Classy? is
+            if depth > 64 then
+                return null
+            fi
+
+            for ancestor in symbol.ancestors do
+                let ancestor_symbol = cast Semantic.Symbols.Classy?(ancestor.symbol)
+
+                if !ancestor_symbol? then
+                    continue
+                fi
+
+                let equals = ancestor_symbol.find_member("=~")
+
+                if equals? /\ equals.is_internal then
+                    return ancestor_symbol
+                fi
+
+                let further = _synthesized_equality_ancestor(ancestor_symbol, depth + 1)
+
+                if further? then
+                    return further
+                fi
+            od
+
+            return null
+        si
+
+        // The operator returns `bool`, which the synthesis names and
+        // resolve-type-expressions looks up like any other name. A file
+        // whose scope is already broken - globals mixed with a
+        // namespace, say - may not have it in reach, and a synthesized
+        // member reporting that is noise on top of the real diagnostic.
+        _ensure_return_type(equals: Trees.Definitions.FUNCTION) is
+            if equals.type_expression.type? then
+                return
+            fi
+
+            equals.type_expression.type = _innate_symbol_lookup.get_bool_type()
+        si
+
+        // Whether a class's synthesized members survive. Answered from
+        // the ancestors alone, so the order files are visited in does
+        // not change the answer: a subclass reaches the same decision
+        // whether or not its base has been visited yet.
+        _keeps_equality(class_symbol: Semantic.Symbols.CLASS, depth: int) -> bool is
+            // A hierarchy that refers to itself is already an error;
+            // stopping here keeps this from following it forever.
+            if depth > 64 then
+                return false
+            fi
+
+            let own = class_symbol.find_member("=~")
+
+            // A `partial` or `impl` block declared an operator that the
+            // body this was synthesized from could not see.
+            if !own? \/ !own.is_internal then
+                return false
+            fi
+
+            // An operator reached through a trait, or through any
+            // ancestor that did not get one from here, answers for this
+            // class already. A second one at this class's parameter
+            // type would be an overload against it rather than an
+            // override of it.
+            if _inherits_foreign_equality(class_symbol, 0) then
+                return false
+            fi
+
+            let base = _base_class_type(class_symbol)
+
+            if !base? then
+                return true
+            fi
+
+            // A base taking type arguments is declined. The parameter
+            // a subclass overrides at is the base's own read through
+            // the instantiation, and an ancestor lookup on a closed
+            // instantiation answers the unspecialised type instead.
+            if base.arguments.count > 0 then
+                return false
+            fi
+
+            let base_symbol = cast Semantic.Symbols.CLASS?(base.symbol)
+
+            if !base_symbol? then
+                return false
+            fi
+
+            if !base_symbol.find_member("=~")? then
+                // `object` holds no state, so a class directly over it
+                // is the root of its own comparison. Any other base
+                // without an operator holds state this one cannot read.
+                return _is_object(base)
+            fi
+
+            if !_is_synthesized_equality(base) then
+                return false
+            fi
+
+            // A base whose own members are withdrawn leaves nothing to
+            // join to.
+            return _keeps_equality(base_symbol, depth + 1)
+        si
+
+        // Whether any ancestor - a superclass, a trait, or one of
+        // theirs - declares an equality this class did not get from
+        // here. Genericity is not in the way of the question: what is
+        // being asked is whether an operator is there at all.
+        _inherits_foreign_equality(symbol: Semantic.Symbols.Classy, depth: int) -> bool is
+            if depth > 64 then
+                return false
+            fi
+
+            for ancestor in symbol.ancestors do
+                if _is_object(ancestor) then
+                    continue
+                fi
+
+                let ancestor_symbol = cast Semantic.Symbols.Classy?(ancestor.symbol)
+
+                if !ancestor_symbol? then
+                    continue
+                fi
+
+                let equals = ancestor_symbol.find_member("=~")
+
+                if equals? /\ !equals.is_internal then
+                    return true
+                fi
+
+                if _inherits_foreign_equality(ancestor_symbol, depth + 1) then
+                    return true
+                fi
+            od
+
+            return false
+        si
+
+        // The class this one extends, or null where it extends nothing
+        // but `object`.
+        _base_class_type(class_symbol: Semantic.Symbols.CLASS) -> Semantic.Types.Type? is
+            for ancestor in class_symbol.ancestors do
+                if !ancestor.is_class then
+                    continue
+                fi
+
+                if _is_object(ancestor) then
+                    return null
+                fi
+
+                return ancestor
+            od
+
+            return null
+        si
+
+        _is_object(type: Semantic.Types.Type) -> bool =>
+            type.unspecialized_symbol == _innate_symbol_lookup.get_object_type().unspecialized_symbol
+
+        _is_synthesized_equality(type: Semantic.Types.Type?) -> bool is
+            if !type? then
+                return false
+            fi
+
+            let symbol = cast Semantic.Symbols.CLASS?(type.symbol)
+
+            if !symbol? then
+                return false
+            fi
+
+            let equals = symbol.find_member("=~")
+
+            return equals? /\ equals.is_internal
+        si
+
+        // The type the whole chain's operator takes, which is the type
+        // of the topmost class the members were synthesized for. Every
+        // class below it overrides at that type rather than narrowing
+        // to its own, since a narrowed parameter would be a second
+        // overload rather than an override.
+        _root_type(class_symbol: Semantic.Symbols.CLASS, depth: int) -> Semantic.Types.Type is
+            if depth > 64 then
+                return class_symbol.type!
+            fi
+
+            let base = _base_class_type(class_symbol)
+
+            if !base? \/ !_is_synthesized_equality(base) then
+                return class_symbol.type!
+            fi
+
+            let base_symbol = cast Semantic.Symbols.CLASS?(base.symbol)
+
+            if !base_symbol? \/ !_keeps_equality(base_symbol, 0) then
+                return class_symbol.type!
+            fi
+
+            return _root_type(base_symbol, depth + 1)
+        si
+
+        // Retypes the operator's parameter to the one the base takes,
+        // so that the two are one virtual slot rather than two
+        // overloads. Nothing else: what the body does about the base
+        // is decided where it is emitted, which is the only place that
+        // knows what the base holds.
+        //
+        // The type expression keeps the name it was built with and is
+        // given the resolved type directly - it carries an internal
+        // location, so the name is never read back, and
+        // resolve-type-expressions has already run.
+        _join_to_base(
+            `class: Trees.Definitions.CLASS,
+            equals: Trees.Definitions.FUNCTION
+        ) is
+            let class_symbol = cast Semantic.Symbols.CLASS?(_symbol_table.scope_for(`class))!
+
+            let root_type = _root_type(class_symbol, 0)
+
+            for argument in equals.arguments do
+                argument.type_expression.type = root_type
+            od
+        si
+
+        // Takes the synthesized members back out, tree node and symbol
+        // alike, so that what the class inherits is what answers.
+        _withdraw(`class: Trees.Definitions.CLASS, class_symbol: Semantic.Symbols.CLASS) is
+            for name in ["=~", "get_hash_code", "equals"] do
+                let definition = _find_synthesized(`class.body, name)
+
+                if !definition? then
+                    continue
+                fi
+
+                `class.body.remove(definition)
+
+                let group = cast Semantic.Symbols.FUNCTION_GROUP?(class_symbol.find_member(name))
+
+                if !group? then
+                    continue
+                fi
+
+                // Only the synthesized halves go: the class may hold a
+                // `partial` block's own member under the same name,
+                // and that is the one left to answer.
+                for function in Collections.LIST[Semantic.Symbols.Function](group.functions) do
+                    if function.is_internal then
+                        group.remove(function)
+                    fi
+                od
+
+                if group.is_empty then
+                    class_symbol.remove_direct(name)
+                fi
+            od
+        si
+
+        _find_synthesized(
+            body: Trees.Definitions.LIST,
+            name: string
+        ) -> Trees.Definitions.FUNCTION? static is
+            for definition in body do
+                if
+                    isa Trees.Definitions.FUNCTION(definition) /\
+                    definition.is_synthesized /\
+                    definition.name? /\
+                    definition.name.name =~ name
+                then
+                    return definition
+                fi
+            od
+
+            return null
+        si
+    si
+si
