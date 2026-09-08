@@ -498,6 +498,8 @@ The pragma applies to the class it is written on and to no other, so each class 
 
 A synthesized operator serves only the class it was written for: it admits operands of exactly that runtime type and reads only that class's members. So a subclass of a class that has one must supply its own, either by asking with `@equality()` or by declaring `=~` and `get_hash_code`, and a subclass that does neither is an error. That holds however little the subclass adds: the rule is uniform, so that every class in a hierarchy states its own position rather than its obligation depending on whether it happens to declare a field. A subclass whose base declares equality by hand is unaffected — what the author wrote is the author's to answer for.
 
+The synthesized pair settles how .NET itself compares the value, through the `Equals` bridge, so a class that asks becomes a dictionary key that finds an equal value rather than only the same object. A class relied on to compare by identity in a `MAP` or a `SET` simply does not ask.
+
 Asking for equality on a class that already declares `=~`, `<>`, `get_hash_code` or an `equals` over `object` is an error, since the request contradicts what is written. So is asking on an `open` class: enforcing the rule above needs every subclass in view, and an `open` class can be extended from another assembly.
 
 A class without the pragma is unaffected: it has no `=~` at all, and comparing two of its values by `==` asks about identity as it always did. Structs and unions need no pragma, and are given equality wherever they declare none — a struct is a value, so two structs holding equal members already are the same value, and a union is compared by which variant it holds and what that variant carries.
@@ -555,46 +557,6 @@ si
 ```
 
 The two modifiers are independent: `open` controls who can extend, `abstract` controls who can be instantiated. They can be combined (`class Animal abstract open is ... si` is an extensible abstract base) or stand alone.
-
-A class that declares no equality of its own, and inherits none, is given a `=~` and a matching `get_hash_code` over the members that hold its state — the same members a struct's are built from, each compared through its own type's equality:
-
-```ghul
-class POINT is
-    x: int;
-    y: int;
-
-    init(x: int, y: int) is
-        self.x = x;
-        self.y = y;
-    si
-si
-
-POINT(1, 2) =~ POINT(1, 2)      // true
-```
-
-The conditions a struct is held to hold here too: declaring `=~`, `<>`, `get_hash_code` or an `equals` over `object` opts the class out of both, and every member holding state must be public. A class holding no state at all is left alone, since an operator over nothing would answer equal for any two instances.
-
-Inheritance decides two more things. **A synthesized comparison requires the same runtime type**, so a base and a subclass are never equal in either direction, whichever side is asked. Without that the relation would be asymmetric: the base's comparison run against a subclass value would compare the base's members and answer true, while the subclass's own answered false.
-
-**Inheriting an operator the class did not get this way opts it out.** A class extending one that declares `=~`, or reaching one through a trait, keeps that operator: a second one at this class's own parameter type would be an overload against the inherited one rather than an override of it. A class over a base that has no equality at all is left alone too — the base's state is part of this class's values and the comparison could not read it, which is the same reason private state keeps a type out. A class over a *synthesized* base is the case that composes: it takes an operator of its own, at the base's parameter type, comparing the members declared here and then handing the base's own to the base.
-
-```ghul
-class POINT_3D: POINT is
-    z: int;
-
-    init(x: int, y: int, z: int) is
-        super.init(x, y);
-        self.z = z;
-    si
-si
-
-POINT_3D(1, 2, 3) =~ POINT_3D(1, 2, 3)               // true
-cast POINT(POINT_3D(1, 2, 3)) =~ POINT(1, 2)         // false - different types
-```
-
-A base taking type arguments is declined, and a subclass of one inherits the base's operator like any other consumer: the comparison then reads the base's members alone, which is coarse and still an equivalence relation.
-
-As with a struct, the synthesized pair settles how .NET itself compares the value, through the `Equals` bridge, so an all-public class becomes a dictionary key that finds an equal value rather than only the same object. A class that was relied on to compare by identity in a `MAP` or a `SET` declares its own `=~` and `get_hash_code` to keep that.
 
 A class is **implicitly abstract** when it has any user-written body-less instance method — `foo();` or `foo() -> int;` with no `is … si` body. The user clearly wrote the method as a contract for subclasses to satisfy, and a bare instance of the class would have nothing useful to do on calling it, so the constructor is rejected the same way `abstract` rejects it. Property accessors, `init`, and static methods are excluded — a write-only property leaves its synthesised getter body-less without making the enclosing class abstract.
 
@@ -987,7 +949,7 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 
 Where more than one of those could answer, the nearest declaration wins: a member operator first, then a global one, and the element-wise or comparer-based comparison only where nothing is declared.
 
-It is not defined everywhere. A class holding non-public state, or holding none at all, does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`. Nor does a struct that holds any non-public state, or that declares `get_hash_code` or an `equals` over `object` without an operator to go with it: either leaves the struct as it was, with no `=~` until one is written for it. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
+It is not defined everywhere. A class that neither declares equality nor asks for one with `@equality()` does not get one — the operator does not resolve, rather than falling back to identity — and neither does `object`. Nor does a struct that holds any non-public state, or that declares `get_hash_code` or an `equals` over `object` without an operator to go with it: either leaves the struct as it was, with no `=~` until one is written for it. Writing `=~` where nothing defines it is a compile error naming the operand types. A `SET` is not compared element by element, since its equality is order-insensitive: `set_equals` answers that. A pipe is not compared at all, since reading one consumes it.
 
 Defining `=~` on a type means defining `get_hash_code` alongside it: the two are a pair, and .NET's collections consult the hash first. [.NET interop](#net-interop) covers the `Ghul.Equatable[T]` contract, the `Equals` bridge, and why the hash cannot be generated for you.
 
