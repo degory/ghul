@@ -382,7 +382,7 @@ A named function's signature is fully explicit: every argument has a written typ
 
 A block body produces its value with an explicit `return`, or by ending on an expression: the final statement of a non-void body is the function's return value on the fall-through path whenever its type is assignable to the declared return type, terminated with `;` or not — the tail is judged by its type, never by its terminator. An expression qualifies, and so do an `if`/`case` expression and a parenthesised block. A tail of an incompatible non-void type is an error at the tail; to genuinely discard such a value, write `let _ = expr`. A void tail — an effect-only call, or an `if`/`case` whose arms diverge or do only effects — is the statement it is: the body falls off the end, returns the default value of the return type, and draws a `definite-return` warning. An asynchronous function accepts a bare-`T` value as its tail exactly where it accepts `return T`. Loops, `let`, assignments and `assert` never provide a tail value, and neither do labelled statements or `try` blocks (until `try` has an expression form). Void bodies tolerate any tail: whatever is left standing at the end of a void method is discarded, and an expression body follows the same rule, so `f(x: int) -> void => g(x);` discards `g`'s result rather than returning it. Generators are exempt from all of this: their fall-through signals end of stream.
 
-Functions are declared at namespace scope — there are no nested function definitions — and may be overloaded on their argument types. There are no default argument values. Execution of a program begins at a function named `entry`, or — in a file with no namespace — at the bare statements written at its file root, which are collected in source order into that entry point. An `entry` function takes either no parameters or a single `string[]` of the command-line arguments, and returns either nothing or an `int` exit status. It should not be asynchronous: an async `entry` returns a task rather than one of those, which draws a warning and leaves the program without an entry point — to run asynchronous work, read `.result` on the returned task. The name can be changed with `--entry <name>`, and an `@entry` pragma marks any function as the entry point regardless of name.
+A function declared at namespace scope may be overloaded on its argument types. There are no default argument values. Execution of a program begins at a function named `entry`, or — in a file with no namespace — at the bare statements written at its file root, which are collected in source order into that entry point. An `entry` function takes either no parameters or a single `string[]` of the command-line arguments, and returns either nothing or an `int` exit status. It should not be asynchronous: an async `entry` returns a task rather than one of those, which draws a warning and leaves the program without an entry point — to run asynchronous work, read `.result` on the returned task. The name can be changed with `--entry <name>`, and an `@entry` pragma marks any function as the entry point regardless of name.
 
 A formal parameter can be a tuple-destructure pattern instead of a plain name. It is still one physical parameter, at the written tuple type — the pattern is unpacked into its named elements on entry, the same way a `let (a, b) = pair;` local is:
 
@@ -392,7 +392,7 @@ add_pair((a: int, b: int): (int, int)) -> int => a + b;
 add_pair((3, 4));    // 7
 ```
 
-Nesting and mixing with ordinary parameters both work: `f(x: int, (a: int, b: int): (int, int), y: int)`. Because a named function's signature is always fully explicit, the aggregate type ascription is required — there is no context to infer it from — and per-element types are optional, exactly as in a `let (a, b) = pair;` local. The aggregate type can be any positionally-destructurable type — a tuple, or a type with a matching `deconstruct(...)` method. The by-name group form (`(x = field, ...)`) is not supported in a formal argument list.
+Nesting and mixing with ordinary parameters both work: `f(x: int, (a: int, b: int): (int, int), y: int)`. Because a namespace-scope function's signature is always fully explicit, the aggregate type ascription is required — there is no context to infer it from — and per-element types are optional, exactly as in a `let (a, b) = pair;` local. The aggregate type can be any positionally-destructurable type — a tuple, or a type with a matching `deconstruct(...)` method. The by-name group form (`(x = field, ...)`) is not supported in a formal argument list.
 
 Functions are first-class values. A function literal has the same shape without a name, but its argument and return types are generally *inferred* — from the body and from the context the literal is used in — so they are usually written without annotations (though either can be given explicitly). With a single argument the parentheses are optional. `A -> B` is the type of a function from `A` to `B`. A function *type* — and so a function literal, or a named function referred to as a value — has at most 16 parameters; a named function itself has no such limit, since it need never be represented as a function-type value. Function literals capture references from the enclosing scope, forming closures: an immutable `let` is captured by value (a snapshot at the point the literal is constructed); a `let mut` is captured by reference, so the closure and the outer scope share one live variable that either side can read or reassign. An anonymous function refers to itself through the `rec` keyword:
 
@@ -430,6 +430,40 @@ entries |> each(((key, value): Collections.KeyValuePair[string, int]) =>
 ```
 
 Patterns nest and take discards, so `(((a, b), c)) => …` and `((_, b)) => …` both work, on plain and asynchronous function literals alike.
+
+A function can also be written among the statements of a body, with a name. It is a function literal that the name is a local variable for, so it captures, compiles and is called exactly as the equivalent `let` would be, and the two spellings are interchangeable:
+
+```ghul
+process(xs: Collections.List[int]) -> int is
+    score(x: int) -> int is
+        if x < 0 then
+            return 0;
+        fi
+
+        x * 2
+    si
+
+    xs |> map(score) |> reduce(0, (a, b) => a + b)
+si
+```
+
+Argument and return types are optional, as they are on any other literal and unlike a namespace-scope function, whose uses are not all in view. Either body form works, and the name may be written wherever a value of its function type is expected, not only in a call:
+
+```ghul
+    halve(x) => x / 2;
+
+    let apply_to_ten = (f: (int) -> int) => f(10);
+
+    apply_to_ten(halve);
+```
+
+The function refers to itself by its own name, so it needs no `rec`, and a literal written inside its body reaches it the same way:
+
+```ghul
+    fact(n: int) -> int => if n <= 1 then 1 else n * fact(n - 1) fi;
+```
+
+Being a local, it is defined from its own definition onward: a reference above it, and mutual recursion between two of them, are both reported. Write one of the pair as a `let mut` literal and assign it afterwards where that is what is wanted. A file's bare top-level statements are not a body, so a named function written among those is a namespace-scope function and its argument types are required.
 
 A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing binding of that name, the same as any other reference. When that binding is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
 
@@ -1856,7 +1890,7 @@ class COROUTINE[T] is ... si
 
 See <https://ghul.dev/type-inference.html>.
 
-ghūl infers types pervasively, but inference is **function-local**: a function's signature — its parameter and return types — is always written out, and inference works only within the body. Within a body, types are inferred for local variables, loop variables, destructured variables, anonymous function parameters and return types, and generic type arguments on calls.
+ghūl infers types pervasively, but inference is **function-local**: a namespace-scope function's signature — its parameter and return types — is always written out, and inference works only within the body. Within a body, types are inferred for local variables, loop variables, destructured variables, the parameters and return types of function literals and of nested named functions, and generic type arguments on calls.
 
 Inference also works from later use: a variable with no immediate clue takes its type from how it is used further down the same body — including from operations the body performs on it, and from its own recursive calls if it is a function. The compiler narrows local variables, fields and store-free properties (see Type narrowing above for how long each kind of fact lasts), and a `let` variable's inferred type does not escape the function it is declared in.
 
