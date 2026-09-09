@@ -200,8 +200,8 @@ let count = 12_345;            // int
 let hex = 0x1234_ABCD;         // int, hexadecimal
 let big = 1_000_000_000L;      // long
 let b = 99b;                   // byte
-let ratio = 123.456;           // single
-let precise = 123.456D;        // double
+let ratio = 123.456;           // double
+let coarse = 123.456s;         // single
 let price = 19.99m;            // decimal
 let huge = 900719925474099n;   // bigint
 let letter = 'c';              // char
@@ -234,13 +234,13 @@ write_line("{factorial}");     // 265252859812191058636308480000000
 
 Mixed operands stay an error, exactly as `1.0D + 1` is: `total * 2` is rejected where `total` is a `bigint`, and `total * 2n` is what to write. `==` is rejected on it as on every other struct; compare with `=~`.
 
-A fractional literal is a `single` unless suffixed — `s` single, `d` double, `m` decimal, in either case. The `m` suffix is also accepted on a digit-only literal to write an integral decimal (`100m`). Exponent notation is accepted: `1.5e3`, `1.5E-3`.
+A fractional literal is a `double` unless suffixed — `s` single, `d` double, `m` decimal, in either case. The `m` suffix is also accepted on a digit-only literal to write an integral decimal (`100m`). Exponent notation is accepted: `1.5e3`, `1.5E-3`.
 
 ghūl does not convert between scalar types implicitly — a mixed-type arithmetic expression is a compile-time error, and a `cast` is required. Upcasting is implicit: a value is assignment-compatible with any ancestor type, so a `string` can be assigned to an `object` with no cast.
 
 ```ghul
-let a = 1.0D + 1.0D;             // ok, both double
-let b = 1.0D + cast double(1);   // ok, explicit cast
+let a = 1.0 + 1.0;               // ok, both double
+let b = 1.0 + cast double(1);    // ok, explicit cast
 let o: object = "hello";         // ok, string is an object
 ```
 
@@ -1974,7 +1974,7 @@ An overloaded name is resolved against whichever function or delegate type the r
 A .NET **user-defined conversion operator** (`op_Implicit` / `op_Explicit`) declared on either the source or the target type is reachable through `cast`, alongside the subtype and scalar conversions `cast` already performs:
 
 ```ghul
-let h = cast System.Half(1.5);      // System.Half declares `explicit operator Half(float)`
+let h = cast System.Half(1.5);      // System.Half declares `explicit operator Half(double)`
 let f = cast single(h);             // and `implicit operator float(Half)`
 ```
 
