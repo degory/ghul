@@ -3,6 +3,9 @@ namespace Semantic.DotNet is
     use Collections.LIST
 
     use TYPE = System.Type
+    use ASSEMBLY = System.Reflection.Assembly
+
+    use System.Reflection.BindingFlags
 
     use MDR = System.Reflection.Metadata.MetadataReader
     use System.Reflection.Metadata.EntityHandle
@@ -10,6 +13,7 @@ namespace Semantic.DotNet is
     use System.Reflection.Metadata.TypeReferenceHandle
     use System.Reflection.Metadata.TypeDefinitionHandle
     use System.Reflection.Metadata.TypeSpecificationHandle
+    use System.Reflection.Metadata.AssemblyReferenceHandle
     use System.Reflection.Metadata.MemberReferenceHandle
     use System.Reflection.Metadata.BlobHandle
     use System.Reflection.Metadata.SignatureTypeCode
@@ -33,109 +37,169 @@ namespace Semantic.DotNet is
     // `System.Reflection.Metadata` directly against the assembly's raw
     // bytes, since ordinary reflection (`System.Type`,
     // `CustomAttributeData`) has no way to address this row at all.
+    //
+    // The result is keyed by the interface's own `System.Type` — never
+    // by a name rendered from each side and compared, which silently
+    // conflates two same-named interfaces from different assemblies and
+    // silently drops a nested interface, whose namespace and enclosing
+    // type the two readers would place differently. `_resolve` recovers
+    // the real `Type` object instead, via the same already-loaded
+    // assemblies the rest of the compiler reflects through, so the
+    // caller compares actual type identity.
     class INTERFACE_NULLABILITY is
         // One entry per interface `declaring_type`'s own `TypeDef`
         // implements directly (not one it only inherits via a base
-        // class), keyed by the interface's open-generic-definition full
-        // name (plain full name when the interface isn't generic) — see
-        // `key_for`. The CLR forbids a type from implementing the same
-        // open generic interface twice with different type arguments,
-        // so the key is unique per `TypeDef`. The byte lists follow the
-        // same pre-order convention `NULLABILITY.apply_bytes` already
-        // reads: whatever the row's own head byte says, only a `2`
-        // anywhere in the tree ever turns a position optional, so this
-        // is safe to feed straight in.
+        // class), keyed by `key_for`'s reduction of the interface's own
+        // `Type` — open generic definition, since the CLR forbids
+        // implementing the same one twice with different type
+        // arguments, so it's unique per `TypeDef`; the type itself when
+        // it isn't generic. The byte lists follow the same pre-order
+        // convention `NULLABILITY.apply_bytes` already reads: whatever
+        // the row's own head byte says, only a `2` anywhere in the tree
+        // ever turns a position optional, so this is safe to feed
+        // straight in.
         //
         // Empty when `reader` can't resolve `declaring_type`'s own
         // `TypeDef`, or that `TypeDef` declares no interfaces with a
         // `NullableAttribute` on their row — the caller's fallback,
         // leaving every position at its non-optional default, is
         // correct either way.
-        read_declared(reader: MDR, declaring_type: TYPE) -> MAP[string, LIST[int]] static is
-            let result = MAP[string, LIST[int]]()
+        read_declared(
+            reader: MDR,
+            declaring_type: TYPE,
+            assembly_names: MAP[string,ASSEMBLY]
+        ) -> MAP[TYPE, LIST[int]] static is
+            let result = MAP[TYPE, LIST[int]]()
 
-            try
-                let type_def_handle = MetadataTokens.type_definition_handle(declaring_type.metadata_token)
-                let type_def = reader.get_type_definition(type_def_handle)
+            let type_def = _type_definition(reader, declaring_type)
 
-                for impl_handle in type_def.get_interface_implementations() do
+            if !type_def? then
+                // `reader` can't resolve `declaring_type`'s own `TypeDef`
+                // — every interface argument stays at its non-optional
+                // default, the same outcome as an assembly with no
+                // nullability metadata at all.
+                return result
+            fi
+
+            for impl_handle in type_def.get_interface_implementations() do
+                // One interface implementation this reader can't resolve
+                // or decode leaves that one interface's arguments at
+                // their non-optional default — never the others in the
+                // same list.
+                try
                     let implementation = reader.get_interface_implementation(impl_handle)
 
-                    if let key = _describe(reader, implementation.`interface) then
+                    if let interface_type: TYPE = _resolve(reader, implementation.`interface, declaring_type.assembly, assembly_names) then
                         if let bytes = _nullable_bytes(reader, implementation) then
-                            result[key] = bytes
+                            result[interface_type] = bytes
                         fi
                     fi
-                od
-            catch ex: System.Exception
-                // Best-effort: a TypeDef this reader can't resolve, or
-                // metadata it can't parse, leaves every interface
-                // argument at its non-optional default — the same
-                // outcome as an assembly with no nullability metadata
-                // at all.
-            yrt
+                catch ex: System.Exception
+                yrt
+            od
 
             return result
         si
 
-        // The matching key for a reflected `System.Type` interface entry
-        // from `type.get_interfaces()`. Must agree with `_describe`'s
-        // raw-metadata key for the same interface — both reduce to the
-        // interface's own namespace-qualified, arity-suffixed name and
-        // drop its type arguments, which is what makes the two sides
-        // comparable despite reading the interface through two
-        // completely different mechanisms.
-        key_for(interface_type: TYPE) -> string static is
-            let definition =
-                if interface_type.is_generic_type then
-                    interface_type.get_generic_type_definition()
-                else
-                    interface_type
-                fi
-
-            return "{definition.`namespace ?? ""}.{definition.name}"
+        _type_definition(reader: MDR, declaring_type: TYPE) -> System.Reflection.Metadata.TypeDefinition? static is
+            try
+                return reader.get_type_definition(MetadataTokens.type_definition_handle(declaring_type.metadata_token))
+            catch ex: System.Exception
+                return null
+            yrt
         si
 
-        // The namespace-qualified name `key_for` would compute for the
-        // type `handle` names, read straight from raw metadata rather
-        // than via reflection. A `TypeSpecification` (a closed generic
-        // instantiation, which is what an `InterfaceImpl` row almost
-        // always names) is unwrapped to the open generic definition it
-        // instantiates — the same reduction `key_for` performs on the
-        // reflected side.
-        _describe(reader: MDR, handle: EntityHandle) -> string? static is
-            case handle.kind
-            when HandleKind.TYPE_REFERENCE then
-                let type_ref = reader.get_type_reference(cast TypeReferenceHandle(handle))
+        // The matching key for a reflected interface `Type` from
+        // `type.get_interfaces()` — the same reduction `read_declared`
+        // applies to what it resolves, so the two sides compare equal
+        // for the same interface.
+        key_for(interface_type: TYPE) -> TYPE static is
+            if interface_type.is_generic_type then
+                interface_type.get_generic_type_definition()
+            else
+                interface_type
+            fi
+        si
 
-                return "{reader.get_string(type_ref.`namespace)}.{reader.get_string(type_ref.name)}"
+        // Resolves `handle` — an `InterfaceImplementation`'s own
+        // `Interface` field, or the open generic definition inside a
+        // `TypeSpecification` naming a closed instantiation — to the
+        // real `System.Type` it names, by walking the same identity
+        // fields .NET itself resolves a type reference through: an
+        // `AssemblyReference`'s own name (an exact metadata field,
+        // looked up in `assembly_names` — the same map
+        // `ASSEMBLIES._assemblies_by_name` already keys by this name
+        // elsewhere) locates the assembly, and `Assembly.get_type`
+        // resolves the type in it, nested types included (a `+`-joined
+        // name, built by walking `ResolutionScope` / the declaring-type
+        // chain, is what `Assembly.get_type` itself expects — this
+        // hands that name to the framework's own resolver rather than
+        // comparing it against anything). `own_assembly` is the
+        // assembly to resolve a `TypeDefinitionHandle` against: such a
+        // handle carries no assembly reference of its own, since the
+        // type it names is unambiguously in the assembly `reader` is
+        // reading.
+        _resolve(
+            reader: MDR,
+            handle: EntityHandle,
+            own_assembly: ASSEMBLY,
+            assembly_names: MAP[string,ASSEMBLY]
+        ) -> TYPE? static is
+            case handle.kind
+            when HandleKind.TYPE_SPECIFICATION then
+                let spec = reader.get_type_specification(cast TypeSpecificationHandle(handle))
+                let blob mut = reader.get_blob_reader(spec.signature)
+
+                if blob.read_signature_type_code() != SignatureTypeCode.GENERIC_TYPE_INSTANCE then
+                    return null
+                fi
+
+                blob.read_signature_type_code()
+
+                return _resolve(reader, blob.read_type_handle(), own_assembly, assembly_names)
             when HandleKind.TYPE_DEFINITION then
                 let type_def = reader.get_type_definition(cast TypeDefinitionHandle(handle))
 
-                return "{reader.get_string(type_def.`namespace)}.{reader.get_string(type_def.name)}"
-            when HandleKind.TYPE_SPECIFICATION then
-                return _describe_instantiation(reader, cast TypeSpecificationHandle(handle))
+                if type_def.is_nested then
+                    if let enclosing: TYPE = _resolve(reader, cast EntityHandle(type_def.get_declaring_type()), own_assembly, assembly_names) then
+                        return enclosing.get_nested_type(
+                            reader.get_string(type_def.name),
+                            cast BindingFlags(16 + 32))
+                    fi
+
+                    return null
+                fi
+
+                return own_assembly.get_type("{reader.get_string(type_def.`namespace)}.{reader.get_string(type_def.name)}")
+            when HandleKind.TYPE_REFERENCE then
+                let type_ref = reader.get_type_reference(cast TypeReferenceHandle(handle))
+                let scope = type_ref.resolution_scope
+
+                if scope.kind == HandleKind.ASSEMBLY_REFERENCE then
+                    let assembly_ref = reader.get_assembly_reference(cast AssemblyReferenceHandle(scope))
+                    let assembly_name = reader.get_string(assembly_ref.name)
+
+                    let assembly: ASSEMBLY mut
+
+                    if !assembly_names.try_get_value(assembly_name, assembly ref) then
+                        return null
+                    fi
+
+                    return assembly.get_type("{reader.get_string(type_ref.`namespace)}.{reader.get_string(type_ref.name)}")
+                elif scope.kind == HandleKind.TYPE_REFERENCE then
+                    if let enclosing: TYPE = _resolve(reader, scope, own_assembly, assembly_names) then
+                        return enclosing.get_nested_type(
+                            reader.get_string(type_ref.name),
+                            cast BindingFlags(16 + 32))
+                    fi
+
+                    return null
+                else
+                    return null
+                fi
             else
                 return null
             esac
-        si
-
-        // A `TypeSpecification`'s signature (ECMA-335 II.23.2.14) is a
-        // `GENERICINST` element type, a `CLASS`/`VALUETYPE` marker, then
-        // a compressed `TypeDefOrRefOrSpecEncoded` token for the open
-        // generic type being instantiated — that token is all this
-        // needs; the argument list after it is never read.
-        _describe_instantiation(reader: MDR, handle: TypeSpecificationHandle) -> string? static is
-            let spec = reader.get_type_specification(handle)
-            let blob mut = reader.get_blob_reader(spec.signature)
-
-            if blob.read_signature_type_code() != SignatureTypeCode.GENERIC_TYPE_INSTANCE then
-                return null
-            fi
-
-            blob.read_signature_type_code()
-
-            return _describe(reader, blob.read_type_handle())
         si
 
         // The pre-order nullability bytes off `implementation`'s own
