@@ -884,6 +884,25 @@ si
 
 Enum values compare with the relational operators as well as for equality (`=~` and `==`), so they order by their underlying integer. `=~` works over an optional enum too, as it does over any other optional. An individual member can be imported by name — `use Some.Namespace.Suit.HEARTS;` — as well as reached through the type.
 
+An enum carrying `System.FlagsAttribute` — via the ordinary .NET-attribute pragma, see [.NET interop](#net-interop) — additionally gets the bitwise operators `&`, `|`, `^`, and the unary `\`, for combining and testing flag-shaped values. Each takes and returns the enum's own type — there is no coercion to or from the underlying integer, and combining two different enum types is a compile error, the ordinary overload-resolution failure. An enum without the attribute has none of the four: an ordinal enum's members were never meant to combine, so `Suit.SPADES & Suit.HEARTS` is rejected the same way as any other undefined operator.
+
+```ghul
+@System.Flags()
+enum Access is
+    READ = 1,
+    WRITE = 2,
+    EXECUTE = 4,
+si
+
+let read_write = Access.READ | Access.WRITE;
+
+if read_write & Access.READ == Access.READ then
+    write_line("can read");
+fi
+```
+
+Unlike C#, where `[Flags]` changes nothing about which operators an enum has — `&`/`|`/`^`/`~` there work on any enum, built into the language — `System.FlagsAttribute` in ghūl gates the four operators as well as its usual effect on `to_string()`: it makes the default rendering of a combined value list its constituent names (`READ, WRITE`) instead of the raw number, exactly as it does in C#. ghūl has no attribute for naming a combined value as a member (`ALL = A | B | C`): an enum member's initializer is restricted to a plain integer literal.
+
 ### partial and impl blocks
 
 Members can be added to an already-declared type from a separate block - even a separate file - as long as the type is declared in the same assembly. The added members are real members of the target: full private access and normal virtual dispatch, indistinguishable from members written in the type's own body.
