@@ -1733,7 +1733,19 @@ let e = 5 |> $();                // the same call, written out
 
 The operator and the `|>` have to be separated by a space. A run of operator characters scans as a single token, so `5 |>$` is one operator named `|>$` rather than two.
 
-A `|>` at the end of a line carries the chain onto the next one, which is how a long chain is wrapped. Only a name continues it that way, so a line beginning with anything else leaves the `|>` without a right side and is reported as one — the next statement is never read as the call.
+The propagating thread-first operator `~>` is `|>` combined with absence propagation, the way `?.` is member access combined with it. The left value has to be optional; an absent one skips the call — argument expressions included, as `?.` skips them — and yields the absent value, while a present one is threaded in unwrapped, exactly as `|>` threads a value. The result is always optional: a callee returning a non-optional `U` is widened to `U?` as `?.` widens a member's type, and a void callee is simply skipped:
+
+```ghul
+parse_port(s: string) -> int?;
+clamp_port(n: int) -> int?;
+label(n: int) -> string;
+
+let port = text |> trim() |> parse_port() ~> clamp_port() ~> label() ?? "closed";
+```
+
+The two operators chain together — a `|>` stage runs unconditionally, a `~>` stage propagates — and `~>` works over every optional kind, including an unconstrained `T?` in a generic. The diagnostics are `?.`'s: a `~>` whose subject was never optional is an error on a value type (`receiver is not optional`) and stays legal as a defensive null test on a reference, and where flow analysis has proven the subject present the operator draws a `redundant-coalesce` warning. Inside a generic the callee sees the unwrapped `T` and its result widens back to the optional of whatever it returns.
+
+A `|>` or `~>` at the end of a line carries the chain onto the next one, which is how a long chain is wrapped. Only a name continues it that way, so a line beginning with anything else leaves the operator without a right side and is reported as one — the next statement is never read as the call.
 
 ## generics
 
