@@ -72,6 +72,8 @@ use IO.Std.write_line;
 write_line("hello");
 ```
 
+On Linux, a file's first two bytes may be a `#!...` shebang line naming an interpreter, exactly as for a shell, Python or Ruby script — `chmod +x` the file and run it directly. The compiler recognises the line only there, as the very first thing in the file, and skips it; it is otherwise invisible to parsing, including to the rule above that a file-level `@@` pragma must be the first thing in the file, so a `@@` pragma is written immediately after the shebang line rather than instead of it.
+
 The `use` statement brings names into scope so they can be referred to without qualification. Applied to a namespace it imports every public symbol; applied to a single symbol it imports just that one:
 
 ```ghul
