@@ -36,6 +36,22 @@ namespace Semantic.DotNet is
         _assemblies_by_name: MAP[string,Assembly]
         _assemblies_by_ghul_namespace: MAP[string,SET[Assembly]]
 
+        // The file each assembly was loaded from, kept so
+        // `interface_nullability_bytes` can re-read the raw bytes —
+        // `Assembly.location` is empty for one loaded via
+        // `load_from_byte_array` below, so the path has to be tracked
+        // separately or it's lost the moment the byte array is.
+        _assembly_paths: MAP[string,string]
+
+        // One `System.Reflection.Metadata.MetadataReader` per assembly
+        // that has actually needed one, built lazily on first request —
+        // most assemblies never implement a generic BCL interface with
+        // a nullable reference type argument, so most never pay for
+        // this. `null` is cached too, for an assembly whose path
+        // couldn't be read or parsed, so a failing lookup isn't retried
+        // on every call.
+        _interface_metadata_readers: MAP[string,System.Reflection.Metadata.MetadataReader?]
+
         _is_started: bool
         _default_imports_are_needed: bool
 
@@ -50,6 +66,8 @@ namespace Semantic.DotNet is
 
             _assemblies_by_name = MAP()
             _assemblies_by_ghul_namespace = MAP[string,SET[Assembly]]()
+            _assembly_paths = MAP()
+            _interface_metadata_readers = MAP[string,System.Reflection.Metadata.MetadataReader?]()
 
             blocked_assemblies = SET()
             block_all_unsupported_assemblies()
@@ -83,6 +101,64 @@ namespace Semantic.DotNet is
             assembly_and_type_names |>
                 map(names => get_type(names.assembly_name, names.type_name)) |>
                 collect()
+
+        // See `INTERFACE_NULLABILITY` for why this exists at all: the
+        // nullability of a reference type argument in `declaring_type`'s
+        // own ancestor list (`class THING: MutableMap[string, string?]`)
+        // has no reflection-visible carrier, so `add_ancestors` needs
+        // this to recover it from the assembly's raw metadata instead.
+        // Empty when the reader can't be built, or `declaring_type`
+        // implements nothing with a `?` in its type arguments.
+        interface_nullability_bytes(declaring_type: TYPE) -> MAP[string,Collections.LIST[int]] is
+            let reader = _interface_metadata_reader(declaring_type)
+
+            if !reader? then
+                return MAP[string,Collections.LIST[int]]()
+            fi
+
+            return INTERFACE_NULLABILITY.read_declared(reader, declaring_type)
+        si
+
+        _interface_metadata_reader(type: TYPE) -> System.Reflection.Metadata.MetadataReader? is
+            let assembly_name = type.assembly.get_name().name ?? ""
+
+            let cached: System.Reflection.Metadata.MetadataReader? mut
+
+            if _interface_metadata_readers.try_get_value(assembly_name, cached ref) then
+                return cached
+            fi
+
+            let result = _load_interface_metadata_reader(assembly_name)
+
+            _interface_metadata_readers.add(assembly_name, result)
+
+            return result
+        si
+
+        // Re-reads the assembly's bytes rather than reusing what
+        // `_metadata_load_context` loaded with: those went into
+        // `load_from_byte_array` and aren't retained afterwards, and a
+        // fresh in-memory copy carries none of the open-file-handle risk
+        // that reading via a file stream would (see the comment on
+        // `load_from_byte_array` above) — the bytes are read once, into
+        // an `ImmutableArray`, and the file is never held open.
+        _load_interface_metadata_reader(assembly_name: string) -> System.Reflection.Metadata.MetadataReader? is
+            let path: string mut
+
+            if !_assembly_paths.try_get_value(assembly_name, path ref) then
+                return null
+            fi
+
+            try
+                let bytes = IO.File.read_all_bytes(path)
+                let image = System.Collections.Immutable.ImmutableArray.create[ubyte](bytes)
+                let pe_reader = System.Reflection.PortableExecutable.PEReader(image)
+
+                return System.Reflection.Metadata.PEReaderExtensions.get_metadata_reader(pe_reader)
+            catch ex: System.Exception
+                return null
+            yrt
+        si
 
         import(assembly_names: Iterable[string]? mut) is
             if _is_started then
@@ -143,6 +219,7 @@ namespace Semantic.DotNet is
                 to_process.add((assembly, name, version))
 
                 _assemblies_by_name.add(name, assembly)
+                _assembly_paths.add(name, path)
             od
 
             _type_name_map.start(self)
