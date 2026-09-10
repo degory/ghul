@@ -1,0 +1,208 @@
+namespace Semantic.DotNet is
+    use Collections.MAP
+    use Collections.LIST
+
+    use TYPE = System.Type
+    use ASSEMBLY = System.Reflection.Assembly
+
+    use MDR = System.Reflection.Metadata.MetadataReader
+    use System.Reflection.Metadata.HandleKind
+    use System.Reflection.Metadata.TypeReferenceHandle
+    use System.Reflection.Metadata.TypeDefinitionHandle
+    use System.Reflection.Metadata.TypeSpecificationHandle
+    use System.Reflection.Metadata.MemberReferenceHandle
+    use System.Reflection.Metadata.BlobHandle
+    use System.Reflection.Metadata.InterfaceImplementation
+    use System.Reflection.Metadata.CustomAttribute
+    use System.Reflection.Metadata.Ecma335.MetadataTokens
+
+    // Reads the `NullableAttribute` an interface implementation carries
+    // on its own `InterfaceImpl` metadata row — the one reference-`?`
+    // carrier `NULLABILITY.resolve` can't reach cross-assembly, because
+    // .NET reflection has no `MemberInfo` for "this type's
+    // implementation of interface X" to hang `CustomAttributeData` off.
+    // A class's field, property, parameter and return slots all round-
+    // trip a `T?` type argument fine on import — this is specifically
+    // about a type argument in the class's own ancestor list, e.g.
+    // `class THING: MutableMap[string, string?]`.
+    //
+    // Reads it the way the emitter writes it (`SRM_STRUCTURE_WALK`'s
+    // `_nullable_slot_attributes` on the `InterfaceImplementationHandle`
+    // `SRM_ASSEMBLY_EMITTER.add_interface_implementation` returns): via
+    // `System.Reflection.Metadata` directly against the assembly's raw
+    // bytes, since ordinary reflection (`System.Type`,
+    // `CustomAttributeData`) has no way to address this row at all.
+    //
+    // The result is keyed by the interface's own closed `System.Type`.
+    // `INTERFACE_TYPE_PROVIDER` decodes the full instantiation to that
+    // `Type`, via the same already-loaded assemblies the rest of the
+    // compiler reflects through, so the caller compares actual type
+    // identity rather than a name rendered from either side.
+    class INTERFACE_NULLABILITY is
+        // One entry per interface `declaring_type`'s own `TypeDef`
+        // implements directly (not one it only inherits via a base
+        // class), keyed by the interface's own closed `Type` — see
+        // `key_for`, which reflects the same interface to the same
+        // `Type` for comparison at the call site. The byte lists follow
+        // the same pre-order convention `NULLABILITY.apply_bytes`
+        // already reads: whatever the row's own head byte says, only a
+        // `2` anywhere in the tree ever turns a position optional, so
+        // this is safe to feed straight in.
+        //
+        // Empty when `reader` can't resolve `declaring_type`'s own
+        // `TypeDef`, or that `TypeDef` declares no interfaces with a
+        // `NullableAttribute` on their row — the caller's fallback,
+        // leaving every position at its non-optional default, is
+        // correct either way.
+        read_declared(
+            reader: MDR,
+            declaring_type: TYPE,
+            assembly_names: MAP[string,ASSEMBLY]
+        ) -> MAP[TYPE, LIST[int]] static is
+            let result = MAP[TYPE, LIST[int]]()
+
+            let type_def = _type_definition(reader, declaring_type)
+
+            if !type_def? then
+                // `reader` can't resolve `declaring_type`'s own `TypeDef`
+                // — every interface argument stays at its non-optional
+                // default, the same outcome as an assembly with no
+                // nullability metadata at all.
+                return result
+            fi
+
+            let provider = INTERFACE_TYPE_PROVIDER(declaring_type.assembly, assembly_names)
+
+            for impl_handle in type_def.get_interface_implementations() do
+                // One interface implementation this reader can't resolve
+                // or decode leaves that one interface's arguments at
+                // their non-optional default — never the others in the
+                // same list.
+                try
+                    let implementation = reader.get_interface_implementation(impl_handle)
+                    let interface_type = _resolve(provider, reader, declaring_type, implementation.`interface)
+
+                    if let bytes = _nullable_bytes(reader, implementation) then
+                        result[interface_type] = bytes
+                    fi
+                catch ex: System.Exception
+                yrt
+            od
+
+            return result
+        si
+
+        _type_definition(reader: MDR, declaring_type: TYPE) -> System.Reflection.Metadata.TypeDefinition? static is
+            try
+                return reader.get_type_definition(MetadataTokens.type_definition_handle(declaring_type.metadata_token))
+            catch ex: System.Exception
+                return null
+            yrt
+        si
+
+        // The matching key for a reflected interface `Type` from
+        // `type.get_interfaces()` — identity, unreduced: it already is
+        // the closed instantiation `read_declared` resolves through
+        // `INTERFACE_TYPE_PROVIDER`, so the two sides compare equal for
+        // the same interface directly.
+        key_for(interface_type: TYPE) -> TYPE static => interface_type
+
+        // `handle` is an `InterfaceImplementation`'s own `Interface`
+        // field: a bare `TypeReference`/`TypeDefinition` for a
+        // non-generic interface, or a `TypeSpecification` — a
+        // signature, not a handle a provider method resolves directly —
+        // for a closed generic one, decoded via `TypeSpecification`'s
+        // own `decode_signature`, which is what makes `provider`'s
+        // recursive calls back into itself well-typed for nested
+        // generics.
+        _resolve(
+            provider: INTERFACE_TYPE_PROVIDER,
+            reader: MDR,
+            declaring_type: TYPE,
+            handle: System.Reflection.Metadata.EntityHandle
+        ) -> TYPE static is
+            case handle.kind
+            when HandleKind.TYPE_SPECIFICATION then
+                return reader.get_type_specification(cast TypeSpecificationHandle(handle))
+                    .decode_signature[TYPE, TYPE](provider, declaring_type)
+            when HandleKind.TYPE_DEFINITION then
+                return provider.get_type_from_definition(reader, cast TypeDefinitionHandle(handle), 0ub)
+            when HandleKind.TYPE_REFERENCE then
+                return provider.get_type_from_reference(reader, cast TypeReferenceHandle(handle), 0ub)
+            else
+                throw System.NotSupportedException("unsupported interface handle kind {handle.kind}")
+            esac
+        si
+
+        // The pre-order nullability bytes off `implementation`'s own
+        // `NullableAttribute`, or absent when the row carries none, or
+        // carries some other attribute only.
+        _nullable_bytes(reader: MDR, implementation: InterfaceImplementation) -> LIST[int]? static is
+            for attribute_handle in implementation.get_custom_attributes() do
+                let attribute = reader.get_custom_attribute(attribute_handle)
+
+                if _is_nullable_attribute(reader, attribute) then
+                    return _decode_value(reader, attribute.value)
+                fi
+            od
+
+            return null
+        si
+
+        _is_nullable_attribute(reader: MDR, attribute: CustomAttribute) -> bool static is
+            let constructor = attribute.constructor
+
+            if constructor.kind != HandleKind.MEMBER_REFERENCE then
+                return false
+            fi
+
+            let member_ref = reader.get_member_reference(cast MemberReferenceHandle(constructor))
+            let parent = member_ref.parent
+
+            if parent.kind != HandleKind.TYPE_REFERENCE then
+                return false
+            fi
+
+            let type_ref = reader.get_type_reference(cast TypeReferenceHandle(parent))
+
+            return reader.get_string(type_ref.`namespace) =~ "System.Runtime.CompilerServices" /\
+                reader.get_string(type_ref.name) =~ "NullableAttribute"
+        si
+
+        // `SRM_ATTRIBUTE_BLOB_ENCODER.encode_byte_argument` /
+        // `encode_byte_array_argument` write exactly two shapes, and
+        // their total lengths never overlap: prolog(2) + one byte +
+        // num-named(2) = 5 for a single-position attribute, or
+        // prolog(2) + count(4) + `count` bytes + num-named(2) = 8 +
+        // count otherwise. That is enough to tell the two apart without
+        // decoding the constructor's own signature.
+        _decode_value(reader: MDR, value_handle: BlobHandle) -> LIST[int]? static is
+            let blob mut = reader.get_blob_reader(value_handle)
+            let total = blob.length
+
+            if total < 5 \/ blob.read_u_int16() != 1us then
+                return null
+            fi
+
+            let result = LIST[int]()
+
+            if total == 5 then
+                result.add(cast int(blob.read_byte()))
+            elif total >= 8 then
+                let count = cast int(blob.read_u_int32())
+
+                if total != 8 + count then
+                    return null
+                fi
+
+                for i in 0..count do
+                    result.add(cast int(blob.read_byte()))
+                od
+            else
+                return null
+            fi
+
+            return result
+        si
+    si
+si

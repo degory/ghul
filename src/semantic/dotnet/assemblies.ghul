@@ -36,6 +36,33 @@ namespace Semantic.DotNet is
         _assemblies_by_name: MAP[string,Assembly]
         _assemblies_by_ghul_namespace: MAP[string,SET[Assembly]]
 
+        // The file each assembly was loaded from, kept so
+        // `interface_nullability_bytes` can re-read the raw bytes —
+        // `Assembly.location` is empty for one loaded via
+        // `load_from_byte_array` below, so the path has to be tracked
+        // separately or it's lost the moment the byte array is.
+        _assembly_paths: MAP[string,string]
+
+        // One `System.Reflection.PortableExecutable.PEReader` per
+        // assembly that has actually needed one — built, and its file
+        // read into memory, only once `interface_nullability_bytes`
+        // finds a type that implements a generic interface at all (its
+        // own cheap gate, checked before this cache is ever touched);
+        // an assembly contributing no such type is never opened here,
+        // however many of its types get imported. `null` is cached too,
+        // for an assembly whose path couldn't be read or parsed, so a
+        // failing lookup isn't retried on every call. Kept for the
+        // process's lifetime once built, so this only pays off in the
+        // common case where a nullable-argument-carrying assembly is
+        // asked about more than once.
+        //
+        // Cached as the `PEReader` itself, not the `MetadataReader` it
+        // hands out — a `MetadataReader` is a pointer into the memory
+        // block the `PEReader` owns and holds no reference back to it,
+        // so a `MetadataReader` cached alone outlives the pin on that
+        // block only until the `PEReader` is collected.
+        _interface_metadata_readers: MAP[string,System.Reflection.PortableExecutable.PEReader?]
+
         _is_started: bool
         _default_imports_are_needed: bool
 
@@ -50,6 +77,8 @@ namespace Semantic.DotNet is
 
             _assemblies_by_name = MAP()
             _assemblies_by_ghul_namespace = MAP[string,SET[Assembly]]()
+            _assembly_paths = MAP()
+            _interface_metadata_readers = MAP[string,System.Reflection.PortableExecutable.PEReader?]()
 
             blocked_assemblies = SET()
             block_all_unsupported_assemblies()
@@ -83,6 +112,102 @@ namespace Semantic.DotNet is
             assembly_and_type_names |>
                 map(names => get_type(names.assembly_name, names.type_name)) |>
                 collect()
+
+        // See `INTERFACE_NULLABILITY` for why this exists at all: the
+        // nullability of a reference type argument in `declaring_type`'s
+        // own ancestor list (`class THING: MutableMap[string, string?]`)
+        // has no reflection-visible carrier, so `add_ancestors` needs
+        // this to recover it from the assembly's raw metadata instead.
+        // Empty when `declaring_type` implements no generic interface at
+        // all — the common case, and the check that keeps this from
+        // reading every referenced assembly's file into memory just
+        // because *some* type in it got imported — or the reader can't
+        // be built, or `declaring_type` implements nothing with a `?` in
+        // its type arguments.
+        interface_nullability_bytes(declaring_type: TYPE) -> MAP[TYPE,Collections.LIST[int]] is
+            if !_implements_generic_interface(declaring_type) then
+                return MAP[TYPE,Collections.LIST[int]]()
+            fi
+
+            let reader = _interface_metadata_reader(declaring_type)
+
+            if !reader? then
+                return MAP[TYPE,Collections.LIST[int]]()
+            fi
+
+            return INTERFACE_NULLABILITY.read_declared(reader, declaring_type, _assemblies_by_name)
+        si
+
+        // A cheap, reflection-only pre-check: does `declaring_type`
+        // implement any generic interface at all? Every case this whole
+        // mechanism exists for needs one — a non-generic interface has
+        // no type argument to be `?`. A false positive here (a generic
+        // interface with no nullable argument) still costs a metadata
+        // read; a false negative would silently drop a real `?`, so the
+        // check stays deliberately wide rather than trying to rule out
+        // value-type arguments here too.
+        _implements_generic_interface(type: TYPE) -> bool is
+            for i in type.get_interfaces() do
+                if i.is_generic_type then
+                    return true
+                fi
+            od
+
+            return false
+        si
+
+        _interface_metadata_reader(type: TYPE) -> System.Reflection.Metadata.MetadataReader? is
+            let assembly_name = type.assembly.get_name().name ?? ""
+
+            let cached: System.Reflection.PortableExecutable.PEReader? mut
+
+            let pe_reader =
+                if _interface_metadata_readers.try_get_value(assembly_name, cached ref) then
+                    cached
+                else
+                    let loaded = _load_interface_reader(assembly_name)
+
+                    _interface_metadata_readers.add(assembly_name, loaded)
+
+                    loaded
+                fi
+
+            if !pe_reader? then
+                return null
+            fi
+
+            return System.Reflection.Metadata.PEReaderExtensions.get_metadata_reader(pe_reader)
+        si
+
+        // Re-reads the assembly's bytes rather than reusing what
+        // `_metadata_load_context` loaded with: those went into
+        // `load_from_byte_array` and aren't retained afterwards, and a
+        // fresh in-memory copy carries none of the open-file-handle risk
+        // that reading via a file stream would (see the comment on
+        // `load_from_byte_array` above) — the bytes are read once, into
+        // an `ImmutableArray`, and the file is never held open.
+        //
+        // Returns the `PEReader` itself, not a `MetadataReader` derived
+        // from it — see the comment on `_interface_metadata_readers`.
+        // The caller derives a fresh `MetadataReader` from the cached
+        // `PEReader` on every call, which is cheap: it just wraps the
+        // memory block the `PEReader` already read.
+        _load_interface_reader(assembly_name: string) -> System.Reflection.PortableExecutable.PEReader? is
+            let path: string mut
+
+            if !_assembly_paths.try_get_value(assembly_name, path ref) then
+                return null
+            fi
+
+            try
+                let bytes = IO.File.read_all_bytes(path)
+                let image = System.Collections.Immutable.ImmutableArray.create[ubyte](bytes)
+
+                return System.Reflection.PortableExecutable.PEReader(image)
+            catch ex: System.Exception
+                return null
+            yrt
+        si
 
         import(assembly_names: Iterable[string]? mut) is
             if _is_started then
@@ -143,6 +268,7 @@ namespace Semantic.DotNet is
                 to_process.add((assembly, name, version))
 
                 _assemblies_by_name.add(name, assembly)
+                _assembly_paths.add(name, path)
             od
 
             _type_name_map.start(self)

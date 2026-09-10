@@ -1,0 +1,179 @@
+namespace Semantic.DotNet is
+    use Collections.MAP
+    use Collections.LIST
+
+    use TYPE = System.Type
+    use ASSEMBLY = System.Reflection.Assembly
+
+    use System.Reflection.BindingFlags
+
+    use MDR = System.Reflection.Metadata.MetadataReader
+    use System.Reflection.Metadata.HandleKind
+    use System.Reflection.Metadata.TypeReferenceHandle
+    use System.Reflection.Metadata.TypeDefinitionHandle
+    use System.Reflection.Metadata.TypeSpecificationHandle
+    use System.Reflection.Metadata.AssemblyReferenceHandle
+    use System.Reflection.Metadata.ArrayShape
+    use System.Reflection.Metadata.MethodSignature
+    use System.Reflection.Metadata.PrimitiveTypeCode
+    use System.Reflection.Metadata.ISignatureTypeProvider
+
+    use System.Collections.Immutable.ImmutableArray
+
+    // Decodes a metadata type signature to the real `System.Type` it
+    // names, via `System.Reflection.Metadata.ISignatureTypeProvider` —
+    // the standard mechanism for this, also used by Roslyn's own
+    // metadata layer. The full generic instantiation is decoded,
+    // arguments included: an interface type argument is part of the
+    // interface's own identity, since a class can implement the same
+    // open generic interface more than once at different closed
+    // arguments.
+    //
+    // References resolve through `assembly_names` — the same map
+    // `ASSEMBLIES._assemblies_by_name` already keys by an assembly's
+    // own name elsewhere — and through `own_assembly` for a
+    // `TypeDefinitionHandle`, which carries no assembly reference of
+    // its own since the type it names is unambiguously in the assembly
+    // being read. `generic_context` is `declaring_type` itself: a
+    // `VAR` signature element (the declaring type's own generic
+    // parameter, reached when that type implements an interface
+    // through one of its own type arguments) resolves against its
+    // `get_generic_arguments()`.
+    //
+    // A shape this provider has no real answer for (a function
+    // pointer, a custom modifier, a pinned type — none of which can
+    // occur in an interface's own type argument list) throws, which
+    // the caller already treats as "this one interface couldn't be
+    // resolved" rather than aborting the whole class.
+    class INTERFACE_TYPE_PROVIDER(
+        _own_assembly: ASSEMBLY,
+        _assembly_names: MAP[string,ASSEMBLY]
+    ): ISignatureTypeProvider[TYPE, TYPE] is
+        _required(value: TYPE?, message: string) -> TYPE static is
+            if let found: TYPE = value then
+                return found
+            fi
+
+            throw System.TypeLoadException(message)
+        si
+
+        get_primitive_type(code: PrimitiveTypeCode) -> TYPE is
+            let name =
+                case code
+                when PrimitiveTypeCode.BOOLEAN then "System.Boolean"
+                when PrimitiveTypeCode.CHAR then "System.Char"
+                when PrimitiveTypeCode.SBYTE then "System.SByte"
+                when PrimitiveTypeCode.BYTE then "System.Byte"
+                when PrimitiveTypeCode.INT16 then "System.Int16"
+                when PrimitiveTypeCode.UINT16 then "System.UInt16"
+                when PrimitiveTypeCode.INT32 then "System.Int32"
+                when PrimitiveTypeCode.UINT32 then "System.UInt32"
+                when PrimitiveTypeCode.INT64 then "System.Int64"
+                when PrimitiveTypeCode.UINT64 then "System.UInt64"
+                when PrimitiveTypeCode.SINGLE then "System.Single"
+                when PrimitiveTypeCode.DOUBLE then "System.Double"
+                when PrimitiveTypeCode.STRING then "System.String"
+                when PrimitiveTypeCode.TYPED_REFERENCE then "System.TypedReference"
+                when PrimitiveTypeCode.INT_PTR then "System.IntPtr"
+                when PrimitiveTypeCode.UINT_PTR then "System.UIntPtr"
+                when PrimitiveTypeCode.OBJECT then "System.Object"
+                else throw System.NotSupportedException("unrecognised primitive type code {code}")
+                esac
+
+            let assembly: ASSEMBLY mut
+
+            assert _assembly_names.try_get_value("System.Runtime", assembly ref) else
+                "System.Runtime is not among the referenced assemblies"
+
+            return _required(assembly.get_type(name), "couldn't resolve {name} in System.Runtime")
+        si
+
+        get_type_from_definition(reader: MDR, handle: TypeDefinitionHandle, raw_kind: ubyte) -> TYPE is
+            let type_def = reader.get_type_definition(handle)
+
+            if type_def.is_nested then
+                let enclosing = get_type_from_definition(reader, type_def.get_declaring_type(), raw_kind)
+
+                return _required(
+                    enclosing.get_nested_type(reader.get_string(type_def.name), cast BindingFlags(16 + 32)),
+                    "couldn't resolve nested type {reader.get_string(type_def.name)}")
+            fi
+
+            let name = "{reader.get_string(type_def.`namespace)}.{reader.get_string(type_def.name)}"
+
+            return _required(_own_assembly.get_type(name), "couldn't resolve {name}")
+        si
+
+        get_type_from_reference(reader: MDR, handle: TypeReferenceHandle, raw_kind: ubyte) -> TYPE is
+            let type_ref = reader.get_type_reference(handle)
+            let scope = type_ref.resolution_scope
+
+            if scope.kind == HandleKind.ASSEMBLY_REFERENCE then
+                let assembly_ref = reader.get_assembly_reference(cast AssemblyReferenceHandle(scope))
+                let assembly_name = reader.get_string(assembly_ref.name)
+
+                let assembly: ASSEMBLY mut
+
+                assert _assembly_names.try_get_value(assembly_name, assembly ref) else
+                    "{assembly_name} is not among the referenced assemblies"
+
+                let name = "{reader.get_string(type_ref.`namespace)}.{reader.get_string(type_ref.name)}"
+
+                return _required(assembly.get_type(name), "couldn't resolve {name} in {assembly_name}")
+            elif scope.kind == HandleKind.TYPE_REFERENCE then
+                let enclosing = get_type_from_reference(reader, cast TypeReferenceHandle(scope), raw_kind)
+
+                return _required(
+                    enclosing.get_nested_type(reader.get_string(type_ref.name), cast BindingFlags(16 + 32)),
+                    "couldn't resolve nested type {reader.get_string(type_ref.name)}")
+            else
+                throw System.NotSupportedException("unsupported type reference resolution scope {scope.kind}")
+            fi
+        si
+
+        get_type_from_specification(
+            reader: MDR,
+            generic_context: TYPE,
+            handle: TypeSpecificationHandle,
+            raw_kind: ubyte
+        ) -> TYPE =>
+            reader.get_type_specification(handle).decode_signature[TYPE, TYPE](self, generic_context)
+
+        get_generic_instantiation(generic_type: TYPE, type_arguments: ImmutableArray[TYPE]) -> TYPE is
+            let arguments = LIST[TYPE]()
+
+            for argument in type_arguments do
+                arguments.add(argument)
+            od
+
+            return generic_type.make_generic_type(arguments.to_array())
+        si
+
+        get_generic_type_parameter(generic_context: TYPE, index: int) -> TYPE =>
+            generic_context.get_generic_arguments()[index]
+
+        get_generic_method_parameter(generic_context: TYPE, index: int) -> TYPE =>
+            throw System.NotSupportedException("a method type parameter can't occur in an interface's own type argument")
+
+        get_array_type(element_type: TYPE, shape: ArrayShape) -> TYPE =>
+            element_type.make_array_type(shape.rank)
+
+        get_s_z_array_type(element_type: TYPE) -> TYPE =>
+            element_type.make_array_type()
+
+        get_pointer_type(element_type: TYPE) -> TYPE =>
+            element_type.make_pointer_type()
+
+        get_by_reference_type(element_type: TYPE) -> TYPE =>
+            element_type.make_by_ref_type()
+
+        get_pinned_type(element_type: TYPE) -> TYPE =>
+            throw System.NotSupportedException("a pinned type can't occur in an interface's own type argument")
+
+        get_modified_type(modifier: TYPE, unmodified_type: TYPE, is_required: bool) -> TYPE =>
+            throw System.NotSupportedException("a custom modifier can't occur in an interface's own type argument")
+
+        get_function_pointer_type(signature: MethodSignature[TYPE]) -> TYPE =>
+            throw System.NotSupportedException("a function pointer can't occur in an interface's own type argument")
+    si
+si
