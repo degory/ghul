@@ -1,0 +1,243 @@
+namespace Syntax.Process is
+    use Source
+    use Trees
+
+    // Synthesises the private CLR-facing `_entry` wrapper a hand-written
+    // entry function needs when it declares a `Ghul.Environment` parameter.
+    //
+    // A named function's signature is always fully explicit (GHUL.md), so
+    // recognising the two argument shapes - a `string[]` and a
+    // `Ghul.Environment` - needs nothing but the written type expressions,
+    // and this runs at the same syntax-tree-rewriting stage as
+    // synthesise-top-level-entry and rewrite-primary-constructors, before
+    // any symbol exists.
+    //
+    // Only a function whose name matches the configured entry-point name
+    // is considered - the same name select-entry-point itself matches -
+    // and only when every one of its one or two parameters is one of the
+    // two recognised shapes, with a `Ghul.Environment` one actually among
+    // them. Anything else (a lone `string[]`, no parameters, an
+    // unrecognised shape) is left untouched: select-entry-point's existing
+    // signature check decides its fate exactly as it always has.
+    //
+    // The wrapper takes the real Main-compatible shape - no parameters, or
+    // one `string[]` when the original declared one - and its body is a
+    // single call back to the original function, with `Ghul.ENVIRONMENT`
+    // .instance` in the environment slot and its own `args` parameter (if
+    // any) in the other, in whichever order the original declared them.
+    // The wrapper's own return type is a copy of the original's, so its
+    // tail - the call itself, with no explicit `return` - is handled by
+    // the ordinary ghul tail-return rule regardless of whether that type
+    // is `int` or void.
+    //
+    // The original function is marked so select-entry-point excludes it
+    // from candidacy outright: its own signature is never Main-compatible,
+    // and the wrapper is what stands in for it.
+    class SYNTHESISE_ENTRY_ENVIRONMENT_WRAPPER(_ir_context: IR.CONTEXT) is
+        _WRAPPER_NAME: string static => "_entry"
+        _ARGS_PARAMETER_NAME: string static => "args"
+
+        apply(node: Node) is
+            if let list = cast Definitions.LIST?(node) then
+                _process_list(list)
+            fi
+        si
+
+        _process_list(list: Definitions.LIST) is
+            let to_add = Collections.LIST[Definitions.FUNCTION]()
+
+            // `use` applies only within the namespace block it is written
+            // in (GHUL.md), so each list's own uses are what a bare name
+            // written in its own definitions can have come from.
+            let uses = list.uses
+
+            for d in list do
+                let unwrapped = d.without_pragmas
+
+                if let `namespace = cast Definitions.NAMESPACE?(unwrapped) then
+                    _process_list(`namespace.body)
+                elif let function = cast Definitions.FUNCTION?(unwrapped) then
+                    if let wrapper = _maybe_synthesise_wrapper(function, uses) then
+                        to_add.add(wrapper)
+                    fi
+                fi
+            od
+
+            for wrapper in to_add do
+                list.add(wrapper)
+            od
+        si
+
+        _maybe_synthesise_wrapper(function: Definitions.FUNCTION, uses: Collections.List[Definitions.USE]) -> Definitions.FUNCTION? is
+            if function.is_top_level_entry then
+                return null
+            fi
+
+            let name = function.name
+
+            if !name? \/ !(name.name =~ _ir_context.entry_point_name) then
+                return null
+            fi
+
+            let variables = function.arguments.variables
+
+            if variables.count < 1 \/ variables.count > 2 then
+                return null
+            fi
+
+            let args_variable: Variables.VARIABLE? mut = null
+            let env_variable: Variables.VARIABLE? mut = null
+
+            for variable in variables do
+                if _is_args_shaped(variable.type_expression) then
+                    if args_variable? then
+                        return null
+                    fi
+
+                    args_variable = variable
+                elif _is_environment_shaped(variable.type_expression, uses) then
+                    if env_variable? then
+                        return null
+                    fi
+
+                    env_variable = variable
+                else
+                    return null
+                fi
+            od
+
+            if !env_variable? then
+                return null
+            fi
+
+            function.wrapped_by_synthesized_main = true
+
+            return _synthesise_wrapper(function, args_variable?, env_variable)
+        si
+
+        _is_args_shaped(type_expression: TypeExpressions.TypeExpression) -> bool is
+            if let array = cast TypeExpressions.ARRAY_?(type_expression) then
+                return _is_bare_named(array.element, "string")
+            fi
+
+            return false
+        si
+
+        // Fully-qualified `Ghul.Environment` always matches. A bare name
+        // also matches when this namespace block's own `use` declarations
+        // (GHUL.md: a `use` applies only within the block it is written
+        // in) bring `Ghul.Environment` into scope under that name - the
+        // three ordinary (non-type-alias) import shapes: `use Ghul;`,
+        // `use Ghul.Environment;`, and `use X = Ghul.Environment;`.
+        _is_environment_shaped(type_expression: TypeExpressions.TypeExpression, uses: Collections.List[Definitions.USE]) -> bool is
+            if let named = cast TypeExpressions.NAMED?(type_expression) then
+                let id = named.name
+
+                if _names_ghul_environment(id) then
+                    return true
+                fi
+
+                if id.is_qualified then
+                    return false
+                fi
+
+                for u in uses do
+                    if let imported = u.`use then
+                        if let alias = u.name then
+                            if alias.name =~ id.name /\ _names_ghul_environment(imported) then
+                                return true
+                            fi
+                        elif imported.is_qualified then
+                            if imported.name =~ id.name /\ _names_ghul_environment(imported) then
+                                return true
+                            fi
+                        elif imported.name =~ "Ghul" /\ id.name =~ "Environment" then
+                            return true
+                        fi
+                    fi
+                od
+            fi
+
+            return false
+        si
+
+        _names_ghul_environment(id: Identifiers.Identifier) -> bool =>
+            id.name =~ "Environment" /\
+                id.qualifier? /\
+                id.qualifier.name =~ "Ghul" /\
+                !id.qualifier.qualifier?
+
+        _is_bare_named(type_expression: TypeExpressions.TypeExpression, name: string) -> bool is
+            if let named = cast TypeExpressions.NAMED?(type_expression) then
+                return !named.name.is_qualified /\ named.name.name =~ name
+            fi
+
+            return false
+        si
+
+        _synthesise_wrapper(
+            original: Definitions.FUNCTION,
+            has_args: bool,
+            env_variable: Variables.VARIABLE
+        ) -> Definitions.FUNCTION is
+            let location = original.location
+            let arg_vars = Collections.LIST[Variables.VARIABLE]()
+
+            if has_args then
+                let args_type = TypeExpressions.ARRAY_(location, TypeExpressions.NAMED(location, Identifiers.Identifier(location, "string")))
+                let args_param = Variables.VARIABLE(location, Identifiers.Identifier(location, _ARGS_PARAMETER_NAME), args_type, false, true, null)
+
+                args_param.mark_argument()
+                arg_vars.add(args_param)
+            fi
+
+            let arg_list = Variables.LIST(location, arg_vars)
+            let call_args = Collections.LIST[Expressions.Expression]()
+
+            for variable in original.arguments.variables do
+                if variable == env_variable then
+                    call_args.add(_environment_instance_expression(location))
+                else
+                    call_args.add(Expressions.IDENTIFIER(location, Identifiers.Identifier(location, _ARGS_PARAMETER_NAME)))
+                fi
+            od
+
+            let call =
+                Expressions.CALL(
+                    location,
+                    Expressions.IDENTIFIER(location, Identifiers.Identifier(location, _ir_context.entry_point_name)),
+                    Expressions.LIST(location, call_args)
+                )
+
+            let body_statements = Collections.LIST[Statements.Statement]()
+
+            body_statements.add(Statements.EXPRESSION(location, call))
+
+            let body = Bodies.BLOCK(location, Statements.LIST(location, body_statements))
+            let modifiers = Modifiers.LIST(location, null, null)
+
+            let wrapper =
+                Definitions.FUNCTION(
+                    location,
+                    Identifiers.Identifier(LOCATION.internal, _WRAPPER_NAME),
+                    TypeExpressions.LIST(location, Collections.LIST[TypeExpressions.TypeExpression](0)),
+                    arg_list,
+                    original.type_expression.copy(),
+                    modifiers,
+                    body
+                )
+
+            wrapper.mark_synthesized()
+            wrapper.is_synthesized_main_wrapper = true
+
+            return wrapper
+        si
+
+        _environment_instance_expression(location: LOCATION) -> Expressions.Expression is
+            let ghul = Expressions.IDENTIFIER(location, Identifiers.Identifier(location, "Ghul"))
+            let environment_class = Expressions.MEMBER(location, ghul, Identifiers.Identifier(location, "ENVIRONMENT"), location)
+
+            return Expressions.MEMBER(location, environment_class, Identifiers.Identifier(location, "instance"), location)
+        si
+    si
+si
