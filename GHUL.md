@@ -1879,9 +1879,18 @@ run[T.., U](make: (int) -> T.. -> U, v: T) -> U => make(10)(v);
 run(n => (a, b) => a + b + n, (1, 2));   // 13
 ```
 
-The marker reads only as a formal's own type, or as the parameter of a function type on that type's return spine. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+The marker reads only as a formal's own type, as the parameter of a function type on that type's return spine, or as the parameter of a function type in a declared return type. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
 
 What each formal asks for survives into the assembly, so a pack declared in one assembly reads the same way from another.
+
+A return type marked that way hands the pack back out, which is how a combinator preserves the arity of a function it takes:
+
+```ghul
+retry[T.., U](f: T.. -> U, attempts: int) -> T.. -> U =>
+    v => ( ... call f(v) with retries ... );
+```
+
+Inside `retry`, the declared return type still names the tuple-in shape the body's `v => ...` literal has. The presentation happens at each call that binds the pack to a concrete tuple: `retry(parse, 3)` evaluates once, where the call stands, and its value is the N-ary function `f`'s own arity suggests — `let safe = retry(parse, 3); safe("2a", 10)` calls it as a two-argument function. A call that binds the pack to a single argument needs no presentation and returns the function as it is. The same rule applies one level up: a generic whose own return type carries the marker returns the tuple-in value its declaration names, and the call of *that* function does the presenting.
 
 
 A generic function or method named with no argument list is a *value*, the same way a non-generic name in value position is. Written with its type arguments it is the value at that instantiation; written bare, the type arguments are inferred from the function type of the slot it goes into — from the parameter positions, and from the return slot for a variable that appears only there. It converts wherever a function type or a named delegate is expected, and where the name is overloaded the expected type picks the member:
