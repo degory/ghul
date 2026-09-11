@@ -1249,6 +1249,15 @@ namespace Syntax.Process is
 
                     _mark_nested_pack(effective_candidate, index, original)
 
+                    // An operand that is not in the tree to re-walk - a
+                    // call's function value, a stored one included -
+                    // still fills a pack formal: its value is hoisted
+                    // and eta-expanded, evaluate-once, so the operand
+                    // runs once where it stands and the wrapper calls
+                    // the local. Set when the branch fires, and
+                    // composed in around the walked literal below.
+                    let hoist_pending: (Semantic.Symbols.Symbol, IR.Values.Value, Type)? mut = _
+
                     if let pack_arity = _pack_adaptation_arity(push_candidate!, index, original, argument_types[index]) then
                         if
                             let literal =
@@ -1260,6 +1269,31 @@ namespace Syntax.Process is
                             _splice(cache_key, original, index, literal)
                         then
                             a = literal
+                        fi
+                    elif let hoist_arity = _pack_adaptation_value_arity(push_candidate!, index, original, argument_types[index]) then
+                        let packed = Semantic.ARGUMENT_PACK.packed_parameters(argument_types[index])
+
+                        if
+                            let adapted =
+                                _function_reference_adapter.try_adapt_packed_hoisted(
+                                    original.location,
+                                    packed,
+                                    argument_types[index]
+                                ) /\
+                            _splice(cache_key, original, index, adapted.literal)
+                        then
+                            a = adapted.literal
+                            hoist_pending = (adapted.hoist, arguments[index], argument_types[index])
+
+                            // The adapted expression may itself carry
+                            // body-carrying wrappers - a call whose
+                            // declared return type is pack-marked, or
+                            // arguments adapted into the call. The
+                            // splice takes the expression out of the
+                            // tree; move its wrappers along so
+                            // generate-il still reaches them and
+                            // emits their bodies.
+                            _transfer_pack_literals(original, adapted.literal)
                         fi
                     elif let shape = _carrier_mismatch_shape(original, argument_types[index], f) then
                         if
@@ -1279,8 +1313,19 @@ namespace Syntax.Process is
                     a.walk(_visitor)
 
                     if let a.value? /\ value.type? /\ value.check_is_consumable(_logger, a.location) then
-                        arguments[index] = value
-                        argument_types[index] = value.type!
+                        if let (hoist, hoisted, hoist_type) = hoist_pending then
+                            let block = IR.Values.BLOCK(value.type!)
+
+                            block.add(IR.Values.DECLARE_LOCAL(hoist.il_name, hoist_type))
+                            block.add(IR.Values.Store.LOCAL_VARIABLE(hoist, hoisted))
+                            block.add(value)
+
+                            arguments[index] = block
+                            argument_types[index] = block.type
+                        else
+                            arguments[index] = value
+                            argument_types[index] = value.type!
+                        fi
                     else
                         let t = Semantic.Types.ERROR()
 
@@ -1319,6 +1364,34 @@ namespace Syntax.Process is
             fi
 
             return false
+        si
+
+        // Moves the body-carrying wrappers the adapted expression
+        // carries onto the wrapper that replaces it, so generate-il
+        // keeps reaching them across the splice. The wrappers are
+        // self-contained by construction: they call hoisted locals or
+        // names, never tree positions the splice could take away.
+        _transfer_pack_literals(
+            removed: Trees.Expressions.Expression,
+            replacement: Trees.Expressions.FUNCTION
+        ) is
+            if let call: Trees.Expressions.CALL = removed then
+                if call.return_pack_literal? then
+                    replacement.nested_return_pack_literals.add(call.return_pack_literal!)
+                fi
+
+                for a in call.arguments.expressions do
+                    if let literal: Trees.Expressions.FUNCTION = a then
+                        if literal.is_pack_adapter then
+                            replacement.nested_return_pack_literals.add(literal)
+                        fi
+                    fi
+                od
+            elif let binary: Trees.Expressions.BINARY = removed then
+                if binary.return_pack_literal? then
+                    replacement.nested_return_pack_literals.add(binary.return_pack_literal!)
+                fi
+            fi
         si
 
         // The function-type shape a formal presents: the formal itself
@@ -1446,6 +1519,36 @@ namespace Syntax.Process is
             return null
         si
 
+        // The arity to eta-expand a general function-typed operand with
+        // when the formal it is going into was declared to take an
+        // argument pack spread out. The expression is not re-walked into
+        // the wrapper - re-running it per wrapper call would break the
+        // evaluate-once presentation - so its already-computed value is
+        // hoisted into a local the wrapper captures instead. Absent when
+        // the formal is not a pack formal or the operand is not a
+        // function value of two or more parameters.
+        _pack_adaptation_value_arity(
+            candidate: Semantic.Symbols.Function,
+            index: int,
+            argument: Trees.Expressions.Expression,
+            argument_type: Type?
+        ) -> int? is
+            if !candidate.get_argument_is_pack(index) then
+                return null
+            fi
+
+            // A marker written past the formal's own function type is
+            // about the function the actual returns, not the actual, so
+            // there is nothing to adapt here.
+            if candidate.get_argument_pack_depth(index) != 0 then
+                return null
+            fi
+
+            let formal = if index < candidate.arguments.count then candidate.arguments[index] else null fi
+
+            return Semantic.ARGUMENT_PACK.adaptation_arity(_target_shape_of(formal), argument_type)
+        si
+
         // A call whose callee's declared return type carries the pack
         // marker - `retry[T.., U](f: T.. -> U, n: int) -> T.. -> U` -
         // resolves to the tuple-in function type the declaration names.
@@ -1462,11 +1565,14 @@ namespace Syntax.Process is
             call_receiver: IR.Values.Value?,
             arguments: Collections.LIST[IR.Values.Value]
         ) -> bool is
+
             let wrapped = wrap_return_pack(function, call.location, call_receiver, arguments)
 
             if !wrapped? then
+
                 return false
             fi
+
 
             call.return_pack_literal = wrapped.literal
 
@@ -1675,6 +1781,10 @@ namespace Syntax.Process is
 
             for i in 0..argument_expressions.count do
                 if _pack_adaptation_arity(candidate, i, argument_expressions[i], argument_types[i])? then
+                    return true
+                fi
+
+                if _pack_adaptation_value_arity(candidate, i, argument_expressions[i], argument_types[i])? then
                     return true
                 fi
             od
