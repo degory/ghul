@@ -1,6 +1,6 @@
 # Cloud code review brief
 
-Instructions for the cloud reviewer invoked from the `code_review` job in `.github/workflows/ci.yml`. The shared rules every review runs under - posting mechanics, what makes a finding worth raising, source-comment and PR-description hygiene, the versioning mechanism - are supplied by the review workflow *before* this brief. This brief carries only what is specific to the compiler repo; don't restate the shared rules here.
+Instructions for the cloud reviewer invoked from the `code_review` job in `.github/workflows/review.yml`. The shared rules every review runs under - posting mechanics, what makes a finding worth raising, source-comment and PR-description hygiene, the versioning mechanism - are supplied by the review workflow *before* this brief. This brief carries only what is specific to the compiler repo; don't restate the shared rules here.
 
 ## How to operate
 
