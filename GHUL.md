@@ -84,6 +84,8 @@ use Console = IO.Std;             // import under a different name
 
 A `use` applies only within the current namespace block — if a namespace is split across blocks or files, each block needs its own `use` statements.
 
+The names the language itself owns are visible in every namespace block without a `use`: the magic types (`int`, `bool`, `string`, `bigint`, the rest of the scalar set), and the language's own operators (`==`, `<>`, `=~`, the range operators, and so on). Anything else a referenced assembly declares in `Ghul` is imported like any other namespace's symbols, with an explicit `use` — `use Ghul.Disposable;`, `use Ghul.MAYBE;`, or `use Ghul;` for the whole namespace. Library globals that live there, such as the `apply` and `>>` function combinators, are reached the same way; they are never added to a program's bare-name lookup unasked, so a global of your own named `apply` does not collide with the runtime's.
+
 A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
 
 ```ghul
