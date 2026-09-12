@@ -113,6 +113,20 @@ Because an alias is transparent, it cannot be defined in terms of itself — dir
 
 An alias is scoped like any other `use`: it belongs to the namespace block it is written in, and a block elsewhere that wants the same shorthand declares it again. Consumers are unaffected either way, since a signature written with an alias is a signature written in the type it names.
 
+`use default` stands for a set of imports rather than naming one: the clause expands to the imports most files want before they want anything specific, which by default are `IO.Std.write_line`, `Ghul.Pipes` and `Collections`. It is an ordinary `use` in every other respect, so it applies to the namespace block it is written in and imports nothing implicitly: a file that does not write it gets none of them.
+
+```ghul
+use default
+
+entry() is
+    let totals = LIST[int]([1, 2, 3, 4])
+
+    write_line("{totals |> filter(x => x % 2 == 0) |> reduce(0, (a, b) => a + b)}")
+si
+```
+
+Importing something the set already carries is how a file adds to the set rather than a duplicate, so `use default` and `use Ghul.Pipes` together are accepted, and a declaration of your own named like one of the set's is simply the one in scope. A project replaces the set with its own with `--default-use`, once per name; naming any leaves the default set out entirely, so a project that wants the collections and nothing else asks for exactly that.
+
 ## statement terminators
 
 A `;` separates two statements or simple declarations written on one line. At the end of a line it is not needed: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either.
