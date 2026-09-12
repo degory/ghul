@@ -84,6 +84,8 @@ use Console = IO.Std;             // import under a different name
 
 A `use` applies only within the current namespace block — if a namespace is split across blocks or files, each block needs its own `use` statements.
 
+One namespace needs no `use` anywhere: `Ghul.Intrinsics` holds the names the language itself supplies — the built-in types such as `int` and `string`, the function and tuple shapes, and the operators on them — and every namespace block sees it as if it had written `use Ghul.Intrinsics;` first. Everything else the runtime provides is declared in `Ghul` and its nested namespaces and is imported like any other library: `use Ghul;` for the functional combinators such as `apply`, `use Ghul.Pipes;` for the pipe combinators. A definition of your own that shares a name with one of those — an `apply` of your own, say — is simply the one in scope, with nothing to import around.
+
 A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
 
 ```ghul
