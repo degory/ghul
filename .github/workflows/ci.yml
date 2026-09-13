@@ -22,25 +22,27 @@ concurrency:
 # time falls with the number of runners rather than with the size of any one
 # of them.
 #
-# Two jobs keep a paid runner, because neither responds to sharding and both
-# sit on the critical path.
+# One job keeps a paid runner, because it does not respond to sharding and
+# sits on the critical path. The analysis tests are one MSTest assembly, so
+# there is no shard to cut them into, and they are the longest single job in
+# the run: 77s on 8 vCPU against 193s and 263s in two runs on a GitHub-hosted
+# one. Left hosted they set the end to end time on their own. The lever if
+# this becomes painful again is the harness's parallelism, not a larger
+# runner - past 8 vCPU buys nothing, because the bottleneck is per-test
+# compiler-subprocess IPC (8 vCPU 42s, 16 vCPU 44s).
 #
-# The bootstrap is sequential compiler passes that do not parallelise, so it
-# is bound by single-core speed: 95s against 121s, measured.
-#
-# The analysis tests are one MSTest assembly, so there is no shard to cut them
-# into, and they are the longest job in the run: 77s on 8 vCPU against 193s
-# and 263s in two runs on a GitHub-hosted one. Left hosted they set the end to
-# end time on their own. The lever if this becomes painful again is the
-# harness's parallelism, not a larger runner - past 8 vCPU buys nothing,
-# because the bottleneck is per-test compiler-subprocess IPC (8 vCPU 42s,
-# 16 vCPU 44s).
-#
-# `version` picks both runners, and sends two cases to a GitHub-hosted one
+# `version` picks that runner, and sends two cases to a GitHub-hosted one
 # instead. A pull request from a fork runs in *this* repository's context and
 # would otherwise spend this repository's Ubicloud credit. A Renovate pull
 # request is routine dependency churn that does not warrant paid capacity -
 # slower, and no less thorough.
+#
+# A push to main is the release build, and it does not repeat the suite the
+# pull request just passed: `version` checks that the merged tree is the one
+# the pull request's run tested, and when it is, only the bootstrap, a smoke
+# test of the packed tool, and the publish run - see `version` for the
+# reasoning and the fallback. The test jobs are gated on its `full_suite`
+# output, and `gate` is where the two shapes are reconciled into one verdict.
 #
 # This is a default for well-meant contributions, not a control. A `pull_request`
 # run uses the workflow file from the pull request itself, so a contributor can
@@ -67,7 +69,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       package: ${{ steps.version.outputs.package }}
       compiler: ${{ steps.compiler_version.outputs.compiler }}
-      runner_bootstrap: ${{ steps.runners.outputs.bootstrap }}
+      full_suite: ${{ steps.compiler_version.outputs.full_suite }}
       runner_analysis: ${{ steps.runners.outputs.analysis }}
 
     permissions:
@@ -83,10 +85,8 @@ jobs:
                     || startsWith(github.head_ref, 'renovate/') }}
       run: |
         if [ "$HOSTED" = true ]; then
-          echo "bootstrap=ubuntu-latest" >> "$GITHUB_OUTPUT"
           echo "analysis=ubuntu-latest" >> "$GITHUB_OUTPUT"
         else
-          echo "bootstrap=ubicloud-standard-2" >> "$GITHUB_OUTPUT"
           echo "analysis=ubicloud-standard-8" >> "$GITHUB_OUTPUT"
         fi
 
@@ -105,16 +105,29 @@ jobs:
       with:
         prerelease: ${{ github.event_name == 'pull_request' && format('beta.{0}', github.run_number) || '' }}
 
-    # Resolve the ghul.compiler version that bootstraps this build.
+    # Resolve the ghul.compiler version that bootstraps this build, and
+    # decide whether this run owes the test suite.
     #
     # On a pull request: the latest published version that is actually
-    # downloadable from NuGet (skipping a release still propagating).
+    # downloadable from NuGet (skipping a release still propagating), and
+    # the suite always runs.
+    #
     # On a push to main (the release build): reuse the exact version the
     # merged PR's CI resolved, read from that run's artifact - so the
     # release is bootstrapped with the compiler it was tested with, and
     # a compiler published since the PR ran cannot break the release.
+    # The same artifact carries the tree the PR's run tested. Branch
+    # protection requires a pull request to be up to date with main before
+    # it merges, and the merge is a squash, so the commit that lands is
+    # the tree the pull request's run checked out and tested, with the
+    # same bootstrap compiler. When the two trees match, the suite has
+    # already passed on exactly this source and is not run again: the
+    # release build bootstraps, smoke-tests the package, and publishes.
+    # When they do not match - a direct push, a run that could not be
+    # found, a carry that failed - nothing is known about this tree and
+    # the full suite runs as it does on a pull request.
     #
-    # The version is published as the `bootstrap-compiler-version`
+    # Both values are published as the `bootstrap-compiler-version`
     # artifact; on a release run that is the diagnostic record of what
     # compiled the release, for as long as the artifact is retained.
     - name: Determine bootstrap compiler version
@@ -124,6 +137,8 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
+
+        tree=$(git rev-parse 'HEAD^{tree}')
 
         resolve_latest() {
           local versions v
@@ -147,8 +162,10 @@ jobs:
         }
 
         compiler=""
+        full_suite=true
         if [ "${{ github.event_name }}" = "push" ]; then
-          # Release build: carry the version the merged PR's CI resolved.
+          # Release build: carry the version the merged PR's CI resolved,
+          # and the tree it tested.
           pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
                  --jq 'first(.[].number) // empty' 2>/dev/null || true)
           if [ -n "${pr}" ]; then
@@ -157,6 +174,13 @@ jobs:
                     --jq 'first(.workflow_runs[].id) // empty' 2>/dev/null || true)
             if [ -n "${run}" ] && gh run download "${run}" -n bootstrap-compiler-version -D carried 2>/dev/null; then
               compiler=$(tr -d '[:space:]' < carried/bootstrap-compiler-version.txt)
+              tested=$(tr -d '[:space:]' < carried/tested-tree.txt 2>/dev/null || true)
+              if [ -n "${tested}" ] && [ "${tested}" = "${tree}" ]; then
+                full_suite=false
+                echo "tree ${tree} passed the suite in run ${run} for PR #${pr}; not running it again"
+              else
+                echo "::warning::tree ${tree} is not the tree PR #${pr}'s run ${run} tested (${tested:-unknown}); running the full suite"
+              fi
             fi
           fi
           if [ -z "${compiler}" ]; then
@@ -168,16 +192,21 @@ jobs:
         fi
 
         echo "compiler=${compiler}" >> "$GITHUB_OUTPUT"
+        echo "full_suite=${full_suite}" >> "$GITHUB_OUTPUT"
         echo "Bootstrap compiler: ${compiler}"
         echo "Bootstrap compiler: \`${compiler}\`" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${full_suite}" = false ]; then
+          echo "Test suite: already passed on this tree in run ${run} (PR #${pr}); smoke tests only" >> "$GITHUB_STEP_SUMMARY"
+        fi
         mkdir -p artifact
         printf '%s\n' "${compiler}" > artifact/bootstrap-compiler-version.txt
+        printf '%s\n' "${tree}" > artifact/tested-tree.txt
 
     - name: Upload bootstrap compiler version
       uses: actions/upload-artifact@v7
       with:
         name: bootstrap-compiler-version
-        path: artifact/bootstrap-compiler-version.txt
+        path: artifact/
 
 
   # Built by the compiler this commit produces, not by the one that
@@ -190,6 +219,7 @@ jobs:
   unit_tests:
     name: Run unit tests
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
@@ -248,8 +278,10 @@ jobs:
     name: Bootstrap compiler
 
     # Three sequential compiler passes, and the compiler does not
-    # parallelise its source walk, so cores past the second buy nothing.
-    runs-on: ${{ needs.version.outputs.runner_bootstrap }}
+    # parallelise its source walk, so cores past the second buy nothing
+    # and only single-core speed would: a paid ubicloud-standard-2 ran
+    # this in 95s against 121s here, and that is the whole difference.
+    runs-on: ubuntu-latest
 
     timeout-minutes: 30
 
@@ -331,6 +363,7 @@ jobs:
   # count is therefore a change to this file alone.
   integration_shards:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Integration shard
 
     runs-on: ubuntu-latest
@@ -342,7 +375,7 @@ jobs:
       # out costs another bootstrap.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     steps:
     - uses: actions/checkout@v7
@@ -387,7 +420,7 @@ jobs:
     - name: Run integration tests
       env:
         GHUL_RUNTIME_DLL: ${{ github.workspace }}/bootstrap-tool/ghul-runtime.dll
-      run: bash -c "set -o pipefail ; dotnet ghul-test --shard ${{ matrix.shard }}/5 integration-tests | tee test-results.txt"
+      run: bash -c "set -o pipefail ; dotnet ghul-test --shard ${{ matrix.shard }}/10 integration-tests | tee test-results.txt"
 
     - uses: actions/upload-artifact@v7
       with:
@@ -405,7 +438,7 @@ jobs:
   # never built. With it the job runs regardless and judges the result
   # itself.
   integration_tests:
-    needs: [integration_shards]
+    needs: [version, integration_shards]
     name: Run integration tests
 
     if: always()
@@ -418,9 +451,10 @@ jobs:
     - name: Check every shard passed
       env:
         RESULT: ${{ needs.integration_shards.result }}
+        FULL_SUITE: ${{ needs.version.outputs.full_suite }}
       run: |
         echo "shards: $RESULT"
-        [ "$RESULT" = success ]
+        [ "$RESULT" = success ] || { [ "$RESULT" = skipped ] && [ "$FULL_SUITE" != true ]; }
 
 
   # Drives --analyse, which emits nothing. It still needs the emission
@@ -429,6 +463,7 @@ jobs:
   # while that library came out empty.
   analysis_tests:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Run analysis tests
 
     runs-on: ${{ needs.version.outputs.runner_analysis }}
@@ -490,6 +525,7 @@ jobs:
   # #2288 lists.
   format_round_trip:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Run formatter round trip
 
     runs-on: ubuntu-latest
@@ -539,16 +575,22 @@ jobs:
 
   # Real .ghulproj builds against a separate assembly, so they need the
   # emission surface too.
-  cross_assembly_tests:
+  cross_assembly_shards:
     needs: [version, bootstrap]
-    name: Run cross-assembly tests
+    if: needs.version.outputs.full_suite == 'true'
+    name: Cross-assembly shard
 
-    # ghul-test harness runs each .ghulproj in parallel and each `dotnet
-    # build` is itself multithreaded. In practice the suite is small enough
-    # that the work step finishes in ~5s on 4 vCPU; sized accordingly.
+    # Each test is a `dotnet build`, so the suite is MSBuild-bound and
+    # sharded like the integration tests. `cross_assembly_tests` below is
+    # the required status check.
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
 
     steps:
     - uses: actions/checkout@v7
@@ -591,15 +633,36 @@ jobs:
     # here only because an earlier step overwrote that manifest, which is a
     # thin thread to hang the whole point of the job on.
     - name: Run cross-assembly tests
-      run: bash -c "set -o pipefail ; dotnet ghul-test --use-dotnet-build --compiler \"dotnet ${GITHUB_WORKSPACE}/bootstrap-tool/ghul.dll\" cross-assembly-tests | tee cross-assembly-test-results.txt"
+      run: bash -c "set -o pipefail ; dotnet ghul-test --use-dotnet-build --compiler \"dotnet ${GITHUB_WORKSPACE}/bootstrap-tool/ghul.dll\" --shard ${{ matrix.shard }}/3 cross-assembly-tests | tee cross-assembly-test-results.txt"
 
     - uses: actions/upload-artifact@v7
       with:
-        name: cross-assembly-test-results
+        name: cross-assembly-test-results-${{ matrix.shard }}
         path: cross-assembly-test-results.txt
+
+  # The required status check; see the note on `integration_tests`.
+  cross_assembly_tests:
+    needs: [version, cross_assembly_shards]
+    name: Run cross-assembly tests
+
+    if: always()
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+    - name: Check every shard passed
+      env:
+        RESULT: ${{ needs.cross_assembly_shards.result }}
+        FULL_SUITE: ${{ needs.version.outputs.full_suite }}
+      run: |
+        echo "shards: $RESULT"
+        [ "$RESULT" = success ] || { [ "$RESULT" = skipped ] && [ "$FULL_SUITE" != true ]; }
 
   bare_invocation_test:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Run bare invocation test
 
     runs-on: ubuntu-latest
@@ -662,6 +725,7 @@ jobs:
   # the emission surface to be complete rather than merely correct.
   runtime_tests:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Run runtime tests
 
     runs-on: ubuntu-latest
@@ -757,6 +821,7 @@ jobs:
   # to compile against what the bootstrapped compiler produced.
   examples_tests:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Run examples tests
 
     runs-on: ubuntu-latest
@@ -852,6 +917,7 @@ jobs:
   # the integration shards.
   rosetta_shards:
     needs: [version, bootstrap]
+    if: needs.version.outputs.full_suite == 'true'
     name: Rosetta Code shard
 
     runs-on: ubuntu-latest
@@ -861,7 +927,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
     # Build and run every ghul-rosetta-code task (latest main) against the
     # bootstrapped compiler. The tasks are the largest corpus of top-level
@@ -948,12 +1014,12 @@ jobs:
     # cross-assembly tests.
     - name: Run Rosetta Code integration tests
       working-directory: ghul-rosetta-code
-      run: dotnet ghul-test --use-dotnet-build --compiler "dotnet ${GITHUB_WORKSPACE}/bootstrap-tool/ghul.dll" --shard ${{ matrix.shard }}/5 tasks
+      run: dotnet ghul-test --use-dotnet-build --compiler "dotnet ${GITHUB_WORKSPACE}/bootstrap-tool/ghul.dll" --shard ${{ matrix.shard }}/10 tasks
 
 
   # The required status check; see the note on `integration_tests`.
   rosetta_tests:
-    needs: [rosetta_shards]
+    needs: [version, rosetta_shards]
     name: Run Rosetta Code tests
 
     if: always()
@@ -966,12 +1032,112 @@ jobs:
     - name: Check every shard passed
       env:
         RESULT: ${{ needs.rosetta_shards.result }}
+        FULL_SUITE: ${{ needs.version.outputs.full_suite }}
       run: |
         echo "shards: $RESULT"
-        [ "$RESULT" = success ]
+        [ "$RESULT" = success ] || { [ "$RESULT" = skipped ] && [ "$FULL_SUITE" != true ]; }
+
+  # What a release run checks when the suite is not re-run: the packed
+  # tool installs from the package as a consumer installs it, and the
+  # `smoke` subset of the integration tests - one representative per
+  # feature and group - passes under it. The bootstrap has already shown
+  # the compiler reproduces itself; this shows the package it was put in
+  # is whole and runs. A pull request run has the full suite for that and
+  # skips this.
+  smoke_tests:
+    needs: [version, bootstrap]
+    if: github.event_name != 'pull_request'
+    name: Run smoke tests
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '10.0.x'
+        cache: true
+        cache-dependency-path: |
+          **/Directory.Packages.props
+          **/.config/dotnet-tools.json
+
+    - name: Download ghul.compiler package
+      uses: actions/download-artifact@v8
+      with:
+        name: ghul-compiler-package
+        path: nupkg
+
+    - name: Download bootstrap compiler tool tree
+      uses: actions/download-artifact@v8
+      with:
+        name: ghul-compiler-tool
+        path: bootstrap-tool
+
+    - name: Add GHCR package source
+      run: dotnet nuget add source --username USERNAME --password ${{ secrets.GITHUB_TOKEN }} --store-password-in-clear-text --name github "https://nuget.pkg.github.com/degory/index.json"
+
+    - name: Install the freshly-built compiler
+      run: dotnet tool uninstall --local ghul.compiler || true; dotnet tool install --local ghul.compiler --version ${{ needs.version.outputs.package }} --add-source nupkg
+
+    - name: Restore local .NET tools
+      run: dotnet tool restore
+
+    - name: Run smoke tests
+      env:
+        GHUL_RUNTIME_DLL: ${{ github.workspace }}/bootstrap-tool/ghul-runtime.dll
+      run: bash -c "set -o pipefail ; dotnet ghul-test --tag smoke integration-tests | tee smoke-test-results.txt"
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: smoke-test-results
+        path: smoke-test-results.txt
+
+  # The one verdict the publish jobs wait on. On a pull request every test
+  # job ran and must have passed; on a release run whose tree the pull
+  # request already tested, the suite was skipped and the smoke tests must
+  # have passed instead. A `needs` list cannot say that: a skipped job in
+  # it skips the dependent too unless the dependent runs `always()`, and
+  # then a skipped job satisfies it. This job runs regardless and checks
+  # that nothing was skipped that should have run.
+  gate:
+    needs: [version, bootstrap, unit_tests, analysis_tests, integration_tests, cross_assembly_tests, bare_invocation_test, runtime_tests, examples_tests, format_round_trip, rosetta_tests, smoke_tests]
+    name: Gate
+
+    if: always()
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+    - name: Check every required job passed
+      env:
+        FULL_SUITE: ${{ needs.version.outputs.full_suite }}
+        EVENT: ${{ github.event_name }}
+        RESULTS: ${{ toJSON(needs) }}
+      run: |
+        set -euo pipefail
+        echo "full suite: ${FULL_SUITE}"
+        ok=true
+        for job in $(echo "${RESULTS}" | jq -r 'keys[]'); do
+          result=$(echo "${RESULTS}" | jq -r --arg j "${job}" '.[$j].result')
+          echo "${job}: ${result}"
+          case "${job}:${result}" in
+            *:success) continue ;;
+            smoke_tests:skipped) [ "${EVENT}" = pull_request ] && continue ;;
+            *:skipped) [ "${FULL_SUITE}" != true ] && continue ;;
+          esac
+          echo "::error::${job}: ${result}"
+          ok=false
+        done
+        [ "${ok}" = true ]
 
   publish_beta_package:
-    needs: [version, unit_tests, analysis_tests, integration_tests, cross_assembly_tests, bare_invocation_test, runtime_tests, examples_tests, format_round_trip, rosetta_tests]
+    needs: [version, gate]
     name: Publish beta package
 
     timeout-minutes: 5
@@ -1013,7 +1179,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish_release_package:
-    needs: [version, unit_tests, analysis_tests, integration_tests, cross_assembly_tests, bare_invocation_test, runtime_tests, examples_tests, format_round_trip, rosetta_tests]
+    needs: [version, gate]
     name: Publish release package
 
     timeout-minutes: 5
@@ -1064,7 +1230,7 @@ jobs:
         NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
 
   create_release:
-    needs: [version, integration_tests, publish_release_package]
+    needs: [version, gate, publish_release_package]
     name: Create release
     runs-on: ubuntu-latest
 

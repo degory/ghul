@@ -49,9 +49,10 @@ a pull request the maintainer reviews on its diff - see
 
 Assume every test failure you see was caused by what you just did. "That test
 was already broken" is almost never true here: CI runs the whole suite on every
-pull request, branch protection blocks the merge unless it is green, and the
-same suite runs again on `main` after the merge. A published release has passed
-it twice.
+pull request, branch protection blocks the merge unless it is green and the
+branch is up to date with `main`, and the squash-merged commit is the tree the
+pull request tested. A published release is that tree, bootstrapped again and
+smoke-tested from the packed tool.
 
 Before concluding otherwise, reproduce the failure against the latest published
 compiler on an unmodified checkout, and find the CI run where it failed. If you
