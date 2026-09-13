@@ -1,6 +1,6 @@
 # inference-oracle
 
-Checks the argument-pack grid for silent mis-resolution.
+Checks that a program resolved the way its inferred types say: the argument-pack grid, and any directory of programs.
 
 A cell that compiles and prints the right answer can still have been resolved
 wrongly, as long as the wrong resolution happens to compute the same thing.
@@ -65,6 +65,42 @@ Only what differs between two compiles of one program:
   order the compiler first meets them and so can change when a type is
   written out. Each frame's parameters are put in name order, and every
   index reference to them follows.
+
+## Checking real programs
+
+The grid is rendered from a cell model, so its explicit programs are rendered
+too. Any other program gets its explicit form from the compiler itself:
+`--annotate-inferred` builds the program and prints it with the types the
+build settled written in at every site that left them to inference - a
+function literal's parameters and return, and a `let` local - rendered with
+the same scope-relative names diagnostics use. `--annotate-inferred-in-place`
+rewrites the files instead. Sites whose type cannot be written at that scope
+are left as written and listed on standard error, with the count.
+
+```sh
+dotnet publish/ghul.dll --annotate-inferred program.ghul > program.annotated.ghul
+dotnet run --project tools/inference-oracle -- corpus integration-tests/execution <work-directory>
+```
+
+`corpus` takes a directory of programs, one per subdirectory holding a
+`test.ghul` (the integration-test layout; a `ghulflags` file beside it is
+passed to every compile), compiles each as written and again annotated, and
+compares the IL as `check` does. The verdicts are `=`, `≠`, `E` (the annotated
+program does not compile) and `C` (the program itself does not compile, or is
+recorded as not compiling). A program under `≠` or `E` is named in the output;
+its two programs, disassemblies and `il.diff` are under the work directory as
+for a cell, with the annotator's report in `explicit/annotate.out`.
+
+Two more things the comparison ignores, both from writing a type out: the
+purity attribute a literal's proven purity emits on its parameters and
+return, and the namespace a file with no namespace declaration takes from its
+path, which differs between the two working directories.
+
+What the annotator leaves to inference: a type still holding a placeholder,
+ERROR or a type parameter foreign to the body; a type carrying `MAYBE`, whose
+`T?` spelling is a different carrier when written back; a type
+parameter another of the same name shadows at that scope; the
+type arguments of generic calls, which are not annotated yet.
 
 ## Not in CI
 
