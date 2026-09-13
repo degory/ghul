@@ -1,0 +1,241 @@
+namespace Syntax.Process is
+    use Logging
+    use Trees
+
+    use Semantic.Types.Type
+
+    // Collects, from a tree every body of which has compiled, the type
+    // the build settled at each site that left it to inference: a
+    // function literal's parameters and return, and a `let` local. The
+    // built tree carries nodes the source never had - adapters spliced
+    // around literals, synthesised names - so nothing is recorded
+    // against a node: each type is keyed by the position the site was
+    // written at, and read back against a fresh parse of the file.
+    //
+    // A type is written only where it can be spelled at that scope: a
+    // placeholder that never settled, ERROR, a type parameter foreign
+    // to the body, and anything rendering with a synthesised name are
+    // all left as written and counted as skipped.
+    class INFERRED_ANNOTATIONS: DefaultVisitor, Printer.InferredAnnotations is
+        _parameters: Collections.MAP[string, string]
+        _returns: Collections.MAP[string, string]
+        _locals: Collections.MAP[string, string]
+
+        annotated: int
+        skipped: int
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES
+        )
+        is
+            super.init(logger, symbol_table, namespaces)
+
+            _parameters = Collections.MAP[string, string]()
+            _returns = Collections.MAP[string, string]()
+            _locals = Collections.MAP[string, string]()
+        si
+
+        collect(node: Node) is
+            node.walk(self)
+        si
+
+        parameter_type(location: Source.LOCATION) -> string? => _lookup(_parameters, location)
+        return_type(location: Source.LOCATION) -> string? => _lookup(_returns, location)
+        local_type(location: Source.LOCATION) -> string? => _lookup(_locals, location)
+
+        visit_default(node: Node) is
+        si
+
+        visit(function: Expressions.FUNCTION) is
+            if !function.is_pack_adapter then
+                if let closure: Semantic.Symbols.Closure = function.scope then
+                    _collect_literal(function, closure)
+                fi
+            fi
+
+            super.visit(function)
+        si
+
+        visit(variable: Variables.VARIABLE) is
+            if
+                isa TypeExpressions.INFER(variable.type_expression) /\
+                variable.left.is_simple_name /\
+                !variable.is_synthesized
+            then
+                if let name = variable.left.name then
+                    if name.name !~ "_" then
+                        if let symbol = find(name.name) then
+                            _record(_locals, variable.location, symbol.type)
+                        fi
+                    fi
+                fi
+            fi
+        si
+
+        _collect_literal(function: Expressions.FUNCTION, closure: Semantic.Symbols.Closure) is
+            let index mut = 0
+
+            for a in function.arguments.expressions do
+                if let parameter: Expressions.VARIABLE = a then
+                    if
+                        isa TypeExpressions.INFER(parameter.type_expression) /\
+                        index < closure.arguments.count
+                    then
+                        _record(_parameters, parameter.location, closure.arguments[index])
+                    fi
+                fi
+
+                index = index + 1
+            od
+
+            if isa TypeExpressions.INFER(function.type_expression) then
+                _record(_returns, function.location, _writable_return(function, closure.return_type))
+            fi
+        si
+
+        // The return type as the source can write it. A literal whose
+        // body evaluates to an N-ary literal at a pack-marked hop has
+        // that hop presented in the one-parameter shape the formal takes;
+        // written back, the hop is spelled as the N-ary type the source
+        // is licensed to declare there.
+        _writable_return(function: Expressions.FUNCTION, type: Type?) -> Type? is
+            if !type? then
+                return null
+            fi
+
+            let body = cast Bodies.EXPRESSION?(function.body)
+
+            if !body? then
+                return type
+            fi
+
+            let inner = cast Expressions.FUNCTION?(body.expression)
+
+            if !inner? then
+                return type
+            fi
+
+            if inner.is_pack_adapter then
+                if let adapter_body = cast Bodies.EXPRESSION?(inner.body) then
+                    if let call = cast Expressions.CALL?(adapter_body.expression) then
+                        if let original = cast Expressions.FUNCTION?(call.function) then
+                            if let value = original.value then
+                                return value.type
+                            fi
+                        fi
+                    fi
+                fi
+
+                return type
+            fi
+
+            if !type.is_function \/ type.is_action then
+                return type
+            fi
+
+            let count = type.arguments.count
+
+            let rewritten = _writable_return(inner, type.arguments[count - 1])
+
+            if !rewritten? \/ rewritten == type.arguments[count - 1] then
+                return type
+            fi
+
+            let types = Collections.LIST[Type]()
+
+            for i in 0..count - 1 do
+                types.add(type.arguments[i])
+            od
+
+            types.add(rewritten)
+
+            return IoC.CONTAINER.instance.innate_symbol_lookup.get_function_type(types, type.is_pure_function)
+        si
+
+        _record(into: Collections.MAP[string, string], location: Source.LOCATION, type: Type?) is
+            if let text = _spell(type) then
+                into[_key(location)] = text
+                annotated = annotated + 1
+            else
+                skipped = skipped + 1
+
+                IO.Std.error.write_line("{location}: left as written: {type} ({_why(type)})")
+            fi
+        si
+
+        _spell(type: Type?) -> string? is
+            if !type? then
+                return null
+            fi
+
+            let scope = _symbol_table.current_scope
+
+            if
+                type.contains_inferred \/
+                type.is_error \/
+                type.has_function_generic_argument_foreign_to(scope)
+            then
+                return null
+            fi
+
+            // `T?` over an unconstrained type parameter is carried as MAYBE[T]
+            // and renders as `T?`, which written back is a different carrier;
+            // the site is left to inference.
+            if _carries_maybe(type) then
+                return null
+            fi
+
+            let use render_scope = IoC.CONTAINER.instance.name_display.with_scope(scope)
+
+            let text = "{type}"
+
+            if text.contains("!!!") \/ text.contains("$") then
+                return null
+            fi
+
+            return text
+        si
+
+        _carries_maybe(type: Type) -> bool is
+            let found mut = false
+
+            type.walk(t => if t.is_maybe then found = true fi)
+
+            return found
+        si
+
+        _why(type: Type?) -> string is
+            if !type? then
+                return "no type"
+            fi
+
+            let scope = _symbol_table.current_scope
+
+            if type.contains_inferred then
+                return "placeholder"
+            elif type.is_error then
+                return "error"
+            elif type.has_function_generic_argument_foreign_to(scope) then
+                return "foreign type parameter"
+            elif _carries_maybe(type) then
+                return "maybe carrier"
+            fi
+
+            return "synthesised name"
+        si
+
+        _lookup(from: Collections.MAP[string, string], location: Source.LOCATION) -> string? is
+            let key = _key(location)
+
+            if from.contains_key(key) then
+                return from[key]
+            fi
+
+            return null
+        si
+
+        _key(location: Source.LOCATION) -> string => "{location.start_line},{location.start_column}"
+    si
+si

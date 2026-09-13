@@ -99,7 +99,11 @@ namespace InferenceOracle is
 
         let in_members mut = false
 
-        for line in text.split(['\n']) do
+        let lines = text.split(['\n'])
+
+        for i in 0..lines.count do
+            let line = lines[i]
+
             if line.contains("CLASS MEMBERS DECLARATION") then
                 in_members = true
                 continue
@@ -113,7 +117,26 @@ namespace InferenceOracle is
                 continue
             fi
 
-            let without_offsets = Regex.replace(line.trim_end(), "IL_[0-9a-f]{4}", "IL_")
+            // A literal's proven purity is carried as an attribute on
+            // its return and its parameters, and writing a type out can
+            // add or drop it without changing what was resolved.
+            if line.contains("Ghul.Internal.PURE_ATTRIBUTE") then
+                continue
+            fi
+
+            if line.trim().starts_with(".param [") /\ i + 1 < lines.count /\ lines[i + 1].contains("Ghul.Internal.PURE_ATTRIBUTE") then
+                continue
+            fi
+
+            // A file with no namespace gets one made from its path, and
+            // the two programs are compiled from different directories.
+            let without_paths = Regex.replace(line.trim_end(), "__tmp__[A-Za-z0-9_`]*?(inferred|explicit)__test", "__file__")
+
+            // An assert message carries the source position it was
+            // written at, which formatting moves.
+            let without_positions = Regex.replace(without_paths, "ldstr\\s+\"test\\.ghul [0-9]+,[0-9]+\\.\\.[0-9]+,[0-9]+: ", "ldstr \"test.ghul: ")
+
+            let without_offsets = Regex.replace(without_positions, "IL_[0-9a-f]{4}", "IL_")
 
             let renumbered = Regex.replace(
                 without_offsets,
@@ -389,6 +412,160 @@ namespace InferenceOracle is
         report(checks)
     si
 
+    // What checking one corpus program found: a directory holding
+    // `test.ghul`, compiled as written and again with the types the
+    // compiler inferred written out by `--annotate-inferred`.
+    class CORPUS_CHECK(name: string, source: string, inferred: string, explicit: string) is
+        verdict: string? public
+        annotated: int public
+        skipped: int public
+    si
+
+    // The programs under a directory: each subdirectory holding a
+    // `test.ghul`, in name order. One recorded as failing to compile
+    // is left out, since there is nothing to compare.
+    corpus_programs(directory: string, work: string, filter_text: string?) -> LIST[CORPUS_CHECK] is
+        let result = LIST[CORPUS_CHECK]()
+
+        let directories = LIST[string](Directory.get_directories(directory))
+
+        directories.sort()
+
+        for d in directories do
+            let name = Path.get_file_name(d)!
+
+            if filter_text? /\ !name.contains(filter_text) then
+                continue
+            fi
+
+            if !File.exists(Path.combine(d, "test.ghul")) then
+                continue
+            fi
+
+            let check = CORPUS_CHECK(name, d, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+
+            if File.exists(Path.combine(d, "fail.expected")) then
+                check.verdict = "C"
+            fi
+
+            result.add(check)
+        od
+
+        result
+    si
+
+    // The flags a program's `ghulflags` asks for, on one line.
+    program_flags(source: string) -> string is
+        let path = Path.combine(source, "ghulflags")
+
+        if !File.exists(path) then
+            return ""
+        fi
+
+        File.read_all_text(path).split(['\n', '\r', ' ']) |> filter(f => f.length > 0) |> join(" ")
+    si
+
+    // The site counts `--annotate-inferred` reports on its standard error.
+    read_annotation_counts(check: CORPUS_CHECK) is
+        let path = Path.combine(check.explicit, "annotate.out")
+
+        if !File.exists(path) then
+            return
+        fi
+
+        let m = Regex.match(File.read_all_text(path), "annotated ([0-9]+) inferred sites, skipped ([0-9]+)")
+
+        if m.success then
+            check.annotated = int.parse(m.groups[1].value)
+            check.skipped = int.parse(m.groups[2].value)
+        fi
+    si
+
+    corpus(directory: string, work: string, compiler: string, ildasm: string, filter_text: string?) -> int is
+        make_executable(ildasm)
+
+        let checks = corpus_programs(directory, work, filter_text)
+        let to_compile = LIST[CORPUS_CHECK](checks |> filter(c => !c.verdict?))
+
+        let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
+
+        write_line("checking {to_compile.count} programs, {batch_size} at a time")
+
+        for batch in to_compile |> chunk(batch_size) do
+            let processes = LIST[System.Diagnostics.Process]()
+
+            for c in batch do
+                for d in [c.inferred, c.explicit] do
+                    if Directory.exists(d) then
+                        Directory.delete(d, true)
+                    fi
+
+                    Directory.create_directory(d)
+                od
+
+                File.copy(Path.combine(c.source, "test.ghul"), Path.combine(c.inferred, "test.ghul"))
+
+                let flags = program_flags(c.source)
+
+                // The explicit program is the inferred one annotated, so
+                // both are compiled in one command: the annotation itself
+                // is a build, and a program the compiler rejects has no
+                // annotated form to compare.
+                let compile = "dotnet {quote(compiler)} {flags} test.ghul -o binary.exe > compiler.out 2>&1"
+                let annotate = "dotnet {quote(compiler)} --annotate-inferred {flags} test.ghul > ../explicit/test.ghul 2> ../explicit/annotate.out"
+
+                processes.add(start(c.inferred, "{compile} && {annotate} && cd ../explicit && {compile}"))
+            od
+
+            for p in processes do
+                p.wait_for_exit()
+            od
+
+            for c in batch do
+                read_annotation_counts(c)
+
+                c.verdict =
+                    if !File.exists(Path.combine(c.inferred, "binary.exe")) then
+                        "C"
+                    else
+                        compare_directories(c.inferred, c.explicit, ildasm)
+                    fi
+            od
+        od
+
+        report_corpus(checks)
+    si
+
+    report_corpus(checks: LIST[CORPUS_CHECK]) -> int is
+        let counts = MAP[string, int]()
+        let annotated mut = 0
+        let skipped mut = 0
+
+        for c in checks do
+            let verdict = c.verdict ?? "?"
+
+            counts[verdict] = if counts.contains_key(verdict) then counts[verdict] + 1 else 1 fi
+
+            annotated = annotated + c.annotated
+            skipped = skipped + c.skipped
+
+            if verdict =~ "≠" \/ verdict =~ "E" then
+                write_line("{verdict} {c.name}")
+            fi
+        od
+
+        write_line("")
+
+        for (key, value) in counts do
+            write_line("- `{key}`: {value}")
+        od
+
+        write_line("")
+        write_line("{annotated} inferred sites written out, {skipped} left as written")
+
+        if counts.contains_key("≠") then 1 else 0 fi
+    si
+
     compare(c: CHECK, ildasm: string) -> string is
         if !File.exists(Path.combine(c.inferred, "binary.exe")) then
             // The grid records this cell as compiling, so the compiler used
@@ -396,11 +573,18 @@ namespace InferenceOracle is
             return "?"
         fi
 
-        if !File.exists(Path.combine(c.explicit, "binary.exe")) then
+        compare_directories(c.inferred, c.explicit, ildasm)
+    si
+
+    // The verdict for two compiled programs: `=` when their normalised
+    // IL matches, `≠` when it differs, `E` when the explicit one did
+    // not compile.
+    compare_directories(inferred: string, explicit: string, ildasm: string) -> string is
+        if !File.exists(Path.combine(explicit, "binary.exe")) then
             return "E"
         fi
 
-        for directory in [c.inferred, c.explicit] do
+        for directory in [inferred, explicit] do
             let p = start(directory, "{quote(ildasm)} -out=il.raw binary.exe > ildasm.out 2>&1")
 
             p.wait_for_exit()
@@ -409,14 +593,14 @@ namespace InferenceOracle is
         od
 
         let diff = start(
-            Path.get_directory_name(c.inferred)!,
+            Path.get_directory_name(inferred)!,
             "diff -u inferred/il.normalised explicit/il.normalised > il.diff"
         )
 
         diff.wait_for_exit()
 
         if diff.exit_code == 0 then
-            File.delete(Path.combine(Path.get_directory_name(c.inferred)!, "il.diff"))
+            File.delete(Path.combine(Path.get_directory_name(inferred)!, "il.diff"))
             "="
         else
             "≠"
@@ -478,8 +662,12 @@ namespace InferenceOracle is
     si
 
     entry(args: string[]) -> int is
-        if args.count < 3 \/ !(args[0] =~ "check") then
+        let is_check = args.count >= 1 /\ args[0] =~ "check"
+        let is_corpus = args.count >= 1 /\ args[0] =~ "corpus"
+
+        if args.count < 3 \/ !(is_check \/ is_corpus) then
             write_line("usage: inference-oracle check <grid-directory> <work-directory> [--compiler <ghul.dll>] [--ildasm <path>] [--cell <text>]")
+            write_line("       inference-oracle corpus <programs-directory> <work-directory> [--compiler <ghul.dll>] [--ildasm <path>] [--cell <text>]")
             return 1
         fi
 
@@ -504,6 +692,10 @@ namespace InferenceOracle is
             i = i + 2
         od
 
-        check(Path.get_full_path(args[1]), Path.get_full_path(args[2]), Path.get_full_path(compiler), find_ildasm(ildasm), filter_text)
+        if is_corpus then
+            corpus(Path.get_full_path(args[1]), Path.get_full_path(args[2]), Path.get_full_path(compiler), find_ildasm(ildasm), filter_text)
+        else
+            check(Path.get_full_path(args[1]), Path.get_full_path(args[2]), Path.get_full_path(compiler), find_ildasm(ildasm), filter_text)
+        fi
     si
 si
