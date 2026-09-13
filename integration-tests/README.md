@@ -130,6 +130,37 @@ for t in integration-tests/execution/argument-pack-grid/*/ ; do [ -f "$t/failed"
 
 `report` in place of `generate` prints the grid's outcomes as a Markdown table.
 
+### The inference oracle
+
+A cell that compiles and prints the right answer can still have been resolved
+wrongly, as long as the wrong resolution happens to compute the same thing.
+`generators/inference-oracle` checks for that. For each grid cell that compiles,
+it writes a second program with every type the compiler would infer written
+out: lambda parameter and return types, local variable types, and the type
+arguments of every generic call. It compiles both with the same compiler and
+compares the two assemblies' IL. The comparison ignores what differs between
+two compiles of one program: the assembly header, instruction offsets and code
+sizes, and the numbers the compiler gives its generated members.
+
+The explicit programs come from the same cell model as the grid, in
+`generators/argument-pack-grid/src/grid.ghul`, so a new axis value is checked
+by the oracle as soon as the grid has it. Publish the compiler, then run it
+from the repository root:
+
+```sh
+dotnet run --project integration-tests/generators/inference-oracle -- check integration-tests/execution/argument-pack-grid <work-directory>
+```
+
+It prints a table of verdicts per cell: `=` the IL matches, `≠` it does not,
+`E` the explicit program does not compile, `C` the grid cell itself does not
+compile, so there is nothing to compare, and `·` the language rules the cell
+out. Each checked cell leaves both programs, their normalised IL and, where
+they differ, `il.diff` under the work directory. The exit status is non-zero
+when any cell's IL differs. `--compiler <ghul.dll>` names a compiler other than
+`publish/ghul.dll`, `--ildasm <path>` an ildasm other than the one in the NuGet
+package cache, and `--cell <text>` restricts the run to cells whose name
+contains the text.
+
 ## The IL snapshot tests
 
 Tests under `il/` carrying an `il.expected` snapshot assert the shape of what
