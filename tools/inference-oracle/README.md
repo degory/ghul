@@ -65,6 +65,9 @@ Only what differs between two compiles of one program:
   order the compiler first meets them and so can change when a type is
   written out. Each frame's parameters are put in name order, and every
   index reference to them follows.
+- The same order for a generic literal's method: its declared parameters are
+  put in name order, and each reference to it has its instantiation and the
+  indices in the signature it writes out reordered to match.
 
 ## Checking real programs
 
