@@ -35,4 +35,8 @@ The `COMPILER` class (see `src/compiler/compiler.ghul`) runs these in order:
 - **signature_help.ghul** – determines overload information for function calls.
 - **printer/** – visitors that pretty-print trees for debugging.
 
+### Tracing inference
+
+`--trace-inference` (to stderr), `--trace-inference-file <path>`, or `GHUL_TRACE_INFERENCE` (a path, or `-` for stderr) writes a line-oriented trace of compile-expressions' inference: for each function body and each of its outer walks, the type-argument placeholders minted, every bound or constraint offered to an inference variable and whether it was taken, every local re-walk site that fired, and how the body's walks ended. `src/semantic/inference_trace.ghul` lists the events. The trace names no memory addresses or hash-ordered collections, so traces of the same input from two compiler versions can be diffed.
+
 Support code like the visitor base classes are used by multiple passes. Not every pass runs in every scenario; the driver selects them based on build flags and whether analysis mode is active.
