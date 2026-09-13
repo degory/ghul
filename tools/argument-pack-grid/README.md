@@ -2,12 +2,19 @@
 
 Writes the argument-pack conformance grid under
 `integration-tests/execution/argument-pack-grid`: one integration test per
-combination of how the function filling a `T.. -> U` formal is written, where
-it sits relative to the pack, what pins the pack, and the arity.
+combination of how the combinator is reached, how the function filling a
+`T.. -> U` formal is written, where it sits relative to the pack, what pins
+the pack, and the arity.
 
 The axes are lists in `src/grid.ghul`, so an axis gains a value by adding one
 entry there. Cells the language rules out are skipped, and `skip_reason` says
 why for each.
+
+Every position is crossed with a global combinator. Only the positions marked
+`crosses_callees` are also crossed with the other ways of reaching one - a
+static or instance method, a call on `self`, and a class whose type parameter
+is the pack - since the rest would multiply the grid for little that the
+direct call and the pipe do not already exercise.
 
 ## Regenerating
 

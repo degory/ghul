@@ -107,8 +107,9 @@ opportunistic upkeep, not a project.
 ## Generated tests
 
 `execution/argument-pack-grid` holds one test per cell of a conformance grid
-for argument packs: how the function filling a `T.. -> U` formal is written,
-where it sits relative to the pack, what pins the pack, and the arity. The
+for argument packs: how the combinator is reached, how the function filling a
+`T.. -> U` formal is written, where it sits relative to the pack, what pins
+the pack, and the arity. The
 cells are written by the ghūl program in `tools/argument-pack-grid`, whose
 README says how to regenerate them. Edit the generator rather than a cell.
 
