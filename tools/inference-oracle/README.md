@@ -32,6 +32,7 @@ Options:
   `GHUL_TEST_ILDASM` is used if set, then the newest
   `runtime.linux-x64.microsoft.netcore.ildasm` in the NuGet package cache.
 - `--cell <text>` checks only cells whose name contains the text.
+- `--json <file>` also writes the run as JSON; see below.
 
 ## Reading the output
 
@@ -131,7 +132,36 @@ ERROR or a type parameter foreign to the body; a type carrying `MAYBE`, whose
 parameter another of the same name shadows at that scope; the
 type arguments of generic calls, which are not annotated yet.
 
+## Machine-readable output
+
+`--json <file>` writes the run as JSON beside the human-readable output:
+each program's name, verdict and annotator counts in the order checked, the
+verdict counts, and the annotator's totals. `compare-runs.sh` diffs two
+such reports and prints, as Markdown, every program whose verdict changed
+and every program new to the corpus that did not come out `=` or `·`;
+it prints nothing when nothing changed.
+
+## The scheduled run
+
+`.github/workflows/oracle.yml` runs the four corpora nightly at 03:00 UTC
+with the latest published `ghul.compiler` - the argument-pack grid,
+`integration-tests/execution`, the Rosetta Code solutions at their default
+branch, and the compiler's own source - and skips the night when that
+compiler is the one the previous run checked. It is not a pull-request
+gate: the four corpora take most of an hour, and a difference is worth
+knowing about the morning after rather than on every push. A manual
+dispatch runs it on demand; its `force` input runs it even when nothing
+was published.
+
+Each run writes its totals to the job summary and appends itself to the
+`oracle-history` branch: one line per run in `totals.jsonl`, and the four
+reports under `runs/<compiler version>/`, which the next run diffs its own
+against. The tracking issue's body is rewritten with the latest totals,
+and a comment goes on it only when a program's verdict differs from the
+previous run. Nothing opens an issue per finding.
+
 ## Not in CI
 
 A development tool, like `mdump`. Nothing builds it as part of a normal
-build, and the suite does not run it.
+build, and the pull-request suite does not run it; the scheduled run above
+is the only automated use.
