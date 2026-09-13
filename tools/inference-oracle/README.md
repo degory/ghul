@@ -82,10 +82,34 @@ dotnet publish/ghul.dll --annotate-inferred program.ghul > program.annotated.ghu
 dotnet run --project tools/inference-oracle -- corpus integration-tests/execution <work-directory>
 ```
 
-`corpus` takes a directory of programs, one per subdirectory holding a
-`test.ghul` (the integration-test layout; a `ghulflags` file beside it is
-passed to every compile), compiles each as written and again annotated, and
-compares the IL as `check` does. The verdicts are `=`, `≠`, `E` (the annotated
+`corpus` takes a directory of programs, compiles each as written and again
+annotated, and compares the IL as `check` does. A program is one of:
+
+- a subdirectory holding a `test.ghul` (the integration-test layout; a
+  `ghulflags` file beside it is passed to every compile);
+- a subdirectory holding a `.ghulproj`, or one level further down when a
+  directory keeps several solutions as projects of their own;
+- the directory itself, when it holds a `.ghulproj`, so one project such as
+  the compiler can be checked on its own.
+
+A project's sources are every `.ghul` its `GhulSources` items glob
+(`src/**/*.ghul` when it has none), outside `bin/` and `obj/`, copied to both
+working directories so the annotated program keeps the same files. Its
+options are its unconditioned `GhulOptions` items, those of the nearest
+`Directory.Build.props`, and the flags the ghūl build targets derive from
+`GhulUnderscoreAccess`, `GhulGlobalNamespace`, `GhulDefaultUses`,
+`GhulLibrary` and `OutputType`. Its references are written out in full,
+since a compile given any discovers none: the .NET 10 targeting pack beside
+the running .NET, and each package at the version it or the nearest
+`Directory.Packages.props` pins, read from the package cache - so restore the
+project first. Another project's output comes from `.assemblies.json`, which
+has to be current. A project whose references cannot all be found is reported
+as `·`.
+
+```sh
+dotnet run --project tools/inference-oracle -- corpus ../ghul-rosetta-code/tasks <work-directory>
+dotnet run --project tools/inference-oracle -- corpus . <work-directory>
+``` The verdicts are `=`, `≠`, `E` (the annotated
 program does not compile) and `C` (the program itself does not compile, or is
 recorded as not compiling). A program under `≠` or `E` is named in the output;
 its two programs, disassemblies and `il.diff` are under the work directory as
