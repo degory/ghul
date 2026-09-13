@@ -1895,6 +1895,14 @@ run[T.., U](make: (int) -> T.. -> U, v: T) -> U => make(10)(v);
 run(n => (a, b) => a + b + n, (1, 2));   // 13
 ```
 
+A literal written there can spell its types out. Its return is written as the N-ary function type the marker licenses, and the literal is presented in the tuple-in shape the formal takes, exactly as the inferred one is - at whatever depth the marker sits. The tuple-in shape itself is not a type an N-ary literal can be returned as, there or anywhere else:
+
+```ghul
+run((n: int) -> (int, int) -> int => (a: int, b: int) -> int => a + b + n, (1, 2));   // 13
+
+run((n: int) -> ((int, int)) -> int => (a: int, b: int) -> int => a + b + n, (1, 2)); // error
+```
+
 The marker reads only as a formal's own type, as the parameter of a function type on that type's return spine, or as the parameter of a function type in a declared return type. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
 
 What each formal asks for survives into the assembly, so a pack declared in one assembly reads the same way from another.
