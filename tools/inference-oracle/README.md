@@ -134,8 +134,10 @@ alone unless every one of its type arguments can be written.
 What the annotator leaves to inference: a type still holding a placeholder,
 ERROR or a type parameter foreign to the body; a type carrying `MAYBE`, whose
 `T?` spelling is a different carrier when written back; a type
-parameter another of the same name shadows at that scope; and the type
-arguments of a call whose callee is anything but a name.
+parameter another of the same name shadows at that scope; the type
+arguments of a call whose callee is anything but a name; and those of a
+construction through a type alias, which belong to the type the alias names,
+or of `MAYBE`.
 
 ## Machine-readable output
 
