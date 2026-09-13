@@ -14,16 +14,19 @@ set -euo pipefail
 previous=${1:?previous report}
 current=${2:?current report}
 
+# A corpus of a thousand programs is too long for an argument, so the
+# reports reach jq as files.
 if [ -f "${previous}" ]; then
-  previous_programs=$(jq '[.programs[] | {key: .name, value: .verdict}] | from_entries' "${previous}")
+  before=${previous}
 else
-  previous_programs='{}'
+  before=$(mktemp)
+  echo '{"programs": []}' > "${before}"
 fi
 
-current_programs=$(jq '[.programs[] | {key: .name, value: .verdict}] | from_entries' "${current}")
-
-jq -rn --argjson before "${previous_programs}" --argjson after "${current_programs}" '
-  ($after | keys) as $is
+jq -rn --slurpfile before "${before}" --slurpfile after "${current}" '
+  ($before[0].programs | map({key: .name, value: .verdict}) | from_entries) as $before
+  | ($after[0].programs | map({key: .name, value: .verdict}) | from_entries) as $after
+  | ($after | keys) as $is
   | [ $is[] | select(($before[.] != null) and ($before[.] != $after[.]))
       | "- `\($before[.])` → `\($after[.])` \(.)" ]
     + [ $is[] | select(($before[.] == null) and ($after[.] != "=") and ($after[.] != "·"))
