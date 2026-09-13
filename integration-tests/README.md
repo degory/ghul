@@ -104,6 +104,32 @@ an existing test clearly needs a feature tag that doesn't exist yet. Don't go
 looking for mistagged tests outside of what you're already touching — this is
 opportunistic upkeep, not a project.
 
+## Generated tests
+
+`execution/argument-pack-grid` holds one test per cell of a conformance grid
+for argument packs: how the function filling a `T.. -> U` formal is written,
+where it sits relative to the pack, what pins the pack, and the arity. The
+cells are written by the ghūl program in `generators/argument-pack-grid`, so an
+axis gains a value by adding one entry to its list there. Cells the language
+rules out are skipped by the generator, which says why.
+
+A cell that fails today is kept, with the failure captured as its expectation:
+`fail.expected` and `err.expected` for one that does not compile, and
+`run.expected` for one that compiles, since each program catches any exception
+and prints what it caught and whether its result was right. Fixing a gap
+therefore fails the cells it fixes, and recapturing them records the fix.
+
+Regenerate after changing the generator, then run the grid and capture what
+changed:
+
+```sh
+dotnet run --project integration-tests/generators/argument-pack-grid -- generate integration-tests/execution/argument-pack-grid
+dotnet ghul-test integration-tests/execution/argument-pack-grid
+for t in integration-tests/execution/argument-pack-grid/*/ ; do [ -f "$t/failed" ] && ./tasks/capture.sh "$t" ; done
+```
+
+`report` in place of `generate` prints the grid's outcomes as a Markdown table.
+
 ## The IL snapshot tests
 
 Tests under `il/` carrying an `il.expected` snapshot assert the shape of what
