@@ -98,8 +98,8 @@ path, which differs between the two working directories.
 
 What the annotator leaves to inference: a type still holding a placeholder,
 ERROR or a type parameter foreign to the body; a type carrying `MAYBE`, whose
-`T?` spelling is a different carrier when written back; a recursive literal's
-return, which the parser does not accept after a typed `let` (#2565); the
+`T?` spelling is a different carrier when written back; a type
+parameter another of the same name shadows at that scope; the
 type arguments of generic calls, which are not annotated yet.
 
 ## Not in CI
