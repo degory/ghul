@@ -109,7 +109,9 @@ as `·`.
 ```sh
 dotnet run --project tools/inference-oracle -- corpus ../ghul-rosetta-code/tasks <work-directory>
 dotnet run --project tools/inference-oracle -- corpus . <work-directory>
-``` The verdicts are `=`, `≠`, `E` (the annotated
+```
+
+The verdicts are `=`, `≠`, `E` (the annotated
 program does not compile) and `C` (the program itself does not compile, or is
 recorded as not compiling). A program under `≠` or `E` is named in the output;
 its two programs, disassemblies and `il.diff` are under the work directory as
