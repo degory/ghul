@@ -146,13 +146,9 @@ namespace InferenceOracle is
 
             // A file with no namespace gets one made from its path, and
             // the two programs are compiled from different directories.
-            let without_paths = Regex.replace(without_blobs, "__tmp__[A-Za-z0-9_`]*?(inferred|explicit)__test", "__file__")
+            let without_paths = Regex.replace(without_blobs, "__(inferred|explicit)__", "__program__")
 
-            // An assert message carries the source position it was
-            // written at, which formatting moves.
-            let without_positions = Regex.replace(without_paths, "ldstr\\s+\"test\\.ghul [0-9]+,[0-9]+\\.\\.[0-9]+,[0-9]+: ", "ldstr \"test.ghul: ")
-
-            let without_offsets = Regex.replace(without_positions, "IL_[0-9a-f]{{4}}", "IL_")
+            let without_offsets = Regex.replace(without_paths, "IL_[0-9a-f]{{4}}", "IL_")
 
             if without_offsets.trim().length == 0 then
                 continue
@@ -164,7 +160,10 @@ namespace InferenceOracle is
         let result = System.Text.StringBuilder()
 
         for line in out do
-            result.append(line).append('\n')
+            // An assert message carries the source position it was
+            // written at, which annotating moves. Matched once a wrapped
+            // string has been joined back into one line.
+            result.append(Regex.replace(line, "ldstr\\s+\"([^\" ]*\\.ghul) [0-9]+,[0-9]+\\.\\.[0-9]+,[0-9]+: ", "ldstr \"$1: ")).append('\n')
         od
 
         renumber(canonicalise_class_order(canonicalise_frames(result.to_string())))
@@ -517,19 +516,39 @@ namespace InferenceOracle is
     si
 
     // What checking one corpus program found: a directory holding
-    // `test.ghul`, compiled as written and again with the types the
-    // compiler inferred written out by `--annotate-inferred`.
+    // `test.ghul`, or a project's sources, compiled as written and again
+    // with the types the compiler inferred written out by
+    // `--annotate-inferred`. `sources` are paths relative to `source`,
+    // and `options` the flags and references every compile of the
+    // program is given.
     class CORPUS_CHECK(name: string, source: string, inferred: string, explicit: string) is
         verdict: string? public
         annotated: int public
         skipped: int public
+        sources: LIST[string] public
+        options: string public
+
+        init(..) is
+            sources = LIST[string]()
+            options = ""
+        si
     si
 
-    // The programs under a directory: each subdirectory holding a
-    // `test.ghul`, in name order. One recorded as failing to compile
-    // is left out, since there is nothing to compare.
-    corpus_programs(directory: string, work: string, filter_text: string?) -> LIST[CORPUS_CHECK] is
+    // The programs under a directory, in name order: each subdirectory
+    // holding a `test.ghul` or a `.ghulproj`, or the directory itself
+    // when it holds a `.ghulproj`. One recorded as failing to compile,
+    // or whose references a bare compile cannot resolve, is left out,
+    // since there is nothing to compare.
+    corpus_programs(directory: string, work: string, compiler: string, filter_text: string?) -> LIST[CORPUS_CHECK] is
         let result = LIST[CORPUS_CHECK]()
+
+        if find_project(directory)? then
+            let name = Path.get_file_name(directory)!
+
+            result.add(project_program(directory, name, work, compiler))
+
+            return result
+        fi
 
         let directories = LIST[string](Directory.get_directories(directory))
 
@@ -542,17 +561,377 @@ namespace InferenceOracle is
                 continue
             fi
 
-            if !File.exists(Path.combine(d, "test.ghul")) then
-                continue
+            if File.exists(Path.combine(d, "test.ghul")) then
+                let check = CORPUS_CHECK(name, d, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+
+                check.sources = LIST[string](["test.ghul"])
+                check.options = program_flags(d)
+
+                if File.exists(Path.combine(d, "fail.expected")) then
+                    check.verdict = "C"
+                fi
+
+                result.add(check)
+            elif find_project(d)? then
+                result.add(project_program(d, name, work, compiler))
+            else
+                // A directory holding several solutions keeps each as a
+                // project of its own, one level down.
+                let solutions = LIST[string](Directory.get_directories(d) |> filter(s => find_project(s)?))
+
+                solutions.sort()
+
+                for s in solutions do
+                    result.add(project_program(s, "{name}/{Path.get_file_name(s)}", work, compiler))
+                od
+            fi
+        od
+
+        result
+    si
+
+    find_project(directory: string) -> string? =>
+        Directory.get_files(directory, "*.ghulproj") |> first()
+
+    // The text of every `<element Include="...">` in `text` that carries
+    // no other attribute, so an item MSBuild includes only under a
+    // condition is left out.
+    item_includes(text: string, element: string) -> LIST[string] =>
+        LIST[string](
+            Regex.matches(text, "<{element}\\s+Include=\"([^\"]*)\"\\s*/?>")
+                |> map((m: System.Text.RegularExpressions.Match) -> string => m.groups[1].value)
+        )
+
+    property_value(text: string, name: string) -> string? is
+        let m = Regex.match(text, "<{name}>([^<]*)</{name}>")
+
+        if m.success then m.groups[1].value.trim() else null fi
+    si
+
+    // The nearest `Directory.Build.props` MSBuild imports for a project
+    // in `directory`.
+    build_props(directory: string) -> string? is
+        let current: string? mut = directory
+
+        while current? do
+            let path = Path.combine(current, "Directory.Build.props")
+
+            if File.exists(path) then
+                return path
             fi
 
-            let check = CORPUS_CHECK(name, d, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+            current = Path.get_directory_name(current)
+        od
 
-            if File.exists(Path.combine(d, "fail.expected")) then
-                check.verdict = "C"
+        return null
+    si
+
+    // A program built from a `.ghulproj`: every `.ghul` its `GhulSources`
+    // items glob, compiled with the options its items and the properties
+    // the ghūl targets read ask for.
+    project_program(directory: string, name: string, work: string, compiler: string) -> CORPUS_CHECK is
+        let check = CORPUS_CHECK(name, directory, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+
+        let project = File.read_all_text(find_project(directory)!)
+        let props = if let path = build_props(directory) then File.read_all_text(path) else "" fi
+        let text = "{props}\n{project}"
+
+        let patterns = item_includes(project, "GhulSources")
+
+        if patterns.count == 0 then
+            patterns.add("src/**/*.ghul")
+        fi
+
+        let sources = SET[string]()
+
+        for pattern in patterns do
+            for file in glob(directory, pattern) do
+                sources.add(file)
+            od
+        od
+
+        check.sources = LIST[string](sources)
+        check.sources.sort()
+
+        let options = LIST[string](item_includes(text, "GhulOptions"))
+
+        if let access = property_value(text, "GhulUnderscoreAccess") then
+            options.add("--underscore-access {access}")
+        fi
+
+        if let global = property_value(text, "GhulGlobalNamespace") /\ global.to_lower() =~ "true" then
+            options.add("--global-namespace")
+        fi
+
+        if let uses = property_value(text, "GhulDefaultUses") then
+            options.add("--default-use \"{uses.replace(';', ',')}\"")
+        fi
+
+        let library = property_value(text, "GhulLibrary")
+        let output_type = property_value(text, "OutputType")
+
+        if
+            (library? /\ library.to_lower() =~ "true") \/
+            (!library? /\ (!output_type? \/ output_type.to_lower() =~ "library"))
+        then
+            options.add("--library")
+        fi
+
+        // A compile given any reference discovers none of its own, so the
+        // references are all written out: the SDK's reference assemblies,
+        // and each package at the version the project pins, read from the
+        // package cache as a restore left it. The runtime is one of those
+        // packages, and without a pin the one beside the compiler.
+        let references = LIST[string](sdk_references())
+        let versions = if let path = packages_props(directory) then File.read_all_text(path) else "" fi
+        let has_runtime mut = false
+
+        let seen = SET[string]()
+
+        for (id, version) in package_references(text) do
+            if id.to_lower() =~ "ghul.runtime" then
+                has_runtime = true
             fi
 
-            result.add(check)
+            let pinned = version ?? package_version(versions, id)
+
+            if !pinned? \/ !add_package(id, pinned, references, seen) then
+                check.verdict = "·"
+            fi
+        od
+
+        if !has_runtime then
+            references.add(Path.combine(Path.get_directory_name(compiler)!, "ghul-runtime.dll"))
+        fi
+
+        // Another project's output is only where its last build left it,
+        // and the paths that build resolved are recorded beside this one.
+        if item_includes(project, "ProjectReference").count > 0 then
+            let recorded = Path.combine(directory, ".assemblies.json")
+
+            if !File.exists(recorded) then
+                check.verdict = "·"
+            else
+                let document = System.Text.Json.JsonDocument.parse(File.read_all_text(recorded), _)
+                let packages = nuget_packages()
+
+                for element in document.root_element.get_property("assemblies").enumerate_array() do
+                    let assembly = element.get_string() ?? ""
+
+                    if assembly.length > 0 /\ !assembly.starts_with(packages) /\ !assembly.contains("/packs/") then
+                        references.add(assembly)
+                    fi
+                od
+            fi
+        fi
+
+        for reference in references do
+            options.add("-a {quote(reference)}")
+        od
+
+        check.options = options |> join(" ")
+
+        if check.sources.count == 0 then
+            check.verdict = "·"
+        fi
+
+        check
+    si
+
+    nuget_packages() -> string is
+        let from_environment = System.Environment.get_environment_variable("NUGET_PACKAGES")
+
+        if from_environment? /\ from_environment.length > 0 then
+            from_environment
+        else
+            Path.combine(System.Environment.get_folder_path(System.Environment_SpecialFolder.USER_PROFILE), ".nuget/packages")
+        fi
+    si
+
+    // The reference assemblies of the newest .NET 10 targeting pack beside
+    // the running .NET.
+    sdk_references() -> LIST[string] is
+        let shared = Path.get_directory_name((typeof object).assembly.location)!
+        let root = Path.get_directory_name(Path.get_directory_name(Path.get_directory_name(shared)!)!)!
+        let packs = Path.combine(root, "packs/Microsoft.NETCore.App.Ref")
+
+        let versions = LIST[string](Directory.get_directories(packs) |> filter(d => Path.get_file_name(d)!.starts_with("10.")))
+
+        versions.sort((a: string, b: string) -> int => System.Version(Path.get_file_name(a)!.split(['-'])[0]).compare_to(System.Version(Path.get_file_name(b)!.split(['-'])[0])))
+
+        LIST[string](Directory.get_files(Path.combine(versions[versions.count - 1], "ref/net10.0"), "*.dll"))
+    si
+
+    // Every `<PackageReference>` in `text`, with the version written on
+    // it when there is one.
+    package_references(text: string) -> LIST[(id: string, version: string?)] =>
+        LIST[(id: string, version: string?)](
+            Regex.matches(text, "<PackageReference\\s+Include=\"([^\"]*)\"(?:\\s+Version=\"([^\"]*)\")?\\s*/?>")
+                |> map((m: System.Text.RegularExpressions.Match) -> (id: string, version: string?) =>
+                    (id = m.groups[1].value, version = if m.groups[2].success then m.groups[2].value else null fi))
+        )
+
+    // The nearest `Directory.Packages.props`, where central package
+    // management pins versions.
+    packages_props(directory: string) -> string? is
+        let current: string? mut = directory
+
+        while current? do
+            let path = Path.combine(current, "Directory.Packages.props")
+
+            if File.exists(path) then
+                return path
+            fi
+
+            current = Path.get_directory_name(current)
+        od
+
+        return null
+    si
+
+    package_version(text: string, id: string) -> string? is
+        let m = Regex.match(text, "<PackageVersion\\s+Include=\"{Regex.escape(id)}\"\\s+Version=\"([^\"]*)\"", System.Text.RegularExpressions.RegexOptions.IGNORE_CASE)
+
+        if m.success then m.groups[1].value else null fi
+    si
+
+    // A package's assemblies for the newest framework it ships that .NET 10
+    // can load, or null when the cache does not hold that version.
+    package_assemblies(id: string, version: string) -> LIST[string]? is
+        let lib = Path.combine(Path.combine(Path.combine(nuget_packages(), id.to_lower()), version), "lib")
+
+        for framework in ["net10.0", "net9.0", "net8.0", "net7.0", "net6.0", "netstandard2.1", "netstandard2.0"] do
+            let path = Path.combine(lib, framework)
+
+            if Directory.exists(path) then
+                return LIST[string](Directory.get_files(path, "*.dll"))
+            fi
+        od
+
+        return null
+    si
+
+    // Adds a package's assemblies and, following its `.nuspec`, those of
+    // the packages it depends on, since a package can be a facade whose
+    // types live in its dependencies. False when the package itself is not
+    // in the cache; a dependency missing from it is left for the compile to
+    // report.
+    add_package(id: string, version: string, references: LIST[string], seen: SET[string]) -> bool is
+        if !seen.add(id.to_lower()) then
+            return true
+        fi
+
+        let assemblies = package_assemblies(id, version)
+
+        if !assemblies? then
+            return false
+        fi
+
+        references.add_range(assemblies)
+
+        let directory = Path.combine(Path.combine(nuget_packages(), id.to_lower()), version)
+        let nuspec = Path.combine(directory, "{id.to_lower()}.nuspec")
+
+        if !File.exists(nuspec) then
+            return true
+        fi
+
+        for (dependency, range) in nuspec_dependencies(File.read_all_text(nuspec)) do
+            if let resolved = cached_version(dependency, range) then
+                add_package(dependency, resolved, references, seen)
+            fi
+        od
+
+        true
+    si
+
+    // The dependencies a `.nuspec` lists for the newest framework group
+    // .NET 10 can use, or its ungrouped list.
+    nuspec_dependencies(text: string) -> LIST[(id: string, range: string)] is
+        let singleline = System.Text.RegularExpressions.RegexOptions.SINGLELINE
+        let groups = Regex.matches(text, "<group targetFramework=\"([^\"]*)\"\\s*>(.*?)</group>", singleline)
+
+        let chosen: string? mut = null
+
+        for framework in ["net10.0", "net9.0", "net8.0", "net7.0", "net6.0", ".NETStandard2.1", ".NETStandard2.0"] do
+            if chosen? then
+                break
+            fi
+
+            for k in 0..groups.count do
+                if groups[k].groups[1].value =~ framework then
+                    chosen = groups[k].groups[2].value
+                    break
+                fi
+            od
+        od
+
+        let body = chosen ?? (if groups.count == 0 then text else "" fi)
+
+        LIST[(id: string, range: string)](
+            Regex.matches(body, "<dependency id=\"([^\"]*)\" version=\"([^\"]*)\"")
+                |> map((m: System.Text.RegularExpressions.Match) -> (id: string, range: string) => (id = m.groups[1].value, range = m.groups[2].value))
+        )
+    si
+
+    // The version of a dependency to use: its range's lower bound when the
+    // cache holds that, otherwise the newest version the cache holds.
+    cached_version(id: string, range: string) -> string? is
+        let directory = Path.combine(nuget_packages(), id.to_lower())
+
+        if !Directory.exists(directory) then
+            return null
+        fi
+
+        let lower = range.trim_start(['[', '(']).split([',', ']', ')'])[0].trim()
+
+        if lower.length > 0 /\ Directory.exists(Path.combine(directory, lower)) then
+            return lower
+        fi
+
+        let available = LIST[string](Directory.get_directories(directory) |> map(d => Path.get_file_name(d)!) |> filter(v => System.Version.try_parse(v.split(['-'])[0], _)))
+
+        if available.count == 0 then
+            return null
+        fi
+
+        available.sort((a: string, b: string) -> int => System.Version(a.split(['-'])[0]).compare_to(System.Version(b.split(['-'])[0])))
+
+        available[available.count - 1]
+    si
+
+    // The files under `directory` that an MSBuild include pattern names,
+    // relative to it, leaving out the build's own output directories.
+    glob(directory: string, pattern: string) -> LIST[string] is
+        let normalised = pattern.replace('\\', '/')
+        let result = LIST[string]()
+
+        let files =
+            if normalised.contains("**/") then
+                let at = normalised.index_of("**/")
+                let root = Path.combine(directory, normalised.substring(0, at))
+
+                if Directory.exists(root) then
+                    Directory.get_files(root, normalised.substring(at + 3), IO.SearchOption.ALL_DIRECTORIES)
+                else
+                    System.Array.empty`[string]()
+                fi
+            else
+                let root = Path.combine(directory, Path.get_directory_name(normalised) ?? "")
+
+                if Directory.exists(root) then
+                    Directory.get_files(root, Path.get_file_name(normalised)!, IO.SearchOption.TOP_DIRECTORY_ONLY)
+                else
+                    System.Array.empty`[string]()
+                fi
+            fi
+
+        for file in files do
+            let relative = Path.get_relative_path(directory, file).replace('\\', '/')
+
+            if !relative.starts_with("bin/") /\ !relative.starts_with("obj/") then
+                result.add(relative)
+            fi
         od
 
         result
@@ -588,7 +967,7 @@ namespace InferenceOracle is
     corpus(directory: string, work: string, compiler: string, ildasm: string, filter_text: string?) -> int is
         make_executable(ildasm)
 
-        let checks = corpus_programs(directory, work, filter_text)
+        let checks = corpus_programs(directory, work, compiler, filter_text)
         let to_compile = LIST[CORPUS_CHECK](checks |> filter(c => !c.verdict?))
 
         let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
@@ -605,20 +984,35 @@ namespace InferenceOracle is
                     fi
 
                     Directory.create_directory(d)
+
+                    // The same tree in both, so the annotator rewrites
+                    // each file where it stands and a program of many
+                    // files stays one.
+                    for relative in c.sources do
+                        let target = Path.combine(d, relative)
+
+                        Directory.create_directory(Path.get_directory_name(target)!)
+                        File.copy(Path.combine(c.source, relative), target)
+                    od
                 od
 
-                File.copy(Path.combine(c.source, "test.ghul"), Path.combine(c.inferred, "test.ghul"))
-
-                let flags = program_flags(c.source)
+                let files = c.sources |> map(s => quote(s)) |> join(" ")
 
                 // The explicit program is the inferred one annotated, so
-                // both are compiled in one command: the annotation itself
+                // all three steps are one command: the annotation itself
                 // is a build, and a program the compiler rejects has no
                 // annotated form to compare.
-                let compile = "dotnet {quote(compiler)} {flags} test.ghul -o binary.exe > compiler.out 2>&1"
-                let annotate = "dotnet {quote(compiler)} --annotate-inferred {flags} test.ghul > ../explicit/test.ghul 2> ../explicit/annotate.out"
+                let compile = "dotnet {quote(compiler)} {c.options} {files} -o binary.exe > compiler.out 2>&1"
+                let annotate = "dotnet {quote(compiler)} --annotate-inferred-in-place {c.options} {files} > annotate.out 2>&1"
 
-                processes.add(start(c.inferred, "{compile} && {annotate} && cd ../explicit && {compile}"))
+                // A project's command line runs past what one argument may
+                // hold, so it is run from a script rather than passed to
+                // the shell whole.
+                let script = Path.combine(Path.get_directory_name(c.inferred)!, "run.sh")
+
+                File.write_all_text(script, "cd inferred && {compile} && cd ../explicit && {annotate} && {compile}\n")
+
+                processes.add(start(Path.get_directory_name(c.inferred)!, "bash run.sh"))
             od
 
             for p in processes do
