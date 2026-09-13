@@ -126,11 +126,16 @@ purity attribute a literal's proven purity emits on its parameters and
 return, and the namespace a file with no namespace declaration takes from its
 path, which differs between the two working directories.
 
+The type arguments of a generic call or construction whose callee is a name
+are written after the callee, as `apply_n[(int, int), int](f, 1, 2)` and
+`BOX[string]("x")`, unless the source already wrote them; a call is left
+alone unless every one of its type arguments can be written.
+
 What the annotator leaves to inference: a type still holding a placeholder,
 ERROR or a type parameter foreign to the body; a type carrying `MAYBE`, whose
 `T?` spelling is a different carrier when written back; a type
-parameter another of the same name shadows at that scope; the
-type arguments of generic calls, which are not annotated yet.
+parameter another of the same name shadows at that scope; and the type
+arguments of a call whose callee is anything but a name.
 
 ## Machine-readable output
 
