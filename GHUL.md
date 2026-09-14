@@ -169,6 +169,20 @@ result = compute();
 
 A deferred-init local is still covered by definite-assignment analysis: reading it on a path that has not assigned it draws a `definite-assignment` warning, so the default value is a backstop rather than something to lean on.
 
+`null` says a local can be absent without saying what it holds when present, so an initializer or an assignment of `null` does not settle the local's type. The type comes from the other values assigned to it, or from the fallback a later `??` supplies, and is the optional of that type:
+
+```ghul
+let root mut = null;       // NODE?, from the assignment below
+root = NODE("first");
+
+let unknown = null;        // bool?, from the fallback
+if unknown ?? false then
+    ...
+fi
+```
+
+A local whose initializer, assignments and uses give it no type at all is reported as `cannot infer type here` where it is declared, and needs an annotation.
+
 A `mut` variable still cannot change type. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. For a `T ref` parameter, `_` discards what the callee writes: the callee is handed the address of a fresh local holding the default of `T`, so `System.Version.try_parse("1.2", _)` tests the text without keeping the result. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
 
 Applied to an argument list, `_(...)` *constructs* the type the context expects instead of taking its zero value, so a value can be built without naming its type a second time:
