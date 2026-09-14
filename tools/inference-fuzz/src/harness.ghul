@@ -17,6 +17,10 @@ namespace InferenceFuzz is
     class RESULT(seed: int, directory: string) is
         verdict: string public;
         detail: string public;
+        // The verdict of the same program with its statements wrapped in
+        // an `entry()` function, taken only when the program failed as
+        // written: `=` when the wrapping is what makes the difference.
+        entry: string? public;
 
         init(..) is
             verdict = "?"
@@ -63,9 +67,6 @@ namespace InferenceFuzz is
         // Compiles, runs and annotates each program, a batch at a time.
         check(results: LIST[RESULT]) is
             let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
-            let compile = "dotnet {quote(compiler)} test.ghul -o binary.exe > compile.out 2>&1"
-            let run = "timeout 10 dotnet binary.exe > run.out 2>&1; echo $? > run.status"
-            let annotate = "dotnet {quote(compiler)} --annotate-inferred test.ghul > annotated.ghul 2> annotate.out"
 
             for i in 0..results.count do
                 if i % batch_size == 0 then
@@ -76,7 +77,7 @@ namespace InferenceFuzz is
                     od
 
                     let processes = LIST[System.Diagnostics.Process](
-                        batch |> map(r => start(r.directory, "{compile} && {run} && {annotate}"))
+                        batch |> map(r => start(r.directory, pipeline()))
                     )
 
                     for p in processes do
@@ -87,11 +88,79 @@ namespace InferenceFuzz is
                         judge(r)
                     od
 
+                    retry_wrapped(LIST[RESULT](batch |> filter(r => !(r.verdict =~ "="))))
+
                     IO.Std.write("\r{System.Math.min(i + batch_size, results.count)} of {results.count}  ")
                 fi
             od
 
             write_line("")
+        si
+
+        // Every statement that is not a global function goes into an
+        // `entry()` body, so a failure that only top-level statements
+        // show separates from one inference shows anywhere.
+        wrap(source: string) -> string is
+            let out = System.Text.StringBuilder()
+            let body = System.Text.StringBuilder()
+
+            for line in source.split(['\n']) do
+                if line.starts_with("use ") \/ Regex.is_match(line, "^f[a-z0-9_]*\\(") then
+                    out.append_line(line)
+                elif line.trim().length > 0 then
+                    body.append_line("    {line}")
+                fi
+            od
+
+            out.append_line("")
+            out.append_line("entry() is")
+            out.append(body.to_string())
+            out.append_line("si")
+
+            out.to_string()
+        si
+
+        retry_wrapped(failed: LIST[RESULT]) is
+            if failed.count == 0 then
+                return
+            fi
+
+            let wrapped = LIST[RESULT]()
+
+            for r in failed do
+                let directory = Path.combine(r.directory, "entry")
+
+                Directory.create_directory(directory)
+                File.write_all_text(Path.combine(directory, "test.ghul"), wrap(read(Path.combine(r.directory, "test.ghul"))))
+                File.copy(Path.combine(r.directory, "intended.txt"), Path.combine(directory, "intended.txt"), true)
+
+                let link = Path.combine(directory, "ghul-runtime.dll")
+
+                if !File.exists(link) then
+                    File.create_symbolic_link(link, Path.combine(r.directory, "ghul-runtime.dll"))
+                fi
+
+                wrapped.add(RESULT(r.seed, directory))
+            od
+
+            let processes = LIST[System.Diagnostics.Process](wrapped |> map(w => start(w.directory, pipeline())))
+
+            for p in processes do
+                p.wait_for_exit()
+            od
+
+            for i in 0..failed.count do
+                judge(wrapped[i])
+                failed[i].entry = wrapped[i].verdict
+            od
+        si
+
+        pipeline() -> string is
+            let compile = "dotnet {quote(compiler)} test.ghul -o binary.exe > compile.out 2>&1"
+            let run = "timeout 10 dotnet binary.exe > run.out 2>&1; echo $? > run.status"
+            let annotate = "dotnet {quote(compiler)} --annotate-inferred test.ghul > annotated.ghul 2> annotate.out"
+
+            return "{compile} && {run} && {annotate}"
         si
 
         judge(r: RESULT) is
@@ -159,7 +228,7 @@ namespace InferenceFuzz is
             let result = MAP[string, string]()
 
             let matches = LIST[System.Text.RegularExpressions.Match](
-                Regex.matches(annotated, "(?m)^let ([a-z0-9_]+): (.+?)(?: mut)? = ")
+                Regex.matches(annotated, "(?m)^\\s*let ([a-z0-9_]+): (.+?)(?: mut)? = ")
                     |> map((m: System.Text.RegularExpressions.Match) -> System.Text.RegularExpressions.Match => m)
             )
 
@@ -214,7 +283,8 @@ namespace InferenceFuzz is
             counts[r.verdict] = if counts.contains_key(r.verdict) then counts[r.verdict] + 1 else 1 fi
 
             if !(r.verdict =~ "=") then
-                let key = "{r.verdict} {bucket(r.detail)}"
+                let wrapped = if let e = r.entry then if e =~ r.verdict then "same" else e fi else "?" fi
+                let key = "{r.verdict} [in entry(): {wrapped}] {bucket(r.detail)}"
 
                 if !buckets.contains_key(key) then
                     buckets[key] = LIST[RESULT]()
@@ -270,6 +340,7 @@ namespace InferenceFuzz is
             writer.write_string("name", "{r.seed}")
             writer.write_string("verdict", r.verdict)
             writer.write_string("detail", r.detail)
+            writer.write_string("entry", r.entry ?? "")
             writer.write_end_object()
         od
 
@@ -346,15 +417,11 @@ namespace InferenceFuzz is
         si
 
         judge(directory: string) -> string is
-            let compile = "dotnet {quote(harness.compiler)} test.ghul -o binary.exe > compile.out 2>&1"
-            let run = "timeout 10 dotnet binary.exe > run.out 2>&1; echo $? > run.status"
-            let annotate = "dotnet {quote(harness.compiler)} --annotate-inferred test.ghul > annotated.ghul 2> annotate.out"
-
             for stale in ["binary.exe", "run.status", "annotated.ghul"] do
                 File.delete(Path.combine(directory, stale))
             od
 
-            let p = start(directory, "{compile} && {run} && {annotate}")
+            let p = start(directory, harness.pipeline())
 
             p.wait_for_exit()
 
