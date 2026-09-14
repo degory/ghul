@@ -348,6 +348,8 @@ let first = pair.`0;                       // positional access
 let (name, age) = ("alice", 30);           // destructuring
 ```
 
+A tuple is assignable to a tuple type whose elements each accept its own, so a `(CAT, Shape.DOT)` value goes wherever a `(Animal, Shape)` is expected, and an `(int, string)` wherever an `(int, object)` is. The .NET tuple type is invariant, so the value is rebuilt at the wider type where it crosses into it, converting each element as it would be converted on its own, boxing and optional widening included. The rule is for tuple values: a function type returning a tuple is not made assignable by it, so a `(int) -> (int, int)` value is not a `(int) -> (object, object)`.
+
 When an unnamed tuple-literal element is a bare identifier, it takes its name from the identifier: `(a, b)` constructs the same tuple as `(a = a, b = b)`. When the identifier resolves to a field whose name carries the single-underscore private-member convention, the leading `_` is stripped from the inferred element name: `(_count, _total)` packed from private fields surfaces as `(count: ..., total: ...)` to consumers. Locals are not affected, and only a single leading underscore is ever stripped.
 
 Destructuring comes in two forms: **positional** and **by-name**, distinguished syntactically.
