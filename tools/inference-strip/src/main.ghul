@@ -1,0 +1,414 @@
+namespace InferenceStrip is
+    use default
+
+    use IO.File
+    use IO.Directory
+    use IO.Path
+
+    use System.Text.RegularExpressions.Regex
+
+    // One project of the corpus: a directory holding a `.ghulproj`, its
+    // sources, and a `run.expected` the program's output is checked
+    // against.
+    class TASK(name: string, directory: string) is
+        sources: LIST[string];
+        // Every strippable site, as `<file index>:<site number> <kind> <line>,<column>`.
+        sites: LIST[string];
+        verdict: string public;
+        detail: string public;
+        // The smallest set of sites found to fail together, once bisected.
+        minimal: LIST[string] public;
+        // How many sites the kept variant strips: every one when the task
+        // passes stripped entirely, the rest when it passes with the
+        // minimal failing set kept.
+        stripped: int public;
+
+        init(..) is
+            sources = LIST[string](Directory.get_files(directory, "*.ghul"))
+            sources.sort()
+            sites = LIST[string]()
+            minimal = LIST[string]()
+            verdict = "?"
+            detail = ""
+            stripped = 0
+        si
+    si
+
+    quote(text: string) -> string => "'{text.replace("'", "'\\''")}'"
+
+    run(directory: string, command: string) -> int is
+        let info = System.Diagnostics.ProcessStartInfo("bash")
+
+        info.argument_list.add("-c")
+        info.argument_list.add(command)
+        info.working_directory = directory
+        info.use_shell_execute = false
+
+        let p = System.Diagnostics.Process.start(info)!
+
+        p.wait_for_exit()
+
+        p.exit_code
+    si
+
+    read(path: string) -> string => if File.exists(path) then File.read_all_text(path) else "" fi
+
+    class HARNESS(compiler: string, work: string, root: string) is
+        // The stripping sites of every source of the task, numbered per
+        // file by the compiler's `list` selection.
+        list_sites(task: TASK) is
+            for i in 0..task.sources.count do
+                let listing = Path.combine(work, "sites.txt")
+
+                run(task.directory, "dotnet {quote(compiler)} --strip-annotations list {quote(task.sources[i])} > {quote(listing)} 2>/dev/null")
+
+                for line in read(listing).split(['\n']) do
+                    if line.trim().length > 0 then
+                        task.sites.add("{i}:{line.trim()}")
+                    fi
+                od
+            od
+        si
+
+        // A copy of the task with the selected sites stripped, built and
+        // run; the verdict of that copy. `label` names the copy's directory.
+        variant(task: TASK, selected: LIST[string], label: string) -> (verdict: string, detail: string) is
+            let directory = Path.combine(Path.combine(work, task.name), label)
+
+            if Directory.exists(directory) then
+                Directory.delete(directory, true)
+            fi
+
+            Directory.create_directory(directory)
+
+            for file in Directory.get_files(task.directory) do
+                let name = Path.get_file_name(file)!
+
+                if !(name =~ "failed") then
+                    File.copy(file, Path.combine(directory, name), true)
+                fi
+            od
+
+            for i in 0..task.sources.count do
+                let numbers = LIST[string]()
+
+                for site in selected do
+                    let colon = site.index_of(':')
+                    let space = site.index_of(' ')
+
+                    if int.parse(site.substring(0, colon)) == i then
+                        numbers.add(site.substring(colon + 1, space - colon - 1))
+                    fi
+                od
+
+                let selection = if numbers.count == 0 then "list" else numbers |> join(",") fi
+                let target = Path.combine(directory, Path.get_file_name(task.sources[i])!)
+
+                if !(selection =~ "list") then
+                    run(directory, "dotnet {quote(compiler)} --strip-annotations {selection} {quote(task.sources[i])} > {quote(target)} 2>/dev/null")
+                fi
+            od
+
+            let build = run(directory, "dotnet build -v:q -nologo -p:GhulCompiler={quote("dotnet {compiler} --test-run")} > build.out 2>&1")
+            let build_out = read(Path.combine(directory, "build.out"))
+
+            if build != 0 then
+                if build_out.contains("exception") \/ build_out.contains("   at ") then
+                    return (verdict = "I", detail = first_line(build_out, "xception"))
+                fi
+
+                return (verdict = "C", detail = first_diagnostic(build_out))
+            fi
+
+            let status = run(directory, "timeout 20 dotnet bin/Debug/net10.0/binary.dll > run.out 2>&1")
+            let run_out = read(Path.combine(directory, "run.out"))
+
+            if status != 0 then
+                return (verdict = "X", detail = if status == 124 then "timed out" else first_line(run_out, "xception") fi)
+            fi
+
+            if !(normalise(run_out) =~ normalise(read(Path.combine(task.directory, "run.expected")))) then
+                return (verdict = "W", detail = "output differs from run.expected")
+            fi
+
+            (verdict = "=", detail = "")
+        si
+
+        normalise(text: string) -> string => Regex.replace(text.replace("\r", ""), "[ \\t]+\\n", "\n").trim()
+
+        first_diagnostic(text: string) -> string is
+            let m = Regex.match(text, "(?m)^[^\\n]*: error[^\\n]*$")
+
+            if m.success then
+                Regex.replace(m.value, " \\[.*$", "")
+            else
+                first_line(text, "error")
+            fi
+        si
+
+        first_line(text: string, containing: string) -> string is
+            for line in text.split(['\n']) do
+                if line.trim().length > 0 /\ line.contains(containing) then
+                    return Regex.replace(line.trim(), " \\[.*$", "")
+                fi
+            od
+
+            ""
+        si
+
+        // Finds a small set of sites that fails together, halving the
+        // set while one half alone still fails. A set neither half of
+        // which fails is kept whole.
+        bisect(task: TASK, reference: string) is
+            let current mut = LIST[string](task.sites)
+            let round mut = 0
+
+            while current.count > 1 do
+                let half = current.count / 2
+                let a = LIST[string](current |> take(half))
+                let b = LIST[string](current |> skip(half))
+
+                round = round + 1
+
+                let ra = variant(task, a, "bisect-{round}a")
+
+                if key(ra) =~ reference then
+                    current = a
+                    continue
+                fi
+
+                let rb = variant(task, b, "bisect-{round}b")
+
+                if key(rb) =~ reference then
+                    current = b
+                    continue
+                fi
+
+                break
+            od
+
+            task.minimal = current
+        si
+
+        key(result: (verdict: string, detail: string)) -> string => "{result.verdict} {bucket(result.detail)}"
+    si
+
+    // A diagnostic with its position and numbers taken out, so one cause
+    // groups as one line.
+    bucket(detail: string) -> string is
+        // The compiler's own `file: l,c..l,c: error:` and MSBuild's
+        // `file(l,c,l,c): error :` both lead with the position.
+        let without_position = Regex.replace(detail, "^[^:(]*(\\([0-9,]+\\)|: [0-9,.]+): (error|warn) ?: ?", "error: ")
+
+        Regex.replace(without_position, "[0-9]+", "N")
+    si
+
+    entry(args: string[]) -> int is
+        if args.count < 3 \/ !(args[0] =~ "run") then
+            write_line("usage: inference-strip run <tasks-directory> <work-directory> --compiler <ghul.dll> [--task <text>] [--bisect] [--collect <dir>] [--json <file>]")
+            return 1
+        fi
+
+        let tasks_directory = Path.get_full_path(args[1])
+        let work = Path.get_full_path(args[2])
+        let compiler mut = "publish/ghul.dll"
+        let filter_text: string? mut = null
+        let want_bisect mut = false
+        let json: string? mut = null
+        let collect: string? mut = null
+        let i mut = 3
+
+        while i < args.count do
+            if args[i] =~ "--compiler" then
+                compiler = Path.get_full_path(args[i + 1])
+                i = i + 2
+            elif args[i] =~ "--task" then
+                filter_text = args[i + 1]
+                i = i + 2
+            elif args[i] =~ "--json" then
+                json = Path.get_full_path(args[i + 1])
+                i = i + 2
+            elif args[i] =~ "--bisect" then
+                want_bisect = true
+                i = i + 1
+            elif args[i] =~ "--collect" then
+                collect = Path.get_full_path(args[i + 1])
+                i = i + 2
+            else
+                write_line("unknown option {args[i]}")
+                return 1
+            fi
+        od
+
+        Directory.create_directory(work)
+
+        // The corpus root's shared MSBuild files apply to the copies too.
+        for shared in ["Directory.Build.props", "Directory.Packages.props", "NuGet.config"] do
+            let source = Path.combine(Path.get_directory_name(tasks_directory)!, shared)
+
+            if File.exists(source) then
+                File.copy(source, Path.combine(work, shared), true)
+            fi
+        od
+
+        let harness = HARNESS(compiler, work, tasks_directory)
+        let tasks = LIST[TASK]()
+        let directories = LIST[string](Directory.get_directories(tasks_directory))
+
+        directories.sort()
+
+        for d in directories do
+            let name = Path.get_file_name(d)!
+
+            if Directory.get_files(d, "*.ghulproj").count > 0 /\ File.exists(Path.combine(d, "run.expected")) then
+                if !filter_text? \/ name.contains(filter_text) then
+                    tasks.add(TASK(name, d))
+                fi
+            fi
+        od
+
+        write_line("checking {tasks.count} tasks with {compiler}")
+
+        let done mut = 0
+
+        for task in tasks do
+            harness.list_sites(task)
+
+            if task.sites.count == 0 then
+                task.verdict = "·"
+            else
+                let result = harness.variant(task, task.sites, "all")
+
+                task.verdict = result.verdict
+                task.detail = result.detail
+
+                if task.verdict =~ "=" then
+                    task.stripped = task.sites.count
+                fi
+
+                let kept: string? mut = null
+
+                if task.verdict =~ "=" then
+                    kept = "all"
+                elif want_bisect then
+                    harness.bisect(task, harness.key(result))
+
+                    // What is left once the failing sites are kept: the
+                    // most that can be stripped while the program works.
+                    let rest = LIST[string](task.sites |> filter(site => !(task.minimal |> any(m => m =~ site))))
+
+                    if rest.count > 0 /\ harness.variant(task, rest, "rest").verdict =~ "=" then
+                        task.stripped = rest.count
+                        kept = "rest"
+                    fi
+                fi
+
+                if let label = kept /\ collect? then
+                    let into = Path.combine(collect, task.name)
+
+                    Directory.create_directory(into)
+
+                    for source in task.sources do
+                        let name = Path.get_file_name(source)!
+
+                        File.copy(Path.combine(Path.combine(Path.combine(work, task.name), label), name), Path.combine(into, name), true)
+                    od
+                fi
+            fi
+
+            done = done + 1
+            IO.Std.write("\r{done} of {tasks.count}  ")
+        od
+
+        write_line("")
+
+        report(tasks, json)
+    si
+
+    report(tasks: LIST[TASK], json: string?) -> int is
+        let counts = MAP[string, int]()
+        let buckets = MAP[string, LIST[TASK]]()
+
+        for t in tasks do
+            counts[t.verdict] = if counts.contains_key(t.verdict) then counts[t.verdict] + 1 else 1 fi
+
+            if !(t.verdict =~ "=") /\ !(t.verdict =~ "·") then
+                let key = "{t.verdict} {bucket(t.detail)}"
+
+                if !buckets.contains_key(key) then
+                    buckets[key] = LIST[TASK]()
+                fi
+
+                buckets[key].add(t)
+            fi
+        od
+
+        write_line("")
+
+        for (key, value) in counts do
+            write_line("- `{key}`: {value}")
+        od
+
+        let sites = tasks |> map(t => t.sites.count) |> reduce(0, (a, b) => a + b)
+        let stripped = tasks |> map(t => t.stripped) |> reduce(0, (a, b) => a + b)
+
+        write_line("")
+        write_line("{stripped} of {sites} annotations stripped with the programs still working")
+
+        let keys = LIST[string](buckets.keys)
+
+        keys.sort((a: string, b: string) -> int => buckets[b].count - buckets[a].count)
+
+        for key in keys do
+            write_line("")
+            write_line("{buckets[key].count,5}  {key}")
+
+            for t in buckets[key] do
+                let sites = if t.minimal.count > 0 then " [{t.minimal |> join("; ")}]" else "" fi
+
+                write_line("       {t.name}{sites}")
+            od
+        od
+
+        if json? then
+            write_json(json, tasks)
+        fi
+
+        if buckets.count == 0 then 0 else 1 fi
+    si
+
+    write_json(path: string, tasks: LIST[TASK]) is
+        let options: System.Text.Json.JsonWriterOptions mut = _
+
+        options.indented = true
+
+        let stream = File.create(path)
+        let writer = System.Text.Json.Utf8JsonWriter(stream, options)
+
+        writer.write_start_object()
+        writer.write_start_array("tasks")
+
+        for t in tasks do
+            writer.write_start_object()
+            writer.write_string("name", t.name)
+            writer.write_string("verdict", t.verdict)
+            writer.write_string("detail", t.detail)
+            writer.write_number("sites", t.sites.count)
+            writer.write_number("stripped", t.stripped)
+            writer.write_start_array("minimal")
+
+            for site in t.minimal do
+                writer.write_string_value(site)
+            od
+
+            writer.write_end_array()
+            writer.write_end_object()
+        od
+
+        writer.write_end_array()
+        writer.write_end_object()
+        writer.flush()
+        writer.dispose()
+        stream.dispose()
+    si
+si
