@@ -1,0 +1,416 @@
+namespace InferenceFuzz is
+    use default
+
+    use IO.File
+    use IO.Directory
+    use IO.Path
+
+    use System.Text.RegularExpressions.Regex
+
+    // What checking one program found. The verdicts:
+    //   `=` compiled, ran, and every inferred type is the intended one
+    //   `T` compiled and ran, but a local's inferred type is not the intended one
+    //   `C` the compiler rejected the program
+    //   `I` the compiler crashed
+    //   `X` the program crashed, or did not finish in time
+    //   `A` the annotator failed on a program that compiled
+    class RESULT(seed: int, directory: string) is
+        verdict: string public;
+        detail: string public;
+
+        init(..) is
+            verdict = "?"
+            detail = ""
+        si
+    si
+
+    quote(text: string) -> string => "'{text.replace("'", "'\\''")}'"
+
+    start(directory: string, command: string) -> System.Diagnostics.Process is
+        let info = System.Diagnostics.ProcessStartInfo("bash")
+
+        info.argument_list.add("-c")
+        info.argument_list.add(command)
+        info.working_directory = directory
+        info.use_shell_execute = false
+
+        System.Diagnostics.Process.start(info)!
+    si
+
+    class HARNESS(compiler: string) is
+        // Writes the program into its own directory under `work`, with the
+        // intended types beside it.
+        place(program: PROGRAM, work: string) -> RESULT is
+            let directory = Path.combine(work, "{program.seed}")
+
+            Directory.create_directory(directory)
+            File.write_all_text(Path.combine(directory, "test.ghul"), program.source)
+            File.write_all_text(
+                Path.combine(directory, "intended.txt"),
+                "{program.intended |> map(i => "{i.name}: {i.type.spell()}") |> join("\n")}\n"
+            )
+
+            let runtime = Path.combine(Path.get_directory_name(compiler)!, "ghul-runtime.dll")
+            let link = Path.combine(directory, "ghul-runtime.dll")
+
+            if File.exists(runtime) /\ !File.exists(link) then
+                File.create_symbolic_link(link, runtime)
+            fi
+
+            RESULT(program.seed, directory)
+        si
+
+        // Compiles, runs and annotates each program, a batch at a time.
+        check(results: LIST[RESULT]) is
+            let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
+            let compile = "dotnet {quote(compiler)} test.ghul -o binary.exe > compile.out 2>&1"
+            let run = "timeout 10 dotnet binary.exe > run.out 2>&1; echo $? > run.status"
+            let annotate = "dotnet {quote(compiler)} --annotate-inferred test.ghul > annotated.ghul 2> annotate.out"
+
+            for i in 0..results.count do
+                if i % batch_size == 0 then
+                    let batch = LIST[RESULT]()
+
+                    for j in i..System.Math.min(i + batch_size, results.count) do
+                        batch.add(results[j])
+                    od
+
+                    let processes = LIST[System.Diagnostics.Process](
+                        batch |> map(r => start(r.directory, "{compile} && {run} && {annotate}"))
+                    )
+
+                    for p in processes do
+                        p.wait_for_exit()
+                    od
+
+                    for r in batch do
+                        judge(r)
+                    od
+
+                    IO.Std.write("\r{System.Math.min(i + batch_size, results.count)} of {results.count}  ")
+                fi
+            od
+
+            write_line("")
+        si
+
+        judge(r: RESULT) is
+            let compile_out = read(Path.combine(r.directory, "compile.out"))
+
+            if !File.exists(Path.combine(r.directory, "binary.exe")) then
+                if compile_out.contains("Unhandled exception") \/ compile_out.contains("   at ") then
+                    r.verdict = "I"
+                    r.detail = crash_line(compile_out)
+                else
+                    r.verdict = "C"
+                    r.detail = first_diagnostic(compile_out)
+                fi
+
+                return
+            fi
+
+            let status = read(Path.combine(r.directory, "run.status")).trim()
+
+            if !(status =~ "0") then
+                r.verdict = "X"
+                r.detail = if status =~ "124" then "timed out" else first_line(read(Path.combine(r.directory, "run.out")), "") fi
+
+                return
+            fi
+
+            let annotated = Path.combine(r.directory, "annotated.ghul")
+
+            if !File.exists(annotated) \/ read(annotated).length == 0 then
+                r.verdict = "A"
+                r.detail = first_diagnostic(read(Path.combine(r.directory, "annotate.out")))
+
+                return
+            fi
+
+            let written = written_types(read(annotated))
+
+            for line in read(Path.combine(r.directory, "intended.txt")).split(['\n']) do
+                let colon = line.index_of(": ")
+
+                if colon < 0 then
+                    continue
+                fi
+
+                let name = line.substring(0, colon)
+                let intended = normalise(line.substring(colon + 2))
+
+                if written.contains_key(name) then
+                    let got = normalise(written[name])
+
+                    if !(got =~ intended) then
+                        r.verdict = "T"
+                        r.detail = "{name}: intended {intended}, inferred {got}"
+
+                        return
+                    fi
+                fi
+            od
+
+            r.verdict = "="
+        si
+
+        // The type the annotator wrote on each local.
+        written_types(annotated: string) -> MAP[string, string] is
+            let result = MAP[string, string]()
+
+            let matches = LIST[System.Text.RegularExpressions.Match](
+                Regex.matches(annotated, "(?m)^let ([a-z0-9_]+): (.+?)(?: mut)? = ")
+                    |> map((m: System.Text.RegularExpressions.Match) -> System.Text.RegularExpressions.Match => m)
+            )
+
+            for m in matches do
+                result[m.groups[1].value] = m.groups[2].value
+            od
+
+            result
+        si
+
+        // The exception and its message, without the frames after it.
+        crash_line(text: string) -> string is
+            let line = first_line(text, "exception")
+            let frames = line.index_of("    at ")
+
+            if frames > 0 then line.substring(0, frames).trim() else line fi
+        si
+
+        read(path: string) -> string => if File.exists(path) then File.read_all_text(path) else "" fi
+
+        first_diagnostic(text: string) -> string is
+            let m = Regex.match(text, "(?m)^[^\\n]*: (error|warn)[^\\n]*$")
+
+            if m.success then m.value else first_line(text, "") fi
+        si
+
+        first_line(text: string, containing: string) -> string is
+            for line in text.split(['\n']) do
+                if line.trim().length > 0 /\ line.contains(containing) then
+                    return line.trim()
+                fi
+            od
+
+            ""
+        si
+    si
+
+    // A diagnostic with its position, its numbers and its generated names
+    // taken out, so one cause groups as one line.
+    bucket(detail: string) -> string is
+        let without_position = Regex.replace(detail, "^[^:]*: [0-9,.]+: ", "")
+        let without_names = Regex.replace(without_position, "\\bv[0-9]+\\b", "v")
+
+        Regex.replace(without_names, "[0-9]+", "N")
+    si
+
+    report(results: LIST[RESULT], json: string?) -> int is
+        let counts = MAP[string, int]()
+        let buckets = MAP[string, LIST[RESULT]]()
+
+        for r in results do
+            counts[r.verdict] = if counts.contains_key(r.verdict) then counts[r.verdict] + 1 else 1 fi
+
+            if !(r.verdict =~ "=") then
+                let key = "{r.verdict} {bucket(r.detail)}"
+
+                if !buckets.contains_key(key) then
+                    buckets[key] = LIST[RESULT]()
+                fi
+
+                buckets[key].add(r)
+            fi
+        od
+
+        write_line("")
+
+        for (key, value) in counts do
+            write_line("- `{key}`: {value}")
+        od
+
+        if buckets.count > 0 then
+            write_line("")
+
+            let keys = LIST[string](buckets.keys)
+
+            keys.sort((a: string, b: string) -> int => buckets[b].count - buckets[a].count)
+
+            for key in keys do
+                let seeds = LIST[RESULT](buckets[key])
+
+                seeds.sort((a: RESULT, b: RESULT) -> int => a.seed - b.seed)
+
+                write_line("{seeds.count,5}  {key}")
+                write_line("       seeds {seeds |> take(8) |> map(r => "{r.seed}") |> join(" ")}{if seeds.count > 8 then " ..." else "" fi}")
+            od
+        fi
+
+        if json? then
+            write_json(json, results, counts)
+        fi
+
+        if counts.contains_key("=") /\ counts.count == 1 then 0 else 1 fi
+    si
+
+    write_json(path: string, results: LIST[RESULT], counts: MAP[string, int]) is
+        let options: System.Text.Json.JsonWriterOptions mut = _
+
+        options.indented = true
+
+        let stream = File.create(path)
+        let writer = System.Text.Json.Utf8JsonWriter(stream, options)
+
+        writer.write_start_object()
+        writer.write_start_array("programs")
+
+        for r in results do
+            writer.write_start_object()
+            writer.write_string("name", "{r.seed}")
+            writer.write_string("verdict", r.verdict)
+            writer.write_string("detail", r.detail)
+            writer.write_end_object()
+        od
+
+        writer.write_end_array()
+        writer.write_start_object("counts")
+
+        for (verdict, count) in counts do
+            writer.write_number(verdict, count)
+        od
+
+        writer.write_end_object()
+        writer.write_end_object()
+        writer.flush()
+        writer.dispose()
+        stream.dispose()
+    si
+si
+
+namespace InferenceFuzz is
+    use default
+
+    use IO.File
+    use IO.Path
+
+    // Reduces a failing program by removing statements one at a time,
+    // keeping each removal that leaves the same failure standing. A
+    // removal that changes the failure - usually to a missing symbol -
+    // is put back. The result overwrites test.ghul, with the original
+    // kept as original.ghul.
+    class SHRINKER(harness: HARNESS) is
+        shrink(directory: string) -> string is
+            let path = Path.combine(directory, "test.ghul")
+            let original = Path.combine(directory, "original.ghul")
+
+            if !File.exists(original) then
+                File.copy(path, original)
+            fi
+
+            let reference = judge(directory)
+
+            write_line("shrinking {directory}: {reference}")
+
+            let groups = LIST[LIST[string]](statement_groups(File.read_all_text(path)))
+            let changed mut = true
+
+            while changed do
+                changed = false
+
+                let i mut = 0
+
+                while i < groups.count do
+                    let candidate = LIST[LIST[string]]()
+
+                    for j in 0..groups.count do
+                        if j != i then
+                            candidate.add(groups[j])
+                        fi
+                    od
+
+                    File.write_all_text(path, render(candidate))
+
+                    if judge(directory) =~ reference then
+                        groups.remove_at(i)
+                        changed = true
+                    else
+                        i = i + 1
+                    fi
+                od
+            od
+
+            File.write_all_text(path, render(groups))
+
+            reference
+        si
+
+        judge(directory: string) -> string is
+            let compile = "dotnet {quote(harness.compiler)} test.ghul -o binary.exe > compile.out 2>&1"
+            let run = "timeout 10 dotnet binary.exe > run.out 2>&1; echo $? > run.status"
+            let annotate = "dotnet {quote(harness.compiler)} --annotate-inferred test.ghul > annotated.ghul 2> annotate.out"
+
+            for stale in ["binary.exe", "run.status", "annotated.ghul"] do
+                File.delete(Path.combine(directory, stale))
+            od
+
+            let p = start(directory, "{compile} && {run} && {annotate}")
+
+            p.wait_for_exit()
+
+            let r = RESULT(0, directory)
+
+            harness.judge(r)
+
+            "{r.verdict} {bucket(r.detail)}"
+        si
+
+        // The program's statements: a line each, except that an `if let`
+        // and its arm go together. The `use` line and blank lines are
+        // kept out of the removable set.
+        statement_groups(source: string) -> LIST[LIST[string]] is
+            let result = LIST[LIST[string]]()
+            let lines = source.split(['\n'])
+            let i mut = 0
+
+            while i < lines.count do
+                let line = lines[i]
+
+                if line.trim().length == 0 \/ line.starts_with("use ") then
+                    i = i + 1
+                elif line.starts_with("if let ") then
+                    let group = LIST[string]()
+
+                    while i < lines.count /\ !(lines[i] =~ "fi") do
+                        group.add(lines[i])
+                        i = i + 1
+                    od
+
+                    group.add("fi")
+                    i = i + 1
+                    result.add(group)
+                else
+                    result.add(LIST[string]([line]))
+                    i = i + 1
+                fi
+            od
+
+            result
+        si
+
+        render(groups: LIST[LIST[string]]) -> string is
+            let out = System.Text.StringBuilder()
+
+            out.append_line("use default")
+            out.append_line("")
+
+            for group in groups do
+                for line in group do
+                    out.append_line(line)
+                od
+            od
+
+            out.to_string()
+        si
+    si
+si
