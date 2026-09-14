@@ -27,6 +27,10 @@ Options:
   A seed always produces the same program.
 - `--statements <n>` per program (8), `--depth <n>` the expression budget (3).
 - `--compiler <ghul.dll>` the compiler to test; `publish/ghul.dll` otherwise.
+  A published compiler references the runtime beside it, which is the one
+  it was built with and can predate the one the generator writes for. To
+  test against a newer runtime, copy the compiler's directory and replace
+  its `ghul-runtime.dll` before pointing `--compiler` at the copy.
 - `--json <file>` also writes each program's verdict and detail as JSON.
 
 `generate <directory>` writes the programs without checking them. `shrink
