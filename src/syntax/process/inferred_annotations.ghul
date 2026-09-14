@@ -1,0 +1,375 @@
+namespace Syntax.Process is
+    use Logging
+    use Trees
+
+    use Semantic.Types.Type
+
+    // Collects, from a tree every body of which has compiled, the type
+    // the build settled at each site that left it to inference: a
+    // function literal's parameters and return, and a `let` local. The
+    // built tree carries nodes the source never had - adapters spliced
+    // around literals, synthesised names - so nothing is recorded
+    // against a node: each type is keyed by the position the site was
+    // written at, and read back against a fresh parse of the file.
+    //
+    // A type is written only where it can be spelled at that scope: a
+    // placeholder that never settled, ERROR, a type parameter foreign
+    // to the body, and anything rendering with a synthesised name are
+    // all left as written and counted as skipped.
+    class INFERRED_ANNOTATIONS: DefaultVisitor, Printer.InferredAnnotations is
+        _parameters: Collections.MAP[string, string]
+        _returns: Collections.MAP[string, string]
+        _locals: Collections.MAP[string, string]
+        _type_arguments: Collections.MAP[string, string]
+
+        annotated: int
+        skipped: int
+
+        init(
+            logger: Logger,
+            symbol_table: Semantic.SYMBOL_TABLE,
+            namespaces: Semantic.NAMESPACES
+        )
+        is
+            super.init(logger, symbol_table, namespaces)
+
+            _parameters = Collections.MAP[string, string]()
+            _returns = Collections.MAP[string, string]()
+            _locals = Collections.MAP[string, string]()
+            _type_arguments = Collections.MAP[string, string]()
+        si
+
+        collect(node: Node) is
+            node.walk(self)
+        si
+
+        parameter_type(location: Source.LOCATION) -> string? => _lookup(_parameters, location)
+        return_type(location: Source.LOCATION) -> string? => _lookup(_returns, location)
+        local_type(location: Source.LOCATION) -> string? => _lookup(_locals, location)
+
+        type_arguments(callee: Source.LOCATION) -> string? is
+            let key = _span_key(callee)
+
+            if _type_arguments.contains_key(key) then
+                return _type_arguments[key]
+            fi
+
+            return null
+        si
+
+        visit_default(node: Node) is
+        si
+
+        // A call or construction whose callee is a plain or qualified
+        // name and whose type arguments the build bound rather than the
+        // source wrote. The callee's whole span is the key, since a call
+        // whose callee is itself a call starts where that inner call does.
+        visit(call: Expressions.CALL) is
+            let callee = call.function
+
+            let callee_name =
+                if let identifier: Expressions.IDENTIFIER = callee then
+                    identifier.identifier.name
+                elif let member: Expressions.MEMBER = callee then
+                    member.identifier.name
+                else
+                    return
+                fi
+
+            let arguments = _bound_type_arguments(call.value, callee_name)
+
+            if !arguments? \/ arguments.count == 0 then
+                return
+            fi
+
+            let spelled = System.Text.StringBuilder()
+
+            for type in arguments do
+                if let text = _spell(type) then
+                    if spelled.length > 0 then
+                        spelled.append(", ")
+                    fi
+
+                    spelled.append(text)
+                else
+                    skipped = skipped + 1
+
+                    IO.Std.error.write_line("{callee.location}: type arguments left as written: {type} ({_why(type)})")
+
+                    return
+                fi
+            od
+
+            _type_arguments[_span_key(callee.location)] = spelled.to_string()
+            annotated = annotated + 1
+        si
+
+        _bound_type_arguments(value: IR.Values.Value?, callee_name: string) -> Collections.List[Type]? is
+            if let wrapper: IR.Values.WRAPPER = value then
+                return _bound_type_arguments(wrapper.value, callee_name)
+            elif let global: IR.Values.Call.GLOBAL = value then
+                return global.function.generic_arguments
+            elif let static_call: IR.Values.Call.STATIC = value then
+                return static_call.function.generic_arguments
+            elif let instance: IR.Values.Call.INSTANCE = value then
+                return instance.function.generic_arguments
+            elif let struct_call: IR.Values.Call.STRUCT = value then
+                return struct_call.function.generic_arguments
+            elif let construction: IR.Values.NEW = value then
+                // Constructed through a type alias, the type arguments
+                // belong to the type the alias names, and the alias
+                // cannot take them.
+                // A MAYBE construction is left as written for the reason a
+                // MAYBE type is: written out, it is a different carrier.
+                if
+                    isa Semantic.Types.GENERIC(construction.type) /\
+                    !construction.type.is_maybe /\
+                    callee_name =~ construction.type.symbol.name
+                then
+                    return construction.type.arguments
+                fi
+            fi
+
+            return null
+        si
+
+        visit(function: Expressions.FUNCTION) is
+            if !function.is_pack_adapter then
+                if let closure: Semantic.Symbols.Closure = function.scope then
+                    _collect_literal(function, closure)
+                fi
+            fi
+
+            super.visit(function)
+        si
+
+        visit(variable: Variables.VARIABLE) is
+            if
+                isa TypeExpressions.INFER(variable.type_expression) /\
+                variable.left.is_simple_name /\
+                !variable.is_synthesized
+            then
+                if let name = variable.left.name then
+                    if name.name !~ "_" then
+                        if let symbol = find(name.name) then
+                            _record(_locals, variable.location, symbol.type)
+                        fi
+                    fi
+                fi
+            fi
+        si
+
+        _collect_literal(function: Expressions.FUNCTION, closure: Semantic.Symbols.Closure) is
+            let index mut = 0
+
+            for a in function.arguments.expressions do
+                if let parameter: Expressions.VARIABLE = a then
+                    if
+                        isa TypeExpressions.INFER(parameter.type_expression) /\
+                        index < closure.arguments.count
+                    then
+                        _record(_parameters, parameter.location, closure.arguments[index])
+                    fi
+                fi
+
+                index = index + 1
+            od
+
+            if isa TypeExpressions.INFER(function.type_expression) then
+                _record(_returns, function.location, _writable_return(function, closure.return_type))
+            fi
+        si
+
+        // The return type as the source can write it. A literal whose
+        // body evaluates to an N-ary literal at a pack-marked hop has
+        // that hop presented in the one-parameter shape the formal takes;
+        // written back, the hop is spelled as the N-ary type the source
+        // is licensed to declare there.
+        _writable_return(function: Expressions.FUNCTION, type: Type?) -> Type? is
+            if !type? then
+                return null
+            fi
+
+            let body = cast Bodies.EXPRESSION?(function.body)
+
+            if !body? then
+                return type
+            fi
+
+            let inner = cast Expressions.FUNCTION?(body.expression)
+
+            if !inner? then
+                return type
+            fi
+
+            if inner.is_pack_adapter then
+                if let adapter_body = cast Bodies.EXPRESSION?(inner.body) then
+                    if let call = cast Expressions.CALL?(adapter_body.expression) then
+                        // The callee is whatever the wrapper stands in for: a
+                        // literal, a stored value, or a name, which loads as its
+                        // overload group and is spelled as the one function in it.
+                        if let value = call.function.value then
+                            if let group: Semantic.Types.FUNCTION_GROUP = value.type then
+                                if group.function_group.functions.count == 1 then
+                                    return group.function_group.functions[0].get_full_type(IoC.CONTAINER.instance.innate_symbol_lookup)
+                                fi
+
+                                return null
+                            fi
+
+                            return value.type
+                        fi
+                    fi
+                fi
+
+                return type
+            fi
+
+            if !type.is_function \/ type.is_action then
+                return type
+            fi
+
+            let count = type.arguments.count
+
+            let rewritten = _writable_return(inner, type.arguments[count - 1])
+
+            if !rewritten? \/ rewritten == type.arguments[count - 1] then
+                return type
+            fi
+
+            let types = Collections.LIST[Type]()
+
+            for i in 0..count - 1 do
+                types.add(type.arguments[i])
+            od
+
+            types.add(rewritten)
+
+            return IoC.CONTAINER.instance.innate_symbol_lookup.get_function_type(types, type.is_pure_function)
+        si
+
+        _record(into: Collections.MAP[string, string], location: Source.LOCATION, type: Type?) is
+            if let text = _spell(type) then
+                into[_key(location)] = text
+                annotated = annotated + 1
+            else
+                skipped = skipped + 1
+
+                IO.Std.error.write_line("{location}: left as written: {type} ({_why(type)})")
+            fi
+        si
+
+        // The type a site is written as. A closed-hierarchy narrowing
+        // displays its member set; what is written is the type it narrows,
+        // optional where the narrowing is.
+        writable_type(given: Type) -> Type static =>
+            if let one_of: Semantic.Types.ONE_OF = given then
+                if given.is_optional then one_of.underlying_type.as_optional() else one_of.underlying_type fi
+            else
+                given
+            fi
+
+        _spell(given: Type?) -> string? is
+            if !given? then
+                return null
+            fi
+
+            let type = writable_type(given)
+
+            if isa Semantic.Types.FUNCTION_GROUP(type) then
+                return null
+            fi
+
+            let scope = _symbol_table.current_scope
+
+            if
+                type.contains_inferred \/
+                type.is_error \/
+                type.has_function_generic_argument_foreign_to(scope)
+            then
+                return null
+            fi
+
+            // `T?` over an unconstrained type parameter is carried as MAYBE[T]
+            // and renders as `T?`, which written back is a different carrier;
+            // the site is left to inference.
+            if _carries_maybe(type) then
+                return null
+            fi
+
+            // A type parameter whose name another in scope shadows cannot be
+            // named: the written name would resolve to the other one.
+            if _has_shadowed_type_parameter(type, scope) then
+                return null
+            fi
+
+            let use render_scope = IoC.CONTAINER.instance.name_display.with_scope(scope)
+
+            let text = "{type}"
+
+            if text.contains("!!!") \/ text.contains("$") then
+                return null
+            fi
+
+            return text
+        si
+
+        _has_shadowed_type_parameter(type: Type, scope: Semantic.Scope?) -> bool is
+            let found mut = false
+
+            type.walk(
+                t => if t.is_type_variable /\ t.symbol? /\ scope? then
+                    if scope.find_enclosing(t.symbol.name) != t.symbol then
+                        found = true
+                    fi
+                fi)
+
+            return found
+        si
+
+        _carries_maybe(type: Type) -> bool is
+            let found mut = false
+
+            type.walk(t => if t.is_maybe then found = true fi)
+
+            return found
+        si
+
+        _why(type: Type?) -> string is
+            if !type? then
+                return "no type"
+            fi
+
+            let scope = _symbol_table.current_scope
+
+            if type.contains_inferred then
+                return "placeholder"
+            elif type.is_error then
+                return "error"
+            elif type.has_function_generic_argument_foreign_to(scope) then
+                return "foreign type parameter"
+            elif _carries_maybe(type) then
+                return "maybe carrier"
+            elif _has_shadowed_type_parameter(type, scope) then
+                return "shadowed type parameter"
+            fi
+
+            return "synthesised name"
+        si
+
+        _lookup(from: Collections.MAP[string, string], location: Source.LOCATION) -> string? is
+            let key = _key(location)
+
+            if from.contains_key(key) then
+                return from[key]
+            fi
+
+            return null
+        si
+
+        _key(location: Source.LOCATION) -> string => "{location.start_line},{location.start_column}"
+
+        _span_key(location: Source.LOCATION) -> string =>
+            "{location.start_line},{location.start_column}-{location.end_line},{location.end_column}"
+    si
+si

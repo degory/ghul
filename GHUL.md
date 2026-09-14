@@ -169,7 +169,7 @@ result = compute();
 
 A deferred-init local is still covered by definite-assignment analysis: reading it on a path that has not assigned it draws a `definite-assignment` warning, so the default value is a backstop rather than something to lean on.
 
-A `mut` variable still cannot change type. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
+A `mut` variable still cannot change type. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. For a `T ref` parameter, `_` discards what the callee writes: the callee is handed the address of a fresh local holding the default of `T`, so `System.Version.try_parse("1.2", _)` tests the text without keeping the result. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
 
 Applied to an argument list, `_(...)` *constructs* the type the context expects instead of taking its zero value, so a value can be built without naming its type a second time:
 
@@ -1893,6 +1893,14 @@ The marker can sit on the parameter of any function type along the formal's retu
 run[T.., U](make: (int) -> T.. -> U, v: T) -> U => make(10)(v);
 
 run(n => (a, b) => a + b + n, (1, 2));   // 13
+```
+
+A literal written there can spell its types out. Its return is written as the N-ary function type the marker licenses, and the literal is presented in the tuple-in shape the formal takes, exactly as the inferred one is - at whatever depth the marker sits. The tuple-in shape itself is not a type an N-ary literal can be returned as, there or anywhere else:
+
+```ghul
+run((n: int) -> (int, int) -> int => (a: int, b: int) -> int => a + b + n, (1, 2));   // 13
+
+run((n: int) -> ((int, int)) -> int => (a: int, b: int) -> int => a + b + n, (1, 2)); // error
 ```
 
 The marker reads only as a formal's own type, as the parameter of a function type on that type's return spine, or as the parameter of a function type in a declared return type. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.

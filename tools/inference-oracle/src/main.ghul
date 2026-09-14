@@ -1,0 +1,1406 @@
+namespace InferenceOracle is
+    use default
+
+    use IO.File
+    use IO.Directory
+    use IO.Path
+
+    use System.Text.RegularExpressions.Regex
+
+    use ArgumentPackGrid
+
+    // What checking one cell found. `inferred` and `explicit` hold the two
+    // programs' working directories.
+    class CHECK(cell: CELL, inferred: string, explicit: string) is
+        verdict: string? public
+    si
+
+    // Runs a shell command line in a directory and returns the process,
+    // which the caller waits on. Output goes to a file named by the command,
+    // so a batch of processes started together never blocks on a full pipe.
+    start(directory: string, command: string) -> System.Diagnostics.Process is
+        let info = System.Diagnostics.ProcessStartInfo("bash")
+
+        info.argument_list.add("-c")
+        info.argument_list.add(command)
+        info.working_directory = directory
+        info.use_shell_execute = false
+
+        System.Diagnostics.Process.start(info)!
+    si
+
+    // Single-quoted for bash, with any quote in the text closed, escaped and reopened.
+    quote(text: string) -> string => "'{text.replace("'", "'\\''")}'"
+
+    find_ildasm(named: string?) -> string is
+        if named? then
+            return Path.get_full_path(named)
+        fi
+
+        let from_environment = System.Environment.get_environment_variable("GHUL_TEST_ILDASM")
+
+        if from_environment? /\ from_environment.length > 0 then
+            return from_environment
+        fi
+
+        let packages_variable = System.Environment.get_environment_variable("NUGET_PACKAGES")
+
+        let packages =
+            if packages_variable? /\ packages_variable.length > 0 then
+                packages_variable
+            else
+                Path.combine(System.Environment.get_folder_path(System.Environment_SpecialFolder.USER_PROFILE), ".nuget/packages")
+            fi
+
+        let package = Path.combine(packages, "runtime.linux-x64.microsoft.netcore.ildasm")
+
+        if !Directory.exists(package) then
+            throw System.Exception("ildasm not found: pass --ildasm <path> or set GHUL_TEST_ILDASM")
+        fi
+
+        let best: string? mut = null
+        let best_version: System.Version? mut = null
+
+        for directory in Directory.get_directories(package) do
+            let version = System.Version(Path.get_file_name(directory)!)
+
+            if !best_version? \/ version > best_version then
+                best_version = version
+                best = Path.combine(directory, "runtimes/linux-x64/native/ildasm")
+            fi
+        od
+
+        if !best? then
+            throw System.Exception("ildasm not found under {package}")
+        fi
+
+        best
+    si
+
+    // A NuGet package carries no Unix permissions, so the native arrives
+    // without its execute bit.
+    make_executable(path: string) is
+        let mode = cast int(File.get_unix_file_mode(path))
+        let wanted = mode | cast int(IO.UnixFileMode.USER_EXECUTE)
+
+        if mode != wanted then
+            File.set_unix_file_mode(path, cast IO.UnixFileMode(wanted))
+        fi
+    si
+
+    // The disassembly with everything that differs between two compiles of
+    // the same program removed: the assembly header (ildasm's banner, the
+    // MVID, the image base), instruction offsets and code sizes, which move
+    // whenever any earlier instruction does, and the numbers the compiler
+    // gives its generated members, which count in the order they are made
+    // rather than anything about what they are.
+    normalise(text: string) -> string is
+        let out = LIST[string]()
+        let in_members mut = false
+
+        let lines = text.split(['\n'])
+
+        for i in 0..lines.count do
+            let line = lines[i]
+
+            if line.contains("CLASS MEMBERS DECLARATION") then
+                in_members = true
+                continue
+            fi
+
+            if !in_members then
+                continue
+            fi
+
+            if line.contains("DISASSEMBLY COMPLETE") \/ line.trim().starts_with("// Code size") then
+                continue
+            fi
+
+            // A literal's proven purity is carried as an attribute on
+            // its return and its parameters, and writing a type out can
+            // add or drop it without changing what was resolved.
+            if line.contains("Ghul.Internal.PURE_ATTRIBUTE") then
+                continue
+            fi
+
+            if line.trim().starts_with(".param [") /\ i + 1 < lines.count /\ lines[i + 1].contains("Ghul.Internal.PURE_ATTRIBUTE") then
+                continue
+            fi
+
+            // A custom attribute's blob is dumped as hex with the text beside
+            // it, and one naming a type carries the file-derived namespace.
+            let without_comment = Regex.replace(line.trim_end(), "\\s+//.*$", "")
+
+            if Regex.is_match(without_comment, "^\\s*([0-9A-F]{{2}}\\s*)+\\)?\\s*$") then
+                continue
+            fi
+
+            let without_blobs = Regex.replace(without_comment, "= \\( [0-9A-F][0-9A-F] .*$", "= ( ... )")
+
+            // ildasm wraps a long string literal onto `+ "..."` lines at a
+            // width that depends on the instruction's offset text.
+            if without_blobs.trim().starts_with("+ \"") /\ out.count > 0 then
+                out[out.count - 1] = "{out[out.count - 1].trim_end('"')}{without_blobs.trim().substring(3)}"
+
+                continue
+            fi
+
+            // A file with no namespace gets one made from its path, and
+            // the two programs are compiled from different directories.
+            let without_paths = Regex.replace(without_blobs, "__(inferred|explicit)__", "__program__")
+
+            let without_offsets = Regex.replace(without_paths, "IL_[0-9a-f]{{4}}", "IL_")
+
+            if without_offsets.trim().length == 0 then
+                continue
+            fi
+
+            out.add(without_offsets)
+        od
+
+        let result = System.Text.StringBuilder()
+
+        for line in out do
+            // An assert message carries the source position it was
+            // written at, which annotating moves. Matched once a wrapped
+            // string has been joined back into one line.
+            result.append(Regex.replace(line, "ldstr\\s+\"([^\" ]*\\.ghul) [0-9]+,[0-9]+\\.\\.[0-9]+,[0-9]+: ", "ldstr \"$1: ")).append('\n')
+        od
+
+        renumber(canonicalise_class_order(canonicalise_generic_methods(canonicalise_frames(result.to_string()))))
+    si
+
+    // A generated member's name ends in one or more numbers that count
+    // in the order the compiler made things; each distinct name is
+    // renumbered in order of first appearance among those sharing its
+    // prefix. Last, so that the order is the canonical one.
+    renumber(text: string) -> string is
+        let numbering = MAP[string, string]()
+
+        Regex.replace(
+            text,
+            "\\$[A-Za-z$_]*[A-Za-z$](?:_[0-9]+)+",
+            (m: System.Text.RegularExpressions.Match) -> string is
+                let key = m.value
+
+                if !numbering.contains_key(key) then
+                    let prefix = Regex.replace(key, "_[0-9]+", "")
+                    let used = numbering.values |> filter(v => v.starts_with("{prefix}_")) |> count()
+
+                    numbering[key] = "{prefix}_{used}"
+                fi
+
+                numbering[key]
+            si
+        )
+    si
+
+    // The index of the `>` closing the `<` at `open`.
+    matching_close(text: string, open: int) -> int is
+        let depth mut = 0
+
+        for i in open..text.length do
+            if text[i] == '<' then
+                depth = depth + 1
+            elif text[i] == '>' then
+                depth = depth - 1
+
+                if depth == 0 then
+                    return i
+                fi
+            fi
+        od
+
+        -1
+    si
+
+    // The top-level comma-separated items between `open` and `close`.
+    split_arguments(text: string, open: int, close: int) -> LIST[string] is
+        let result = LIST[string]()
+        let depth mut = 0
+        let start mut = open + 1
+
+        for i in open + 1..close do
+            if text[i] == '<' then
+                depth = depth + 1
+            elif text[i] == '>' then
+                depth = depth - 1
+            elif text[i] == ',' /\ depth == 0 then
+                result.add(text.substring(start, i - start))
+                start = i + 1
+            fi
+        od
+
+        result.add(text.substring(start, close - start))
+
+        result
+    si
+
+    // Each occurrence of a closure frame class's name followed by its type
+    // arguments: the frame's name, where its `<` is and where its `>` is.
+    frame_references(line: string) -> LIST[(name: string, open: int, close: int)] is
+        let result = LIST[(name: string, open: int, close: int)]()
+
+        let found = Regex.matches(line, "\\$frame_[0-9]+<")
+
+        for k in 0..found.count do
+            let m = found[k]
+
+            let open = m.index + m.length - 1
+            let close = matching_close(line, open)
+
+            if close > 0 then
+                result.add((name = m.value.substring(0, m.length - 1), open = open, close = close))
+            fi
+        od
+
+        result
+    si
+
+    // A closure frame class takes the type parameters its lambda captures, in
+    // the order the compiler first meets them, and writing a type out can
+    // change that order. Two frames differing only in it are the same class,
+    // so each frame's type parameters are put in name order, and every
+    // reference to the frame and to its parameters by index follows.
+    canonicalise_frames(text: string) -> string is
+        let lines = text.split(['\n'])
+
+        // For each frame, the new index of each of its type parameters.
+        let permutations = MAP[string, int[]]()
+
+        for line in lines do
+            if line.starts_with(".class ") then
+                let m = Regex.match(line, "(\\$frame_[0-9]+)<")
+
+                if m.success then
+                    let open = m.index + m.length - 1
+                    let close = matching_close(line, open)
+
+                    if close > 0 then
+                        // A parameter may carry a constraint in front of
+                        // its name - `(class X<!K>) K` - so the name is the
+                        // last word of each.
+                        let parameters = LIST[string]()
+
+                        for argument in split_arguments(line, open, close) do
+                            let words = argument.trim().split([' '])
+
+                            parameters.add(words[words.count - 1])
+                        od
+
+                        let sorted = LIST[string](parameters)
+
+                        sorted.sort()
+
+                        let permutation = LIST[int]()
+
+                        for p in parameters do
+                            permutation.add(sorted.index_of(p))
+                        od
+
+                        permutations[m.groups[1].value] = permutation.to_array()
+                    fi
+                fi
+            fi
+        od
+
+        let result = System.Text.StringBuilder()
+        let current_frame: string? mut = null
+        let continued_owner: string? mut = null
+        let open_parentheses mut = 0
+
+        for original in lines do
+            let line mut = original
+
+            if line.starts_with(".class ") then
+                let m = Regex.match(line, "(\\$frame_[0-9]+)<")
+
+                current_frame = if m.success then m.groups[1].value else null fi
+            fi
+
+            // An index written after `::` belongs to the type named before
+            // it; anywhere else in a frame's body it belongs to the frame.
+            // A signature ildasm wraps onto following lines keeps the owner
+            // of the line it started on.
+            let owner mut =
+                if continued_owner? then
+                    continued_owner
+                elif line.contains("::") then
+                    null
+                else
+                    current_frame
+                fi
+
+            let starts_signature = !continued_owner?
+
+            for reference in frame_references(line) do
+                if reference.close + 2 < line.length /\ line.substring(reference.close + 1, 2) =~ "::" then
+                    owner = reference.name
+                fi
+            od
+
+            open_parentheses = open_parentheses + line.split(['(']).count - line.split([')']).count
+
+            continued_owner =
+                if open_parentheses > 0 /\ (!starts_signature \/ line.contains("::")) then
+                    owner
+                else
+                    open_parentheses = 0
+                    null
+                fi
+
+            if let permutation = if owner? /\ permutations.contains_key(owner) then permutations[owner] else null fi then
+                line = Regex.replace(
+                    line,
+                    "(?<![!\\w])!([0-9]+)",
+                    (m: System.Text.RegularExpressions.Match) -> string is
+                        let index = int.parse(m.groups[1].value)
+
+                        if index < permutation.count then "!{permutation[index]}" else m.value fi
+                    si
+                )
+            fi
+
+            // Reorder the type arguments of each reference, last first so the
+            // earlier positions stay valid.
+            let references = frame_references(line)
+
+            for i in 0..references.count do
+                let reference = references[references.count - 1 - i]
+
+                if permutations.contains_key(reference.name) then
+                    let permutation = permutations[reference.name]
+                    let arguments = split_arguments(line, reference.open, reference.close)
+
+                    if arguments.count == permutation.count then
+                        let reordered = LIST[string](arguments)
+
+                        for j in 0..arguments.count do
+                            reordered[permutation[j]] = arguments[j]
+                        od
+
+                        let before = line.substring(0, reference.open + 1)
+                        let joined = reordered |> join(",")
+                        let after = line.substring(reference.close)
+
+                        line = "{before}{joined}{after}"
+                    fi
+                fi
+            od
+
+            if line.starts_with("}} // end of class") then
+                current_frame = null
+            fi
+
+            result.append(line).append('\n')
+        od
+
+        result.to_string()
+    si
+
+    // A generic literal's method takes the type parameters its body uses,
+    // in the order the compiler first meets them, and writing a type out
+    // can change that order - as for a closure frame. The method's own
+    // signature and body name its parameters, so only the declaration's
+    // list and each reference need reordering: a reference instantiates
+    // the method in declaration order, and indexes its parameters in the
+    // signature it writes out.
+    canonicalise_generic_methods(text: string) -> string is
+        let lines = text.split(['\n'])
+        let declaration_pattern = "(\\$anon_[0-9]+)<([A-Za-z_][^<>(),!]*(?:,[A-Za-z_][^<>(),!]*)*)>\\("
+
+        // For each generic method, the new index of each of its type
+        // parameters.
+        let permutations = MAP[string, int[]]()
+
+        for line in lines do
+            let m = Regex.match(line, declaration_pattern)
+
+            if m.success /\ !line.contains("::") then
+                let parameters = LIST[string]()
+
+                for parameter in m.groups[2].value.split([',']) do
+                    let words = parameter.trim().split([' '])
+
+                    parameters.add(words[words.count - 1])
+                od
+
+                let sorted = LIST[string](parameters)
+
+                sorted.sort()
+
+                let permutation = LIST[int]()
+
+                for p in parameters do
+                    permutation.add(sorted.index_of(p))
+                od
+
+                permutations[m.groups[1].value] = permutation.to_array()
+            fi
+        od
+
+        if permutations.count == 0 then
+            return text
+        fi
+
+        let result = System.Text.StringBuilder()
+        let continued: int[]? mut = null
+        let open_parentheses mut = 0
+
+        for i in 0..lines.count do
+            let line mut = lines[i]
+
+            let declaration = Regex.match(line, declaration_pattern)
+
+            if declaration.success /\ !line.contains("::") /\ permutations.contains_key(declaration.groups[1].value) then
+                let names = LIST[string](declaration.groups[2].value.split([',']))
+                let order = permutations[declaration.groups[1].value]
+                let reordered = LIST[string](names)
+
+                for j in 0..names.count do
+                    reordered[order[j]] = names[j]
+                od
+
+                let group = declaration.groups[2]
+
+                line = "{line.substring(0, group.index)}{reordered |> join(",")}{line.substring(group.index + group.length)}"
+            fi
+
+            let reference = Regex.match(line, "::(\\$anon_[0-9]+)<")
+
+            let permutation: int[]? mut = continued
+            let instantiation_open mut = -1
+            let instantiation_close mut = -1
+
+            if reference.success /\ permutations.contains_key(reference.groups[1].value) then
+                permutation = permutations[reference.groups[1].value]
+                instantiation_open = reference.index + reference.length - 1
+                instantiation_close = matching_close(line, instantiation_open)
+            fi
+
+            if let p = permutation then
+                if instantiation_close > 0 then
+                    let arguments = split_arguments(line, instantiation_open, instantiation_close)
+                    let reordered = LIST[string](arguments)
+
+                    if arguments.count == p.count then
+                        for j in 0..arguments.count do
+                            reordered[p[j]] = arguments[j]
+                        od
+                    fi
+
+                    // Every index outside the instantiation is the
+                    // method's own, in the signature the reference writes.
+                    let before = remap_method_indices(line.substring(0, instantiation_open + 1), p)
+                    let after = remap_method_indices(line.substring(instantiation_close), p)
+
+                    line = "{before}{reordered |> join(",")}{after}"
+                else
+                    line = remap_method_indices(line, p)
+                fi
+
+                // ildasm wraps a long signature onto following lines, which
+                // belong to the same reference.
+                open_parentheses = open_parentheses + line.split(['(']).count - line.split([')']).count
+
+                if open_parentheses > 0 then
+                    continued = p
+                else
+                    continued = null
+                    open_parentheses = 0
+                fi
+            fi
+
+            result.append(line)
+
+            if i + 1 < lines.count then
+                result.append('\n')
+            fi
+        od
+
+        result.to_string()
+    si
+
+    remap_method_indices(segment: string, permutation: int[]) -> string =>
+        Regex.replace(
+            segment,
+            "(?<![!\\w])!!([0-9]+)",
+            (m: System.Text.RegularExpressions.Match) -> string is
+                let index = int.parse(m.groups[1].value)
+
+                if index < permutation.count then "!!{permutation[index]}" else m.value fi
+            si
+        )
+
+    // Top-level classes in name order. A closure frame or a generated
+    // class is emitted where the compiler first needed it, which a
+    // written type can move without changing the class.
+    canonicalise_class_order(text: string) -> string is
+        let lines = text.split(['\n'])
+
+        let blocks = LIST[LIST[string]]()
+        let current: LIST[string]? mut = null
+
+        for line in lines do
+            if line.starts_with(".class ") then
+                current = LIST[string]()
+                blocks.add(current!)
+            fi
+
+            if let block = current then
+                block.add(line)
+            else
+                let loose = LIST[string]()
+
+                loose.add(line)
+                blocks.add(loose)
+            fi
+
+            if line.starts_with("}} // end of class") then
+                current = null
+            fi
+        od
+
+        let classes = LIST[LIST[string]](blocks |> filter(b => b.count > 0 /\ b[0].starts_with(".class ")))
+        let others = LIST[LIST[string]](blocks |> filter(b => b.count == 0 \/ !b[0].starts_with(".class ")))
+
+        // Ordered by content with the generated numbers stripped, so that
+        // two classes differing only in numbering sort the same way.
+        let key = (block: LIST[string]) -> string => Regex.replace(block |> join("\n"), "(\\$[A-Za-z$_]*[A-Za-z$])(?:_[0-9]+)+", "$1")
+
+        classes.sort((a: LIST[string], b: LIST[string]) -> int => string.compare_ordinal(key(a), key(b)))
+
+        let result = System.Text.StringBuilder()
+
+        for block in others do
+            for line in block do
+                result.append(line).append('\n')
+            od
+        od
+
+        for block in classes do
+            for line in block do
+                result.append(line).append('\n')
+            od
+        od
+
+        result.to_string()
+    si
+
+    check(grid: string, work: string, compiler: string, ildasm: string, filter_text: string?, json: string?) -> int is
+        make_executable(ildasm)
+
+        let checks = LIST[CHECK]()
+
+        for cell in all_cells() do
+            if filter_text? /\ !cell.slug.contains(filter_text) then
+                continue
+            fi
+
+            let result = CHECK(cell, Path.combine(Path.combine(work, cell.slug), "inferred"), Path.combine(Path.combine(work, cell.slug), "explicit"))
+
+            if skip_reason(cell)? then
+                result.verdict = "·"
+            elif File.exists(Path.combine(Path.combine(grid, cell.slug), "fail.expected")) then
+                result.verdict = "C"
+            elif !File.exists(Path.combine(Path.combine(grid, cell.slug), "test.ghul")) then
+                result.verdict = "?"
+            fi
+
+            checks.add(result)
+        od
+
+        let to_compile = LIST[CHECK](checks |> filter(c => !c.verdict?))
+
+        let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
+
+        write_line("compiling {to_compile.count} cells twice each, {batch_size} at a time")
+
+        for batch in to_compile |> chunk(batch_size) do
+            let processes = LIST[System.Diagnostics.Process]()
+
+            for c in batch do
+                for directory in [c.inferred, c.explicit] do
+                    if Directory.exists(directory) then
+                        Directory.delete(directory, true)
+                    fi
+
+                    Directory.create_directory(directory)
+                od
+
+                // The inferred program is the grid's own cell, so the oracle
+                // checks what the grid runs.
+                File.copy(Path.combine(Path.combine(grid, c.cell.slug), "test.ghul"), Path.combine(c.inferred, "test.ghul"))
+                File.write_all_text(Path.combine(c.explicit, "test.ghul"), program(c.cell, true))
+
+                for directory in [c.inferred, c.explicit] do
+                    processes.add(start(directory, "dotnet {quote(compiler)} test.ghul -o binary.exe > compiler.out 2>&1"))
+                od
+            od
+
+            for p in processes do
+                p.wait_for_exit()
+            od
+
+            for c in batch do
+                c.verdict = compare(c, ildasm)
+            od
+        od
+
+        if json? then
+            write_json(json, grid, compiler, LIST[RESULT](checks |> map(c => RESULT(c.cell.slug, c.verdict ?? "?", 0, 0))))
+        fi
+
+        report(checks)
+    si
+
+    // What checking one corpus program found: a directory holding
+    // `test.ghul`, or a project's sources, compiled as written and again
+    // with the types the compiler inferred written out by
+    // `--annotate-inferred`. `sources` are paths relative to `source`,
+    // and `options` the flags and references every compile of the
+    // program is given.
+    class CORPUS_CHECK(name: string, source: string, inferred: string, explicit: string) is
+        verdict: string? public
+        annotated: int public
+        skipped: int public
+        sources: LIST[string] public
+        options: string public
+
+        init(..) is
+            sources = LIST[string]()
+            options = ""
+        si
+    si
+
+    // The programs under a directory, in name order: each subdirectory
+    // holding a `test.ghul` or a `.ghulproj`, or the directory itself
+    // when it holds a `.ghulproj`. One recorded as failing to compile,
+    // or whose references a bare compile cannot resolve, is left out,
+    // since there is nothing to compare.
+    corpus_programs(directory: string, work: string, compiler: string, filter_text: string?) -> LIST[CORPUS_CHECK] is
+        let result = LIST[CORPUS_CHECK]()
+
+        if find_project(directory)? then
+            let name = Path.get_file_name(directory)!
+
+            result.add(project_program(directory, name, work, compiler))
+
+            return result
+        fi
+
+        let directories = LIST[string](Directory.get_directories(directory))
+
+        directories.sort()
+
+        for d in directories do
+            let name = Path.get_file_name(d)!
+
+            if filter_text? /\ !name.contains(filter_text) then
+                continue
+            fi
+
+            if File.exists(Path.combine(d, "test.ghul")) then
+                let check = CORPUS_CHECK(name, d, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+
+                check.sources = LIST[string](["test.ghul"])
+                check.options = program_flags(d)
+
+                if File.exists(Path.combine(d, "fail.expected")) then
+                    check.verdict = "C"
+                fi
+
+                result.add(check)
+            elif find_project(d)? then
+                result.add(project_program(d, name, work, compiler))
+            else
+                // A directory holding several solutions keeps each as a
+                // project of its own, one level down.
+                let solutions = LIST[string](Directory.get_directories(d) |> filter(s => find_project(s)?))
+
+                solutions.sort()
+
+                for s in solutions do
+                    result.add(project_program(s, "{name}/{Path.get_file_name(s)}", work, compiler))
+                od
+            fi
+        od
+
+        result
+    si
+
+    find_project(directory: string) -> string? =>
+        Directory.get_files(directory, "*.ghulproj") |> first()
+
+    // The text of every `<element Include="...">` in `text` that carries
+    // no other attribute, so an item MSBuild includes only under a
+    // condition is left out.
+    item_includes(text: string, element: string) -> LIST[string] =>
+        LIST[string](
+            Regex.matches(text, "<{element}\\s+Include=\"([^\"]*)\"\\s*/?>")
+                |> map((m: System.Text.RegularExpressions.Match) -> string => m.groups[1].value)
+        )
+
+    property_value(text: string, name: string) -> string? is
+        let m = Regex.match(text, "<{name}>([^<]*)</{name}>")
+
+        if m.success then m.groups[1].value.trim() else null fi
+    si
+
+    // The nearest `Directory.Build.props` MSBuild imports for a project
+    // in `directory`.
+    build_props(directory: string) -> string? is
+        let current: string? mut = directory
+
+        while current? do
+            let path = Path.combine(current, "Directory.Build.props")
+
+            if File.exists(path) then
+                return path
+            fi
+
+            current = Path.get_directory_name(current)
+        od
+
+        return null
+    si
+
+    // A program built from a `.ghulproj`: every `.ghul` its `GhulSources`
+    // items glob, compiled with the options its items and the properties
+    // the ghūl targets read ask for.
+    project_program(directory: string, name: string, work: string, compiler: string) -> CORPUS_CHECK is
+        let check = CORPUS_CHECK(name, directory, Path.combine(Path.combine(work, name), "inferred"), Path.combine(Path.combine(work, name), "explicit"))
+
+        let project = File.read_all_text(find_project(directory)!)
+        let props = if let path = build_props(directory) then File.read_all_text(path) else "" fi
+        let text = "{props}\n{project}"
+
+        let patterns = item_includes(project, "GhulSources")
+
+        if patterns.count == 0 then
+            patterns.add("src/**/*.ghul")
+        fi
+
+        let sources = SET[string]()
+
+        for pattern in patterns do
+            for file in glob(directory, pattern) do
+                sources.add(file)
+            od
+        od
+
+        check.sources = LIST[string](sources)
+        check.sources.sort()
+
+        let options = LIST[string](item_includes(text, "GhulOptions"))
+
+        if let access = property_value(text, "GhulUnderscoreAccess") then
+            options.add("--underscore-access {access}")
+        fi
+
+        if let global = property_value(text, "GhulGlobalNamespace") /\ global.to_lower() =~ "true" then
+            options.add("--global-namespace")
+        fi
+
+        if let uses = property_value(text, "GhulDefaultUses") then
+            options.add("--default-use \"{uses.replace(';', ',')}\"")
+        fi
+
+        let library = property_value(text, "GhulLibrary")
+        let output_type = property_value(text, "OutputType")
+
+        if
+            (library? /\ library.to_lower() =~ "true") \/
+            (!library? /\ (!output_type? \/ output_type.to_lower() =~ "library"))
+        then
+            options.add("--library")
+        fi
+
+        // A compile given any reference discovers none of its own, so the
+        // references are all written out: the SDK's reference assemblies,
+        // and each package at the version the project pins, read from the
+        // package cache as a restore left it. The runtime is one of those
+        // packages, and without a pin the one beside the compiler.
+        let references = LIST[string](sdk_references())
+        let versions = if let path = packages_props(directory) then File.read_all_text(path) else "" fi
+        let has_runtime mut = false
+
+        let seen = SET[string]()
+
+        for (id, version) in package_references(text) do
+            if id.to_lower() =~ "ghul.runtime" then
+                has_runtime = true
+            fi
+
+            let pinned = version ?? package_version(versions, id)
+
+            if !pinned? \/ !add_package(id, pinned, references, seen) then
+                check.verdict = "·"
+            fi
+        od
+
+        if !has_runtime then
+            references.add(Path.combine(Path.get_directory_name(compiler)!, "ghul-runtime.dll"))
+        fi
+
+        // Another project's output is only where its last build left it,
+        // and the paths that build resolved are recorded beside this one.
+        if item_includes(project, "ProjectReference").count > 0 then
+            let recorded = Path.combine(directory, ".assemblies.json")
+
+            if !File.exists(recorded) then
+                check.verdict = "·"
+            else
+                let document = System.Text.Json.JsonDocument.parse(File.read_all_text(recorded), _)
+                let packages = nuget_packages()
+
+                for element in document.root_element.get_property("assemblies").enumerate_array() do
+                    let assembly = element.get_string() ?? ""
+
+                    if assembly.length > 0 /\ !assembly.starts_with(packages) /\ !assembly.contains("/packs/") then
+                        references.add(assembly)
+                    fi
+                od
+            fi
+        fi
+
+        for reference in references do
+            options.add("-a {quote(reference)}")
+        od
+
+        check.options = options |> join(" ")
+
+        if check.sources.count == 0 then
+            check.verdict = "·"
+        fi
+
+        check
+    si
+
+    nuget_packages() -> string is
+        let from_environment = System.Environment.get_environment_variable("NUGET_PACKAGES")
+
+        if from_environment? /\ from_environment.length > 0 then
+            from_environment
+        else
+            Path.combine(System.Environment.get_folder_path(System.Environment_SpecialFolder.USER_PROFILE), ".nuget/packages")
+        fi
+    si
+
+    // The reference assemblies of the newest .NET 10 targeting pack beside
+    // the running .NET.
+    sdk_references() -> LIST[string] is
+        let shared = Path.get_directory_name((typeof object).assembly.location)!
+        let root = Path.get_directory_name(Path.get_directory_name(Path.get_directory_name(shared)!)!)!
+        let packs = Path.combine(root, "packs/Microsoft.NETCore.App.Ref")
+
+        let versions = LIST[string](Directory.get_directories(packs) |> filter(d => Path.get_file_name(d)!.starts_with("10.")))
+
+        versions.sort((a: string, b: string) -> int => System.Version(Path.get_file_name(a)!.split(['-'])[0]).compare_to(System.Version(Path.get_file_name(b)!.split(['-'])[0])))
+
+        LIST[string](Directory.get_files(Path.combine(versions[versions.count - 1], "ref/net10.0"), "*.dll"))
+    si
+
+    // Every `<PackageReference>` in `text`, with the version written on
+    // it when there is one.
+    package_references(text: string) -> LIST[(id: string, version: string?)] =>
+        LIST[(id: string, version: string?)](
+            Regex.matches(text, "<PackageReference\\s+Include=\"([^\"]*)\"(?:\\s+Version=\"([^\"]*)\")?\\s*/?>")
+                |> map((m: System.Text.RegularExpressions.Match) -> (id: string, version: string?) =>
+                    (id = m.groups[1].value, version = if m.groups[2].success then m.groups[2].value else null fi))
+        )
+
+    // The nearest `Directory.Packages.props`, where central package
+    // management pins versions.
+    packages_props(directory: string) -> string? is
+        let current: string? mut = directory
+
+        while current? do
+            let path = Path.combine(current, "Directory.Packages.props")
+
+            if File.exists(path) then
+                return path
+            fi
+
+            current = Path.get_directory_name(current)
+        od
+
+        return null
+    si
+
+    package_version(text: string, id: string) -> string? is
+        let m = Regex.match(text, "<PackageVersion\\s+Include=\"{Regex.escape(id)}\"\\s+Version=\"([^\"]*)\"", System.Text.RegularExpressions.RegexOptions.IGNORE_CASE)
+
+        if m.success then m.groups[1].value else null fi
+    si
+
+    // A package's assemblies for the newest framework it ships that .NET 10
+    // can load, or null when the cache does not hold that version.
+    package_assemblies(id: string, version: string) -> LIST[string]? is
+        let lib = Path.combine(Path.combine(Path.combine(nuget_packages(), id.to_lower()), version), "lib")
+
+        for framework in ["net10.0", "net9.0", "net8.0", "net7.0", "net6.0", "netstandard2.1", "netstandard2.0"] do
+            let path = Path.combine(lib, framework)
+
+            if Directory.exists(path) then
+                return LIST[string](Directory.get_files(path, "*.dll"))
+            fi
+        od
+
+        return null
+    si
+
+    // Adds a package's assemblies and, following its `.nuspec`, those of
+    // the packages it depends on, since a package can be a facade whose
+    // types live in its dependencies. False when the package itself is not
+    // in the cache; a dependency missing from it is left for the compile to
+    // report.
+    add_package(id: string, version: string, references: LIST[string], seen: SET[string]) -> bool is
+        if !seen.add(id.to_lower()) then
+            return true
+        fi
+
+        let assemblies = package_assemblies(id, version)
+
+        if !assemblies? then
+            return false
+        fi
+
+        references.add_range(assemblies)
+
+        let directory = Path.combine(Path.combine(nuget_packages(), id.to_lower()), version)
+        let nuspec = Path.combine(directory, "{id.to_lower()}.nuspec")
+
+        if !File.exists(nuspec) then
+            return true
+        fi
+
+        for (dependency, range) in nuspec_dependencies(File.read_all_text(nuspec)) do
+            if let resolved = cached_version(dependency, range) then
+                add_package(dependency, resolved, references, seen)
+            fi
+        od
+
+        true
+    si
+
+    // The dependencies a `.nuspec` lists for the newest framework group
+    // .NET 10 can use, or its ungrouped list.
+    nuspec_dependencies(text: string) -> LIST[(id: string, range: string)] is
+        let singleline = System.Text.RegularExpressions.RegexOptions.SINGLELINE
+        let groups = Regex.matches(text, "<group targetFramework=\"([^\"]*)\"\\s*>(.*?)</group>", singleline)
+
+        let chosen: string? mut = null
+
+        for framework in ["net10.0", "net9.0", "net8.0", "net7.0", "net6.0", ".NETStandard2.1", ".NETStandard2.0"] do
+            if chosen? then
+                break
+            fi
+
+            for k in 0..groups.count do
+                if groups[k].groups[1].value =~ framework then
+                    chosen = groups[k].groups[2].value
+                    break
+                fi
+            od
+        od
+
+        let body = chosen ?? (if groups.count == 0 then text else "" fi)
+
+        LIST[(id: string, range: string)](
+            Regex.matches(body, "<dependency id=\"([^\"]*)\" version=\"([^\"]*)\"")
+                |> map((m: System.Text.RegularExpressions.Match) -> (id: string, range: string) => (id = m.groups[1].value, range = m.groups[2].value))
+        )
+    si
+
+    is_version(text: string) -> bool is
+        let parsed: System.Version? mut
+
+        System.Version.try_parse(text.split(['-'])[0], parsed ref)
+    si
+
+    // The version of a dependency to use: its range's lower bound when the
+    // cache holds that, otherwise the newest version the cache holds.
+    cached_version(id: string, range: string) -> string? is
+        let directory = Path.combine(nuget_packages(), id.to_lower())
+
+        if !Directory.exists(directory) then
+            return null
+        fi
+
+        let lower = range.trim_start(['[', '(']).split([',', ']', ')'])[0].trim()
+
+        if lower.length > 0 /\ Directory.exists(Path.combine(directory, lower)) then
+            return lower
+        fi
+
+        let available = LIST[string](Directory.get_directories(directory) |> map(d => Path.get_file_name(d)!) |> filter(v => is_version(v)))
+
+        if available.count == 0 then
+            return null
+        fi
+
+        available.sort((a: string, b: string) -> int => System.Version(a.split(['-'])[0]).compare_to(System.Version(b.split(['-'])[0])))
+
+        available[available.count - 1]
+    si
+
+    // The files under `directory` that an MSBuild include pattern names,
+    // relative to it, leaving out the build's own output directories.
+    glob(directory: string, pattern: string) -> LIST[string] is
+        let normalised = pattern.replace('\\', '/')
+        let result = LIST[string]()
+
+        let files =
+            if normalised.contains("**/") then
+                let at = normalised.index_of("**/")
+                let root = Path.combine(directory, normalised.substring(0, at))
+
+                if Directory.exists(root) then
+                    Directory.get_files(root, normalised.substring(at + 3), IO.SearchOption.ALL_DIRECTORIES)
+                else
+                    System.Array.empty`[string]()
+                fi
+            else
+                let root = Path.combine(directory, Path.get_directory_name(normalised) ?? "")
+
+                if Directory.exists(root) then
+                    Directory.get_files(root, Path.get_file_name(normalised)!, IO.SearchOption.TOP_DIRECTORY_ONLY)
+                else
+                    System.Array.empty`[string]()
+                fi
+            fi
+
+        for file in files do
+            let relative = Path.get_relative_path(directory, file).replace('\\', '/')
+
+            if !relative.starts_with("bin/") /\ !relative.starts_with("obj/") then
+                result.add(relative)
+            fi
+        od
+
+        result
+    si
+
+    // The flags a program's `ghulflags` asks for, on one line.
+    program_flags(source: string) -> string is
+        let path = Path.combine(source, "ghulflags")
+
+        if !File.exists(path) then
+            return ""
+        fi
+
+        File.read_all_text(path).split(['\n', '\r', ' ']) |> filter(f => f.length > 0) |> map(f => quote(f)) |> join(" ")
+    si
+
+    // The site counts `--annotate-inferred` reports on its standard error.
+    read_annotation_counts(check: CORPUS_CHECK) is
+        let path = Path.combine(check.explicit, "annotate.out")
+
+        if !File.exists(path) then
+            return
+        fi
+
+        let m = Regex.match(File.read_all_text(path), "annotated ([0-9]+) inferred sites, skipped ([0-9]+)")
+
+        if m.success then
+            check.annotated = int.parse(m.groups[1].value)
+            check.skipped = int.parse(m.groups[2].value)
+        fi
+    si
+
+    corpus(directory: string, work: string, compiler: string, ildasm: string, filter_text: string?, json: string?) -> int is
+        make_executable(ildasm)
+
+        let checks = corpus_programs(directory, work, compiler, filter_text)
+        let to_compile = LIST[CORPUS_CHECK](checks |> filter(c => !c.verdict?))
+
+        let batch_size = System.Math.max(1, System.Environment.processor_count / 2)
+
+        write_line("checking {to_compile.count} programs, {batch_size} at a time")
+
+        for batch in to_compile |> chunk(batch_size) do
+            let processes = LIST[System.Diagnostics.Process]()
+
+            for c in batch do
+                for d in [c.inferred, c.explicit] do
+                    if Directory.exists(d) then
+                        Directory.delete(d, true)
+                    fi
+
+                    Directory.create_directory(d)
+
+                    // The same tree in both, so the annotator rewrites
+                    // each file where it stands and a program of many
+                    // files stays one.
+                    for relative in c.sources do
+                        let target = Path.combine(d, relative)
+
+                        Directory.create_directory(Path.get_directory_name(target)!)
+                        File.copy(Path.combine(c.source, relative), target)
+                    od
+                od
+
+                let files = c.sources |> map(s => quote(s)) |> join(" ")
+
+                // The explicit program is the inferred one annotated, so
+                // all three steps are one command: the annotation itself
+                // is a build, and a program the compiler rejects has no
+                // annotated form to compare.
+                let compile = "dotnet {quote(compiler)} {c.options} {files} -o binary.exe > compiler.out 2>&1"
+                let annotate = "dotnet {quote(compiler)} --annotate-inferred-in-place {c.options} {files} > annotate.out 2>&1"
+
+                // A project's command line runs past what one argument may
+                // hold, so it is run from a script rather than passed to
+                // the shell whole.
+                let script = Path.combine(Path.get_directory_name(c.inferred)!, "run.sh")
+
+                File.write_all_text(script, "cd inferred && {compile} && cd ../explicit && {annotate} && {compile}\n")
+
+                processes.add(start(Path.get_directory_name(c.inferred)!, "bash run.sh"))
+            od
+
+            for p in processes do
+                p.wait_for_exit()
+            od
+
+            for c in batch do
+                read_annotation_counts(c)
+
+                c.verdict =
+                    if !File.exists(Path.combine(c.inferred, "binary.exe")) then
+                        "C"
+                    else
+                        compare_directories(c.inferred, c.explicit, ildasm)
+                    fi
+            od
+        od
+
+        if json? then
+            write_json(json, directory, compiler, LIST[RESULT](checks |> map(c => RESULT(c.name, c.verdict ?? "?", c.annotated, c.skipped))))
+        fi
+
+        report_corpus(checks)
+    si
+
+    report_corpus(checks: LIST[CORPUS_CHECK]) -> int is
+        let counts = MAP[string, int]()
+        let annotated mut = 0
+        let skipped mut = 0
+
+        for c in checks do
+            let verdict = c.verdict ?? "?"
+
+            counts[verdict] = if counts.contains_key(verdict) then counts[verdict] + 1 else 1 fi
+
+            annotated = annotated + c.annotated
+            skipped = skipped + c.skipped
+
+            if verdict =~ "≠" \/ verdict =~ "E" then
+                write_line("{verdict} {c.name}")
+            fi
+        od
+
+        write_line("")
+
+        for (key, value) in counts do
+            write_line("- `{key}`: {value}")
+        od
+
+        write_line("")
+        write_line("{annotated} inferred sites written out, {skipped} left as written")
+
+        if counts.contains_key("≠") then 1 else 0 fi
+    si
+
+    compare(c: CHECK, ildasm: string) -> string is
+        if !File.exists(Path.combine(c.inferred, "binary.exe")) then
+            // The grid records this cell as compiling, so the compiler used
+            // here is not the one the grid was captured with.
+            return "?"
+        fi
+
+        compare_directories(c.inferred, c.explicit, ildasm)
+    si
+
+    // The verdict for two compiled programs: `=` when their normalised
+    // IL matches, `≠` when it differs, `E` when the explicit one did
+    // not compile.
+    compare_directories(inferred: string, explicit: string, ildasm: string) -> string is
+        if !File.exists(Path.combine(explicit, "binary.exe")) then
+            return "E"
+        fi
+
+        for directory in [inferred, explicit] do
+            let p = start(directory, "{quote(ildasm)} -out=il.raw binary.exe > ildasm.out 2>&1")
+
+            p.wait_for_exit()
+
+            File.write_all_text(Path.combine(directory, "il.normalised"), normalise(File.read_all_text(Path.combine(directory, "il.raw"))))
+        od
+
+        let diff = start(
+            Path.get_directory_name(inferred)!,
+            "diff -u inferred/il.normalised explicit/il.normalised > il.diff"
+        )
+
+        diff.wait_for_exit()
+
+        if diff.exit_code == 0 then
+            File.delete(Path.combine(Path.get_directory_name(inferred)!, "il.diff"))
+            "="
+        else
+            "≠"
+        fi
+    si
+
+    // One program's line in the machine-readable report: the name the
+    // human-readable output uses, its verdict, and the annotator's counts.
+    class RESULT(name: string, verdict: string, annotated: int, skipped: int);
+
+    // Writes the run as JSON, for a caller that compares runs rather
+    // than reads them: the programs in the order they were checked, the
+    // verdict counts, and the annotator's totals.
+    write_json(path: string, corpus: string, compiler: string, results: LIST[RESULT]) is
+        let options: System.Text.Json.JsonWriterOptions mut = _
+
+        options.indented = true
+
+        let stream = File.create(path)
+        let writer = System.Text.Json.Utf8JsonWriter(stream, options)
+
+        writer.write_start_object()
+        writer.write_string("corpus", corpus)
+        writer.write_string("compiler", compiler)
+
+        writer.write_start_array("programs")
+
+        for r in results do
+            writer.write_start_object()
+            writer.write_string("name", r.name)
+            writer.write_string("verdict", r.verdict)
+            writer.write_number("annotated", r.annotated)
+            writer.write_number("skipped", r.skipped)
+            writer.write_end_object()
+        od
+
+        writer.write_end_array()
+
+        let counts = MAP[string, int]()
+
+        for r in results do
+            counts[r.verdict] = if counts.contains_key(r.verdict) then counts[r.verdict] + 1 else 1 fi
+        od
+
+        writer.write_start_object("counts")
+
+        for (verdict, count) in counts do
+            writer.write_number(verdict, count)
+        od
+
+        writer.write_end_object()
+
+        writer.write_number("annotated", results |> map(r => r.annotated) |> reduce(0, (a, b) => a + b))
+        writer.write_number("skipped", results |> map(r => r.skipped) |> reduce(0, (a, b) => a + b))
+        writer.write_end_object()
+
+        writer.flush()
+        writer.dispose()
+        stream.dispose()
+    si
+
+    report(checks: LIST[CHECK]) -> int is
+        write_line("")
+        write_line("| callee | shape | position | pinning | {ARITIES |> map(i => "{i}") |> join(" | ")} |")
+        write_line("|---|---|---|---|{ARITIES |> map(i => "---") |> join("|")}|")
+
+        let counts = MAP[string, int]()
+        let row = LIST[string]()
+
+        for i in 0..checks.count do
+            let c = checks[i]
+            let verdict = c.verdict ?? "?"
+
+            counts[verdict] = if counts.contains_key(verdict) then counts[verdict] + 1 else 1 fi
+
+            row.add(verdict)
+
+            let next: CELL? = if i + 1 < checks.count then checks[i + 1].cell else null fi
+
+            if !next? \/ next.callee != c.cell.callee \/ next.shape != c.cell.shape \/ next.position != c.cell.position \/ next.pinning != c.cell.pinning then
+                write_line("| {c.cell.callee.slug} | {c.cell.shape.slug} | {c.cell.position.slug} | {c.cell.pinning.slug} | {row |> join(" | ")} |")
+                row.clear()
+            fi
+        od
+
+        write_line("")
+
+        for (key, value) in counts do
+            write_line("- `{key}`: {value}")
+        od
+
+        let mismatches = LIST[CHECK](checks |> filter(c => c.verdict =~ "≠"))
+        let rejected = LIST[CHECK](checks |> filter(c => c.verdict =~ "E"))
+
+        if mismatches.count > 0 then
+            write_line("")
+            write_line("IL differs:")
+
+            for c in mismatches do
+                write_line("- {c.cell.slug}")
+            od
+        fi
+
+        if rejected.count > 0 then
+            write_line("")
+            write_line("explicit program does not compile:")
+
+            for c in rejected do
+                write_line("- {c.cell.slug}")
+            od
+        fi
+
+        if mismatches.count > 0 then 1 else 0 fi
+    si
+
+    entry(args: string[]) -> int is
+        let is_check = args.count >= 1 /\ args[0] =~ "check"
+        let is_corpus = args.count >= 1 /\ args[0] =~ "corpus"
+
+        if args.count < 3 \/ !(is_check \/ is_corpus) then
+            write_line("usage: inference-oracle check <grid-directory> <work-directory> [--compiler <ghul.dll>] [--ildasm <path>] [--cell <text>] [--json <file>]")
+            write_line("       inference-oracle corpus <programs-directory> <work-directory> [--compiler <ghul.dll>] [--ildasm <path>] [--cell <text>] [--json <file>]")
+            return 1
+        fi
+
+        let compiler mut = "publish/ghul.dll"
+        let ildasm: string? mut = null
+        let filter_text: string? mut = null
+        let json: string? mut = null
+
+        let i mut = 3
+
+        while i + 1 < args.count do
+            if args[i] =~ "--compiler" then
+                compiler = args[i + 1]
+            elif args[i] =~ "--ildasm" then
+                ildasm = args[i + 1]
+            elif args[i] =~ "--json" then
+                json = Path.get_full_path(args[i + 1])
+            elif args[i] =~ "--cell" then
+                filter_text = args[i + 1]
+            else
+                write_line("unknown option {args[i]}")
+                return 1
+            fi
+
+            i = i + 2
+        od
+
+        if is_corpus then
+            corpus(Path.get_full_path(args[1]), Path.get_full_path(args[2]), Path.get_full_path(compiler), find_ildasm(ildasm), filter_text, json)
+        else
+            check(Path.get_full_path(args[1]), Path.get_full_path(args[2]), Path.get_full_path(compiler), find_ildasm(ildasm), filter_text, json)
+        fi
+    si
+si

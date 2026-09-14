@@ -107,11 +107,11 @@ opportunistic upkeep, not a project.
 ## Generated tests
 
 `execution/argument-pack-grid` holds one test per cell of a conformance grid
-for argument packs: how the function filling a `T.. -> U` formal is written,
-where it sits relative to the pack, what pins the pack, and the arity. The
-cells are written by the ghūl program in `generators/argument-pack-grid`, so an
-axis gains a value by adding one entry to its list there. Cells the language
-rules out are skipped by the generator, which says why.
+for argument packs: how the combinator is reached, how the function filling a
+`T.. -> U` formal is written, where it sits relative to the pack, what pins
+the pack, and the arity. The
+cells are written by the ghūl program in `tools/argument-pack-grid`, whose
+README says how to regenerate them. Edit the generator rather than a cell.
 
 A cell that fails today is kept, with the failure captured as its expectation:
 `fail.expected` and `err.expected` for one that does not compile, and
@@ -119,16 +119,9 @@ A cell that fails today is kept, with the failure captured as its expectation:
 and prints what it caught and whether its result was right. Fixing a gap
 therefore fails the cells it fixes, and recapturing them records the fix.
 
-Regenerate after changing the generator, then run the grid and capture what
-changed:
-
-```sh
-dotnet run --project integration-tests/generators/argument-pack-grid -- generate integration-tests/execution/argument-pack-grid
-dotnet ghul-test integration-tests/execution/argument-pack-grid
-for t in integration-tests/execution/argument-pack-grid/*/ ; do [ -f "$t/failed" ] && ./tasks/capture.sh "$t" ; done
-```
-
-`report` in place of `generate` prints the grid's outcomes as a Markdown table.
+`tools/inference-oracle` checks the same cells for silent mis-resolution, by
+comparing each one's IL against the same program with its inferred types
+written out. It is run by hand, not by the suite.
 
 ## The IL snapshot tests
 

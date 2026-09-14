@@ -1,0 +1,278 @@
+# The scheduled inference-oracle run.
+#
+# The oracle (tools/inference-oracle) compiles each program of a corpus as
+# written and again with every inferred type written out, and compares the
+# IL of the two: a difference means the program resolved differently from
+# what its inferred types say. This runs it nightly over four corpora with
+# the latest published compiler, and records what it found.
+#
+# It is not a pull-request gate. The four corpora take most of an hour on a
+# hosted runner, and a resolution that drifts from its inferred types is
+# worth knowing about the morning after rather than on every push. A night
+# with no new release is skipped: the compiler checked is the latest
+# published one, and the previous run's verdicts still stand for it.
+#
+# Reporting is deliberately quiet. Every run writes its totals to the job
+# summary and appends itself to the `oracle-history` branch; the tracking
+# issue's body is rewritten with the latest totals, and a comment goes on
+# it only when a program's verdict differs from the previous run. Nothing
+# opens an issue per finding.
+
+name: Inference oracle
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run even if no compiler has been published since the last run
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CI: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+  TRACKING_ISSUE: 2601
+
+jobs:
+  oracle:
+    name: Check inferred types against resolution
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    # Write, to append the run to the oracle-history branch and to keep the
+    # tracking issue current. Nothing else in the repository is written.
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        path: ghul
+
+    - name: Check out the oracle history
+      uses: actions/checkout@v7
+      with:
+        ref: oracle-history
+        path: oracle-history
+
+    # The latest version that is listed and downloadable, as ci.yml resolves
+    # its bootstrap compiler. A night on which that version was already
+    # checked has nothing new to say, unless a dispatch asks anyway.
+    - name: Resolve the compiler to check
+      id: compiler
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        versions=$(curl -fsSL https://api.nuget.org/v3-flatcontainer/ghul.compiler/index.json \
+          | jq -r '.versions | reverse | .[]')
+        compiler=""
+        for v in ${versions}; do
+          case "${v}" in *-*) continue ;; esac
+          curl -fsSL --compressed "https://api.nuget.org/v3/registration5-gz-semver2/ghul.compiler/${v}.json" \
+            | jq -e '.listed' >/dev/null || continue
+          if curl -fsI "https://api.nuget.org/v3-flatcontainer/ghul.compiler/${v}/ghul.compiler.${v}.nupkg" >/dev/null 2>&1; then
+            compiler=${v}
+            break
+          fi
+        done
+        [ -n "${compiler}" ] || { echo "no downloadable ghul.compiler version found" >&2; exit 1; }
+
+        previous=""
+        if [ -s oracle-history/totals.jsonl ]; then
+          previous=$(tail -n 1 oracle-history/totals.jsonl | jq -r '.compiler')
+        fi
+
+        echo "compiler=${compiler}" >> "$GITHUB_OUTPUT"
+        echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+
+        if [ "${compiler}" = "${previous}" ] && [ "${{ inputs.force }}" != true ]; then
+          echo "ghul.compiler ${compiler} was checked by the previous run; nothing to do"
+          echo "run=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "checking ghul.compiler ${compiler} (previous run: ${previous:-none})"
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up .NET 10
+      if: steps.compiler.outputs.run == 'true'
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Check out the Rosetta Code solutions
+      if: steps.compiler.outputs.run == 'true'
+      uses: actions/checkout@v7
+      with:
+        repository: degory/ghul-rosetta-code
+        path: ghul-rosetta-code
+
+    # The compiler under test is installed as the repository's local tool,
+    # so the oracle itself is built with it, and the same dll is what the
+    # oracle hands each program. The Rosetta projects are restored only far
+    # enough to put the packages they reference in the cache, which is
+    # where the oracle reads references from; the compiler's own project
+    # additionally needs `.assemblies.json`, which carries the output of
+    # the project it references. ildasm is the copy the ghul.test tool
+    # ships.
+    - name: Install the compiler and restore what the corpora reference
+      if: steps.compiler.outputs.run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        cd ghul
+        dotnet tool uninstall --local ghul.compiler || true
+        dotnet tool install --local ghul.compiler --version ${{ steps.compiler.outputs.compiler }}
+        dotnet tool restore
+        dotnet build -verbosity:quiet -t:GenerateAssembliesJson
+        cd ..
+
+        # One project per referenced package is enough to fill the cache. No
+        # pipes here: `set -o pipefail` turns the broken pipe a `head` leaves
+        # behind on a long listing into a failed step.
+        projects=(ghul-rosetta-code/tasks/*/*.ghulproj)
+        restore=("${projects[0]}")
+        for project in "${projects[@]}"; do
+          if grep -q "ghul.raster" "${project}"; then
+            restore+=("${project}")
+            break
+          fi
+        done
+        for project in "${restore[@]}"; do
+          dotnet restore -verbosity:quiet "${project}"
+        done
+
+        ildasm=$(find ~/.nuget/packages/ghul.test -path '*/linux-x64/native/ildasm' | sort | tail -n 1)
+        [ -n "${ildasm}" ] || { echo "ildasm not found in the ghul.test package" >&2; exit 1; }
+        echo "GHUL_TEST_ILDASM=${ildasm}" >> "$GITHUB_ENV"
+        echo "GHUL_DLL=$HOME/.nuget/packages/ghul.compiler/${{ steps.compiler.outputs.compiler }}/tools/net10.0/any/ghul.dll" >> "$GITHUB_ENV"
+
+    - name: Build the oracle
+      if: steps.compiler.outputs.run == 'true'
+      working-directory: ghul
+      run: dotnet build -verbosity:quiet tools/inference-oracle
+
+    # Each corpus writes its own report; a corpus that fails to run leaves
+    # no report, and the run carries on to the next so one broken corpus
+    # does not lose the other three.
+    - name: Run the oracle over the four corpora
+      if: steps.compiler.outputs.run == 'true'
+      working-directory: ghul
+      shell: bash
+      run: |
+        # The oracle exits non-zero when any verdict is ≠; that is a finding
+        # to report, not a reason to stop before the other corpora run.
+        set +e
+        mkdir -p ../reports ../work
+
+        oracle() {
+          echo "::group::$1"
+          dotnet run --no-build --project tools/inference-oracle -- "$2" "$3" "../work/$1" \
+            --compiler "${GHUL_DLL}" --json "../reports/$1.json"
+          echo "::endgroup::"
+        }
+
+        oracle grid check integration-tests/execution/argument-pack-grid
+        oracle execution corpus integration-tests/execution
+        oracle rosetta corpus ../ghul-rosetta-code/tasks
+        oracle compiler corpus .
+
+        # The step reports the last command's status, so end on a true one.
+        true
+
+    - name: Summarise, record and report
+      if: steps.compiler.outputs.run == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        COMPILER: ${{ steps.compiler.outputs.compiler }}
+        PREVIOUS: ${{ steps.compiler.outputs.previous }}
+      run: |
+        set -euo pipefail
+
+        run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        today=$(date -u +%F)
+
+        # The totals table, one row per corpus, and the delta against the
+        # previous run's reports.
+        table=$'| corpus | `=` | `≠` | `E` | `C` | `·` | `?` | sites written out |\n|---|---|---|---|---|---|---|---|'
+        delta=""
+        totals='{}'
+        for corpus in grid execution rosetta compiler; do
+          report="reports/${corpus}.json"
+          if [ ! -f "${report}" ]; then
+            table+=$'\n'"| ${corpus} | did not run | | | | | | |"
+            continue
+          fi
+          row=$(jq -r --arg c "${corpus}" '"| \($c) | \(.counts["="] // 0) | \(.counts["≠"] // 0) | \(.counts["E"] // 0) | \(.counts["C"] // 0) | \(.counts["·"] // 0) | \(.counts["?"] // 0) | \(.annotated) |"' "${report}")
+          table+=$'\n'"${row}"
+          totals=$(jq -c --arg c "${corpus}" --slurpfile r "${report}" '. + {($c): $r[0].counts}' <<<"${totals}")
+
+          previous_report="oracle-history/runs/${PREVIOUS}/${corpus}.json"
+          changes=$(ghul/tools/inference-oracle/compare-runs.sh "${previous_report}" "${report}")
+          if [ -n "${changes}" ]; then
+            delta+=$'\n\n'"**${corpus}** (against ${PREVIOUS:-no previous run}):"$'\n'"${changes}"
+          fi
+        done
+
+        {
+          echo "## ghul.compiler ${COMPILER}"
+          echo
+          echo "${table}"
+          if [ -n "${delta}" ]; then
+            echo
+            echo "### Changed since the previous run"
+            echo "${delta}"
+          else
+            echo
+            echo "No program's verdict changed since the previous run."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Record the run. Only a scheduled run or a dispatch on main is a
+        # measurement of a release; a dispatch on some other ref is a trial.
+        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          mkdir -p "oracle-history/runs/${COMPILER}"
+          cp reports/*.json "oracle-history/runs/${COMPILER}/"
+          jq -cn --arg date "${today}" --arg run "${{ github.run_id }}" --arg compiler "${COMPILER}" --argjson corpora "${totals}" \
+            '{date: $date, run: $run, compiler: $compiler, corpora: $corpora}' >> oracle-history/totals.jsonl
+
+          cd oracle-history
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Record ghul.compiler ${COMPILER}"
+          for attempt in 1 2 3; do
+            if git pull -q --rebase origin oracle-history && git push -q origin HEAD:oracle-history; then
+              break
+            fi
+            echo "push attempt ${attempt} failed, retrying"
+            sleep 5
+          done
+          cd ..
+
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "Tracks the scheduled inference-oracle run (\`.github/workflows/oracle.yml\`). The oracle compiles each program as written and again with every inferred type written out, and compares the IL; a difference means the program resolved differently from what its inferred types say. It runs at 03:00 UTC on the nights a new \`ghul.compiler\` has been published since the last run. Every run appends itself to the \`oracle-history\` branch; this body carries the latest totals, and a comment is posted only when a program's verdict changed since the previous run." \
+            "Latest: ghul.compiler ${COMPILER}, ${today} ([run](${run_url}))" \
+            "${table}")
+          gh issue edit "${TRACKING_ISSUE}" --repo "${{ github.repository }}" --body "${body}"
+
+          # The first run has nothing to differ from; its baseline is in the body.
+          if [ -n "${delta}" ] && [ -n "${PREVIOUS}" ]; then
+            gh issue comment "${TRACKING_ISSUE}" --repo "${{ github.repository }}" \
+              --body "$(printf 'ghul.compiler %s ([run](%s)) changed these verdicts:%s\n' "${COMPILER}" "${run_url}" "${delta}")"
+          fi
+        fi
