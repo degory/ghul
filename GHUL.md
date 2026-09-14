@@ -183,7 +183,19 @@ fi
 
 A local whose initializer, assignments and uses give it no type at all is reported as `cannot infer type here` where it is declared, and needs an annotation.
 
-A `mut` variable still cannot change type. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. For a `T ref` parameter, `_` discards what the callee writes: the callee is handed the address of a fresh local holding the default of `T`, so `System.Version.try_parse("1.2", _)` tests the text without keeping the result. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
+A `mut` local with an initializer and no written type holds everything assigned to it, so its type is the join of the initializer and every value assigned later: a union variant or a subclass as the initializer does not stop a sibling being assigned.
+
+```ghul
+let tree mut = Tree.EMPTY;     // Tree, from the assignment below
+tree = Tree.NODE(tree, 1, Tree.EMPTY);
+
+let pet mut = CAT();           // Animal
+pet = DOG();
+```
+
+The join is only taken where the author wrote a type for the values to share. Where it would be `object`, `System.ValueType`, or a trait neither the initializer nor any assigned value is typed as, or where any of them is a value type, the local keeps its initializer's type and the assignment is reported: `let i mut = 0; i = 1L` is an error, as is assigning an unrelated class. Writing the type out (`let pet: Animal mut = CAT()`) always fixes it.
+
+A `mut` variable still cannot change type once it has one. Either form can also take its value from `_`, the default-value expression — `let i = _` takes its type from the local's own annotation or from later use, with `_[T]` to pin it explicitly. A bare `_` in a call-argument position infers the parameter type from the callee, provided the call resolves to a single unambiguous overload; if the parameter has a declared .NET default value, `_` takes that value rather than the type's zero value, so writing it out positionally behaves exactly like omitting the same argument by name. For a `T ref` parameter, `_` discards what the callee writes: the callee is handed the address of a fresh local holding the default of `T`, so `System.Version.try_parse("1.2", _)` tests the text without keeping the result. A `_` argument is never itself used to infer a generic type variable — one pinned only by the `_` slot, or a call left ambiguous between overloads, is still an error (`cannot infer type of default here`). `_[T]` always means the literal zero value of `T`, in every position — it never picks up a callee's declared default.
 
 Applied to an argument list, `_(...)` *constructs* the type the context expects instead of taking its zero value, so a value can be built without naming its type a second time:
 
