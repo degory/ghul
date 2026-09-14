@@ -70,11 +70,9 @@ Every new or edited `error`/`warn`/`info`/`hint` call (and `set_constraint` mess
 - Interpolated identifiers and types appear bare in `{...}` - never quoted.
 - Only non-alphanumeric tokens (operators, punctuation, escape sequences) get single quotes, e.g. `'{{'`, `'{operator}'`.
 - Terse - a noun phrase or short fragment, subject usually implicit.
-- No user advice (`try`, `consider`, `rewrite as`, `did you mean`) folded into the message string - a genuine fix hint goes in a separate `hint` call at the same location instead.
+- No user advice (`try`, `consider`, `rewrite as`, `did you mean`) folded into the main message string. `error`/`warn` accept a related location and message (`error(location, message, related_location, related_message)`, conventionally prefixed `"help: ..."`) - that's the sanctioned place for a fix hint, and even there it must be **specific**: only include it when the diff shows with certainty that the stated fix applies to this exact match, never a generally-plausible-sounding suggestion. Reject a help string that assumes something about the flagged value or code shape the surrounding logic hasn't actually established - e.g. "copy into a local variable" is wrong advice where the value is already a local, or where the code checked can't tell either way.
 - No second-person, no apologies, no `please`.
 - No CLI flag names, issue references, URLs, or markdown in the rendered text.
-
-Full rubric with worked examples: `docs/claude/diagnostic-message-audit.md` in the parent workspace (not visible to you from inside this checkout - the summary above is complete for review purposes).
 
 ### Cross-assembly tests
 
