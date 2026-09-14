@@ -23,6 +23,7 @@ Flag:
 - Violations of the contracts below (type-system change protocol, cross-assembly test traps).
 - Deprecated idioms.
 - **Any new use of rendered text as an entity's identity** - see the contract below. This one is a rejection, not a suggestion.
+- **Any new or reworded diagnostic message that violates the wording rubric below** - most commonly, a backtick around a literal keyword or an interpolated identifier.
 - Missing tests where CONTRIBUTING.md requires one (any behavioural change wants an integration test; type-system changes additionally want unit tests).
 - `GHUL.md` falling out of step with reality - a PR introduces a feature `GHUL.md` doesn't document, changes documented behaviour without updating it, or otherwise leaves the reference contradicting the code.
 
@@ -59,6 +60,21 @@ This is a hard rule rather than a preference because rendering is lossy in both 
 What this does *not* cover: a source-level identifier used as a name is the datum, not a proxy for one. Scope and member lookup, completion prefix matching, `use` imports, suppression slugs, diagnostic codes, file paths - all legitimate, don't flag them. The rule is about a rendered *description* of an entity standing in for the entity.
 
 Existing text-keyed mechanisms (the `MAP[string, Type]` type-argument maps in the specializers and the placeholder registry, the state-machine frame's function-name-keyed class map, the name-keyed symbol and definition maps) are not to be ripped out on sight, and a PR that merely touches one in passing is fine. But a PR that **significantly changes or extends** one - a new consumer, a new key format, a new entity kind flowing through it, a rework of how the keys are built - must say in its description why it is not being migrated to a non-text identity as part of the work. Any concrete reason is acceptable; silence is not. If the statement is missing, request changes and ask for it.
+
+### Diagnostic message wording
+
+Every new or edited `error`/`warn`/`info`/`hint` call (and `set_constraint` message) in `src/` against this rubric:
+
+- **No backticks, ever.** Not around a literal keyword (`await`, `class`, `default`) and not around an interpolated identifier (`{name}`). This is the one violated most often - flag it on sight. A backtick as the language's own reserved-word-escape prefix inside an interpolation (`` {u.`use} ``) doesn't render and is fine.
+- All-lowercase opening word, no trailing period, no em-dashes.
+- Interpolated identifiers and types appear bare in `{...}` - never quoted.
+- Only non-alphanumeric tokens (operators, punctuation, escape sequences) get single quotes, e.g. `'{{'`, `'{operator}'`.
+- Terse - a noun phrase or short fragment, subject usually implicit.
+- No user advice (`try`, `consider`, `rewrite as`, `did you mean`) folded into the message string - a genuine fix hint goes in a separate `hint` call at the same location instead.
+- No second-person, no apologies, no `please`.
+- No CLI flag names, issue references, URLs, or markdown in the rendered text.
+
+Full rubric with worked examples: `docs/claude/diagnostic-message-audit.md` in the parent workspace (not visible to you from inside this checkout - the summary above is complete for review purposes).
 
 ### Cross-assembly tests
 
