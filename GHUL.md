@@ -347,7 +347,7 @@ let mixed = ["frog", 1234, 12.5];       // object[]
 let p = primes[2];                      // indexing, 0-based
 ```
 
-The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, or a call argument's parameter type.
+The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, a call argument's parameter type, or a sibling element of an enclosing array literal. An untyped immutable local initialized with `[]` takes its element type from its later uses in the same body, such as being passed where an array is expected or placed in an array literal that is; when nothing uses it that way, its element type is `object`.
 
 Indexing with a **range** takes a slice of the source rather than a single element. `..` and `::` count both endpoints from the start, as they do everywhere else; `..<` and `::<` count the end back from the end of the source, and `..<<` and `::<<` count both endpoints back. The number of `<` says how many endpoints are counted back, filling from the right. `<0` is the length, so `a..<0` runs from `a` to the end:
 
