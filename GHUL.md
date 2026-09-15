@@ -84,6 +84,17 @@ use Console = IO.Std;             // import under a different name
 
 A `use` applies only within the current namespace block — if a namespace is split across blocks or files, each block needs its own `use` statements.
 
+`use X.*` imports every usable member of `X` at once, where `X` names a namespace, a class, a struct, a union or an enum. On a namespace this is the same import a bare `use X;` already gives, since a namespace's members are reachable unqualified either way. On a class, struct or union it imports every static field, property, method and operator, and — for a union — every variant; instance members and constructors are never imported, since neither means anything without a receiver. On an enum it imports every member. Each name comes into scope exactly as if it had been `use`d on its own, so a name a wildcard import happens to collide with is the ordinary duplicate-use error:
+
+```ghul
+use Collections.*;               // every public symbol in the namespace - same as `use Collections;`
+use MATH_CONSTANTS.*;            // every static member of a class
+use Suit.*;                      // every member of an enum
+use Result.*;                    // every variant (and static member) of a union
+```
+
+An alias cannot name a wildcard import — `use name = X.*;` is rejected, since a wildcard stands for several imports rather than one value a name could be given.
+
 One namespace needs no `use` anywhere: `Ghul.Intrinsics` holds the names the language itself supplies — the built-in types such as `int` and `string`, the function and tuple shapes, and the operators on them — and every namespace block sees it as if it had written `use Ghul.Intrinsics;` first. Everything else the runtime provides is declared in `Ghul` and its nested namespaces and is imported like any other library: `use Ghul;` for the functional combinators such as `apply`, `use Ghul.Pipes;` for the pipe combinators. A definition of your own that shares a name with one of those — an `apply` of your own, say — is simply the one in scope, with nothing to import around.
 
 A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
