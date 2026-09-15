@@ -11,6 +11,14 @@ bias: the generator draws statements at random from a grammar of top-level
 destructures, annotating a type only where the language leaves it no
 choice. Whatever the compiler makes of the result is the finding.
 
+Among the statements are the shapes whose type is decided only later in
+the body: a literal whose parameter is pinned by a call after it, wrapping
+a spread literal, a stream or a pack combinator over that parameter; a
+stored literal composed with `>>` or passed through a pack-returning
+function and called afterwards; and a `rec` literal destructuring a
+recursive union. Each of these is a shape inference has to wait on rather
+than decide from what it has, so they exercise the obligation queue.
+
 ## Running
 
 Build the tool with the repository's pinned compiler, then point it at the
