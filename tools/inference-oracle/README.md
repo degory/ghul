@@ -121,10 +121,12 @@ recorded as not compiling). A program under `≠` or `E` is named in the output;
 its two programs, disassemblies and `il.diff` are under the work directory as
 for a cell, with the annotator's report in `explicit/annotate.out`.
 
-Two more things the comparison ignores, both from writing a type out: the
+Three more things the comparison ignores, all from writing a type out: the
 purity attribute a literal's proven purity emits on its parameters and
-return, and the namespace a file with no namespace declaration takes from its
-path, which differs between the two working directories.
+return, the tuple element names on the parameter of a generated `$packed_N`
+method, which a written type can carry before the inferred program has
+settled them, and the namespace a file with no namespace declaration takes
+from its path, which differs between the two working directories.
 
 The type arguments of a generic call or construction whose callee is a name
 are written after the callee, as `apply_n[(int, int), int](f, 1, 2)` and
@@ -138,6 +140,18 @@ parameter another of the same name shadows at that scope; the type
 arguments of a call whose callee is anything but a name; and those of a
 construction through a type alias, which belong to the type the alias names,
 or of `MAYBE`.
+
+## Tests
+
+The normaliser has tests of its own, beside the tool rather than in the
+compiler's unit tests, since it reads disassembly text and nothing else:
+
+```sh
+dotnet test tools/inference-oracle/tests
+```
+
+Like the tool, they are not part of a normal build or the pull-request
+suite.
 
 ## Machine-readable output
 
