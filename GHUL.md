@@ -511,7 +511,7 @@ The function refers to itself by its own name, so it needs no `rec`, and a liter
 
 Being a local, it is defined from its own definition onward: a reference above it, and mutual recursion between two of them, are both reported. Write one of the pair as a `let mut` literal and assign it afterwards where that is what is wanted. A file's bare top-level statements are not a body, so a named function written among those is a namespace-scope function and its argument types are required.
 
-A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing binding of that name, the same as any other reference. When that binding is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
+A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing declaration of that name, the same as any other reference. When that declaration is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
 
 ```ghul
 tally(xs: int[]) -> int => xs.count;
@@ -522,7 +522,9 @@ use_tally(xs: int[]) is
 si
 ```
 
-The fallback only applies when the nearest binding cannot be called at all — a function whose overloads reject the supplied arguments still reports the ordinary argument-mismatch error rather than reaching for something else. A name that refers to itself from inside its own initializer's function literal (rather than directly, as above) keeps reporting the reference as one to a value that does not exist yet:
+A bare name written with type arguments (`foo[int]`, whether or not it is then called) follows the same rule, since a name applied to type arguments can only mean a type or a function.
+
+The fallback only applies when the nearest declaration cannot be called at all — a function whose overloads reject the supplied arguments still reports the ordinary argument-mismatch error rather than reaching for something else. A name that refers to itself from inside its own initializer's function literal (rather than directly, as above) keeps reporting the reference as one to a value that does not exist yet:
 
 ```ghul
 let f = (x: int) -> int => f(x);   // error: variable is not defined here
