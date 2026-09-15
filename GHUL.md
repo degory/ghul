@@ -84,6 +84,17 @@ use Console = IO.Std;             // import under a different name
 
 A `use` applies only within the current namespace block — if a namespace is split across blocks or files, each block needs its own `use` statements.
 
+`use X.*` imports every usable member of `X` at once, where `X` names a namespace, a class, a struct, a union or an enum. On a namespace this is the same import a bare `use X;` already gives, since a namespace's members are reachable unqualified either way. On a class, struct or union it imports every static field, property, method and operator, and — for a union — every variant; instance members and constructors are never imported, since neither means anything without a receiver. On an enum it imports every member. Each name comes into scope exactly as if it had been `use`d on its own, so a name a wildcard import happens to collide with is the ordinary duplicate-use error:
+
+```ghul
+use Collections.*;               // every public symbol in the namespace - same as `use Collections;`
+use MATH_CONSTANTS.*;            // every static member of a class
+use Suit.*;                      // every member of an enum
+use Result.*;                    // every variant (and static member) of a union
+```
+
+An alias cannot name a wildcard import — `use name = X.*;` is rejected, since a wildcard stands for several imports rather than one value a name could be given.
+
 One namespace needs no `use` anywhere: `Ghul.Intrinsics` holds the names the language itself supplies — the built-in types such as `int` and `string`, the function and tuple shapes, and the operators on them — and every namespace block sees it as if it had written `use Ghul.Intrinsics;` first. Everything else the runtime provides is declared in `Ghul` and its nested namespaces and is imported like any other library: `use Ghul;` for the functional combinators such as `apply`, `use Ghul.Pipes;` for the pipe combinators. A definition of your own that shares a name with one of those — an `apply` of your own, say — is simply the one in scope, with nothing to import around.
 
 A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
@@ -204,7 +215,7 @@ let xs: LIST[int] = _();
 let b: BOX[int] = _(42);
 ```
 
-The type comes from the same places the bare `_` takes it from: the annotation on a `let`, the left-hand side of an assignment, or the formal type of a call argument. An optional context is unwrapped first — `let b: BOX? = _(1)` constructs a `BOX`, which then widens to the optional — and with nothing to infer from, it is an error (`cannot infer the type to construct here`). `_[T](...)` is not accepted: with the type written out, `T(...)` already says it.
+The type comes from the same places the bare `_` takes it from: the annotation on a `let`, the left-hand side of an assignment, or the formal type of a call argument. An untyped immutable `let` initialized with `_()` takes it from how the local is used later in the body, as a local initialized with `[]` does: `let result = _()` followed by `return result` builds the declared return type. An optional context is unwrapped first — `let b: BOX? = _(1)` constructs a `BOX`, which then widens to the optional — and with nothing to infer from, it is an error (`cannot infer the type to construct here`). `_[T](...)` is not accepted: with the type written out, `T(...)` already says it.
 
 `_` in a binding or pattern position — `let _ = expr`, a destructure leaf `(_, b)`, a `for _`, an `if let _`, a lambda discard formal `_ => ...` or `(_, y) => ...`, a typed discard `(_: T)` — is the discard placeholder, a different meaning from the default-value expression above; the positions are syntactically distinct so the two meanings never collide. `_[T]` has no reading as a lambda formal — a formal's type comes from `_: T`, not `_[T]` — so writing `_[T]` where a formal is expected is a compile error rather than a silently-dropped type argument.
 
@@ -347,7 +358,7 @@ let mixed = ["frog", 1234, 12.5];       // object[]
 let p = primes[2];                      // indexing, 0-based
 ```
 
-The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, or a call argument's parameter type.
+The empty array literal `[]` is accepted wherever the element type comes from context — an explicitly-typed `let`, a `return`, a call argument's parameter type, or a sibling element of an enclosing array literal. An untyped immutable local initialized with `[]` takes its element type from its later uses in the same body, such as being passed where an array is expected or placed in an array literal that is; when nothing uses it that way, its element type is `object`.
 
 Indexing with a **range** takes a slice of the source rather than a single element. `..` and `::` count both endpoints from the start, as they do everywhere else; `..<` and `::<` count the end back from the end of the source, and `..<<` and `::<<` count both endpoints back. The number of `<` says how many endpoints are counted back, filling from the right. `<0` is the length, so `a..<0` runs from `a` to the end:
 
@@ -511,7 +522,7 @@ The function refers to itself by its own name, so it needs no `rec`, and a liter
 
 Being a local, it is defined from its own definition onward: a reference above it, and mutual recursion between two of them, are both reported. Write one of the pair as a `let mut` literal and assign it afterwards where that is what is wanted. A file's bare top-level statements are not a body, so a named function written among those is a namespace-scope function and its argument types are required.
 
-A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing binding of that name, the same as any other reference. When that binding is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
+A bare name in call position (`foo(args)`) normally resolves to the nearest enclosing declaration of that name, the same as any other reference. When that declaration is not callable — a local variable, field, or property holding no function — and an enclosing scope has a function or a function-typed value of the same name, the call reaches that one instead, with a `shadowed-non-callable` warning at the call site:
 
 ```ghul
 tally(xs: int[]) -> int => xs.count;
@@ -522,7 +533,9 @@ use_tally(xs: int[]) is
 si
 ```
 
-The fallback only applies when the nearest binding cannot be called at all — a function whose overloads reject the supplied arguments still reports the ordinary argument-mismatch error rather than reaching for something else. A name that refers to itself from inside its own initializer's function literal (rather than directly, as above) keeps reporting the reference as one to a value that does not exist yet:
+A bare name written with type arguments (`foo[int]`, whether or not it is then called) follows the same rule, since a name applied to type arguments can only mean a type or a function.
+
+The fallback only applies when the nearest declaration cannot be called at all — a function whose overloads reject the supplied arguments still reports the ordinary argument-mismatch error rather than reaching for something else. A name that refers to itself from inside its own initializer's function literal (rather than directly, as above) keeps reporting the reference as one to a value that does not exist yet:
 
 ```ghul
 let f = (x: int) -> int => f(x);   // error: variable is not defined here
@@ -1857,7 +1870,7 @@ build[T: Named class init](name: string) -> T;
 build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
-The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, and — for a generic function referred to as a value — from the function type of the slot it goes into:
+The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, from how an untyped immutable local initialized with the call is used later in the body, and — for a generic function referred to as a value — from the function type of the slot it goes into:
 
 ```ghul
 print_something(1234);                       // T inferred as int
@@ -1868,7 +1881,7 @@ takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
                                              // the slot pins T = int
 ```
 
-When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
+When neither the arguments nor any later use pins a type argument, the construction or call is an error (`cannot infer type here`, or `cannot infer the type of` the local it initializes) — give the type argument explicitly (`BOX[int]()`).
 
 A type parameter written with a trailing `..` is an **argument pack**: it stands for the arguments of a call, held as a positional tuple. The `..` is that parameter's bound — it says what `T` ranges over — so a type bound cannot be written alongside it.
 
