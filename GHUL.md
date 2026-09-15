@@ -215,7 +215,7 @@ let xs: LIST[int] = _();
 let b: BOX[int] = _(42);
 ```
 
-The type comes from the same places the bare `_` takes it from: the annotation on a `let`, the left-hand side of an assignment, or the formal type of a call argument. An optional context is unwrapped first — `let b: BOX? = _(1)` constructs a `BOX`, which then widens to the optional — and with nothing to infer from, it is an error (`cannot infer the type to construct here`). `_[T](...)` is not accepted: with the type written out, `T(...)` already says it.
+The type comes from the same places the bare `_` takes it from: the annotation on a `let`, the left-hand side of an assignment, or the formal type of a call argument. An untyped immutable `let` initialized with `_()` takes it from how the local is used later in the body, as a local initialized with `[]` does: `let result = _()` followed by `return result` builds the declared return type. An optional context is unwrapped first — `let b: BOX? = _(1)` constructs a `BOX`, which then widens to the optional — and with nothing to infer from, it is an error (`cannot infer the type to construct here`). `_[T](...)` is not accepted: with the type written out, `T(...)` already says it.
 
 `_` in a binding or pattern position — `let _ = expr`, a destructure leaf `(_, b)`, a `for _`, an `if let _`, a lambda discard formal `_ => ...` or `(_, y) => ...`, a typed discard `(_: T)` — is the discard placeholder, a different meaning from the default-value expression above; the positions are syntactically distinct so the two meanings never collide. `_[T]` has no reading as a lambda formal — a formal's type comes from `_: T`, not `_[T]` — so writing `_[T]` where a formal is expected is a compile error rather than a silently-dropped type argument.
 
@@ -1870,7 +1870,7 @@ build[T: Named class init](name: string) -> T;
 build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
-The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, and — for a generic function referred to as a value — from the function type of the slot it goes into:
+The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, from how an untyped immutable local initialized with the call is used later in the body, and — for a generic function referred to as a value — from the function type of the slot it goes into:
 
 ```ghul
 print_something(1234);                       // T inferred as int
@@ -1881,7 +1881,7 @@ takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
                                              // the slot pins T = int
 ```
 
-When neither the arguments nor any later use pins a type argument, the construction is an error (`cannot infer type here`) — give the type argument explicitly (`BOX[int]()`).
+When neither the arguments nor any later use pins a type argument, the construction or call is an error (`cannot infer type here`, or `cannot infer the type of` the local it initializes) — give the type argument explicitly (`BOX[int]()`).
 
 A type parameter written with a trailing `..` is an **argument pack**: it stands for the arguments of a call, held as a positional tuple. The `..` is that parameter's bound — it says what `T` ranges over — so a type bound cannot be written alongside it.
 
