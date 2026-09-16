@@ -20,11 +20,22 @@ instead is the number of distinct source lines carrying a *parse* error.
 
 ## What it varies
 
-Around the damage: bare statements at the file root, a global function with a
-block body, a global function with an expression body, a method, an
-expression-bodied method, a trait's default method, a function literal nested
-in a function, and a generator. Inside those, nought to two levels of `if`,
-`while`, `for`, `case` and `try`.
+Around the damage, seventeen contexts: bare statements at the file root,
+global functions with block and expression bodies, methods of both kinds, a
+trait's default method, a function literal nested in a function, a generator,
+an asynchronous function, a property accessor, an operator, a `partial` block
+over a union, a struct method, a primary-constructor class, a namespaced
+file, a lambda in argument position, and a `case` used as an expression.
+
+Four scales, because the small end matters as much as the large: `tiny` is a
+handful of lines with no nesting and nothing around it, which gives recovery
+almost nothing to resynchronise on, and `large` carries five sibling
+definitions and four levels of `if`, `while`, `for`, `case`, `elif` and `try`
+around the damage.
+
+One to three damage sites per program, since a half-written line rarely waits
+for the previous one to be finished. Where several are applied, the oracle
+expects only what all of them leave reachable.
 
 The damage itself:
 
@@ -39,6 +50,19 @@ The damage itself:
 | `drop-opener-keyword` | `if c` with no `then`, a header with no `is` |
 | `drop-open-bracket` / `drop-close-bracket` | an unbalanced bracket |
 | `insert-stray` | a token left where a statement should be |
+| `delete-token` | one token gone, as a stray backspace leaves it |
+| `replace-with-keyword` | a keyword where a name belongs |
+| `unterminated-string` | a string with no closing quote |
+| `unterminated-interpolation` | an interpolation with no closing brace |
+| `drop-type-annotation` | a `: int` not typed yet |
+| `drop-arrow` | a `->` or `=>` missing from a header |
+| `drop-comma` | a separator missing from a list |
+| `duplicate-line` | a line left behind by an edit |
+| `swap-lines` | two lines in the wrong order |
+| `reindent-block` | a block at the wrong indentation after a reformat |
+| `paste-block` | a run of lines pasted in twice, closers and all |
+| `join-lines` | two statements run together by a deleted line break |
+| `split-token` | a line break in the middle of a token |
 
 Each mutation declares which markers it leaves reachable, so a truncation is
 not asked to preserve what it deleted.
@@ -51,7 +75,8 @@ dotnet run --no-build --project tools/recovery-fuzz -- <work-directory> --count 
 ```
 
 Options: `--count <n>` cases (200), `--start <seed>` the first seed (1), a
-seed always producing the same case. `--compiler <ghul.dll>` the compiler to
+seed always producing the same case - its context, scale, damage count and
+damage kinds all come from it. `--compiler <ghul.dll>` the compiler to
 test (`publish/ghul.dll`). `--spill <lines>` how many distinct lines may carry
 a parse error before it counts as a cascade (2 - one place to report the
 mistake, and one more for the closer that turned up instead).
