@@ -137,6 +137,7 @@ namespace Syntax.Parsers is
         _context: CONTEXT?
         _last_error_location: LOCATION
         _last_error_message: string
+        _missing_closer_at: LOCATION?
 
         is_speculating: bool => _context?
 
@@ -144,6 +145,7 @@ namespace Syntax.Parsers is
             _context = context
             _last_error_location = context.last_error_location
             _last_error_message = context.last_error_message
+            _missing_closer_at = context.missing_closer_at
             _context.logger_speculate()
         si
 
@@ -152,6 +154,7 @@ namespace Syntax.Parsers is
             _context = null
             context!.logger_backtrack()
             context.restore_last_error(_last_error_location, _last_error_message)
+            context.missing_closer_at = _missing_closer_at
         si
 
         backtrack_if_speculating() is
@@ -181,11 +184,59 @@ namespace Syntax.Parsers is
         si
     si
 
+    // Holds a construct's enders open for the span between the parser
+    // consuming its opening keyword and expecting its closing one. Used as
+    // `let use`, so they are released however that span is left - the
+    // return, or one of the recovery unwinds.
+    class OPEN_CONSTRUCT: Disposable is
+        _context: CONTEXT?
+
+        init(context: CONTEXT, enders: Collections.LIST[Lexical.TOKEN]) is
+            _context = context
+
+            context.push_awaited_enders(enders)
+        si
+
+        dispose() is
+            let context = _context
+            _context = null
+
+            if context? then
+                context.pop_awaited_enders()
+            fi
+        si
+    si
+
     class CONTEXT is
         _repeated_error_count_at_eof: int
 
         last_error_location: LOCATION
         last_error_message: string
+
+        // Where a construct last failed to find its closing keyword, and
+        // nothing if the last one closed cleanly. See expect_closer.
+        missing_closer_at: LOCATION? public
+
+        // The tokens that would end the body each parser currently in this
+        // parse is reading - a construct's own closing keyword, and the
+        // keywords that start its next clause. Each construct parser holds
+        // its own open across the span between its opening keyword and its
+        // closing one, so this is the recursive descent's own stack made
+        // legible rather than a second copy of it kept in step by hand.
+        //
+        // Error recovery reads it to tell a keyword that some construct
+        // still being parsed is waiting for - where a skip has to stop and
+        // hand the token up - from one that ends nothing open, which is
+        // debris from a construct the parser never entered and can be
+        // skipped past.
+        //
+        // Nothing here counts anything, and deliberately so. Counting how
+        // deeply nested the source is counts the very thing the mistake
+        // being recovered from has broken: brackets in code that is being
+        // edited are not balanced, which is what makes it code that needs
+        // recovering. What a parser is waiting for stays true whatever the
+        // source does next.
+        _awaited_enders: Collections.LIST[Collections.LIST[Lexical.TOKEN]]
 
         allow_tuple_element: bool public
 
@@ -329,6 +380,7 @@ namespace Syntax.Parsers is
             self.logger = logger
 
             _previous_end_marks = Collections.STACK[LOCATION]()
+            _awaited_enders = Collections.LIST[Collections.LIST[Lexical.TOKEN]]()
 
             current = tokenizer.read_token()
             previous_end = current.location
@@ -583,6 +635,106 @@ namespace Syntax.Parsers is
 
         expect_token(tokens: Collections.List[Lexical.TOKEN]) -> bool =>
             expect_token(tokens, "syntax error")
+
+        // The closing keyword of a construct, which is a different thing
+        // from any other expected token: every construct that was open when
+        // one goes missing wants its own closer at the same token, and each
+        // of them reports it. The `while` wanting `od`, the body wanting
+        // `si` and the definition list wanting a definition are one mistake
+        // described three times, and only the first of them - the innermost,
+        // which is the one that knows which closer is actually missing - is
+        // worth saying. So the first report at a token marks it, and the
+        // constructs unwinding through the same token afterwards stay quiet.
+        //
+        // The mark is cleared by any closer that is found, so it never
+        // reaches a later, unrelated failure; it is keyed on the location
+        // as well, so it could not anyway.
+        expect_closer(token: Lexical.TOKEN, message: string) -> bool is
+            if current_token == token then
+                missing_closer_at = null
+
+                next_token()
+
+                return true
+            fi
+
+            if current_token == Lexical.TOKEN.CANCEL_STRING then
+                return false
+            fi
+
+            let at = location
+
+            if !(missing_closer_at? /\ missing_closer_at =~ at) then
+                error(at, "{message}: expected {Lexical.TOKEN_NAMES[token]} but found {current_token_name}")
+            fi
+
+            missing_closer_at = at
+
+            return false
+        si
+
+        expect_closer(token: Lexical.TOKEN) -> bool => expect_closer(token, "syntax error")
+
+        // Hold `enders` open until the returned value is disposed.
+        open_construct(enders: Collections.LIST[Lexical.TOKEN]) -> OPEN_CONSTRUCT =>
+            OPEN_CONSTRUCT(self, enders)
+
+        open_construct(ender: Lexical.TOKEN) -> OPEN_CONSTRUCT =>
+            OPEN_CONSTRUCT(self, Collections.LIST[Lexical.TOKEN]([ender]))
+
+        push_awaited_enders(enders: Collections.LIST[Lexical.TOKEN]) is
+            _awaited_enders.add(enders)
+        si
+
+        pop_awaited_enders() is
+            if _awaited_enders.count > 0 then
+                _awaited_enders.remove_at(_awaited_enders.count - 1)
+            fi
+        si
+
+        // Whether some construct still being parsed would end at this token.
+        // True of the innermost as well as any further out, so a skip that
+        // stops here hands the token to whichever of them claims it first.
+        is_awaited_ender(token: Lexical.TOKEN) -> bool =>
+            _awaited_enders |> any(enders => enders |> any(t => t == token))
+
+        // Debris: a statement construct's closing or clause keyword sitting
+        // where a definition should be, after a construct has already been
+        // reported as unclosed. Every keyword left over by that failure
+        // arrives here one at a time, and reporting each as a definition
+        // that is not one describes the same mistake once per keyword - the
+        // shape a reader sees as a file-long cascade.
+        //
+        // Only debris is skipped: without a missing closer behind it, a
+        // stray `fi` is reported as it always was, and the mark is cleared
+        // by the next closer that is found, so the silence lasts exactly as
+        // long as the unwinding does.
+        //
+        // `si` closes a namespace as well as a body, so the caller says
+        // whether one is debris where it stands.
+        at_stray_construct_closer(include_si: bool) -> bool is
+            if !missing_closer_at? then
+                return false
+            fi
+
+            let token = current_token
+
+            if include_si /\ token == Lexical.TOKEN.SI then
+                return true
+            fi
+
+            token == Lexical.TOKEN.FI \/
+            token == Lexical.TOKEN.OD \/
+            token == Lexical.TOKEN.ESAC \/
+            token == Lexical.TOKEN.YRT \/
+            token == Lexical.TOKEN.LAV \/
+            token == Lexical.TOKEN.CATCH \/
+            token == Lexical.TOKEN.FINALLY \/
+            token == Lexical.TOKEN.ELSE \/
+            token == Lexical.TOKEN.ELIF \/
+            token == Lexical.TOKEN.WHEN \/
+            token == Lexical.TOKEN.THEN
+        si
 
         warn(location: LOCATION, message: string) is
             logger.warn(location, message)

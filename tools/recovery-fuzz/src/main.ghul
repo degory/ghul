@@ -1,0 +1,205 @@
+namespace RecoveryFuzz is
+    use default
+
+    use IO.Directory
+    use IO.Path
+
+    // One case's verdict. The failures are ordered by how much they cost
+    // whoever hits them: a hang wedges an analyser session, a crash loses
+    // the file, a lost marker loses everything after the damage, and a
+    // spill is the cascade itself.
+    //
+    //   .  recovered: the markers the mutation left reachable all survived
+    //   G  the undamaged program did not compile as written - a generator bug
+    //   H  the compiler did not finish
+    //   I  the compiler crashed
+    //   B  the damage took out code written before it
+    //   T  the rest of the damaged body was lost
+    //   A  a definition after the damaged one was lost
+    //   S  errors spilled beyond the damage
+    class VERDICT(seed: int, context: string, mutation: string public) is
+        code: string public;
+        detail: string public;
+
+        init(..) is
+            code = "."
+            detail = ""
+        si
+    si
+
+    usage() -> int is
+        write_line("usage: recovery-fuzz <work-directory> [--count <n>] [--start <seed>] [--compiler <ghul.dll>] [--spill <lines>] [--timeout <seconds>]")
+
+        1
+    si
+
+    entry(args: string[]) -> int is
+        if args.count < 1 then
+            return usage()
+        fi
+
+        let work = Path.get_full_path(args[0])
+        let count mut = 200
+        let start mut = 1
+        let compiler mut = "publish/ghul.dll"
+        let spill_budget mut = 2
+        let timeout mut = 20
+        let i mut = 1
+
+        while i < args.count do
+            if i + 1 >= args.count then
+                return usage()
+            fi
+
+            if args[i] =~ "--count" then
+                count = int.parse(args[i + 1])
+            elif args[i] =~ "--start" then
+                start = int.parse(args[i + 1])
+            elif args[i] =~ "--compiler" then
+                compiler = args[i + 1]
+            elif args[i] =~ "--spill" then
+                spill_budget = int.parse(args[i + 1])
+            elif args[i] =~ "--timeout" then
+                timeout = int.parse(args[i + 1])
+            else
+                write_line("unknown option {args[i]}")
+                return 1
+            fi
+
+            i = i + 2
+        od
+
+        Directory.create_directory(work)
+
+        let harness = HARNESS(Path.get_full_path(compiler), work, timeout)
+        let verdicts = LIST[VERDICT]()
+
+        for seed in start..start + count do
+            verdicts.add(check(harness, seed, spill_budget))
+        od
+
+        report(verdicts)
+
+        if verdicts |> any(v => v.code !~ ".") then 1 else 0 fi
+    si
+
+    check(harness: HARNESS, seed: int, spill_budget: int) -> VERDICT is
+        let rng = RNG(seed)
+        let context = rng.pick(contexts())
+        let scale = rng.pick(scales())
+
+        // More than one damage site is the ordinary case in an editor: a
+        // half-written line rarely waits for the previous one to be
+        // finished. The oracle takes the intersection of what each
+        // mutation leaves reachable.
+        let wanted = rng.between(1, 3)
+
+        let program = GENERATOR(rng).generate(seed, context, scale)
+        let verdict = VERDICT(seed, "{context}/{scale}", "")
+
+        // The program has to compile to exactly its three markers before it
+        // is worth damaging: anything else is the generator's fault and
+        // would otherwise be read as a recovery finding.
+        let baseline = harness.compile(program, "-baseline")
+
+        if baseline.timed_out \/ baseline.crashed \/ !_markers_only(program, baseline) then
+            verdict.code = "G"
+            verdict.detail = "baseline: {_summarise(baseline)}"
+
+            return verdict
+        fi
+
+        let mutator = MUTATOR(rng)
+        let applied = LIST[string]()
+        let expect_tail mut = true
+        let expect_after mut = true
+        let first_damage mut = 0
+
+        for i in 0..wanted do
+            let mutation = rng.pick(mutations())
+
+            if mutator.apply(program, mutation) then
+                applied.add("{mutation}@{program.damage_line}")
+
+                expect_tail = expect_tail /\ program.expect_tail
+                expect_after = expect_after /\ program.expect_after
+
+                if applied.count == 1 then
+                    first_damage = program.damage_line
+                fi
+            fi
+        od
+
+        if applied.count == 0 then
+            // Nothing in this program for those mutations to damage.
+            return verdict
+        fi
+
+        program.expect_tail = expect_tail
+        program.expect_after = expect_after
+        program.damage_line = first_damage
+
+        verdict.mutation = applied |> join(" + ")
+
+        let outcome = harness.compile(program, "-damaged")
+
+        if outcome.timed_out then
+            verdict.code = "H"
+            verdict.detail = "no result in time"
+        elif outcome.crashed then
+            verdict.code = "I"
+            verdict.detail = _summarise(outcome)
+        elif !outcome.mentions(before_marker()) then
+            verdict.code = "B"
+            verdict.detail = "code before the damage was lost"
+        elif program.expect_tail /\ !outcome.mentions(tail_marker()) then
+            verdict.code = "T"
+            verdict.detail = "the rest of the body after line {program.damage_line} was lost"
+        elif program.expect_after /\ !outcome.mentions(after_marker()) then
+            verdict.code = "A"
+            verdict.detail = "the definition after the damage was lost"
+        elif outcome.parse_error_lines().count > spill_budget then
+            verdict.code = "S"
+            verdict.detail =
+                "one mistake at line {program.damage_line} reported on {outcome.parse_error_lines().count} lines: {_parse_errors(outcome)}"
+        fi
+
+        verdict
+    si
+
+    _markers_only(program: PROGRAM, outcome: OUTCOME) -> bool is
+        let wanted = if program.has_tail then 3 else 2 fi
+
+        outcome.count == wanted /\
+        outcome.mentions(before_marker()) /\
+        outcome.mentions(after_marker()) /\
+        (!program.has_tail \/ outcome.mentions(tail_marker()))
+    si
+
+    _summarise(outcome: OUTCOME) -> string =>
+        outcome.errors |> filter(e => !e.contains("_marker")) |> join(" / ")
+
+    _parse_errors(outcome: OUTCOME) -> string =>
+        outcome.errors |> filter(e => outcome.is_parse_error(e)) |> join(" / ")
+
+    report(verdicts: LIST[VERDICT]) is
+        let failures = LIST[VERDICT](verdicts |> filter(v => v.code !~ "."))
+
+        write_line("{verdicts.count} cases, {verdicts.count - failures.count} recovered, {failures.count} failed")
+        write_line("")
+
+        for code in LIST[string](["G", "H", "I", "B", "T", "A", "S"]) do
+            let matching = LIST[VERDICT](failures |> filter(v => v.code =~ code))
+
+            if matching.count > 0 then
+                write_line("{code} {matching.count}")
+
+                for v in matching do
+                    write_line("  {v.seed} {v.context} {v.mutation}: {v.detail}")
+                od
+
+                write_line("")
+            fi
+        od
+    si
+si
