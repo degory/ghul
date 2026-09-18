@@ -41,6 +41,10 @@ in the analysis-protocol library.
 Each request is answered as a batch compile of the same file with
 `--submission <name> --library` and the same references would be: everything
 the previous compile left is cleared first, and the only state kept is the
-reference set, which grows as requests bring new references. The analysis tests
+reference set, which grows as requests bring new references. A reference
+naming an assembly the set already holds with different content, such as a
+cell rebuilt under the same name, is refused with status 2: the set cannot hold
+both, and compiling against the one already loaded would silently use the old
+symbols. The analysis tests
 hold the server to that by compiling each cell both ways and comparing the
 assemblies.
