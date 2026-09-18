@@ -1937,6 +1937,24 @@ e.subscribe((n, s) => write_line("{n} {s}"));
 e.raise(7, "seven");
 ```
 
+Inside the type, a formal holding the handler has its tuple-in type, `T -> void`. That type is what the handler is stored as, since a type argument can't carry the marker:
+
+```ghul
+class EVENT[T..] is
+    _handlers: Collections.LIST[T -> void]
+
+    init() is _handlers = Collections.LIST[T -> void](); si
+
+    subscribe(handler: T.. -> void) is _handlers.add(handler); si
+
+    raise(v: T..) is
+        for handler in _handlers do
+            handler(v);
+        od
+    si
+si
+```
+
 The marker can sit on the parameter of any function type along the formal's return spine, not only the outermost. `f: X -> T.. -> U` asks for a function the caller's own lambda returns, which is how a higher-order function takes an N-ary one:
 
 ```ghul
