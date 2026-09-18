@@ -1,0 +1,202 @@
+namespace Driver is
+    use System.Exception
+
+    use Collections.LIST
+
+    use IO.File
+    use IO.Path
+
+    use Analysis.Protocol.COMPILE_REPLY
+    use Analysis.Protocol.COMPILE_REQUEST
+    use Analysis.Protocol.DIAGNOSTIC
+    use Analysis.Protocol.JSON_PROTOCOL
+
+    // Compiles submissions one after another in one process, so each pays
+    // for its own few lines rather than for starting a runtime and importing
+    // the reference set. Requests and replies are one line of JSON each; the
+    // first line out says the server is ready.
+    //
+    // Every setting a compile depends on is set again for each request, and
+    // everything the previous compile left - its diagnostics, its symbols,
+    // its queued files, its emitter - is cleared first, so that a request is
+    // answered exactly as a batch compile of the same file would be. What
+    // does carry over is the reference set, which only grows: each request's
+    // references are imported into it, and that is the point of keeping the
+    // process.
+    class COMPILE_SERVER(
+        _compiler: Compiler.COMPILER,
+        _container: IoC.CONTAINER,
+        _module_version: string,
+        _input: IO.TextReader,
+        _output: IO.TextWriter
+    ) is
+        serve() is
+            _write(COMPILE_REPLY.ready_reply())
+
+            do
+                let line = _input.read_line()
+
+                if !line? then
+                    return
+                fi
+
+                _write(answer(line))
+            od
+        si
+
+        // The reply to one request line. Nothing that goes wrong inside a
+        // compile escapes: it becomes a reply with status 2, and the server
+        // carries on with the next line.
+        answer(line: string) -> COMPILE_REPLY is
+            let request: COMPILE_REQUEST? mut = null
+
+            try
+                request = System.Text.Json.JsonSerializer.deserialize[COMPILE_REQUEST](line, JSON_PROTOCOL.options)
+            catch e: Exception
+                return COMPILE_REPLY.failure("malformed request: {e.message}")
+            yrt
+
+            if !request? then
+                return COMPILE_REPLY.failure("malformed request: expected an object")
+            fi
+
+            let problem = COMPILE_REQUEST_CHECK.problem_with(request)
+
+            if problem? then
+                return COMPILE_REPLY.failure(problem)
+            fi
+
+            try
+                return compile(request)
+            catch e: Exception
+                return COMPILE_REPLY.failure("{e.get_type().name}: {e.message}")
+            yrt
+        si
+
+        compile(request: COMPILE_REQUEST) -> COMPILE_REPLY is
+            _reset(request)
+
+            let path = COMPILE_REQUEST_CHECK.source_path(request)
+
+            let reader: IO.TextReader =
+                if let text = request.text then
+                    IO.StringReader(text)
+                else
+                    File.open_text(path)
+                fi
+
+            let use disposing_reader = reader
+
+            _compiler.parse_and_queue(
+                path,
+                reader,
+                _container.build_flags.want_compile_up_to_expressions,
+                _container.build_flags.want_compile_expressions,
+                false)
+
+            _compiler.post_parse()
+            _compiler.build()
+
+            let diagnostics = LIST[DIAGNOSTIC]()
+
+            Analysis.DIAGNOSTICS_COLLECTOR.collect_into(_container.logger, diagnostics, LIST[string]())
+
+            let logger = _container.logger
+
+            if logger.any_errors then
+                return COMPILE_REPLY(false, 1, null, diagnostics)
+            elif logger.is_poisoned then
+                return COMPILE_REPLY(false, 2, "internal error", diagnostics)
+            fi
+
+            _container.ir_context.srm_assembly_emitter.write_to(request.output)
+
+            return COMPILE_REPLY(false, 0, null, diagnostics)
+        si
+
+        _reset(request: COMPILE_REQUEST) is
+            let flags = _container.build_flags
+
+            flags.submission_name = request.name
+            flags.want_library = true
+            flags.want_executable = false
+
+            _container.value_boxer.want_boxing = true
+
+            _clear_diagnostics()
+
+            _container.state_store_registry.clear_all()
+
+            _compiler.clear_queue()
+            _compiler.clear_symbols()
+
+            if let references = request.references then
+                for path in references do
+                    _container.assemblies.import_additional(path)
+                od
+            fi
+
+            _container.dotnet_symbol_table.value.forget_no_results()
+
+            _container.ir_context.install_srm_assembly_emitter(
+                Path.get_file_name_without_extension(request.output) ?? "module",
+                _module_version,
+                true)
+        si
+
+        _clear_diagnostics() is
+            let logger = _container.logger
+
+            for path in LIST[string](logger.diagnostic_paths) do
+                logger.clear(path, false)
+            od
+
+            logger.clear_suppression_regions()
+            logger.clear_consumed_error()
+            logger.clear_consumed_any()
+        si
+
+        _write(reply: COMPILE_REPLY) is
+            _output.write(System.Text.Json.JsonSerializer.serialize[COMPILE_REPLY](reply, JSON_PROTOCOL.options))
+            _output.write("\n")
+            _output.flush()
+        si
+    si
+
+    // What a compile request needs before the server can act on it, and
+    // the file name it compiles under.
+    class COMPILE_REQUEST_CHECK is
+        problem_with(request: COMPILE_REQUEST) -> string? static is
+            if string.is_null_or_empty(request.name) then
+                return "request has no name"
+            fi
+
+            if string.is_null_or_empty(request.output) then
+                return "request has no output"
+            fi
+
+            if !request.source? /\ !request.text? then
+                return "request has neither source nor text"
+            fi
+
+            if let source = request.source /\ !request.text? /\ !File.exists(source) then
+                return "source file not found: {source}"
+            fi
+
+            if let references = request.references then
+                for reference in references do
+                    if !File.exists(reference) then
+                        return "reference not found: {reference}"
+                    fi
+                od
+            fi
+
+            return null
+        si
+
+        // Source carried inline is named after the submission, so its
+        // diagnostics name a file a reader can tell apart from any other.
+        source_path(request: COMPILE_REQUEST) -> string static =>
+            if request.text? then "{request.name}.ghul" else request.source ?? "{request.name}.ghul" fi
+    si
+si
