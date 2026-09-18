@@ -121,11 +121,9 @@ recorded as not compiling). A program under `≠` or `E` is named in the output;
 its two programs, disassemblies and `il.diff` are under the work directory as
 for a cell, with the annotator's report in `explicit/annotate.out`.
 
-Three more things the comparison ignores, all from writing a type out: the
+Two more things the comparison ignores, both from writing a type out: the
 purity attribute a literal's proven purity emits on its parameters and
-return, the tuple element names on the parameter of a generated `$packed_N`
-method, which a written type can carry before the inferred program has
-settled them, and the namespace a file with no namespace declaration takes
+return, and the namespace a file with no namespace declaration takes
 from its path, which differs between the two working directories.
 
 The type arguments of a generic call or construction whose callee is a name
