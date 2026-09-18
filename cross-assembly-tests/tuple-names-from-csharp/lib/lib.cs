@@ -24,5 +24,11 @@ namespace TupleNamesFromCSharp {
         public static (int row, int column)[] Cells() {
             return new (int row, int column)[] { (7, 8) };
         }
+
+        // An unnamed tuple ahead of a named one takes null slots in the
+        // flattened array.
+        public static (int, (int x, int y)) AfterUnnamed() {
+            return (9, (10, 11));
+        }
     }
 }
