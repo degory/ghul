@@ -1,0 +1,198 @@
+namespace Analysis.Tests is
+    use Collections.Iterable
+    use Collections.LIST
+
+    use IO.Directory
+    use IO.Path
+
+    use Analysis.Protocol.ANALYSER_PROCESS
+    use Analysis.Protocol.COMPILE_REQUEST
+    use Analysis.Protocol.COMPILE_SERVER_PROCESS
+    use Analysis.Protocol.Response
+
+    use TestClass = Microsoft.VisualStudio.TestTools.UnitTesting.TestClassAttribute
+    use Test = Microsoft.VisualStudio.TestTools.UnitTesting.TestMethodAttribute
+    use Assertions
+
+    // An analyser for an interactive session is handed each earlier cell's
+    // assembly once the cell has compiled, and from then on resolves
+    // against it as if it had been referenced from the start.
+    @TestClass()
+    class ADD_REFERENCES_TESTS is
+        _directory: string
+
+        init() is
+            _directory = Path.combine(Path.get_temp_path(), "ghul-add-references-{System.Guid.new_guid()}")
+
+            Directory.create_directory(_directory)
+        si
+
+        start_server() -> COMPILE_SERVER_PROCESS =>
+            COMPILE_SERVER_PROCESS(ANALYSER_PROCESS.resolve_compiler_dll(), LIST[string]())
+
+        // A cell compiled as a session would compile it, into a directory of
+        // its own so that two builds of one name can both be kept.
+        cell(server: COMPILE_SERVER_PROCESS, name: string, text: string, references: Iterable[string]) -> string is
+            let directory = Path.combine(_directory, System.Guid.new_guid().to_string())
+
+            Directory.create_directory(directory)
+
+            let output = Path.combine(directory, "{name}.dll")
+            let reply = server.compile(COMPILE_REQUEST(name, null, text, output, references))
+
+            are_equal(0, reply.status, "{name}: {reply.message} {reply.diagnostics}")
+
+            return output
+        si
+
+        start_analyser(name: string) -> ANALYSER_PROCESS => ANALYSER_PROCESS(["--submission", name])
+
+        errors_after_edit(analyser: ANALYSER_PROCESS, path: string, text: string) -> LIST[string] is
+            analyser.send_edit(path, text)
+
+            let result = LIST[string]()
+
+            if let diagnostics: Response.DIAGNOSTICS = analyser.read_response() then
+                for d in diagnostics.diagnostics do
+                    if d.severity == 1 then
+                        result.add(d.message)
+                    fi
+                od
+            else
+                is_true(false, "expected a diagnostics response")
+            fi
+
+            return result
+        si
+
+        added(analyser: ANALYSER_PROCESS, paths: Iterable[string]) -> string? is
+            analyser.send_add_references(paths)
+
+            if let reply: Response.ADD_REFERENCES = analyser.read_response() then
+                return reply.message
+            fi
+
+            is_true(false, "expected an add_references response")
+
+            return "no reply"
+        si
+
+        hover(analyser: ANALYSER_PROCESS, path: string, line: int, column: int) -> string is
+            analyser.send_hover(path, line, column)
+
+            do
+                let response = analyser.read_response()
+
+                if let hover: Response.HOVER = response then
+                    return hover.signature
+                elif !isa Response.DIAGNOSTICS(response) then
+                    return ""
+                fi
+            od
+        si
+
+        completions(analyser: ANALYSER_PROCESS, path: string, line: int, column: int) -> LIST[string] is
+            analyser.send_completion(path, line, column)
+
+            do
+                let response = analyser.read_response()
+
+                if let completion: Response.COMPLETION = response then
+                    let names = LIST[string]()
+
+                    for item in completion.items do
+                        names.add(item.name)
+                    od
+
+                    return names
+                elif !isa Response.DIAGNOSTICS(response) then
+                    return LIST[string]()
+                fi
+            od
+        si
+
+        @Test()
+        listen__advertises_add_references() is
+            let use analyser = start_analyser("cell2")
+
+            is_true(analyser.supports("add-references"))
+        si
+
+        @Test()
+        add_references__lets_a_file_resolve_an_earlier_cell() is
+            let use server = start_server()
+
+            let cell1 = cell(server, "cell1", "let x = 41\ninc(n: int) -> int => n + 1\n", LIST[string]())
+
+            let use analyser = start_analyser("cell2")
+
+            let text = "use cell1.x\nuse cell1.inc\nlet y = inc(x)\nlet z = y + \n"
+
+            is_true(errors_after_edit(analyser, "cell2.ghul", text).count > 0, "cell1 should not resolve before it is added")
+
+            are_equal[string?](null, added(analyser, [cell1]))
+
+            let errors = errors_after_edit(analyser, "cell2.ghul", text)
+
+            is_true(!(errors |> Ghul.Pipes.any(e => e.contains("cell1"))), "{errors |> Ghul.Pipes.join("; ")}")
+
+            is_true(hover(analyser, "cell2.ghul", 3, 13).contains("int"), "hover on x should give its type")
+
+            let offered = completions(analyser, "cell2.ghul", 4, 13)
+
+            is_true(offered.contains("x") /\ offered.contains("inc"), "completion should offer cell1's names: {offered |> Ghul.Pipes.join(", ")}")
+        si
+
+        @Test()
+        add_references__resolves_a_cell_that_references_another() is
+            let use server = start_server()
+
+            let cell1 = cell(server, "cell1", "let x = 41\n", LIST[string]())
+            let cell2 = cell(server, "cell2", "use cell1.x\nlet y = x + 1\n", [cell1])
+
+            let use analyser = start_analyser("cell3")
+
+            are_equal[string?](null, added(analyser, [cell1]))
+            are_equal[string?](null, added(analyser, [cell2]))
+
+            let errors = errors_after_edit(analyser, "cell3.ghul", "use cell2.y\nlet z = y * 2\n")
+
+            are_equal(0, errors.count, "{errors |> Ghul.Pipes.join("; ")}")
+        si
+
+        @Test()
+        add_references__accepts_the_same_assembly_twice() is
+            let use server = start_server()
+
+            let cell1 = cell(server, "cell1", "let x = 41\n", LIST[string]())
+
+            let use analyser = start_analyser("cell2")
+
+            are_equal[string?](null, added(analyser, [cell1]))
+            are_equal[string?](null, added(analyser, [cell1]))
+
+            are_equal(0, errors_after_edit(analyser, "cell2.ghul", "use cell1.x\nlet y = x\n").count)
+        si
+
+        @Test()
+        add_references__refuses_a_different_assembly_under_the_same_name() is
+            let use server = start_server()
+
+            let first = cell(server, "cell1", "let x = 41\n", LIST[string]())
+
+            let use second_server = start_server()
+
+            let second = cell(second_server, "cell1", "let x = \"changed\"\n", LIST[string]())
+
+            let use analyser = start_analyser("cell2")
+
+            are_equal[string?](null, added(analyser, [first]))
+
+            let message = added(analyser, [second])
+
+            is_true(message? /\ message.contains("different assembly named cell1"), "expected a refusal, got {message}")
+
+            are_equal(0, errors_after_edit(analyser, "cell2.ghul", "use cell1.x\nlet y: int = x\n").count)
+        si
+    si
+si
