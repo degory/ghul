@@ -1993,7 +1993,7 @@ let closed = typeof BOX[int];   // BOX[int]
 typeof PAIR[_, _];              // a two-argument open generic
 ```
 
-`open` is the type `closed.get_generic_type_definition()` returns. Because nothing but reflection can hold such a type, `FOO[_]` is accepted only as the whole operand of a `typeof` — not as a declared type, not nested inside another type argument, and not with some arguments supplied and others left as `_`. Where a name has no sibling taking no type arguments, a bare name in a `typeof` yields the open generic too, so `typeof List` is `IReadOnlyList\`1[T]`; `X[_]` is the spelling that means it whatever siblings exist, and the only one accepted anywhere a sibling could be meant instead.
+`open` is the type `closed.get_generic_type_definition()` returns. Because nothing but reflection can hold such a type, `FOO[_]` is accepted only as the whole operand of a `typeof` — not as a declared type, not nested inside another type argument, and not with some arguments supplied and others left as `_`. Where a name has no sibling taking no type arguments, a bare name in a `typeof` yields the open generic too, so `typeof List` is ``IReadOnlyList`1[T]``; `X[_]` is the spelling that means it whatever siblings exist, and the only one accepted anywhere a sibling could be meant instead.
 
 The main use for it is an attribute that names a generic type, where the type it names shares its name with a sibling — a task-like whose builder is generic, for instance (see [asynchronous code](#asynchronous-code)):
 
