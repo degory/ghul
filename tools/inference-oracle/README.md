@@ -61,7 +61,9 @@ Only what differs between two compiles of one program:
 - Instruction offsets and code sizes, which move whenever an earlier
   instruction does.
 - The numbers in the names of compiler-generated members (`$anon_N`,
-  `$frame_N`, `$packed_N`), renumbered in order of first appearance.
+  `$frame_N`, `$packed_N`, `$return_packed_N`), renumbered in order of first
+  appearance. Classes identical but for those numbers tie in the class order,
+  so the class order and the numbering are settled together.
 - The order of a closure frame class's type parameters, which follows the
   order the compiler first meets them and so can change when a type is
   written out. Each frame's parameters are put in name order, and every
@@ -79,7 +81,9 @@ build settled written in at every site that left them to inference - a
 function literal's parameters and return, and a `let` local - rendered with
 the same scope-relative names diagnostics use. `--annotate-inferred-in-place`
 rewrites the files instead. Sites whose type cannot be written at that scope
-are left as written and listed on standard error, with the count.
+are left as written and listed on standard error, with the count. So is a
+literal's return presented at an argument-pack hop whose tuple carries element
+names: the N-ary spelling the source would write there has no place for them.
 
 ```sh
 dotnet publish/ghul.dll --annotate-inferred program.ghul > program.annotated.ghul
