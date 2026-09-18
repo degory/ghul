@@ -1993,7 +1993,7 @@ let closed = typeof BOX[int];   // BOX[int]
 typeof PAIR[_, _];              // a two-argument open generic
 ```
 
-`open` is the type `closed.get_generic_type_definition()` returns. Because nothing but reflection can hold such a type, `FOO[_]` is accepted only as the whole operand of a `typeof` — not as a declared type, not nested inside another type argument, and not with some arguments supplied and others left as `_`.
+`open` is the type `closed.get_generic_type_definition()` returns. Because nothing but reflection can hold such a type, `FOO[_]` is accepted only as the whole operand of a `typeof` — not as a declared type, not nested inside another type argument, and not with some arguments supplied and others left as `_`. Where a name has no sibling taking no type arguments, a bare name in a `typeof` yields the open generic too, so `typeof List` is ``IReadOnlyList`1[T]``; `X[_]` is the spelling that means it whatever siblings exist, and the only one accepted anywhere a sibling could be meant instead.
 
 The main use for it is an attribute that names a generic type, where the type it names shares its name with a sibling — a task-like whose builder is generic, for instance (see [asynchronous code](#asynchronous-code)):
 
@@ -2001,6 +2001,8 @@ The main use for it is an attribute that names a generic type, where the type it
 @System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(COROUTINE_BUILDER[_]))
 class COROUTINE[T] is ... si
 ```
+
+Everywhere else a type is required, a generic named with none of its type arguments is an error saying how many it takes: what the name stands for is the open generic, and an assembly naming one is refused by the runtime at load rather than at compile time. That covers a declared type, a parameter, a cast target, an `isa` test and a type argument alike. Two positions are not affected, because each takes its arguments from somewhere else: a union's variant, whose arguments come from the union and so from the value the variant is tested against or assigned to (`isa Option.NONE(o)` over an `Option[int]`), and a call whose type arguments are inferred (`LIST()`).
 
 ## type inference
 
