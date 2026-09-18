@@ -108,6 +108,9 @@ find (`symbol not found: undefined_tail_marker`) on a line that carries no parse
 error. Recovery that tries every stray token as a member can build a member
 out of the line holding a marker, and the marker is then mentioned in its
 diagnostics. That is not the statement or definition it was written as, and
-nothing about it is analysed as one, so it is not counted. The check reads
+nothing about it is analysed as one, so it is not counted. The tail marker is
+written as `total = total + undefined_tail_marker` in a body that declares
+`total`, so it counts only where `total` is found on its line too: a line read
+outside its body, after the body ended early, reports `total` as not found. The check reads
 lines and not definitions: a marker read into the wrong definition, on a line
 with no parse error of its own, still counts.
