@@ -38,6 +38,12 @@ analysis protocol's shape. The request and reply types, and a client that runs
 the server, are `COMPILE_REQUEST`, `COMPILE_REPLY` and `COMPILE_SERVER_PROCESS`
 in the analysis-protocol library.
 
+A request with `check` set and only `source` or `text` asks instead whether the
+source is complete, as `--check-complete` answers it: the reply carries
+`completeness`, one of `complete`, `incomplete` or `invalid`. A check parses
+with state of its own and compiles nothing, so it leaves the session as it was,
+and takes a few milliseconds warm.
+
 Each request is answered as a batch compile of the same file with
 `--submission <name> --library` and the same references would be: everything
 the previous compile left is cleared first, and the only state kept is the
