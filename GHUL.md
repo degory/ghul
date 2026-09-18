@@ -109,7 +109,7 @@ use MaybeName = string?;
 use Numbers = Collections.LIST[int];
 ```
 
-An alias is a spelling for the type it names, not a type of its own, so the two are interchangeable in both directions: a `(index: int, value: string)` value is an `IndexedString` and an `IndexedString` is accepted wherever the tuple type is. That holds for every kind of target, so nothing that already accepts the underlying type has to learn about the alias. Constructing through an alias constructs what it names, so `Numbers()` builds a `Collections.LIST[int]`.
+An alias is a spelling for the type it names, not a type of its own, so the two are interchangeable in both directions: a `(index: int, value: string)` value is an `IndexedString` and an `IndexedString` is accepted wherever the tuple type is. That holds for every kind of target, so nothing that already accepts the underlying type has to learn about the alias. Constructing through an alias constructs what it names, so `Numbers()` builds a `Collections.LIST[int]`. A generic alias is constructed with its type arguments written, `StringMap[int]()`, and with them left off only when it passes its own type parameters straight through to a class, as `use Box[T] = BOX[T]` does, where `Box(42)` infers them as `BOX(42)` would. A tuple has no constructor, so neither does an alias of one.
 
 An alias can take type parameters, which its target uses like any other type parameter:
 
