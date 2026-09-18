@@ -102,3 +102,15 @@ Each case is left in the work directory as `<seed>-baseline` and
 A program is compiled before it is damaged as well as after, and has to
 report exactly its three markers and nothing else. A generator bug therefore
 shows up as `G` rather than being read as a recovery finding.
+
+A marker counts as surviving only when it is reported as the name it fails to
+find (`symbol not found: undefined_tail_marker`) on a line that carries no parse
+error. Recovery that tries every stray token as a member can build a member
+out of the line holding a marker, and the marker is then mentioned in its
+diagnostics. That is not the statement or definition it was written as, and
+nothing about it is analysed as one, so it is not counted. The tail marker is
+written as `total = total + undefined_tail_marker` in a body that declares
+`total`, so it counts only where `total` is found on its line too: a line read
+outside its body, after the body ended early, reports `total` as not found.
+The check reads lines and not definitions: a marker read into the wrong
+definition, on a line with no parse error of its own, still counts.
