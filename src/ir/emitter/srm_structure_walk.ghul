@@ -84,12 +84,14 @@ namespace IR.Emitter is
         _signatures: SRM_SIGNATURE_ENCODER
         _blobs: SRM_ATTRIBUTE_BLOB_ENCODER
         _type_parameters: Collections.LIST[SRM_TYPE_PARAMETER]
+        _pending_overrides: Collections.LIST[SRM_BOUND_METHOD]
 
         init(..) is
             _signatures = SRM_SIGNATURE_ENCODER(_assembly)
             _blobs =
                 SRM_ATTRIBUTE_BLOB_ENCODER(IoC.CONTAINER.instance.innate_symbol_lookup)
             _type_parameters = Collections.LIST[SRM_TYPE_PARAMETER]()
+            _pending_overrides = Collections.LIST[SRM_BOUND_METHOD]()
         si
 
         number(root: Scope) is
@@ -152,6 +154,7 @@ namespace IR.Emitter is
                 od
 
                 next_method = next_method + _boilerplate_members(type).count
+                next_method = next_method + _trait_bridges(type).count
             od
         si
 
@@ -404,6 +407,7 @@ namespace IR.Emitter is
                 _write_async_frame_members(type)
 
                 let boilerplate = _write_boilerplate(type)
+                let bridges = _write_trait_bridges(type)
 
                 let handle =
                     _assembly.add_type_definition(
@@ -444,6 +448,16 @@ namespace IR.Emitter is
                 for bound in boilerplate do
                     _assembly.add_method_implementation(handle, bound.body, bound.declaration)
                 od
+
+                for bound in bridges do
+                    _assembly.add_method_implementation(handle, bound.body, bound.declaration)
+                od
+
+                for bound in _pending_overrides do
+                    _assembly.add_method_implementation(handle, bound.body, bound.declaration)
+                od
+
+                _pending_overrides.clear()
 
                 _write_properties(handle, type)
 
@@ -813,8 +827,17 @@ namespace IR.Emitter is
                 fi
             od
 
+            let covariant_overrides = _class_covariant_overridees(method)
+
+            let attributes =
+                if covariant_overrides.count > 0 then
+                    SRM_FLAGS.with_new_slot(SRM_FLAGS.method_attributes(method))
+                else
+                    SRM_FLAGS.method_attributes(method)
+                fi
+
             let handle = _assembly.add_method_definition(
-                SRM_FLAGS.method_attributes(method),
+                attributes,
                 cast System.Reflection.MethodImplAttributes(0),   // IL, managed
                 _assembly.get_or_add_string(SRM_FLAGS.method_name(method)),
                 _assembly.get_or_add_blob(_signatures.method_signature(method)),
@@ -840,6 +863,26 @@ namespace IR.Emitter is
                         method.get_argument_type_bounds(i),
                         SRM_SIGNATURE_ENCODER.frame_mapping(method)))
             od
+
+            // A narrower return takes the overridden slot through an
+            // explicit override, in a slot of its own; the attribute is what
+            // makes the runtime route a call through the base type to a
+            // further override of this method rather than stopping here.
+            if covariant_overrides.count > 0 then
+                for overridee in covariant_overrides do
+                    _pending_overrides.add(
+                        SRM_BOUND_METHOD(
+                            cast EntityHandle(handle),
+                            IoC.CONTAINER.instance.ir_context.resolve_call_target(overridee)))
+                od
+
+                _attach(
+                    cast EntityHandle(handle),
+                    "System.Runtime",
+                    PRESERVE_BASE_OVERRIDES_ATTRIBUTE_NAME,
+                    Collections.LIST[Semantic.Types.Type](),
+                    SRM_ASSEMBLY_EMITTER.NO_ARGUMENT_ATTRIBUTE_VALUE)
+            fi
 
             if method.is_declared_pure then
                 _mark(cast EntityHandle(handle), PURE_ATTRIBUTE_NAME)
@@ -933,6 +976,9 @@ namespace IR.Emitter is
         // serializer skipping a property's shadow field).
         COMPILER_GENERATED_ATTRIBUTE_NAME: string static =>
             "System.Runtime.CompilerServices.CompilerGeneratedAttribute"
+
+        PRESERVE_BASE_OVERRIDES_ATTRIBUTE_NAME: string static =>
+            "System.Runtime.CompilerServices.PreserveBaseOverridesAttribute"
 
         TUPLE_ELEMENT_NAMES_ATTRIBUTE_NAME: string static =>
             "System.Runtime.CompilerServices.TupleElementNamesAttribute"
@@ -1346,6 +1392,116 @@ namespace IR.Emitter is
                             "get_Current",
                             signature))
                 esac
+            od
+
+            return result
+        si
+
+        // The class members a method overrides with a narrower return
+        // type. Its emitted signature differs from theirs, so it cannot
+        // take their slot by name and signature and binds to it
+        // explicitly instead.
+        _class_covariant_overridees(method: Function) -> Collections.List[Function] static is
+            let result = Collections.LIST[Function]()
+
+            if let overridees = method.overridees then
+                for overridee in overridees do
+                    if let function: Function = overridee /\ !_is_trait_member(function) then
+                        let seen = _as_seen_from(method, function)
+
+                        if method.has_covariant_return_over(seen) then
+                            result.add(seen)
+                        fi
+                    fi
+                od
+            fi
+
+            return result
+        si
+
+        // The trait members a type's methods implement with a narrower
+        // return type. The runtime does not let a class method answer an
+        // interface member of another signature, so each is answered by
+        // a bridge of the trait's own signature that calls the method.
+        //
+        // One list, read by both passes, in one order: the bridges are
+        // rows of the type's method run.
+        _trait_bridges(type: SRM_EMITTED_TYPE) -> Collections.List[(method: Function, overridee: Function)] static is
+            let result = Collections.LIST[(method: Function, overridee: Function)]()
+
+            for method in SRM_MEMBER_ORDER.methods(type) do
+                if let overridees = method.overridees then
+                    for overridee in overridees do
+                        if let function: Function = overridee /\ _is_trait_member(function) then
+                            let seen = _as_seen_from(method, function)
+
+                            if method.has_covariant_return_over(seen) then
+                                result.add((method = method, overridee = seen))
+                            fi
+                        fi
+                    od
+                fi
+            od
+
+            return result
+        si
+
+        // An overridden member as the overriding type sees it: through
+        // that type's own instantiation of the ancestor declaring it,
+        // which is what both its return type and a reference to it name.
+        _as_seen_from(method: Function, overridee: Function) -> Function static is
+            if
+                let owner: Classy = method.owner,
+                    overridee_owner: Classy = overridee.owner,
+                    overridee_type = overridee_owner.type,
+                    ancestor_type = owner.find_ancestor(overridee_type),
+                    ancestor: Semantic.Symbols.GENERIC = ancestor_type.symbol
+            then
+                return overridee.specialize_function(ancestor.type_map, ancestor)
+            fi
+
+            return overridee
+        si
+
+        _is_trait_member(function: Function) -> bool static =>
+            if let owner: Classy = function.owner then owner.is_trait else false fi
+
+        _write_trait_bridges(type: SRM_EMITTED_TYPE) -> Collections.List[SRM_BOUND_METHOD] is
+            let result = Collections.LIST[SRM_BOUND_METHOD]()
+            let context = IoC.CONTAINER.instance.ir_context
+
+            for (method, overridee) in _trait_bridges(type) do
+                let body = SRM_METHOD_BODY_EMITTER()
+
+                for i in 0::method.arguments.count do
+                    body.ldarg(i)
+                od
+
+                let target = context.resolve_call_target(method)
+
+                if isa Semantic.Symbols.STRUCT_METHOD(method) then
+                    body.call(target)
+                else
+                    body.call_virtual(target)
+                fi
+
+                body.ret()
+
+                let definition =
+                    _assembly.add_method_definition(
+                        SRM_FLAGS.explicit_implementation_attributes(false),
+                        cast System.Reflection.MethodImplAttributes(0),   // IL, managed
+                        _assembly.get_or_add_string("{overridee.owner?.qualified_name}.{SRM_FLAGS.method_name(overridee)}"),
+                        _assembly.get_or_add_blob(_signatures.instantiated_method_signature(overridee)),
+                        body.flush(_assembly),
+                        MetadataTokens.parameter_handle(_assembly.next_parameter_row))
+
+                _mark_compiler_generated(cast EntityHandle(definition))
+
+                result.add(
+                    SRM_BOUND_METHOD(
+                        cast EntityHandle(definition),
+                        context.resolve_call_target(overridee)))
             od
 
             return result

@@ -828,6 +828,8 @@ si
 
 Nothing changes inside the declaring assembly, where a closed trait is implemented and derived from exactly as an open one is. A trait imported from an assembly built before the closure existed is treated as open.
 
+An override or trait implementation can narrow its return type to a subtype of the overridden member's, as `make() -> CIRCLE` narrows `make() -> SHAPE`: it is still the override, so a caller holding the base class or the trait reaches it and a caller holding the narrower type gets the narrower return. Only a reference type narrows this way - a value type in place of a reference is a different representation rather than a narrower one - and any other difference in return type is an error at the member.
+
 An override or trait implementation must keep the overridden member's optionality contract. It may strengthen it - a non-optional return or property where the base declares optional, an optional parameter where the base declares non-optional - but weakening it in either position is a compile error: returning `T?` where the base promises `T` would hand null to callers that use the base type, and requiring a non-optional parameter where the base accepts `T?` would receive null from them. A property with an assign accessor faces both directions at once, so its type must match the base's optionality exactly. The equality and order operators `=~` and `<>` are the one exception on the parameter side: presence is settled where the operator is used and the body is only handed present values, so an implementation may declare its parameter non-optional even where the overridden member spells it optional.
 
 ### unions
