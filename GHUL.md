@@ -653,7 +653,11 @@ si
 
 The two modifiers are independent: `open` controls who can extend, `abstract` controls who can be instantiated. They can be combined (`class Animal abstract open is ... si` is an extensible abstract base) or stand alone.
 
-A class is **implicitly abstract** when it has any user-written body-less instance method — `foo();` or `foo() -> int;` with no `is … si` body. The user clearly wrote the method as a contract for subclasses to satisfy, and a bare instance of the class would have nothing useful to do on calling it, so the constructor is rejected the same way `abstract` rejects it. Property accessors, `init`, and static methods are excluded — a write-only property leaves its synthesised getter body-less without making the enclosing class abstract.
+A method written with no body at all — `foo();` or `foo() -> int;` with no `is … si` — is **abstract**: a contract for a subclass to satisfy rather than a method that does nothing. The class that declares one is abstract too, so constructing it is rejected exactly as `abstract` on the header rejects it, and a concrete subclass that does not implement the method is an error naming the method and the class it came from. Property accessors, `init`, and static methods are excluded — a write-only property leaves its synthesised getter body-less, and its accessors read and write the backing field rather than declaring anything.
+
+`super.foo()` cannot reach an abstract method: a super call names the base implementation directly, and there is none.
+
+A body-less method that overrides a method **with** a body is the one case that cannot become an abstract slot, because a caller holding the base type would still reach it. Such a method is given a body that throws `System.NotImplementedException` naming it, so the call says what the declaration says. It is not a contract, so subclasses owe it nothing.
 
 ### structs
 
