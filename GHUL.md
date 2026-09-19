@@ -342,7 +342,7 @@ An interpolated expression can carry an alignment and a format specifier, as in 
 let padded = "[{value,12:F3}]";     // [    1500.000]
 ```
 
-How a value reads depends on its static type. A string, a number, an enum, and any type that declares its own `to_string` read as they always have, through that `to_string`, and so does any value given an alignment or a format. A `bool` reads `true` or `false`, as ghūl spells it. An optional reads as the value it holds, by these same rules, or as `null` when it holds nothing. Anything else - an array, a list, a tuple, a struct or class that declares no `to_string`, a value held as `object`, a trait or a type parameter - would otherwise read as its .NET type name, so it is rendered by the runtime's `$` instead: a sequence as its elements in brackets, a tuple as its parts, and a record as its type and members.
+How a value reads depends on its static type. A string, a number, an enum, and any type that declares its own `to_string` read as they always have, through that `to_string`, and so does any value given an alignment or a format. A `bool` reads `true` or `false`, as ghūl spells it. An optional reads as the value it holds, by these same rules, or as `null` when it holds nothing. Anything else - an array, a list, a tuple, a struct or class that declares no `to_string`, a value held as `object`, a trait or a type parameter - would otherwise read as its .NET type name, so the runtime's `$` writes it instead: a sequence as its elements in brackets, a tuple as its parts, and a record as its type and members.
 
 ```ghul
 struct POINT(x: int public, y: int public);
@@ -1850,7 +1850,7 @@ A `|>` or `~>` at the end of a line carries the chain onto the next one, which i
 
 ## displaying values
 
-The runtime renders any value as text in two ways. `$(value)` gives the text a program shows its user, and is what string interpolation uses for a value its type gives no text of its own (see [types and literals](#types-and-literals)). `inspect(value)` gives the detailed form a REPL or a debugging session wants: the same structure, with strings and characters quoted wherever they appear inside a value. Both take anything, including an absent value, which reads `null`. `$` needs no `use`; `inspect` is in `Ghul`.
+The runtime formats any value as text in two ways. `$(value)` gives the text a program shows its user, and is what string interpolation uses for a value its type gives no text of its own (see [types and literals](#types-and-literals)). `inspect(value)` gives the detailed form a REPL or a debugging session wants: the same structure, with strings and characters quoted wherever they appear inside a value. Both take anything, including an absent value, which reads `null`. `$` needs no `use`; `inspect` is in `Ghul`.
 
 ```ghul
 use Ghul.inspect
@@ -1864,19 +1864,19 @@ $(POINT(3, 4))                    // POINT(x = 3, y = 4)
 inspect((1, "one", 'c', true))    // (1, "one", 'c', true)
 ```
 
-A string or character is quoted only inside a value, and only by `inspect`: at the top it is the whole answer, and reads as itself. A value is rendered by these rules, in order:
+A string or character is quoted only inside a value, and only by `inspect`: at the top it is the whole answer, and reads as itself. `$` and `inspect` write a value by these rules, in order:
 
 - `null` for an absent value, and `true` or `false` for a `bool`
-- a type that implements `Ghul.Displayable` renders itself, as below
+- a type that implements `Ghul.Displayable` writes itself, as below
 - a tuple as its parts in parentheses, and a map entry as `(key, value)`
-- a type that declares its own `to_string` reads as that `to_string`, even when it is also a sequence. The runtime's own pipes, and generators, are the exception: their `to_string` is a render of their elements, and they are rendered as sequences
+- a type that declares its own `to_string` reads as that `to_string`, even when it is also a sequence. The runtime's own pipes, and generators, are the exception: their `to_string` writes their elements, and they are written as sequences
 - a sequence, such as an array, a list or a pipe, as its elements in brackets
 - a class, struct or union variant ghūl compiled, with no `to_string` of its own, as its type and members: `POINT(x = 3, y = 4)`, `Shape.DOT(size = 2)`
 - a value of a type from another language, with no `to_string` of its own, as its .NET type name. Its members are not read, since a property getter can do anything - a task's result waits for the task
 
-A sequence stops after 100 elements with `, ...]`, so an unbounded pipe renders too; a pipe left part way through by that is rewound, as reading it to the end would have left it. A value that contains itself reads `<cycle>` where it recurs, and the same value in two places renders in full both times.
+A sequence stops after 100 elements with `, ...]`, so an unbounded pipe is written too; a pipe left part way through by that is rewound, as reading it to the end would have left it. A value that contains itself reads `<cycle>` where it recurs, and the same value in two places is written in full both times.
 
-A type chooses how it is displayed by implementing `Ghul.Displayable`, whose one method writes the value through a `Ghul.DISPLAY_STATE`. Render a child value with `state.render(child)` rather than with `$(child)`: the state carries the element limit and the values already being rendered, which a fresh call to `$` starts without. `state.mode` says whether the render is `DisplayMode.CLEAN`, for `$`, or `DisplayMode.DETAILED`, for `inspect`:
+A type chooses how it is displayed by implementing `Ghul.Displayable`, whose one method writes the value through a `Ghul.DISPLAY_STATE`. Write a child value with `state.render(child)` rather than with `$(child)`: the state carries the element limit and the values already being written, which a fresh call to `$` starts without. `state.mode` says whether the text is for `$`, `DisplayMode.CLEAN`, or for `inspect`, `DisplayMode.DETAILED`:
 
 ```ghul
 use Ghul
@@ -1893,7 +1893,9 @@ $(SCORE(3))                       // [3]
 inspect(SCORE(3))                 // [3 points]
 ```
 
-A `DISPLAY_STATE` can also be made directly, with a mode and a different element limit, and rendered into: `DISPLAY_STATE(DisplayMode.CLEAN, 3)` renders `[1, 2, 3, 4, 5]` as `[1, 2, 3, ...]`, read back with `to_string()`.
+A `DISPLAY_STATE` can also be made directly, with a mode and a different element limit, and written into: `DISPLAY_STATE(DisplayMode.CLEAN, 3)` writes `[1, 2, 3, 4, 5]` as `[1, 2, 3, ...]`, read back with `to_string()`.
+
+`Displayable` customises the text `$` and `inspect` produce for a value. `Ghul.Renderable` offers other media for the same value, such as an image, which a host like a notebook can show in place of that text: its `representations()` gives each as a MIME type and its content, best first. The host chooses which MIME types it shows, and the text `$` writes is the fallback. A host showing output in a web page does not insert `text/html` or `image/svg+xml` from a value into its own document.
 
 ## generics
 
