@@ -140,6 +140,8 @@ si
 
 Importing something the set already carries is how a file adds to the set rather than a duplicate, so `use default` and `use Ghul.Pipes` together are accepted, and a declaration of your own named like one of the set's is simply the one in scope. A project replaces the set with its own with `--default-use`, which takes a comma-separated list and can be written more than once; naming any name at all leaves the curated set out entirely, so a project that wants the collections and nothing else asks for exactly that. A project built by MSBuild names them in one property: `<GhulDefaultUses>Collections;IO.Std.write_line</GhulDefaultUses>`.
 
+Compiling with `--implicit-default-use` gives every file that declares no namespace an implicit `use default`, placed after the file's pragmas and before everything else, which is how a one-file script run directly gets `write_line`, the pipes and the collections without asking for them. A file that declares a namespace gets nothing implicit, since its namespace blocks choose their own imports. A `use default` the file writes as well is harmless, and a definition of its own still wins over one the set brings in.
+
 ## statement terminators
 
 A `;` separates two statements or simple declarations written on one line. At the end of a line it is not needed: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either.
