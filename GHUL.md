@@ -1072,10 +1072,11 @@ Precedence comes from the operator's first character rather than from anything w
 | bitwise | `&` `\|` `¦` `^` `∩` `∪` `⊻` `⊼` `⊽` |
 | shift | `<` or `>` doubled |
 | range | `..` `::` |
+| thread-first | `\|>` `~>` |
 | relational | `=` `!` `~` `<` `>` `≠` `≤` `≥` `≈` `≉` `≡` `≢` `∈` `∉` `∋` `⊂` `⊃` `⊆` `⊇` |
 | boolean | `∧` `∨`, and `/\` and `\/` |
 
-An operator opening with `?` sits looser than all of those, and everything the table does not name sits between shift and bitwise. Associativity is left, except for an operator opening with `?`, which is right so that a chain of them stays open to the one after it.
+The thread-first row is the two operators themselves rather than a first character: see [collections and pipes](#collections-and-pipes). An operator opening with `?` sits looser than all of those, and everything the table does not name sits between shift and bitwise. Associativity is left, except for an operator opening with `?`, which is right so that a chain of them stays open to the one after it.
 
 Where the first character does not say what is meant, a `@precedence` pragma places the operator explicitly. It takes the operator and a level: one of the eight `user-1` to `user-8`, which interleave with the levels above, or one of those levels by name. The pragma written before a definition covers that definition; the file-level `@@precedence` covers the rest of the file.
 
@@ -1815,6 +1816,12 @@ let a = 5 |> double();           // double(5) is 10
 let b = 5 |> add(3);             // add(5, 3) is 8
 let c = 5 |> double() |> add(1); // add(double(5), 1) is 11
 ```
+
+`|>` and `~>` are a precedence level of their own, below range and above relational (see [operators](#operators)), so the subject is everything to the left that binds tighter: `1 + 2 |> double()` is `double(1 + 2)`, and `0..n |> map(f)` maps the whole range. A comparison or a boolean operator stays outside the chain, so `xs |> count() > 3` compares the count and `ready /\ xs |> any(p)` tests `ready` first.
+
+A prefix operator applies to its operand before the chain does, so `!xs |> any(p)` negates `xs` rather than the answer, and `await t |> f()` is `f(await t)`. Parenthesise the chain for the other reading: `!(xs |> any(p))`.
+
+The subject goes into the last call written on the right-hand side, so `x |> box.combine(a)` is `box.combine(x, a)` and `x |> BOX(1).combine(a)` is `BOX(1).combine(x, a)`. Member access, indexing, `!` and `?` written after that call apply to its result, as they would after any call: `xs |> collect_list()[0]` is the first element and `xs |> collect_list().count` the count. An operator written after the call applies to the result of the whole chain, so `xs |> count() % 2` is `count(xs) % 2`.
 
 A function named with an operator is the one right-hand side that can be written without an argument list, since there is nothing else the bare name could mean. The threaded value is then the only argument, and an argument list is still accepted alongside it:
 
