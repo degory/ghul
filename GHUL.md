@@ -657,9 +657,11 @@ The two modifiers are independent: `open` controls who can extend, `abstract` co
 
 A method written with no body at all — `foo();` or `foo() -> int;` with no `is … si` — is **abstract**: a contract for a subclass to satisfy rather than a method that does nothing. The class that declares one is abstract too, so constructing it is rejected exactly as `abstract` on the header rejects it, and a concrete subclass that does not implement the method is an error naming the method and the class it came from. Property accessors, `init`, and static methods are excluded — a write-only property leaves its synthesised getter body-less, and its accessors read and write the backing field rather than declaring anything.
 
+The rule holds whether or not a trait behind the class supplies a default for the member. A class writing the member again with no body withdraws that default: the class is abstract, its subclasses owe an implementation, and `super` cannot reach the member, since there is nothing in the class chain to reach. A class that wants the default does not mention the member.
+
 `super.foo()` cannot reach an abstract method: a super call names the base implementation directly, and there is none.
 
-A body-less method that overrides a method **with** a body is the one case that cannot become an abstract slot, because a caller holding the base type would still reach it. Such a method is given a body that throws `System.NotImplementedException` naming it, so the call says what the declaration says. It is not a contract, so subclasses owe it nothing.
+A body-less method that overrides a **class** method with a body is the one case that cannot become an abstract slot, because a caller holding the base type would still reach it. Such a method is given a body that throws `System.NotImplementedException` naming it, so the call says what the declaration says. It is not a contract, so subclasses owe it nothing. A trait's default is not this case: a class redeclaring one withdraws it, as above, and the redeclaration is a contract like any other.
 
 ### structs
 
