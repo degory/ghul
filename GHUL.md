@@ -1296,6 +1296,8 @@ else
 fi
 ```
 
+A value type can be the type tested for. Over an `object`, `if let i: int = o` matches a boxed `int`, and over an `int?` it matches a present value. Over a plain `int` or `long` there is nothing to test, and the ascription is an error.
+
 With no type, `if let` simply tests that the value is present — the natural way to consume an optional, since the variable has the non-optional type within the branch. The `let` can also destructure:
 
 ```ghul
@@ -1501,7 +1503,7 @@ A `when` arm can also carry a binding pattern instead of an equality list. The p
 - `when (a, b) then` — destructure a tuple scrutinee into bound names. Per-element ascription works (`when (c: CAT, d: DOG) then`); discards are `_`; literal leaves like `when (1, label) then` or `when (Color.RED, label) then` add a value-equality test at that position, and a `~`-marked leaf like `when (~expected, label) then` tests against the value that name holds rather than binding it.
 - `when _: T then` — type-test only, no binding.
 
-Pattern arms share `if let`'s contract on refutability — an option-shaped scrutinee binds to the unwrapped value, and an impossible value-type narrow is rejected with one error and ERROR-typed recovery on the bound names:
+Pattern arms share `if let`'s contract on refutability — an option-shaped scrutinee binds to the unwrapped value, and a value-type ascription over a plain value-type scrutinee, which has nothing to test, is rejected with one error and ERROR-typed recovery on the bound names:
 
 ```ghul
 case animal
