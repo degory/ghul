@@ -1881,16 +1881,16 @@ A type chooses how it is displayed by implementing `Ghul.Displayable`, whose one
 ```ghul
 use Ghul
 
-class BADGE(label: string): Displayable is
+class SCORE(points: int): Displayable is
     display(state: DISPLAY_STATE) is
         state.append("[")
-        state.render(label)
-        state.append(if state.mode == DisplayMode.DETAILED then " (detailed)]" else "]" fi)
+        state.render(points)
+        state.append(if state.mode == DisplayMode.DETAILED then " points]" else "]" fi)
     si
 si
 
-$(BADGE("new"))                   // [new]
-inspect(BADGE("new"))             // [new (detailed)]
+$(SCORE(3))                       // [3]
+inspect(SCORE(3))                 // [3 points]
 ```
 
 A `DISPLAY_STATE` can also be made directly, with a mode and a different element limit, and rendered into: `DISPLAY_STATE(DisplayMode.CLEAN, 3)` renders `[1, 2, 3, 4, 5]` as `[1, 2, 3, ...]`, read back with `to_string()`.
