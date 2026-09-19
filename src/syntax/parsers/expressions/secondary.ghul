@@ -122,14 +122,32 @@ namespace Syntax.Parsers.Expressions is
             let start = context.location
             let result = expression_primary_parser.parse(context)!
 
-            return _parse_trailers(context, start, result, tokenizer_state, true)
+            return _parse_trailers(context, start, result, tokenizer_state)
         si
 
-        // The shared body of the `|>` and `~>` trailer cases: parse the
-        // right side as a function call with the subject threaded in as
-        // its first argument, so the call resolves and emits like any
-        // other. `propagating` marks a `~>` call, whose evaluation the
-        // expression passes lower inside a presence test on the subject.
+        // The right side of `|>` or `~>`, with `subject` threaded in as
+        // the first argument of its call. Reached from the expression
+        // parser, where both operators are a binary precedence level: the
+        // subject is whatever that level gathered on the left, and the
+        // call is a closed form, so an operator after it applies to the
+        // whole chain.
+        parse_thread_first(
+            context: CONTEXT,
+            subject: Trees.Expressions.Expression,
+            propagating: bool,
+            spelling: string
+        ) -> Trees.Expressions.Expression is
+            let use tokenizer_state = context.tokenizer_speculate_then_commit()
+
+            return _parse_thread_first(context, subject.location, subject, tokenizer_state, propagating, spelling)
+        si
+
+        // Parse the right side as a function call with the subject
+        // threaded in as its first argument, so the call resolves and
+        // emits like any other, then apply any trailers that follow the
+        // call to its result. `propagating` marks a `~>` call, whose
+        // evaluation the expression passes lower inside a presence test
+        // on the subject.
         _parse_thread_first(
             context: CONTEXT,
             start: Source.LOCATION,
@@ -185,24 +203,29 @@ namespace Syntax.Parsers.Expressions is
                 context.next_token()
 
                 if context.current.token == Lexical.TOKEN.PAREN_OPEN then
-                    rhs = _parse_trailers(context, pipe_start, name, tokenizer_state, false)
+                    rhs = _parse_trailers(context, pipe_start, name, tokenizer_state)
                 else
                     rhs =
-                        Trees.Expressions.CALL(
-                            name_location,
-                            name,
-                            Trees.Expressions.LIST(
+                        _parse_trailers(
+                            context,
+                            pipe_start,
+                            Trees.Expressions.CALL(
                                 name_location,
-                                Collections.LIST[Trees.Expressions.Expression]()
-                            )
+                                name,
+                                Trees.Expressions.LIST(
+                                    name_location,
+                                    Collections.LIST[Trees.Expressions.Expression]()
+                                )
+                            ),
+                            tokenizer_state
                         )
                 fi
             else
                 rhs =
-                    _parse_trailers(context, pipe_start, expression_primary_parser.parse(context)!, tokenizer_state, false)
+                    _parse_trailers(context, pipe_start, expression_primary_parser.parse(context)!, tokenizer_state)
             fi
 
-            let rhs_call = cast Trees.Expressions.CALL?(rhs)
+            let rhs_call = _call_to_thread_into(rhs)
 
             if rhs_call? then
                 // Thread the subject in as the first actual argument
@@ -212,7 +235,8 @@ namespace Syntax.Parsers.Expressions is
                 rhs_call.is_thread_first = true
                 rhs_call.propagates_absence = propagating
                 rhs_call.completion_target = operator_location::rhs_call.function.location
-                return rhs_call
+
+                return rhs
             fi
 
             // A name with no argument list is what half-typed code
@@ -226,19 +250,38 @@ namespace Syntax.Parsers.Expressions is
             return _incomplete_thread_first(start, subject, operator_location::rhs.location, rhs)
         si
 
-        // Consume the postfix trailers (`.member`, `(args)`, `[index]`,
-        // `|>`, …) that follow a primary. `allow_bar_arrow` is false while
-        // parsing the right side of a `|>`, so a following `|>` ends the
-        // current stage rather than nesting - which keeps
-        // `a |> f() |> g()` left-associative. A `|>` inside an argument
-        // list is unaffected: the argument parser re-enters through the
-        // public `parse`, where `allow_bar_arrow` is true again.
+        // The call a `|>` right side threads its subject into: the
+        // outermost one, reached through any trailers written after it.
+        // `xs |> f().count` threads into `f()` and reads `count` from the
+        // result, while `xs |> BOX(10).combine(3)` threads into `combine`
+        // with `BOX(10)` as its receiver. Absent when there is no call.
+        _call_to_thread_into(rhs: Trees.Expressions.Expression) -> Trees.Expressions.CALL? static is
+            let current: Trees.Expressions.Expression mut = rhs
+
+            do
+                if let call: Trees.Expressions.CALL = current then
+                    return call
+                elif let member: Trees.Expressions.MEMBER = current then
+                    current = member.left
+                elif let index: Trees.Expressions.INDEX = current then
+                    current = index.left
+                elif let unwrap: Trees.Expressions.UNWRAP = current then
+                    current = unwrap.left
+                elif let has_value: Trees.Expressions.HAS_VALUE = current then
+                    current = has_value.left
+                else
+                    return null
+                fi
+            od
+        si
+
+        // Consume the postfix trailers (`.member`, `(args)`, `[index]`, …)
+        // that follow a primary.
         _parse_trailers(
             context: CONTEXT,
             start: LOCATION,
             result_in: Trees.Expressions.Expression,
-            tokenizer_state: Syntax.Parsers.TOKEN_LOOKAHEAD_SPECULATE_THEN_COMMIT,
-            allow_bar_arrow: bool
+            tokenizer_state: Syntax.Parsers.TOKEN_LOOKAHEAD_SPECULATE_THEN_COMMIT
         ) -> Trees.Expressions.Expression is
             let result: Trees.Expressions.Expression mut = result_in
             let previous_left: Trees.Expressions.Expression? mut = _
@@ -253,8 +296,8 @@ namespace Syntax.Parsers.Expressions is
                 // operator member, a line-start `rec` the self-reference
                 // call of an enclosing anonymous function rather than a
                 // rec-lambda marker for this expression. Trailers that lead
-                // continuation lines by convention (`.`, `?`, `|>`, `ref`)
-                // still continue.
+                // continuation lines by convention (`.`, `?`, `ref`) still
+                // continue.
                 if
                     context.current.first_on_line /\
                     (
@@ -701,21 +744,6 @@ namespace Syntax.Parsers.Expressions is
 
                     context.next_token(Lexical.TOKEN.SQUARE_CLOSE)
 
-                when Lexical.TOKEN.BAR_ARROW then
-                    if !allow_bar_arrow then
-                        return result
-                    fi
-
-                    result =
-                        _parse_thread_first(context, start, result, tokenizer_state, false, "|>")
-
-                when Lexical.TOKEN.TILDE_ARROW then
-                    if !allow_bar_arrow then
-                        return result
-                    fi
-
-                    result =
-                        _parse_thread_first(context, start, result, tokenizer_state, true, "~>")
 
                 else
                     return result
