@@ -661,7 +661,7 @@ The rule holds whether or not a trait behind the class supplies a default for th
 
 `super.foo()` cannot reach an abstract method: a super call names the base implementation directly, and there is none.
 
-A body-less method that overrides a method **with** a body is the one case that cannot become an abstract slot, because a caller holding the base type would still reach it. Such a method is given a body that throws `System.NotImplementedException` naming it, so the call says what the declaration says. It is not a contract, so subclasses owe it nothing.
+A body-less method that overrides a **class** method with a body is the one case that cannot become an abstract slot, because a caller holding the base type would still reach it. Such a method is given a body that throws `System.NotImplementedException` naming it, so the call says what the declaration says. It is not a contract, so subclasses owe it nothing. A trait's default is not this case: a class redeclaring one withdraws it, as above, and the redeclaration is a contract like any other.
 
 ### structs
 
