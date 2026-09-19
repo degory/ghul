@@ -1761,15 +1761,16 @@ A generator's return type has to be `Pipe[T]` — `yield` in a function declared
 
 See <https://ghul.dev/functional-programming.html>.
 
-`Collections.List[T]` is the read-only list trait (the .NET `IReadOnlyList<T>`); `Collections.LIST[T]` is the mutable list. `MAP`/`Map` pair the same way for dictionaries, and `SET` is the mutable hash set. `MutableList`, `MutableMap`, `Bag`, `MutableBag` and `STACK` round out the mapping. There is no map literal — construct a `MAP`:
+`Collections.List[T]` is the read-only list trait (the .NET `IReadOnlyList<T>`); `Collections.LIST[T]` is the mutable list. `MAP`/`Map` pair the same way for dictionaries, and `SET` is the mutable hash set. `MutableList`, `MutableMap`, `Bag`, `MutableBag` and `STACK` round out the mapping. There is no map literal syntax. A map with fixed contents is written as a list literal of key and value pairs, collected with `collect_map()`, which throws if a key is given twice:
 
 ```ghul
-let scores = MAP[string, int]();
-scores.add("alice", 1);
+let scores = [("alice", 1), ("bob", 2)] |> collect_map();
 let total = scores["alice"];
 ```
 
-The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`.
+A map computed from a sequence takes a key and a value function instead, `words |> collect_map(w => w, w => w.length)`, and one that starts empty and is filled later is constructed with no arguments, `MAP()`, its types taken from how it is used.
+
+The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array` / `collect_set` / `collect_map`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`.
 
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
