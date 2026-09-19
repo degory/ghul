@@ -342,6 +342,20 @@ An interpolated expression can carry an alignment and a format specifier, as in 
 let padded = "[{value,12:F3}]";     // [    1500.000]
 ```
 
+How a value reads depends on its static type. A string, a number, an enum, and any type that declares its own `to_string` read as they always have, through that `to_string`, and so does any value given an alignment or a format. A `bool` reads `true` or `false`, as ghūl spells it. An optional reads as the value it holds, by these same rules, or as `null` when it holds nothing. Anything else - an array, a list, a tuple, a struct or class that declares no `to_string`, a value held as `object`, a trait or a type parameter - would otherwise read as its .NET type name, so it is rendered by the runtime's `$` instead: a sequence as its elements in brackets, a tuple as its parts, and a record as its type and members.
+
+```ghul
+struct POINT(x: int public, y: int public);
+
+let xs = [1, 2, 3];
+let found: string? = null;
+
+"{xs} {(1, "one")} {POINT(3, 4)} {true} {found}"
+                                     // [1, 2, 3] (1, one) POINT(x = 3, y = 4) true null
+```
+
+A pipe declares a `to_string` of its own that reads as its elements in brackets, the same text `$` gives it. A type's own `to_string` always wins, so the way to change how a value interpolates is to give its type one.
+
 Adjacent string literals concatenate, so a long string can be split across lines — plain and interpolated literals mix freely. Comments count as the whitespace they sit in, so a commented fragment chains like an uncommented one; only a `;` separates two otherwise-adjacent literals. That `;` is the one statement terminator that carries meaning — where a statement ends on a string literal and the next begins with one, it keeps them from chaining into a single literal, so `redundant-semicolon` never reports it:
 
 ```ghul
