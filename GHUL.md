@@ -2126,6 +2126,8 @@ See <https://ghul.dev/dotnet-integration.html>.
 
 ghūl compiles to .NET IL and can consume most types in any .NET assembly. .NET names are mapped to ghūl conventions: method, property, and field names become `snake_case`; enum names and members become `MACRO_CASE`; class, struct, and trait names are left as they are, with .NET's generic arity suffix removed — `KeyValuePair<K, V>` is `Collections.KeyValuePair[K, V]`. The namespace `System.Collections.Generic` maps to `Collections` and `System.IO` to `IO`, and some common types are remapped — `System.Console` is `IO.Std`, `IReadOnlyList<T>` is `Collections.List[T]`, `IEnumerable<T>` is `Collections.Iterable[T]`, and `IComparable<T>`/`IEquatable<T>` are `Ghul.Comparable[T]`/`Ghul.Equatable[T]`. The dotnet-integration page has the full mapping table.
 
+A type implementing `Collections.Iterator[T]` that declares no `reset` is given one that throws `System.NotSupportedException`, which is what `IEnumerator.Reset` is documented to do and what .NET's own generated iterators answer with; a `reset` the type declares is left alone. `dispose` is not supplied, since what a type holds and must release is its author's to say.
+
 Those two interfaces are declared in terms of the operators rather than named methods: `Ghul.Equatable[T]` requires `=~` and `Ghul.Comparable[T]` requires `<>`, so a type implements them by defining the operator. Every .NET type implementing them gains the operator in turn, which is why `=~` compares a `System.DateTime` and the relational operators order a `System.Version`.
 
 ```ghul
