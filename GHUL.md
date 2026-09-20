@@ -2139,8 +2139,6 @@ class BOX: Ghul.Comparable[BOX], Ghul.Equatable[BOX] is
 si
 ```
 
-A type implementing `Collections.Iterator[T]` that declares no `reset` is given one that throws `System.NotSupportedException`, which is what `IEnumerator.Reset` is documented to do and what .NET's own generated iterators answer with; a `reset` the type declares is left alone. `dispose` is not supplied, since what a type holds and must release is its author's to say.
-
 The parameter is written non-optional: presence is settled where the operator is used, so the body is only handed present values. On a reference type the optional spelling is accepted too, for a body that wants to defend against a null arriving from a caller in another language without the compiler reporting the test as redundant. A value type has no such choice, since its `T?` is a different type rather than the same one annotated.
 
 `<>` answers how its operands are ordered: negative when the left is the lesser, zero when neither is, positive otherwise. The relational operators are written in terms of it — `a < b` is `a <> b` reduced against zero — so defining `<>` is what gives a type all four.
@@ -2154,6 +2152,8 @@ Both halves are needed because .NET requires values that compare equal to hash e
 A tuple takes the same route. `EqualityComparer[T].Default` for a `ValueTuple` is the tuple's own element-wise equality, so each element is compared by the default comparer for *its* type — and so, by the same chain, through a user-written `=~` where the element type declares one.
 
 A member `=~` or `<>` must be `pure` — declared or provably store-free — a compile error otherwise. Both operators are trusted on an operand whose type isn't known until later — a lambda parameter, for instance — and `=~` is trusted again through the `EqualityComparer[T].Default` route above. Nothing at either of those call sites can check what the implementation actually does, so an implementation that could store would make that trust unsound rather than merely unproven. Most bodies — field and property comparisons, delegating to another type's `=~`/`<>` — are provably store-free without any annotation; add `pure` when the body itself is more than the analysis can trace (a loop, a call the analysis doesn't otherwise bound). Overriding a pure `=~`/`<>` requires the override to be pure too, the same rule that governs overriding any other [pure function](#type-narrowing).
+
+A type implementing `Collections.Iterator[T]` that declares no `reset` is given one that throws `System.NotSupportedException`, which is what `IEnumerator.Reset` is documented to do and what .NET's own generated iterators answer with; a `reset` the type declares is left alone. `dispose` is not supplied, since what a type holds and must release is its author's to say.
 
 An identifier that collides with a ghūl keyword is escaped with a backtick — `` `class `` is the identifier `class`.
 
