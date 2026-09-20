@@ -2248,7 +2248,7 @@ Because ghūl has no default argument values, a .NET **optional parameter** has 
 let text = await IO.File.read_all_text_async(path, System.Threading.CancellationToken.none);
 ```
 
-A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list, including a lambda literal's. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
+A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list, including a lambda literal's. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists, in a `use` clause as well as in the pragma — so `use System.Obsolete` brings `System.ObsoleteAttribute` into scope, and `use Marker = System.Obsolete` brings it in as `Marker`. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
 
 ```ghul
 @System.Obsolete("use PRODUCT instead")
