@@ -84,6 +84,13 @@ namespace IR.Emitter is
         _signatures: SRM_SIGNATURE_ENCODER
         _blobs: SRM_ATTRIBUTE_BLOB_ENCODER
         _type_parameters: Collections.LIST[SRM_TYPE_PARAMETER]
+        // The frame's own GetEnumerator and get_Current, recorded as
+        // they are written so the legacy bridges below can call them:
+        // a frame's members are synthesised straight into metadata, so
+        // there is no symbol for the bridge to resolve.
+        _frame_enumerator_members: Collections.MAP[FrameMember, EntityHandle]
+        _frame_element_type: Semantic.Types.Type?
+
         _pending_overrides: Collections.LIST[SRM_BOUND_METHOD]
 
         init(..) is
@@ -92,6 +99,7 @@ namespace IR.Emitter is
                 SRM_ATTRIBUTE_BLOB_ENCODER(IoC.CONTAINER.instance.innate_symbol_lookup)
             _type_parameters = Collections.LIST[SRM_TYPE_PARAMETER]()
             _pending_overrides = Collections.LIST[SRM_BOUND_METHOD]()
+            _frame_enumerator_members = Collections.MAP[FrameMember, EntityHandle]()
         si
 
         number(root: Scope) is
@@ -177,11 +185,13 @@ namespace IR.Emitter is
                 return result
             fi
 
-            if declared.is_derived_from_iterable_trait then
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            if _declares_trait(declared, lookup.get_unspecialized_iterable_type()) then
                 result.add(BoilerplateMember.ENUMERABLE_GET_ENUMERATOR)
             fi
 
-            if declared.is_derived_from_iterator_trait then
+            if _declares_trait(declared, lookup.get_unspecialized_iterator_type()) then
                 result.add(BoilerplateMember.ENUMERATOR_GET_CURRENT)
             fi
 
@@ -275,6 +285,8 @@ namespace IR.Emitter is
         // FRAME_MEMBERS gives and the numbering pass assumed. Each body
         // was deposited by the tree walk against the same key.
         _write_frame_members(type: SRM_EMITTED_TYPE) is
+            _frame_enumerator_members.clear()
+
             let frame = cast Semantic.Symbols.STATE_MACHINE_FRAME?(type.declared)
 
             if !frame? then
@@ -301,7 +313,13 @@ namespace IR.Emitter is
                         MetadataTokens.parameter_handle(_assembly.next_parameter_row))
 
                 _mark_compiler_generated(cast EntityHandle(handle))
+
+                if member == FrameMember.GET_ENUMERATOR \/ member == FrameMember.GET_CURRENT then
+                    _frame_enumerator_members[member] = cast EntityHandle(handle)
+                fi
             od
+
+            _frame_element_type = element
         si
 
         _iterator_ancestor(frame: Classy) -> Semantic.Types.Type is
@@ -1400,7 +1418,8 @@ namespace IR.Emitter is
                             "System.Collections",
                             "IEnumerable",
                             "GetEnumerator",
-                            signature))
+                            signature,
+                            _forward_to_generic(type, "iterator", false)))
 
                 when BoilerplateMember.ENUMERATOR_GET_CURRENT then
                     let signature = _signatures.nullary_instance_signature_returning_object()
@@ -1413,7 +1432,8 @@ namespace IR.Emitter is
                             "System.Collections",
                             "IEnumerator",
                             "get_Current",
-                            signature))
+                            signature,
+                            _forward_to_generic(type, "current", true)))
                 esac
             od
 
@@ -1530,9 +1550,105 @@ namespace IR.Emitter is
             return result
         si
 
-        // One explicit-implementation member: the row, its `ldnull; ret`
-        // body, and the interface member it answers for, which the
-        // MethodImpl row binds it to once the type has a handle.
+        // The body of a legacy bridge: read the generic member the
+        // trait declares and hand back what it returns. The call is
+        // virtual on a class, so a subclass overriding the generic
+        // member is reached through the bridge its base declares, and
+        // direct on a struct, which has no slot to dispatch through.
+        // A value the interface types as object is boxed, which a type
+        // parameter needs as much as a struct does.
+        _forward_to_generic(
+            type: SRM_EMITTED_TYPE,
+            member_name: string,
+            wants_object: bool
+        ) -> SRM_METHOD_BODY_EMITTER is
+            let body = SRM_METHOD_BODY_EMITTER()
+
+            let frame_member =
+                if wants_object then FrameMember.GET_CURRENT else FrameMember.GET_ENUMERATOR fi
+
+            if _frame_enumerator_members.contains_key(frame_member) then
+                body.ldarg(0)
+                body.call_virtual(_frame_enumerator_members[frame_member])
+
+                if wants_object then
+                    if let element = _frame_element_type /\ (element.is_value_type \/ element.is_type_variable) then
+                        body.box(IoC.CONTAINER.instance.ir_context.resolve_type_token(element))
+                    fi
+                fi
+
+                body.ret()
+
+                return body
+            fi
+
+            let read = _generic_reader(type, member_name)
+
+            if !read? then
+                body.ldnull()
+                body.ret()
+
+                return body
+            fi
+
+            body.ldarg(0)
+
+            let target = IoC.CONTAINER.instance.ir_context.resolve_call_target(read)
+
+            if isa Semantic.Symbols.STRUCT_METHOD(read) then
+                body.call(target)
+            else
+                body.call_virtual(target)
+            fi
+
+            if wants_object then
+                if let returns = read.return_type /\ (returns.is_value_type \/ returns.is_type_variable) then
+                    body.box(IoC.CONTAINER.instance.ir_context.resolve_type_token(returns))
+                fi
+            fi
+
+            body.ret()
+
+            return body
+        si
+
+        _generic_reader(type: SRM_EMITTED_TYPE, member_name: string)
+            -> Semantic.Symbols.Function?
+        is
+            if let declared = type.declared then
+                if let property: Semantic.Symbols.Property =
+                    declared.find_member(member_name)
+                then
+                    return property.read_function
+                fi
+            fi
+
+            return null
+        si
+
+        // Whether a type's own interface list reaches `trait`. A type
+        // that only inherits the implementation from its base is
+        // excluded: the base's own bridge already fills the slot and
+        // dispatches back through the generic member, and a MethodImpl
+        // here would name an interface this type does not declare,
+        // which a trimmer rejects.
+        _declares_trait(type: Classy, sought: Semantic.Types.Type) -> bool static is
+            for ancestor in type.ancestors do
+                if !ancestor.is_trait then
+                    continue
+                fi
+
+                if ancestor.find_ancestor(sought)? then
+                    return true
+                fi
+            od
+
+            return false
+        si
+
+        // One explicit-implementation member: the row, its body, and
+        // the interface member it answers for, which the MethodImpl row
+        // binds it to once the type has a handle.
         _write_explicit_implementation(
             name: string,
             signature: ubyte[],
@@ -1540,12 +1656,9 @@ namespace IR.Emitter is
             interface_namespace: string,
             interface_name: string,
             member_name: string,
-            member_signature: ubyte[]
+            member_signature: ubyte[],
+            body: SRM_METHOD_BODY_EMITTER
         ) -> SRM_BOUND_METHOD is
-            let body = SRM_METHOD_BODY_EMITTER()
-
-            body.ldnull()
-            body.ret()
 
             let definition =
                 _assembly.add_method_definition(
