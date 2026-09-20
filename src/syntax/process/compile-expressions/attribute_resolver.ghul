@@ -99,6 +99,14 @@ namespace Syntax.Process is
                 return
             fi
 
+            // `DllImport` is not carried as a custom attribute: it is a
+            // pseudo-attribute, whose whole content becomes flags on the
+            // method row and a row in the ImplMap table.
+            if attribute_type == _dll_import_attribute() then
+                _resolve_pinvoke(pragma, target, completed, named)
+                return
+            fi
+
             if !target.custom_attributes? then
                 target.custom_attributes = Collections.LIST[Semantic.CUSTOM_ATTRIBUTE]()
             fi
@@ -114,6 +122,215 @@ namespace Syntax.Process is
 
             attributes.add(
                 Semantic.CUSTOM_ATTRIBUTE(constructor, completed, named, pragma))
+        si
+
+        // Every type in the signature has to be one the runtime can
+        // carry into the library. Reported at the method, naming the
+        // type that cannot cross.
+        _check_pinvoke_signature(
+            pragma: Trees.Pragmas.PRAGMA,
+            function: Semantic.Symbols.Function
+        ) -> bool is
+            let signature = Semantic.PINVOKE_SIGNATURE(_innate_symbol_lookup)
+
+            let names = function.argument_names
+
+            for i in 0..function.arguments.count do
+                if !signature.can_take(function.arguments[i]) then
+                    _logger.error(
+                        pragma.name.location,
+                        "{names[i]} is a {function.arguments[i]}, which cannot be passed to a shared library")
+
+                    return false
+                fi
+            od
+
+            if !signature.can_return(function.return_type) then
+                _logger.error(
+                    pragma.name.location,
+                    "{function.return_type} cannot be returned from a shared library")
+
+                return false
+            fi
+
+            return true
+        si
+
+        // The attribute type itself, resolved once through the symbol
+        // table and compared by identity: a type is recognised by which
+        // symbol it is rather than by what it renders as, so a user type
+        // that happens to qualify the same way is not taken for this one
+        // and a change to how a type is spelled cannot quietly stop it
+        // being recognised.
+        _dll_import: Semantic.Symbols.Symbol?
+        _dll_import_resolved: bool
+
+        _dll_import_attribute() -> Semantic.Symbols.Symbol? is
+            if _dll_import_resolved then
+                return _dll_import
+            fi
+
+            _dll_import_resolved = true
+
+            let system = _visitor.find("System")
+
+            if !system? then
+                return null
+            fi
+
+            let runtime = system.find_member("Runtime")
+
+            if !runtime? then
+                return null
+            fi
+
+            let interop = runtime.find_member("InteropServices")
+
+            if !interop? then
+                return null
+            fi
+
+            _dll_import = interop.find_member("DllImportAttribute")
+
+            return _dll_import
+        si
+
+        // Reads a `DllImport` into the import the method is emitted
+        // from, and reports the declarations it cannot be written on.
+        // Reported here rather than at emission, so a program that
+        // cannot be called into says so before any IL is written.
+        _resolve_pinvoke(
+            pragma: Trees.Pragmas.PRAGMA,
+            target: Semantic.Symbols.Symbol,
+            positional: Collections.List[IR.Values.Value],
+            named: Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT]
+        ) is
+            let function = cast Semantic.Symbols.Function?(target)
+
+            if !function? then
+                _logger.error(pragma.name.location, "only a method can carry DllImport")
+                return
+            fi
+
+            if function.is_instance then
+                _logger.error(pragma.name.location, "a method carrying DllImport must be static")
+                return
+            fi
+
+            let module = _string_argument(positional, 0)
+
+            if !module? \/ module.length == 0 then
+                _logger.error(pragma.name.location, "the module to call into is missing from this DllImport")
+                return
+            fi
+
+            if !function.is_declared_without_body then
+                _logger.error(
+                    pragma.name.location,
+                    "a method carrying DllImport is the call into the library, so it takes no body of its own")
+                return
+            fi
+
+            if !_check_pinvoke_signature(pragma, function) then
+                return
+            fi
+
+            let entry_point = _named_string(named, "EntryPoint") ?? function.name
+
+            function.pinvoke =
+                Semantic.PINVOKE_IMPORT(module, entry_point, _import_attributes(named))
+        si
+
+        // The flags the runtime marshals the call by, read off the
+        // attribute's named arguments. What is not written takes the
+        // platform's default, which is what leaving the bit clear says.
+        _import_attributes(
+            named: Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT]
+        ) -> System.Reflection.MethodImportAttributes is
+            let flags mut = 0
+
+            if _named_number(named, "SetLastError") == 1 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.SET_LAST_ERROR)
+            fi
+
+            if _named_number(named, "ExactSpelling") == 1 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.EXACT_SPELLING)
+            fi
+
+            case _named_number(named, "CharSet")
+            when 2 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CHAR_SET_ANSI)
+            when 3 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CHAR_SET_UNICODE)
+            when 4 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CHAR_SET_AUTO)
+            else
+            esac
+
+            case _named_number(named, "CallingConvention")
+            when 1 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CALLING_CONVENTION_WIN_API)
+            when 2 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CALLING_CONVENTION_C_DECL)
+            when 3 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CALLING_CONVENTION_STD_CALL)
+            when 4 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CALLING_CONVENTION_THIS_CALL)
+            when 5 then
+                flags = flags | cast int(System.Reflection.MethodImportAttributes.CALLING_CONVENTION_FAST_CALL)
+            else
+            esac
+
+            cast System.Reflection.MethodImportAttributes(flags)
+        si
+
+        _string_argument(values: Collections.List[IR.Values.Value], index: int) -> string? is
+            if index >= values.count then
+                return null
+            fi
+
+            if let literal: IR.Values.Literal.STRING = values[index] then
+                return literal.value
+            fi
+
+            null
+        si
+
+        _named_string(
+            named: Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT],
+            il_name: string
+        ) -> string? is
+            for argument in named do
+                if argument.il_name =~ il_name then
+                    if let literal: IR.Values.Literal.STRING = argument.value then
+                        return literal.value
+                    fi
+                fi
+            od
+
+            null
+        si
+
+        // A named argument written as a number - an enum member, or a
+        // bool - or -1 when the attribute did not write one.
+        _named_number(
+            named: Collections.List[Semantic.NAMED_ATTRIBUTE_ARGUMENT],
+            il_name: string
+        ) -> int is
+            for argument in named do
+                if argument.il_name =~ il_name then
+                    if let literal: IR.Values.Literal.NUMBER = argument.value then
+                        let rendered = literal.rendered
+                        let value mut = 0
+
+                        if int.try_parse(rendered, value ref) then
+                            return value
+                        fi
+                    fi
+                fi
+            od
+
+            -1
         si
 
         // The constructor's parameters filled out from what the call

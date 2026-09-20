@@ -2266,3 +2266,21 @@ app.map_get(
 ```
 
 A parameter attribute is recognised only where a formal parameter can appear: a named function or method's parameter list, or a lambda literal's — not on a `let` or a primary-constructor parameter. Written on an element of a parenthesised expression that turns out not to be a lambda (an ordinary value tuple), it's rejected with an error rather than silently ignored.
+
+`System.Runtime.InteropServices.DllImport` on a static method with no body declares a call into a shared library. The method is emitted as the call itself rather than as a method carrying an attribute, so it needs no body and cannot have one:
+
+```ghul
+class LIBC is
+    @System.Runtime.InteropServices.DllImport("libc")
+    abs(value: int) -> int static;
+
+    @System.Runtime.InteropServices.DllImport("libc", entry_point = "getpid")
+    process_id() -> int static;
+
+    init() is si
+si
+```
+
+The name looked up in the library is the method's own, spelled as written, unless `entry_point` gives another: a native symbol is matched exactly, so none of the case conversion that applies to a .NET name applies here. `char_set`, `set_last_error`, `exact_spelling` and `calling_convention` are carried through as written.
+
+What can cross the boundary is what the machine lays out the same way on both sides: the scalar types, a pointer, a `ref` to a scalar, and a `string` argument, which is marshalled to a null-terminated buffer for the duration of the call. A returned `string` is not accepted, since freeing the buffer the library returned is the library's business rather than the runtime's. Anything else, such as a class, a tuple, an array or a function, is reported at the declaration rather than emitted.
