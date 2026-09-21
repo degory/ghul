@@ -34,6 +34,10 @@ The compiler warns when a ghūl-source declaration doesn't match the convention 
 - `non-pascal-case-name` — abstract classes, traits, unions, enums.
 - `non-upper-snake-case-name` — concrete classes, structs, variants, enum members.
 
+An identifier is written in whatever script its author writes in. A letter of any script starts one, and a letter, a digit, a combining mark or a connecting punctuation mark continues one, which is the set C# admits less the format characters: a zero-width joiner or a bidirectional control renders as nothing, so a name carrying one reads as a name it is not, and one inside an identifier is an error naming the character. Only the basic plane is covered, since a character above it is written as a surrogate pair and the scanner reads that as two characters. A symbol is an operator character and a letter is an identifier character, so no character is ever both, and an operator spelled `×` and an identifier spelled `naïve` are each what they look like.
+
+The conventions above are read with Unicode case. A character that has an upper and a lower form is checked whatever script it is in, so `ТИП` is a concrete class and `μέγεθος` a property. A character with neither form says nothing about case, so a name written entirely in a script that has none — Chinese, Japanese, Arabic, Hebrew — is correct as any kind and draws no warning.
+
 A class with only `static` members (and no primary-constructor parameters) is a static-utility container — never constructed — and accepts either PascalCase or UPPER_SNAKE_CASE.
 
 ## namespaces and `use`
