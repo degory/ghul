@@ -2139,9 +2139,7 @@ namespace Syntax.Process is
         // marker - `retry[T.., U](f: T.. -> U, n: int) -> T.. -> U` -
         // resolves to the tuple-in function type the declaration names.
         // Where this call binds the pack to a concrete tuple, the
-        // result is re-presented as the corresponding N-ary function:
-        // the call's value becomes `(a0, .., an) => call((a0, .., an))`,
-        // built and walked in place. Depth past the outermost return
+        // result is presented as the corresponding N-ary function. Depth past the outermost return
         // is left as the tuple-in shape; the marker there names a
         // function the result itself returns, one the caller reaches
         // through its own call.
@@ -2151,16 +2149,13 @@ namespace Syntax.Process is
             call_receiver: IR.Values.Value?,
             arguments: Collections.LIST[IR.Values.Value]
         ) -> bool is
-            let wrapped = wrap_return_pack(call, function, call.location, call_receiver, arguments, call.arguments.expressions, arity => call.return_pack_state.take_spare(arity))
+            let wrapped = wrap_return_pack(call, function, call.location, call_receiver, arguments)
 
             if !wrapped? then
                 return false
             fi
 
-            call.return_pack_literal = wrapped.literal
-            call.return_pack_state.hoist = wrapped.hoist
-
-            call.compile_expressions_state.value = wrapped.value
+            call.compile_expressions_state.value = wrapped
 
             return true
         si
@@ -2168,23 +2163,19 @@ namespace Syntax.Process is
         // The call-boundary presentation a pack-marked declared return
         // type asks for: `retry[T.., U](f: T.. -> U, n: int) -> T.. -> U`
         // resolves to the tuple-in function type the declaration names.
-        // Where this call binds the pack to a concrete tuple, the
-        // result is re-presented as the corresponding N-ary function:
-        // the call's value is computed once, stored in a hoisted local
-        // the wrapper closure captures, and the wrapper becomes the
-        // call's value. The wrapper literal comes back alongside, for
-        // the caller to record on its tree node - that is where
-        // generate-il finds it to emit the closure body. Null when this
-        // call is not one the presentation applies to.
+        // Where this call binds the pack to a concrete tuple, the result
+        // is presented as the corresponding N-ary function: the call's
+        // own value is computed once, where the call stands, and a thunk
+        // taking the elements packs them and calls it. `key` is the node
+        // the call is compiled for. Null when this call is not one the
+        // presentation applies to.
         wrap_return_pack(
-            key: Trees.Node?,
+            key: Trees.Node,
             function: Semantic.Symbols.Function,
             location: Source.LOCATION,
             call_receiver: IR.Values.Value?,
-            arguments: Collections.LIST[IR.Values.Value],
-            operands: Collections.List[Trees.Expressions.Expression],
-            take_spare: (int) -> (hoist: Semantic.Symbols.Symbol, literal: Trees.Expressions.FUNCTION)?
-        ) -> (value: IR.Values.Value, literal: Trees.Expressions.FUNCTION, hoist: Semantic.Symbols.Symbol)? is
+            arguments: Collections.LIST[IR.Values.Value]
+        ) -> IR.Values.Value? is
             if function.return_pack_depth != 0 then
                 return null
             fi
@@ -2193,101 +2184,20 @@ namespace Syntax.Process is
             // since settled; the stored composite is not rewritten when
             // they do, so it is read through the resolver here.
             let declared = if let rt = function.return_type then Semantic.SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(rt) else null fi
-            if !Semantic.ARGUMENT_PACK.is_pack_slot(declared) then
+
+            if !declared? \/ !_pack_wrap_builder.spread_type(declared, 0)? then
                 return null
             fi
 
-            let pack_parameter = declared!.arguments[0]
-            if
-                !(pack_parameter.is_value_tuple \/ isa Semantic.Types.TUPLE(pack_parameter)) \/
-                pack_parameter.arguments.count < 2 \/
-                pack_parameter.arguments.count > Semantic.ARGUMENT_PACK.MAXIMUM_ARITY \/
-                pack_parameter.contains_inferred
-            then
-                return null
-            fi
-
-            let elements = Collections.LIST[Type]()
-
-            for element in pack_parameter.arguments do
-                elements.add(element)
-            od
-
-            // The wrapper an earlier walk of this node declared serves
-            // again, retyped to what the pack binds to on this walk.
-            let adapted mut = take_spare(elements.count)
-
-            if let reused = adapted then
-                if let settable: Semantic.Types.SettableTyped = reused.hoist then
-                    settable.set_type(declared!)
-                fi
-            else
-                adapted = _function_reference_adapter.try_adapt_return_packed(location, elements, declared!)
-            fi
-
-            if !adapted? then
-                return null
-            fi
-
-            let use retry_site = RETRY_SITE_STATS.enter("calls.wrap_return_pack", RetrySiteKind.ALTERNATIVE)
-
-            // The walk being discarded may have put a bound on a
-            // placeholder that an already-built closure still names; the
-            // retry loop rebuilds that closure only if the progress
-            // signal survives the roll back.
-            let discarded_walk = _logger.roll_back()
-
-            _logger.speculate()
-            _flow.restore()
-
-            // The operands were walked under the speculation the roll back
-            // discarded, and the call below reuses their values: walked
-            // again, so what they reported is not lost with it.
-            if operands.count == arguments.count then
-                for i in 0..operands.count do
-                    let operand = operands[i]
-
-                    _visitor.rewalk(operand)
-
-                    if let operand.value? then
-                        arguments[i] = value
-                    else
-                        arguments[i] = DUMMY(Semantic.Types.ERROR(), operand.location)
-                    fi
-                od
-
-                if let owner = key then
-                    present_pack_arguments(owner, operands, function, arguments)
-                fi
-            fi
-
-            _logger.mark_consumed_any_if(discarded_walk.has_consumed_any)
-
-            if discarded_walk.has_consumed_error then
-                _logger.mark_consumed_error()
-            fi
-
-            try
-                _visitor.rewalk(adapted.literal)
-
-                if let wrapper = adapted.literal.value /\ wrapper.type? then
-                    // The call's own value is computed once, where the
-                    // call stands, and stored in the hoisted local the
-                    // wrapper's closure captures.
-                    let inner =
-                        function.call(location, call_receiver, arguments, null, _function_caller)
-
-                    let result = IR.Values.BLOCK(wrapper.type!)
-
-                    result.add(IR.Values.DECLARE_LOCAL(adapted.hoist.il_name, declared!))
-                    result.add(IR.Values.Store.LOCAL_VARIABLE(adapted.hoist, inner))
-                    result.add(wrapper)
-
-                    return (value = cast IR.Values.Value(result), literal = adapted.literal, hoist = adapted.hoist)
-                fi
-            yrt
-
-            return null
+            return
+                _pack_wrap_builder.pack(
+                    key,
+                    -1,
+                    location,
+                    function.call(location, call_receiver, arguments, null, _function_caller),
+                    declared,
+                    0
+                )
         si
 
         // The type the wrapper's one physical parameter is declared as
