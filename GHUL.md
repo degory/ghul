@@ -2058,6 +2058,27 @@ apply(double, 123);                      // T is int, as for any parameter
 
 A spread formal has to be the last one, since it leaves nothing for the arguments after it. One argument is the value itself rather than a one-element tuple, which is what makes `apply(double, 123)` read the way it does; two or more are the tuple they are spread into. Writing the tuple out goes into the same formal, so both spellings are available and the written-out one is what a caller reaches for when it already holds the tuple.
 
+The pack is the last parameter of the function the formal takes, and that function can take parameters of its own before it. `f: (A, T..) -> A` is the shape a fold's callback has: the running value comes first and is passed as it is, and the rest of the parameters are the pack's elements.
+
+```ghul
+fold[A, T..](source: Collections.Iterable[T], seed: A, f: (A, T..) -> A) -> A is
+    let running mut = seed
+
+    for element in source do
+        running = f(running, element)
+    od
+
+    return running
+si
+
+let pairs = [(1, 2), (3, 4)]
+
+fold(pairs, 0, (total, a, b) => total + a * b)      // 14
+fold(pairs, 0, (total, pair) => total + pair.`0)    // the tuple, written out
+```
+
+Only the last parameter can be the pack, and a parameter list holds one pack: `(A.., B) -> C` and `(T.., T..) -> int` are both errors.
+
 The pack binds to whatever the call supplies, and the function written at its own formal is one of the things that supplies it — its parameters are the tuple. So a call that passes nothing but the function still infers, as long as the function says what its parameters are:
 
 ```ghul
@@ -2120,7 +2141,7 @@ run((n: int) -> (int, int) -> int => (a: int, b: int) -> int => a + b + n, (1, 2
 run((n: int) -> ((int, int)) -> int => (a: int, b: int) -> int => a + b + n, (1, 2)); // error
 ```
 
-The marker reads only as a formal's own type, as the parameter of a function type on that type's return spine, or as the parameter of a function type in a declared return type. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
+The marker reads only as a formal's own type, as the last parameter of a function type on that type's return spine, or as the last parameter of a function type in a declared return type. Written anywhere else — inside a bigger type, reached through a parameter rather than a return, or on a type parameter that no `[T..]` declares — it is an error. The tuple limit is the pack's limit too: past seven arguments there is no tuple to bind to, and the call is reported as it stands. A pack is not `params`: a homogeneous variable-length list is a different thing.
 
 What each formal asks for survives into the assembly, so a pack declared in one assembly reads the same way from another.
 
