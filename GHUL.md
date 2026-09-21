@@ -2041,7 +2041,11 @@ takes_int(zero_of(1));                       // zero_of[T](n: int) -> T:
 
 When neither the arguments nor any later use pins a type argument, the construction or call is an error (`cannot infer type here`, or `cannot infer the type of` the local it initializes) — give the type argument explicitly (`BOX[int]()`).
 
-A type parameter written with a trailing `..` is an **argument pack**: it stands for the arguments of a call, held as a positional tuple. The `..` is that parameter's bound — it says what `T` ranges over — so a type bound cannot be written alongside it.
+A type parameter written with a trailing `..` is an **argument pack**. `[T..]` in the type parameter list says that where `T` appears in the signature it may, if it is marked with `..` there, be implicitly wrapped and unwrapped, so that the calling code does not have to wrap or unwrap it by hand. It still can: a caller is free to write the tuple out, and a single argument is the value itself rather than a one-element tuple. Writing `T..` within the signature then says that the wrap or unwrap is wanted for that specific argument, should it be needed at the call site.
+
+So the two markers do different jobs. The one on the type parameter is the permission, and nothing is spread because of it alone; the one on a formal is the request. A formal over a pack that is left unmarked takes the pack as the tuple it is.
+
+The pack stands for the arguments of a call, held as a positional tuple. The `..` on the type parameter is that parameter's bound — it says what `T` ranges over — so a type bound cannot be written alongside it.
 
 A formal argument then writes `..` on its own type to say which of the pack's readings it wants. `f: T.. -> U` takes the arguments spread out, as a function of as many parameters as the call supplies; `v: T..` takes them as the call's own remaining arguments; a plain `T` is the tuple. So a function taking a function and the values to call it with declares one of each, and callers write the call out rather than assembling the tuple by hand:
 
