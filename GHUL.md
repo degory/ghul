@@ -1437,7 +1437,7 @@ for (key, value) in dictionary do
 od
 ```
 
-Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5). The from-the-end forms (`..<`, `::<`, `..<<`, `::<<`) are for indexing rather than iteration — see [arrays](#types-and-literals).
+Every loop supports `break` to exit and `continue` to skip to the next iteration. A loop disposes nothing it iterated: for a sequence holding a resource, see [collections and pipes](#collections-and-pipes). The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5). The from-the-end forms (`..<`, `::<`, `..<<`, `::<<`) are for indexing rather than iteration — see [arrays](#types-and-literals).
 
 Any loop (`for`, `while`, `do`) can be labelled by prefixing it with an identifier and a colon, and `break` and `continue` can then name the loop they act on, letting an inner loop exit or advance an outer one:
 
@@ -1808,6 +1808,18 @@ let odd = numbers |> count(x => x % 2 == 1);        // 3, the elements the predi
 ```
 
 A pipe is a cursor over its source. Read part way and then read again — by the same consumer or another, through `for`, a combinator, a terminal or interpolation — it carries on from wherever the last read stopped; nothing distinguishes those cases. Once it has run out it rewinds itself, so the next read starts from the beginning: `for x in p` twice sees every element twice, and `p |> count()` followed by `p |> only()` walks the whole sequence both times. A stage reaching its own end counts as the end of everything below it, so `p |> take(2)` yields the first two elements every time it is read, and `skip` is how to page. The rewind is in place, so every holder of the pipe sees it start over. `p.reset()` rewinds early. Nothing disposes on its own: `p.dispose()` on a combinator chain releases every iterator its stages hold, file readers included, while a generator's `dispose()` releases nothing - it does not run the body's `finally` clauses or dispose an iterator the body is walking with `yield in`. `memo` is the one stage whose rewind never asks its source again — it replays what it cached.
+
+A `for` loop does not dispose what it iterated, so a sequence that holds a resource is disposed by naming its iterator and letting `let use` close it. That covers the few that hold one: file and directory enumeration, a database reader, a PLINQ query, and a .NET iterator written with a `using`. It matters where the loop can be left early, since the iterator is then still open.
+
+```ghul
+let use lines = IO.File.read_lines(path).iterator
+
+for line in lines do
+    if line.starts_with(wanted) then
+        return line
+    fi
+od
+```
 
 A pipe can also be started from nothing. `repeat(value)` yields `value` without end and `repeat(value, count)` yields it `count` times; `from(start)` counts upwards from `start` without end, and `from(start, step)` counts in steps of `step`. Collected, a bounded `repeat` is how a list of a given size is made:
 
