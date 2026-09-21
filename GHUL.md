@@ -109,6 +109,8 @@ An alias cannot name a wildcard import — `use name = X.*;` is rejected, since 
 
 One namespace needs no `use` anywhere: `Ghul.Intrinsics` holds the names the language itself supplies — the built-in types such as `int` and `string`, the function and tuple shapes, and the operators on them — and every namespace block sees it as if it had written `use Ghul.Intrinsics;` first. Everything else the runtime provides is declared in `Ghul` and its nested namespaces and is imported like any other library: `use Ghul;` for the functional combinators such as `apply`, `use Ghul.Pipes;` for the pipe combinators. A definition of your own that shares a name with one of those — an `apply` of your own, say — is simply the one in scope, with nothing to import around.
 
+One namespace cannot be named at all. `Ghul.Internal` holds the attributes that carry language facts, such as whether a class is closed or which variant of a union a type is, from the assembly that was compiled to the one that reads it. They state what the compiler established rather than something a program chooses, so naming one from source reports that the symbol is not found, and none of them is offered in completion. The assembly that declares them sees its own declarations as ordinary symbols.
+
 A `use` with a type expression on the right names a type rather than importing a symbol — a *type alias*:
 
 ```ghul
