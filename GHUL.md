@@ -1124,7 +1124,7 @@ The built-in operators on the scalar types are the exception. They are
 instructions rather than methods, so there is no function to take the value of,
 and naming one is an error: `cannot take the value of built-in operator '+'`.
 An instance member is not a value either, operator or not, since it needs a
-receiver. What that rules out is `int.`+`` and `string.`=~``; a function literal
+receiver. What that rules out is ``int.`+`` and ``string.`=~``; a function literal
 says the same thing and is what to write instead.
 
 ## equality
