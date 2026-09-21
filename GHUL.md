@@ -1437,7 +1437,7 @@ for (key, value) in dictionary do
 od
 ```
 
-Every loop supports `break` to exit and `continue` to skip to the next iteration. The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5). The from-the-end forms (`..<`, `::<`, `..<<`, `::<<`) are for indexing rather than iteration — see [arrays](#types-and-literals).
+Every loop supports `break` to exit and `continue` to skip to the next iteration. A loop disposes nothing it iterated: for a sequence holding a resource, see [collections and pipes](#collections-and-pipes). The range operators work in any expression: `..` is inclusive of its start and exclusive of its end (`0..3` is 0, 1, 2), and `::` is inclusive of both (`1::5` is 1 through 5). The from-the-end forms (`..<`, `::<`, `..<<`, `::<<`) are for indexing rather than iteration — see [arrays](#types-and-literals).
 
 Any loop (`for`, `while`, `do`) can be labelled by prefixing it with an identifier and a colon, and `break` and `continue` can then name the loop they act on, letting an inner loop exit or advance an outer one:
 
@@ -1586,6 +1586,8 @@ let m = (box.v = 7; box.v * 2);             // assignment statement, then the va
 ```
 
 A parenthesised group commits to the block reading at the first top-level `;` — or immediately, on a token that can only open a statement (`let`, `try`, `return`, ...) — and stays a tuple, a parenthesised expression, or a lambda's formal parameters otherwise. A compound statement (`if`, `case`, `for`, `while`, `do`) opening the group commits the block reading the same way when what follows cannot continue its expression: `(for x in xs do f(x) od 0)` is a block whose tail is `0`, no `;` needed. An operator-headed tail on the same line is the one exception: any operator can also continue the expression, so the group keeps the expression reading there and the compound statement is the operator's left operand (`(if c then 2 else 5 fi - 1)` is 1 when `c` is true). Only the same line does that — the compound statement ends the line it is written on, so an operator opening the next line begins a new statement like any other, and `(if c then 2 else 5 fi` / `-1)` is a block whose tail is `-1` with no `;` needed. So `(a = f(x), b = g(y))` constructs a named tuple while `(a = f(x); b = g(y); a + b)` runs two assignments and yields the sum; the `,`/`;` is the whole difference, and the elements themselves can be any expression in both. A statement whose expression form already exists keeps it: `(let x = 5 in x * 2)` is the `let ... in` expression, unchanged, while `(let x = 5; x * 2)` is a block with a `let` statement and a tail.
+
+A `let use` written directly in a block is rejected: the block has no disposal region to close it in. One written in a statement list nested inside the block - the body of an `if`, of a loop, of a `try` - has a region of its own and is unaffected.
 
 A common use is loop-as-expression — fold an iterable into a value with the loop body updating a `mut` accumulator and the tail expression handing back the result:
 
@@ -1808,6 +1810,18 @@ let odd = numbers |> count(x => x % 2 == 1);        // 3, the elements the predi
 ```
 
 A pipe is a cursor over its source. Read part way and then read again — by the same consumer or another, through `for`, a combinator, a terminal or interpolation — it carries on from wherever the last read stopped; nothing distinguishes those cases. Once it has run out it rewinds itself, so the next read starts from the beginning: `for x in p` twice sees every element twice, and `p |> count()` followed by `p |> only()` walks the whole sequence both times. A stage reaching its own end counts as the end of everything below it, so `p |> take(2)` yields the first two elements every time it is read, and `skip` is how to page. The rewind is in place, so every holder of the pipe sees it start over. `p.reset()` rewinds early. Nothing disposes on its own: `p.dispose()` on a combinator chain releases every iterator its stages hold, file readers included, while a generator's `dispose()` releases nothing - it does not run the body's `finally` clauses or dispose an iterator the body is walking with `yield in`. `memo` is the one stage whose rewind never asks its source again — it replays what it cached.
+
+A `for` loop does not dispose what it iterated, so a sequence that holds a resource is disposed by naming its iterator and letting `let use` close it. That covers the few that hold one: file and directory enumeration, a database reader, a PLINQ query, and a .NET iterator written with a `using`. It matters where the loop can be left early, since the iterator is then still open.
+
+```ghul
+let use lines = IO.File.read_lines(path).iterator
+
+for line in lines do
+    if line.starts_with(wanted) then
+        return line
+    fi
+od
+```
 
 A pipe can also be started from nothing. `repeat(value)` yields `value` without end and `repeat(value, count)` yields it `count` times; `from(start)` counts upwards from `start` without end, and `from(start, step)` counts in steps of `step`. Collected, a bounded `repeat` is how a list of a given size is made:
 
