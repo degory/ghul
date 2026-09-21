@@ -1942,6 +1942,8 @@ use System.IParsable;
 parse[T: IParsable[T]](s: string) -> T => T.parse(s, null);
 ```
 
+Consuming such a member is all that is supported. A type cannot *implement* one: nothing binds a type's static to the interface's static slot, and the runtime refuses to load a type that leaves one unfilled, so naming an interface that declares a static member on a concrete type is an error at the declaration. That covers the generic-math interfaces above, which is why a bound on one of them is satisfied by the built-in numeric types and not by a type of your own.
+
 Some of those interfaces declare an **operator** as a static member — `IAdditionOperators[TSelf, TOther, TResult]` declares addition, and `INumber[T]` extends it. Such an operator is written as an operator rather than reached through the type parameter, but only once it has been imported by name:
 
 ```ghul
