@@ -37,6 +37,7 @@ namespace Syntax.Process is
         _async_literal_candidates: Semantic.ASYNC_LITERAL_CANDIDATES
         _symbol_loader: Semantic.SYMBOL_LOADER
         _function_reference_adapter: FUNCTION_REFERENCE_ADAPTER
+        _pack_wrap_builder: PACK_WRAP_BUILDER
 
         init(
             logger: Logger,
@@ -77,6 +78,7 @@ namespace Syntax.Process is
             _async_literal_candidates = Semantic.ASYNC_LITERAL_CANDIDATES(innate_symbol_lookup, Semantic.TASK_LIKE_RESOLVER(logger))
             _symbol_loader = symbol_loader
             _function_reference_adapter = function_reference_adapter
+            _pack_wrap_builder = PACK_WRAP_BUILDER(symbol_table, symbol_loader, innate_symbol_lookup)
         si
 
         // Rebuild a named call's already-collected argument lists - the
@@ -1456,86 +1458,24 @@ namespace Syntax.Process is
 
                     _bound_value_parameters_from_pack(push_candidate!, index, argument_types[index])
 
-                    _mark_nested_pack(effective_candidate, index, original)
+                    _take_spread_reading(push_candidate!, index, original, arguments, argument_types)
 
                     if let outer_arity = _nested_pack_adaptation_arity(push_candidate!, index, original, argument_types[index]) then
                         if
                             let literal = _function_reference_adapter.try_adapt(original, outer_arity) /\
                             _splice(cache_key, original, index, literal)
                         then
-                            literal.expected_pack_depth = push_candidate!.get_argument_pack_depth(index)
                             a = literal
                         fi
-                    elif let pack_arity = _pack_adaptation_arity(push_candidate!, index, original, argument_types[index], cache_key) then
-                        if
-                            let literal =
-                                _function_reference_adapter.try_adapt_packed(
-                                    original,
-                                    pack_arity,
-                                    _packed_group_type(push_candidate!, index, argument_types[index])
-                                ) /\
-                            _splice(cache_key, original, index, literal)
-                        then
-                            a = literal
-                        fi
-                    elif let hoist_arity = _pack_adaptation_value_arity(push_candidate!, index, original, argument_types[index]) then
-                        // A value whose parameter types are still being
-                        // inferred is adapted over them all the same: the
-                        // pack binds to the tuple of placeholders, and the
-                        // call resolves provisionally, so that a later use
-                        // of its result has a pack to settle. Each
-                        // placeholder is an obligation on this walk.
-                        let packed =
-                            Semantic.ARGUMENT_PACK.packed_parameters(argument_types[index]) ??
-                            (
-                                if _pack_tuple_waits_for_sibling(push_candidate!, index) \/ parenthesised_literal(original)? then
-                                    null
-                                else
-                                    _provisional_packed_parameters(argument_types[index], original.location)
-                                fi
-                            )
+                    elif _is_packable_literal(push_candidate!, index, original, argument_types[index], cache_key) then
+                        // compiled taking the tuple, under the formal pushed below
+                    elif let presented = _presented_pack_type(cache_key, push_candidate!, index, original, argument_types[index]) then
+                        // A function value of the pack's elements is judged as
+                        // the function of their tuple it will be presented as.
+                        // The value itself is wrapped once a candidate has won.
+                        argument_types[index] = presented
 
-                        if
-                            let adapted =
-                                _function_reference_adapter.try_adapt_packed_hoisted(
-                                    original.location,
-                                    packed,
-                                    argument_types[index]
-                                ) /\
-                            _splice(cache_key, original, index, adapted.literal)
-                        then
-                            a = adapted.literal
-
-                            // An operand that is not in the tree to
-                            // re-walk - a call's function value, a
-                            // stored one included - still fills a pack
-                            // formal: its value is hoisted and
-                            // eta-expanded, evaluate-once, so the
-                            // operand runs once where it stands and the
-                            // wrapper calls the local. The literal
-                            // carries the store and composes it into
-                            // its own value.
-                            adapted.literal.pack_hoist =
-                                (
-                                    symbol = adapted.hoist,
-                                    type = argument_types[index],
-                                    value = arguments[index]
-                                )
-
-                            if !argument_types[index].is_settled then
-                                adapted.literal.pack_hoist_source = original
-                            fi
-
-                            // The adapted expression may itself carry
-                            // body-carrying wrappers - a call whose
-                            // declared return type is pack-marked, or
-                            // arguments adapted into the call. The
-                            // splice takes the expression out of the
-                            // tree; move its wrappers along so
-                            // generate-il still reaches them and
-                            // emits their bodies.
-                            _transfer_pack_literals(original, adapted.literal)
-                        fi
+                        continue
                     elif let shape = _carrier_mismatch_shape(original, argument_types[index], f) then
                         if
                             let literal =
@@ -1550,6 +1490,7 @@ namespace Syntax.Process is
                     fi
 
                     a.set_expected_type(f, "{{0}} is not assignable to {{1}}")
+                    _mark_packed_literal(push_candidate!, index, a)
 
                     _visitor.rewalk(a)
 
@@ -1598,35 +1539,6 @@ namespace Syntax.Process is
             return false
         si
 
-        // Moves the body-carrying wrappers the adapted expression
-        // carries onto the wrapper that replaces it, so generate-il
-        // keeps reaching them across the splice. The wrappers are
-        // self-contained by construction: they call hoisted locals or
-        // names, never tree positions the splice could take away.
-        _transfer_pack_literals(
-            removed: Trees.Expressions.Expression,
-            replacement: Trees.Expressions.FUNCTION
-        ) is
-            if let call: Trees.Expressions.CALL = removed then
-                if call.return_pack_literal? then
-                    replacement.nested_return_pack_literals.add(call.return_pack_literal!)
-                fi
-            elif let binary: Trees.Expressions.BINARY = removed then
-                if binary.return_pack_literal? then
-                    replacement.nested_return_pack_literals.add(binary.return_pack_literal!)
-                fi
-            fi
-
-            // Every literal the removed expression holds, at whatever
-            // depth: an operator's operand, a call's argument, and a
-            // literal inside either. A chain of the same operator
-            // reaches this - the inner operator's operands are adapted
-            // before the outer one adapts the inner expression away.
-            for literal in SPLICED_LITERAL_SCANNER().scan(removed) do
-                replacement.nested_return_pack_literals.add(literal)
-            od
-        si
-
         // Whether the pack tuple the formal at `index` takes is decided
         // by another of the candidate's formals and that formal has not
         // settled it yet - the element type of a pipe whose source is
@@ -1639,28 +1551,9 @@ namespace Syntax.Process is
 
             return
                 shape? /\
-                shape.arguments.count > 0 /\
-                !shape.arguments[0].is_settled /\
-                Semantic.PACK_TUPLE_SOURCE().is_decided_by_another_formal(candidate.arguments, index, shape.arguments[0])
-        si
-
-        // The tuple a pack binds to over a function value whose parameter
-        // types are still placeholders, each recorded as an obligation
-        // of this walk: the value cannot be called through the pack
-        // until they settle, and if nothing settles them the fixing
-        // step names them.
-        _provisional_packed_parameters(argument_type: Type?, location: Source.LOCATION) -> Type? is
-            let packed = Semantic.ARGUMENT_PACK.packed_parameters_provisional(argument_type)
-
-            if let tuple = packed then
-                for element in tuple.arguments do
-                    if element.contains_inferred then
-                        Semantic.OBLIGATIONS.defer("pack_value", element, location)
-                    fi
-                od
-            fi
-
-            return packed
+                Semantic.ARGUMENT_PACK.is_pack_slot(shape) /\
+                !shape.arguments[Semantic.ARGUMENT_PACK.fixed_count(shape)].is_settled /\
+                Semantic.PACK_TUPLE_SOURCE().is_decided_by_another_formal(candidate.arguments, index, shape.arguments[Semantic.ARGUMENT_PACK.fixed_count(shape)])
         si
 
         // A function value whose own parameter types are still
@@ -1685,7 +1578,9 @@ namespace Syntax.Process is
                 return
             fi
 
-            let tuple = shape.arguments[0]
+            let fixed = Semantic.ARGUMENT_PACK.fixed_count(shape)
+
+            let tuple = shape.arguments[fixed]
 
             // A tuple still carrying the candidate's own unbound type
             // parameters names no type the value's parameters could take.
@@ -1693,14 +1588,14 @@ namespace Syntax.Process is
                 return
             fi
 
-            let arity = Semantic.ARGUMENT_PACK.parameter_count(argument_type)
+            let arity = Semantic.ARGUMENT_PACK.parameter_count(argument_type) - fixed
 
             if arity < 2 \/ tuple.arguments.count != arity then
                 return
             fi
 
             for i in 0..arity do
-                if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = argument_type.arguments[i] then
+                if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = argument_type.arguments[fixed + i] then
                     _logger.mark_consumed_any_if(
                         Semantic.INFERENCE_TRACE.add_lower_bound("calls.pack_value_parameters", placeholder.origin, tuple.arguments[i])
                     )
@@ -1754,13 +1649,253 @@ namespace Syntax.Process is
             return shape
         si
 
-        // A formal that wrote the pack marker past its own function
-        // type - `f: X -> T.. -> U` - is asking for the N-ary function
-        // the actual returns. Nothing here can fit it: the literal that
-        // has to be adapted is the one this actual's body evaluates to,
-        // and it is reached only once the body is walked. The depth is
-        // stamped on the actual so the literal path can carry it in.
-        _mark_nested_pack(
+        // A literal that cannot be compiled taking the pack's tuple - one
+        // that calls itself, say - is presented through a thunk like any
+        // other function value. Where the formal has settled the tuple,
+        // the literal is first walked under the other reading of the same
+        // pack, a function of the tuple's elements, so that parameters it
+        // left untyped take their types from them. Returns the type the
+        // literal then has, or the one it had.
+        // How many parameters the formal at `index` takes of its own
+        // before the pack.
+        _fixed_count_of(candidate: Semantic.Symbols.Function, index: int) -> int is
+            if index < candidate.arguments.count then
+                if let shape = _target_shape_of(candidate.arguments[index]) /\ Semantic.ARGUMENT_PACK.is_pack_slot(shape) then
+                    return Semantic.ARGUMENT_PACK.fixed_count(shape)
+                fi
+            fi
+
+            return 0
+        si
+
+        _walk_under_spread_reading(
+            candidate: Semantic.Symbols.Function,
+            index: int,
+            argument: Trees.Expressions.Expression,
+            argument_type: Type?
+        ) -> Type? is
+            let literal = parenthesised_literal(argument)
+
+            if
+                !literal? \/
+                PACKED_LITERAL.is_eligible(literal, _fixed_count_of(candidate, index)) \/
+                !candidate.get_argument_is_pack(index) \/
+                candidate.get_argument_pack_depth(index) != 0 \/
+                index >= candidate.arguments.count
+            then
+                return argument_type
+            fi
+
+            let shape = _target_shape_of(candidate.arguments[index])
+
+            if !Semantic.ARGUMENT_PACK.is_pack_slot(shape) then
+                return argument_type
+            fi
+
+            let fixed = Semantic.ARGUMENT_PACK.fixed_count(shape!)
+
+            let arity = literal.arguments.expressions.count - fixed
+
+            // One parameter in the pack's place is the tuple itself, not
+            // the pack spread out, whatever the tuple destructures into.
+            if arity < 2 \/ arity > Semantic.ARGUMENT_PACK.MAXIMUM_ARITY then
+                return argument_type
+            fi
+
+            let tuple = Semantic.SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(shape.arguments[fixed])
+
+            if !tuple.is_settled then
+                return argument_type
+            fi
+
+            let strategy = DESTRUCTURE_RESOLVER.resolve_strategy(tuple, arity)
+
+            let types = Collections.LIST[Type]()
+
+            for i in 0..fixed do
+                types.add(shape.arguments[i])
+            od
+
+            for i in 0..arity do
+                if strategy.is_deconstruct then
+                    if let element = strategy.deconstruct_function!.arguments[i].get_element_type() then
+                        types.add(element)
+                    fi
+                elif i < strategy.members.count then
+                    if let member = strategy.members[i], member_type = member.type then
+                        types.add(member_type)
+                    fi
+                fi
+            od
+
+            if types.count != fixed + arity then
+                return argument_type
+            fi
+
+            types.add(
+                if shape.is_action then
+                    _innate_symbol_lookup.get_void_type()
+                else
+                    shape.arguments[shape.arguments.count - 1]
+                fi
+            )
+
+            literal.set_expected_type(
+                _innate_symbol_lookup.get_function_type(types, shape.is_pure_function),
+                "{{0}} is not assignable to {{1}}"
+            )
+
+            _visitor.rewalk(literal)
+
+            return literal.value?.type ?? argument_type
+        si
+
+        // The value of `expression`, a function of an argument pack's
+        // elements, presented as a function of their tuple. Absent where
+        // the value is not such a function.
+        present_function_value(expression: Trees.Expressions.Expression) -> Value? is
+            let value = expression.value
+
+            if !value? \/ !value.type? \/ isa IR.Values.PACK_WRAP(value) then
+                return null
+            fi
+
+            return _pack_wrap_builder.unpack(expression, 0, expression.location, value, 0)
+        si
+
+
+        _take_spread_reading(
+            candidate: Semantic.Symbols.Function,
+            index: int,
+            argument: Trees.Expressions.Expression,
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type]
+        ) is
+            let walked = _walk_under_spread_reading(candidate, index, argument, argument_types[index])
+
+            if walked? /\ walked != argument_types[index] then
+                argument_types[index] = walked
+
+                if let value = argument.value then
+                    arguments[index] = value
+                fi
+            fi
+        si
+
+
+        // The type a function value of the pack's elements is presented at
+        // in the formal at `index`, where that formal takes the pack as
+        // one tuple and the value is settled enough to say what the tuple
+        // is. Absent otherwise.
+        _presented_pack_type(
+            owner: Trees.Node?,
+            candidate: Semantic.Symbols.Function,
+            index: int,
+            argument: Trees.Expressions.Expression,
+            argument_type: Type?
+        ) -> Type? is
+            // Only a call and an operator have the step, after a candidate
+            // has won, that wraps the value.
+            if !isa Trees.Expressions.CALL(owner) /\ !isa Trees.Expressions.BINARY(owner) then
+                return null
+            fi
+
+            if let literal = parenthesised_literal(argument) then
+                if PACKED_LITERAL.is_eligible(literal, _fixed_count_of(candidate, index)) then
+                    return null
+                fi
+            fi
+
+            if !_pack_adaptation_value_arity(candidate, index, argument, argument_type)? then
+                return null
+            fi
+
+            let fixed = _fixed_count_of(candidate, index)
+
+            if let settled = _pack_wrap_builder.packed_type(argument_type, fixed) then
+                return settled
+            fi
+
+            // A value whose parameter types are still being inferred is
+            // judged over them all the same, unless another argument is
+            // what decides the tuple: the pack binds to the tuple of
+            // placeholders, and the call resolves provisionally, so that a
+            // later use of its result has a pack to settle. What it is
+            // judged as is the formal's own shape, whose tuple is the pack
+            // that use will bind; each placeholder is an obligation of
+            // this walk.
+            if parenthesised_literal(argument)? \/ _pack_tuple_waits_for_sibling(candidate, index) then
+                return null
+            fi
+
+            let provisional = _pack_wrap_builder.packed_type(argument_type, fixed, true)
+
+            if provisional? /\ argument_type? then
+                for i in 0..Semantic.ARGUMENT_PACK.parameter_count(argument_type) do
+                    if argument_type.arguments[i].contains_inferred then
+                        Semantic.OBLIGATIONS.defer("pack_value", argument_type.arguments[i], argument.location)
+                    fi
+                od
+            fi
+
+            if !provisional? then
+                return null
+            fi
+
+            return _target_shape_of(candidate.arguments[index])
+        si
+
+        // Wraps each argument of a resolved call that is a function of
+        // the pack's elements going into a formal that takes their tuple.
+        present_pack_arguments(
+            key: Trees.Node,
+            expressions: Collections.List[Trees.Expressions.Expression],
+            function: Semantic.Symbols.Function,
+            arguments: Collections.LIST[Value]
+        ) is
+            for index in 0..arguments.count do
+                if !function.get_argument_is_pack(index) \/ function.get_argument_pack_depth(index) != 0 then
+                    continue
+                fi
+
+                let expression = expressions[index]
+
+                if !Semantic.ARGUMENT_PACK.adaptation_arity(_target_shape_of(function.arguments[index]), arguments[index].type)? then
+                    continue
+                fi
+
+                if let wrapped = _pack_wrap_builder.unpack(key, index, expression.location, arguments[index], _fixed_count_of(function, index)) then
+                    arguments[index] = wrapped
+
+                    // Whatever reads the argument.s value afterwards - a fused
+                    // pipe stage takes its callback from there - has to see the
+                    // function the formal was given.
+                    expression.compile_expressions_state.value = wrapped
+                fi
+            od
+        si
+
+        // Whether this argument is a literal written with the pack spread
+        // out that is compiled taking the pack's tuple directly.
+        _is_packable_literal(
+            candidate: Semantic.Symbols.Function,
+            index: int,
+            argument: Trees.Expressions.Expression,
+            argument_type: Type?,
+            owner: Trees.Node?
+        ) -> bool is
+            if let literal = parenthesised_literal(argument) then
+                return
+                    PACKED_LITERAL.is_eligible(literal, _fixed_count_of(candidate, index)) /\
+                    _pack_adaptation_arity(candidate, index, argument, argument_type, owner)?
+            fi
+
+            return false
+        si
+
+        // Says, beside the expected type just pushed, that the formal is
+        // one declared to take an argument pack spread out.
+        _mark_packed_literal(
             candidate: Semantic.Symbols.Function,
             index: int,
             argument: Trees.Expressions.Expression
@@ -1771,25 +1906,27 @@ namespace Syntax.Process is
 
             let depth = candidate.get_argument_pack_depth(index)
 
-            if depth <= 0 then
+            // Where another argument decides the tuple and has not yet, the
+            // literal stays as written until a walk on which it has.
+            if depth == 0 /\ _pack_tuple_waits_for_sibling(candidate, index) then
                 return
             fi
 
-            if let literal: Trees.Expressions.FUNCTION = argument then
-                literal.expected_pack_depth = depth
+            if parenthesised_literal(argument)? then
+                argument.set_expects_pack(depth)
             fi
         si
 
-        // The arity to eta-expand this argument with when the formal it
-        // is going into was declared to take an argument pack spread out
-        // - `f: T.. -> U` - and absent otherwise.
+        // How many of this argument's parameters the pack stands for, when
+        // the formal it is going into was declared to take an argument
+        // pack spread out - `f: T.. -> U` - and absent otherwise.
         //
-        // Such a formal takes a one-parameter function, since the pack
-        // binds to a positional tuple. An actual that is a function of
-        // two or more parameters describes the same call with the pack
-        // spread out, and is adapted to the shape the formal asks for.
-        // Arity one needs no adaptation, and anything past the tuple
-        // limit has no tuple to bind to.
+        // Such a formal takes a function whose last parameter is the
+        // tuple the pack binds to. An actual with two or more parameters
+        // in its place describes the same call with the pack spread out,
+        // and is presented in the shape the formal asks for. One
+        // parameter there needs no presenting, and anything past the
+        // tuple limit has no tuple to bind to.
         _pack_adaptation_arity(
             candidate: Semantic.Symbols.Function,
             index: int,
@@ -1803,7 +1940,7 @@ namespace Syntax.Process is
 
             // A marker written past the formal's own function type is
             // about the function the actual returns, not the actual, so
-            // there is nothing to adapt here.
+            // there is nothing to present here.
             if candidate.get_argument_pack_depth(index) != 0 then
                 return null
             fi
@@ -1818,20 +1955,18 @@ namespace Syntax.Process is
                 return null
             fi
 
-            // The wrapper takes the pack's tuple as its one parameter, and
-            // once spliced in it is never rebuilt. Where another argument
-            // decides that tuple - the element type of a pipe whose source
-            // has not yet been inferred - building it now would pin the
-            // literal's parameters to a placeholder for good, so it waits
-            // for a walk on which that argument has settled it. Where only
-            // the literal itself can decide it, adapting is how it gets
-            // decided.
+            // Where another argument decides the tuple - the element type
+            // of a pipe whose source has not yet been inferred - settling
+            // it from this one would pin a literal's parameters to a
+            // placeholder, so it waits for a walk on which that argument
+            // has settled it. Where only this argument can decide it,
+            // presenting it is how it gets decided.
             if _pack_tuple_waits_for_sibling(candidate, index) then
                 return null
             fi
 
-            // A literal is adapted where it stands; anything else has to
-            // be a function this can call by name in the wrapper's body.
+            // A literal is compiled where it stands; anything else has to
+            // name a function.
             // A call argument in parentheses - the subject of a `|>` has to
             // be written that way - is still one, and so is an operator
             // operand, which is always parenthesised. Either way a context
@@ -1849,21 +1984,11 @@ namespace Syntax.Process is
                 fi
 
             if literal? then
-                // An already-adapted operand - a wrapper a prior retry
-                // pass spliced in over the original - is done: wrapping
-                // it again nests the wrappers and re-walks a literal
-                // whose value is already committed, which is what
-                // produced the invalid IL this guards against.
-                if literal.is_pack_adapter then
-                    return null
-                fi
-
                 return arity
             fi
 
-            // A method named on an instance is included: the wrapper
-            // re-walks the reference in its body, so the receiver is
-            // reached there exactly as a hand-written lambda would.
+            // A method named on an instance is included: the delegate
+            // over it carries its receiver.
             if let delegate: Load.DELEGATE = argument.value then
                 if delegate.referenced_function? then
                     return arity
@@ -1887,14 +2012,13 @@ namespace Syntax.Process is
             return null
         si
 
-        // The arity to eta-expand a general function-typed operand with
-        // when the formal it is going into was declared to take an
-        // argument pack spread out. The expression is not re-walked into
-        // the wrapper - re-running it per wrapper call would break the
-        // evaluate-once presentation - so its already-computed value is
-        // hoisted into a local the wrapper captures instead. Absent when
-        // the formal is not a pack formal or the operand is not a
-        // function value of two or more parameters.
+        // How many of a function-valued operand's parameters the pack
+        // stands for, when the formal it is going into was declared to
+        // take an argument pack spread out. The operand is evaluated once
+        // where it stands and presented through a thunk that captures the
+        // value. Absent when the formal is not a pack formal or the
+        // operand is not a function value with two or more parameters in
+        // the pack's place.
         _pack_adaptation_value_arity(
             candidate: Semantic.Symbols.Function,
             index: int,
@@ -1914,13 +2038,6 @@ namespace Syntax.Process is
 
             let formal = if index < candidate.arguments.count then candidate.arguments[index] else null fi
 
-            // The value-arity reading applies to an operand standing in
-            // the tree, not to a wrapper a prior retry pass already
-            // spliced in over it: the wrapper's value is committed.
-            if isa Trees.Expressions.FUNCTION(argument) /\ argument.is_pack_adapter then
-                return null
-            fi
-
             return Semantic.ARGUMENT_PACK.adaptation_arity(_target_shape_of(formal), argument_type)
         si
 
@@ -1928,9 +2045,7 @@ namespace Syntax.Process is
         // marker - `retry[T.., U](f: T.. -> U, n: int) -> T.. -> U` -
         // resolves to the tuple-in function type the declaration names.
         // Where this call binds the pack to a concrete tuple, the
-        // result is re-presented as the corresponding N-ary function:
-        // the call's value becomes `(a0, .., an) => call((a0, .., an))`,
-        // built and walked in place. Depth past the outermost return
+        // result is presented as the corresponding N-ary function. Depth past the outermost return
         // is left as the tuple-in shape; the marker there names a
         // function the result itself returns, one the caller reaches
         // through its own call.
@@ -1940,16 +2055,13 @@ namespace Syntax.Process is
             call_receiver: IR.Values.Value?,
             arguments: Collections.LIST[IR.Values.Value]
         ) -> bool is
-            let wrapped = wrap_return_pack(function, call.location, call_receiver, arguments, call.arguments.expressions, arity => call.return_pack_state.take_spare(arity))
+            let wrapped = wrap_return_pack(call, function, call.location, call_receiver, arguments)
 
             if !wrapped? then
                 return false
             fi
 
-            call.return_pack_literal = wrapped.literal
-            call.return_pack_state.hoist = wrapped.hoist
-
-            call.compile_expressions_state.value = wrapped.value
+            call.compile_expressions_state.value = wrapped
 
             return true
         si
@@ -1957,22 +2069,19 @@ namespace Syntax.Process is
         // The call-boundary presentation a pack-marked declared return
         // type asks for: `retry[T.., U](f: T.. -> U, n: int) -> T.. -> U`
         // resolves to the tuple-in function type the declaration names.
-        // Where this call binds the pack to a concrete tuple, the
-        // result is re-presented as the corresponding N-ary function:
-        // the call's value is computed once, stored in a hoisted local
-        // the wrapper closure captures, and the wrapper becomes the
-        // call's value. The wrapper literal comes back alongside, for
-        // the caller to record on its tree node - that is where
-        // generate-il finds it to emit the closure body. Null when this
-        // call is not one the presentation applies to.
+        // Where this call binds the pack to a concrete tuple, the result
+        // is presented as the corresponding N-ary function: the call's
+        // own value is computed once, where the call stands, and a thunk
+        // taking the elements packs them and calls it. `key` is the node
+        // the call is compiled for. Null when this call is not one the
+        // presentation applies to.
         wrap_return_pack(
+            key: Trees.Node,
             function: Semantic.Symbols.Function,
             location: Source.LOCATION,
             call_receiver: IR.Values.Value?,
-            arguments: Collections.LIST[IR.Values.Value],
-            operands: Collections.List[Trees.Expressions.Expression],
-            take_spare: (int) -> (hoist: Semantic.Symbols.Symbol, literal: Trees.Expressions.FUNCTION)?
-        ) -> (value: IR.Values.Value, literal: Trees.Expressions.FUNCTION, hoist: Semantic.Symbols.Symbol)? is
+            arguments: Collections.LIST[IR.Values.Value]
+        ) -> IR.Values.Value? is
             if function.return_pack_depth != 0 then
                 return null
             fi
@@ -1981,109 +2090,32 @@ namespace Syntax.Process is
             // since settled; the stored composite is not rewritten when
             // they do, so it is read through the resolver here.
             let declared = if let rt = function.return_type then Semantic.SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(rt) else null fi
-            if !Semantic.ARGUMENT_PACK.is_pack_slot(declared) then
+
+            if !declared? \/ !Semantic.ARGUMENT_PACK.is_pack_slot(declared) then
                 return null
             fi
 
-            let pack_parameter = declared!.arguments[0]
-            if
-                !(pack_parameter.is_value_tuple \/ isa Semantic.Types.TUPLE(pack_parameter)) \/
-                pack_parameter.arguments.count < 2 \/
-                pack_parameter.arguments.count > Semantic.ARGUMENT_PACK.MAXIMUM_ARITY \/
-                pack_parameter.contains_inferred
-            then
+            let fixed = Semantic.ARGUMENT_PACK.fixed_count(declared)
+
+            if !_pack_wrap_builder.spread_type(declared, fixed)? then
                 return null
             fi
 
-            let elements = Collections.LIST[Type]()
-
-            for element in pack_parameter.arguments do
-                elements.add(element)
-            od
-
-            // The wrapper an earlier walk of this node declared serves
-            // again, retyped to what the pack binds to on this walk.
-            let adapted mut = take_spare(elements.count)
-
-            if let reused = adapted then
-                if let settable: Semantic.Types.SettableTyped = reused.hoist then
-                    settable.set_type(declared!)
-                fi
-            else
-                adapted = _function_reference_adapter.try_adapt_return_packed(location, elements, declared!)
-            fi
-
-            if !adapted? then
-                return null
-            fi
-
-            let use retry_site = RETRY_SITE_STATS.enter("calls.wrap_return_pack", RetrySiteKind.ALTERNATIVE)
-
-            // The walk being discarded may have put a bound on a
-            // placeholder that an already-built closure still names; the
-            // retry loop rebuilds that closure only if the progress
-            // signal survives the roll back.
-            let discarded_walk = _logger.roll_back()
-
-            _logger.speculate()
-            _flow.restore()
-
-            // The operands were walked under the speculation the roll back
-            // discarded, and the call below reuses their values: walked
-            // again, so what they reported is not lost with it.
-            if operands.count == arguments.count then
-                for i in 0..operands.count do
-                    let operand = operands[i]
-
-                    _visitor.rewalk(operand)
-
-                    if let operand.value? then
-                        arguments[i] = value
-                    else
-                        arguments[i] = DUMMY(Semantic.Types.ERROR(), operand.location)
-                    fi
-                od
-            fi
-
-            _logger.mark_consumed_any_if(discarded_walk.has_consumed_any)
-
-            if discarded_walk.has_consumed_error then
-                _logger.mark_consumed_error()
-            fi
-
-            try
-                _visitor.rewalk(adapted.literal)
-
-                if let wrapper = adapted.literal.value /\ wrapper.type? then
-                    // The call's own value is computed once, where the
-                    // call stands, and stored in the hoisted local the
-                    // wrapper's closure captures.
-                    let inner =
-                        function.call(location, call_receiver, arguments, null, _function_caller)
-
-                    let result = IR.Values.BLOCK(wrapper.type!)
-
-                    result.add(IR.Values.DECLARE_LOCAL(adapted.hoist.il_name, declared!))
-                    result.add(IR.Values.Store.LOCAL_VARIABLE(adapted.hoist, inner))
-                    result.add(wrapper)
-
-                    return (value = cast IR.Values.Value(result), literal = adapted.literal, hoist = adapted.hoist)
-                fi
-            yrt
-
-            return null
+            return
+                _pack_wrap_builder.pack(
+                    key,
+                    -1,
+                    location,
+                    function.call(location, call_receiver, arguments, null, _function_caller),
+                    declared,
+                    fixed
+                )
         si
 
-        // The type the wrapper's one physical parameter is declared as
-        // when an N-ary actual is adapted to a pack formal. The slot's
-        // own element type is what the pack binds to, so that is the
-        // answer where the call has already settled it; the actual's
-        // written parameter types are the fallback, which is what lets
-        // the type argument be inferred when nothing else pins the
-        // slot. A written tuple the slot disagrees with is not papered
-        // over here - the wrapper walks under the slot's type, and the
-        // ordinary check against the inner literal's written formals
-        // reports the difference.
+        // The tuple the pack formal at `index` binds to. The formal's own
+        // element type is the answer where the call has already settled
+        // it; the actual's parameter types are the fallback, which is what
+        // lets the type argument be inferred when nothing else pins it.
         _packed_group_type(
             candidate: Semantic.Symbols.Function,
             index: int,
@@ -2093,8 +2125,8 @@ namespace Syntax.Process is
             let shape = _target_shape_of(formal)
 
             if let s: Type = shape then
-                if s.is_function /\ s.arguments.count > 0 then
-                    let element = s.arguments[0]
+                if Semantic.ARGUMENT_PACK.is_pack_slot(s) then
+                    let element = s.arguments[Semantic.ARGUMENT_PACK.fixed_count(s)]
 
                     if !element.is_error /\ !element.contains_inferred /\ !element.is_wild then
                         return element
@@ -2102,39 +2134,40 @@ namespace Syntax.Process is
                 fi
             fi
 
-            return Semantic.ARGUMENT_PACK.packed_parameters(argument_type)
+            return Semantic.ARGUMENT_PACK.packed_parameters(argument_type, _fixed_count_of(candidate, index))
         si
 
-        // A pack adapter's parameter is typed before the literal it
-        // wraps is walked, so element names that only the literal's
-        // result gives the pack reach the settled slot but not the
-        // adapter. Where the two differ in nothing but those names, the
-        // adapter takes the slot's, as it would have had the call been
-        // written with its type arguments.
-        _settle_pack_adapter_names(function: Semantic.Symbols.Function, argument_expressions: Collections.List[Trees.Expressions.Expression]) is
+        // A literal compiled taking the pack's tuple was typed before the
+        // call settled the pack, so element names that only its own
+        // result gives the pack reach the settled formal but not the
+        // literal. Where the two differ in nothing but those names, the
+        // literal's one physical parameter takes the formal's, as it
+        // would have had the call been written with its type arguments.
+        _settle_packed_literal_names(function: Semantic.Symbols.Function, argument_expressions: Collections.List[Trees.Expressions.Expression]) is
             for index in 0..argument_expressions.count do
-                if
-                    let adapter: Trees.Expressions.FUNCTION = argument_expressions[index] /\
-                    adapter.is_pack_adapter /\
-                    adapter.arguments.expressions.count == 1
-                then
-                    let settled = _packed_group_type(function, index, null)
-
+                if let literal = parenthesised_literal(argument_expressions[index]) then
                     if
-                        let closure: Semantic.Symbols.Closure = _symbol_table.scope_for(adapter) /\
-                        settled? /\
-                        closure.arguments.count == 1 /\
-                        closure.arguments[0] != settled /\
-                        closure.arguments[0].is_equivalent_to(settled) /\
-                        settled.is_equivalent_to(closure.arguments[0])
+                        let closure: Semantic.Symbols.Closure = _symbol_table.scope_for(literal) /\
+                        closure.packed_parameters? /\
+                        closure.arguments.count >= 1
                     then
-                        if let formal: Trees.Expressions.VARIABLE = adapter.arguments.expressions[0] then
-                            if let settable: Semantic.Types.SettableTyped = closure.find_direct(formal.name.name) then
-                                settable.set_type(settled)
-                            fi
-                        fi
+                        let settled = _packed_group_type(function, index, null)
 
-                        closure.arguments = Collections.LIST[Type]([settled])
+                        let last = closure.arguments.count - 1
+
+                        if
+                            settled? /\
+                            closure.arguments[last] != settled /\
+                            closure.arguments[last].is_equivalent_to(settled) /\
+                            settled.is_equivalent_to(closure.arguments[last])
+                        then
+                            let physical = Collections.LIST[Type](closure.arguments)
+
+                            physical[last] = settled
+
+                            closure.pack_group?.set_type(settled)
+                            closure.arguments = physical
+                        fi
                     fi
                 fi
             od
@@ -2449,34 +2482,21 @@ namespace Syntax.Process is
                 let argument mut = a
                 let is_packed mut = false
 
-                // An N-ary function going into a slot that takes an
-                // argument pack is wrapped here, before the formal is
-                // pushed: the wrapper is what the slot's one-parameter
-                // shape fits, and the original walks inside it.
                 _bound_value_parameters_from_pack(push_function, index, argument_types[index])
 
-                _mark_nested_pack(push_function, index, a)
+                _take_spread_reading(push_function, index, a, arguments, argument_types)
 
-                if let pack_arity = _pack_adaptation_arity(push_function, index, a, argument_types[index], cache_key) then
-                    if
-                        let literal =
-                            _function_reference_adapter.try_adapt_packed(
-                                a,
-                                pack_arity,
-                                _packed_group_type(push_function, index, argument_types[index])
-                            ) /\
-                        _splice(cache_key, a, index, literal)
-                    then
-                        argument = literal
-                        is_packed = true
-                    fi
+                if let presented = _presented_pack_type(cache_key, push_function, index, a, argument_types[index]) then
+                    argument_types[index] = presented
+
+                    continue
                 fi
 
-                if isa Trees.Expressions.FUNCTION(argument) /\ argument.is_pack_adapter /\ argument.value? then
-                    // Already adapted and walked once by the after-null
-                    // retry; keep the committed value at the loop tail.
-                    argument_types[index] = argument.value!.type!
-                elif
+                if _is_packable_literal(push_function, index, a, argument_types[index], cache_key) then
+                    is_packed = true
+                fi
+
+                if
                     is_packed \/
                     (
                         argument.value? /\
@@ -2489,6 +2509,7 @@ namespace Syntax.Process is
                     let f = push_function.arguments[index]
 
                     argument.set_expected_type(f, "{{0}} is not assignable to {{1}}")
+                    _mark_packed_literal(push_function, index, argument)
                     _visitor.rewalk(argument)
 
                     if let argument.value? /\ value.type? then
@@ -2770,7 +2791,8 @@ namespace Syntax.Process is
                         )
                     fi
 
-                    _settle_pack_adapter_names(function, call.arguments.expressions)
+                    _settle_packed_literal_names(function, call.arguments.expressions)
+                    present_pack_arguments(call, call.arguments.expressions, function, arguments)
 
                     let accessor_class = _symbol_table.current_accessor
 

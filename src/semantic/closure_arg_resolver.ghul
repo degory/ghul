@@ -1,6 +1,7 @@
 namespace Semantic is
     use Logging
     use Types.Type
+    use Ghul.Pipes
 
     // Resolve closure argument types from the lambda's AST argument
     // expressions, mutating each argument symbol's `.type` and
@@ -56,6 +57,174 @@ namespace Semantic is
             let argument_names = Collections.LIST[string]()
             let argument_types = Collections.LIST[Type]()
 
+            if !_resolve_all(arguments, closure, implied_argument_types, argument_names, argument_types, null) then
+                return false
+            fi
+
+            closure.packed_parameters = null
+            closure.arguments = Collections.LIST[Type](argument_types)
+            closure.argument_names = argument_names
+
+            return true
+        si
+
+        // The same resolution for a literal written with an argument pack
+        // spread out, going into a formal that takes the pack as one
+        // tuple. The parameters stay the ones the literal declared, typed
+        // from the tuple's elements where it has settled and as any other
+        // parameter is where it has not. The closure is recorded taking
+        // the tuple, so the type it has is the formal's own shape.
+        resolve_packed(
+            arguments: Collections.List[Syntax.Trees.Expressions.Expression],
+            closure: Symbols.Closure,
+            expected_tuple: Type?,
+            fixed_types: Collections.List[Type]
+        ) -> bool is
+            let fixed = fixed_types.count
+            let pack_count = arguments.count - fixed
+
+            let group = closure.pack_group ?? Symbols.LOCAL_ARGUMENT(closure.location, closure, "$pack")
+
+            group.is_defined = true
+
+            closure.pack_group = group
+
+            // What the formal says the tuple is, where it says something a
+            // parameter can take. Where it does not - the tuple is another
+            // function's own type parameters, or a guess that does not
+            // destructure - the tuple is whatever resolving the call has
+            // bound the literal's one physical parameter to so far.
+            let implied =
+                _elements_of(if expected_tuple? then SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(expected_tuple) else null fi, pack_count, closure) ??
+                _elements_of(group.try_get_inferred_type(), pack_count, closure)
+
+            let argument_names = Collections.LIST[string]()
+            let argument_types = Collections.LIST[Type]()
+            let symbols = Collections.LIST[Symbols.Variable]()
+
+            // By position: the formal's own parameters first, then the
+            // pack's elements where they are known.
+            let implied_types = Collections.LIST[Type]()
+
+            for fixed_type in fixed_types do
+                // A parameter of the formal's own that nothing has settled
+                // yet is not a type a parameter can take. An error type in
+                // its place is one no parameter takes, which leaves that
+                // parameter to be inferred from the body.
+                implied_types.add(if fixed_type.is_settled then fixed_type else Types.ERROR() fi)
+            od
+
+            if let known = implied then
+                implied_types.add_range(known.elements)
+            fi
+
+            if !_resolve_all(arguments, closure, implied_types, argument_names, argument_types, symbols) then
+                return false
+            fi
+
+            let element_types = Collections.LIST[Type]()
+            let packed = Collections.LIST[Symbols.Variable]()
+
+            for i in fixed..arguments.count do
+                element_types.add(argument_types[i])
+                packed.add(symbols[i])
+            od
+
+            // A parameter written with a type is filled from the element
+            // at its position, so that element has to be one it accepts.
+            if let known = implied then
+                for i in 0..pack_count do
+                    let written = element_types[i]
+
+                    if written.is_settled /\ !written.is_assignable_from(known.elements[i]) then
+                        _logger.error(
+                            arguments[fixed + i].location,
+                            "expected argument of type {written} but {known.elements[i]} supplied"
+                        )
+                    fi
+                od
+            fi
+
+            let group_type: Type mut
+
+            if let known = implied then
+                group_type = known.tuple
+            elif element_types |> all(t => t.is_settled) then
+                // Nothing else says what the tuple is, so the parameters do.
+                group_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_tuple_type(element_types, null)
+            else
+                // Still open: the one physical parameter stands for it, so
+                // that resolving the call against the literal can bind it.
+                let placeholder = Types.INFERRED_VARIABLE_TYPE(group)
+
+                OBLIGATIONS.defer("parameter", placeholder, null)
+
+                group_type = placeholder
+            fi
+
+            group.set_type(group_type)
+
+            let physical_types = Collections.LIST[Type]()
+            let physical_names = Collections.LIST[string]()
+
+            for i in 0..fixed do
+                physical_types.add(argument_types[i])
+                physical_names.add(argument_names[i])
+            od
+
+            physical_types.add(group_type)
+            physical_names.add("$pack")
+
+            closure.packed_parameters = packed
+            closure.arguments = physical_types
+            closure.argument_names = physical_names
+
+            return true
+        si
+
+        // The types `tuple` destructures into by position, where it is
+        // settled, names nothing out of the literal's scope, and has
+        // `count` elements. Absent otherwise.
+        _elements_of(
+            tuple: Type?,
+            count: int,
+            closure: Symbols.Closure
+        ) -> (tuple: Type, elements: Collections.LIST[Type])? is
+            if !tuple? \/ !tuple.is_settled \/ !_is_implied_type_usable(tuple, closure) then
+                return null
+            fi
+
+            let strategy = Syntax.Process.DESTRUCTURE_RESOLVER.resolve_strategy(tuple, count)
+
+            let elements = Collections.LIST[Type]()
+
+            for i in 0..count do
+                if strategy.is_deconstruct then
+                    if let element_type = strategy.deconstruct_function!.arguments[i].get_element_type() then
+                        elements.add(element_type)
+                    fi
+                elif i < strategy.members.count then
+                    if let member = strategy.members[i], member_type = member.type then
+                        elements.add(member_type)
+                    fi
+                fi
+            od
+
+            if elements.count != count then
+                return null
+            fi
+
+            return (tuple = tuple, elements = elements)
+        si
+
+        _resolve_all(
+            arguments: Collections.List[Syntax.Trees.Expressions.Expression],
+            closure: Symbols.Closure,
+            implied_argument_types: Collections.List[Type]?,
+            argument_names: Collections.LIST[string],
+            argument_types: Collections.LIST[Type],
+            symbols: Collections.LIST[Symbols.Variable]?
+        ) -> bool is
             for index in 0..arguments.count do
                 let a = arguments[index]
 
@@ -101,6 +270,10 @@ namespace Semantic is
 
                 argument_types.add(argument_type)
 
+                if symbols? then
+                    symbols.add(symbol)
+                fi
+
                 // The physical argument's type is what the pattern
                 // unpacks; push it through the leaves so the body sees
                 // each bound name at its element type.
@@ -108,9 +281,6 @@ namespace Semantic is
                     _assign_destructure_element_types(left, argument_type, closure)
                 fi
             od
-
-            closure.arguments = Collections.LIST[Type](argument_types)
-            closure.argument_names = argument_names
 
             return true
         si
