@@ -1098,6 +1098,35 @@ Where the first character does not say what is meant, a `@precedence` pragma pla
 ∘(f: (int) -> int, g: (int) -> int) -> (int) -> int => x => f(g(x));
 ```
 
+An operator is an ordinary function, so its name is a value wherever a function
+of its shape is expected. The name is written with the backtick escape, since
+an operator is not an identifier:
+
+```ghul
+struct N(v: int public);
+
+⊕(a: N, b: N) -> N => N(a.v + b.v);
+
+let totals = values |> reduce(N(0), `⊕);
+```
+
+A static member operator is named through its type, and reads the same way:
+
+```ghul
+struct V(x: int public) is
+    +(a: V, b: V) -> V static pure => V(a.x + b.x)
+si
+
+let total = vectors |> reduce(V(0), V.`+);
+```
+
+The built-in operators on the scalar types are the exception. They are
+instructions rather than methods, so there is no function to take the value of,
+and naming one is an error: `cannot take the value of built-in operator '+'`.
+An instance member is not a value either, operator or not, since it needs a
+receiver. What that rules out is `int.`+`` and `string.`=~``; a function literal
+says the same thing and is what to write instead.
+
 ## equality
 
 ghūl has two equality operators, and they ask different questions.
@@ -1799,15 +1828,23 @@ let total = scores["alice"];
 
 A map computed from a sequence takes a key and a value function instead, `words |> collect_map(w => w, w => w.length)`, and one that starts empty and is filled later is constructed with no arguments, `MAP()`, its types taken from how it is used.
 
-The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `collect` / `collect_list` / `collect_array` / `collect_set` / `collect_map`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`.
+The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `sum`, `product`, `collect` / `collect_list` / `collect_array` / `collect_set` / `collect_map`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`.
 
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
 let evens = numbers |> filter(x => x % 2 == 0);
 let doubled = numbers |> map(x => x * 2);
-let sum = numbers |> reduce(0, (acc, x) => acc + x);
+let total = numbers |> sum();                       // 15
+let folded = numbers |> reduce(1, (acc, x) => acc * x);
 let odd = numbers |> count(x => x % 2 == 1);        // 3, the elements the predicate accepts
 ```
+
+`sum` and `product` total a sequence of any of the numeric types, taking the
+element type from the sequence, so neither needs a seed. Addition and
+multiplication each have an identity, so the total of an empty sequence is `0`
+or `1` rather than an absent value, which is where the two differ from `min` and
+`max`: those answer with a `MAYBE[T]`, since there is no least element of
+nothing.
 
 A pipe is a cursor over its source. Read part way and then read again — by the same consumer or another, through `for`, a combinator, a terminal or interpolation — it carries on from wherever the last read stopped; nothing distinguishes those cases. Once it has run out it rewinds itself, so the next read starts from the beginning: `for x in p` twice sees every element twice, and `p |> count()` followed by `p |> only()` walks the whole sequence both times. A stage reaching its own end counts as the end of everything below it, so `p |> take(2)` yields the first two elements every time it is read, and `skip` is how to page. The rewind is in place, so every holder of the pipe sees it start over. `p.reset()` rewinds early. Nothing disposes on its own: `p.dispose()` on a combinator chain releases every iterator its stages hold, file readers included, while a generator's `dispose()` releases nothing - it does not run the body's `finally` clauses or dispose an iterator the body is walking with `yield in`. `memo` is the one stage whose rewind never asks its source again — it replays what it cached.
 
