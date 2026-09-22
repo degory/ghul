@@ -118,9 +118,13 @@ compiler's own emission looks like.
 
 ## Testing
 
-Everything below must pass before a pull request can merge, and CI runs all of
-it on every pull request. Run what is relevant to your change locally; there is
-no need to run the whole suite yourself, because CI will.
+Everything below must pass before a pull request can merge. A pull request's
+own CI run is the entry check for the merge queue - the bootstrap, the unit
+tests, the analysis tests and a smoke subset of the integration tests - and
+the merge queue then runs all of it on the pull request merged with `main`
+and with anything queued ahead of it, before the merge happens. Run what is
+relevant to your change locally; there is no need to run the whole suite
+yourself, because the queue will.
 
 | Suite | Command | Time | Notes |
 |---|---|---|---|
@@ -260,7 +264,9 @@ Other things worth knowing:
 - Keep the title under about seventy characters. Don't append the pull request
   number - GitHub does that on merge.
 - Every pull request needs a passing CI run and an approving review before it
-  can merge, and its branch must be up to date with `main`.
+  can enter the merge queue, which tests it against `main` as it will land
+  and merges it as one squashed commit. Pull requests that are ready at the
+  same time are tested and released together.
 - Source files use Unix line endings. The one deliberate exception is
   `integration-tests/parse/carriage-returns/test.ghul`, which is test data.
 - If a test fails and you cannot see how your change caused it, say so in the
@@ -296,7 +302,7 @@ knowing before they surprise you:
   for a while. This is normal and is not a problem with your branch.
 - **The tests run on GitHub's runners rather than this repository's**, so they
   are slower than the timings above. Everything else about them is the same, and
-  the full suite still has to pass.
+  the full suite still has to pass in the merge queue.
 - **Two jobs are skipped.** GitHub withholds repository secrets from a fork - 
   correctly, since anyone can open a pull request. The automated code review and
   the beta package publish both need them, so both sit out. A maintainer reviews

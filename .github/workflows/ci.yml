@@ -6,6 +6,8 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+  merge_group:
+
   push:
     branches: [main]
 
@@ -28,12 +30,16 @@ concurrency:
 # harness's parallelism, not a larger runner - past 8 vCPU buys nothing,
 # because the bottleneck is per-test compiler-subprocess IPC.
 #
-# A push to main is the release build, and it does not repeat the suite the
-# pull request just passed: `version` checks that the merged tree is the one
-# the pull request's run tested, and when it is, only the bootstrap, a smoke
-# test of the packed tool, and the publish run - see `version` for the
-# reasoning and the fallback. The test jobs are gated on its `full_suite`
-# output, and `gate` is where the two shapes are reconciled into one verdict.
+# Three events, three shapes. A pull request runs the entry gate for the
+# merge queue: bootstrap, unit tests, analysis tests and the smoke-tagged
+# integration subset. The merge queue's run (`merge_group`) is the one whose
+# result binds: the full suite, on the group's combined tree, and the
+# packages it packs are the release. A push to main is the release build,
+# and on the happy path it builds nothing: `version` finds the merge queue's
+# run for this very commit, carries its packages, and only the publish
+# runs. The test jobs are gated on `version`'s `build` and `full_suite`
+# outputs, and `gate` is where the three shapes are reconciled into one
+# verdict - see `version` for the reasoning and the fallback.
 #
 # This is a default for well-meant contributions, not a control. A `pull_request`
 # run uses the workflow file from the pull request itself, so a contributor can
@@ -60,6 +66,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       package: ${{ steps.version.outputs.package }}
       compiler: ${{ steps.compiler_version.outputs.compiler }}
+      build: ${{ steps.compiler_version.outputs.build }}
       full_suite: ${{ steps.compiler_version.outputs.full_suite }}
 
     permissions:
@@ -77,6 +84,30 @@ jobs:
     # in a commit or PR body can no longer trigger a bump). Pull request builds
     # get a -beta.<run> prerelease so they never collide with a real release.
     # The action only reads the repo - it never tags or releases.
+    #
+    # The merge queue's run packs the release, so its version has to be the
+    # one the release build will compute, and that is the patch bump of the
+    # latest tag. A release build still in flight on main has not tagged
+    # yet, so wait for it before choosing; a version chosen too early is
+    # caught at the release build, which then rebuilds, but costs a full
+    # run.
+    - name: Wait for any release build in flight
+      if: github.event_name == 'merge_group'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        for _ in $(seq 1 60); do
+          active=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=5" \
+                     --jq '[.workflow_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo 0)
+          [ "${active}" = 0 ] && break
+          echo "waiting for ${active} release build(s) on main to finish"
+          sleep 10
+        done
+        [ "${active}" = 0 ] || echo "::warning::a release build on main is still running after ten minutes; if it tags the version chosen below, the release build will rebuild rather than publish this run's packages"
+        # The checkout above took the tags as they were; a release that
+        # finished during the wait tagged since.
+        git fetch --tags origin
+
     - name: Determine the version
       id: version
       uses: ghul-lang/create-version@v1.0.0
@@ -84,30 +115,35 @@ jobs:
         prerelease: ${{ github.event_name == 'pull_request' && format('beta.{0}', github.run_number) || '' }}
 
     # Resolve the ghul.compiler version that bootstraps this build, and
-    # decide whether this run owes the test suite.
+    # decide what this run owes: `build` says whether it bootstraps and
+    # tests at all, `full_suite` whether it runs the whole suite or only
+    # the entry gate.
     #
     # On a pull request: the latest published version that is actually
     # downloadable from NuGet (skipping a release still propagating), and
-    # the suite always runs.
+    # the entry gate - bootstrap, unit, analysis and smoke tests.
     #
-    # On a push to main (the release build): reuse the exact version the
-    # merged PR's CI resolved, read from that run's artifact - so the
-    # release is bootstrapped with the compiler it was tested with, and
-    # a compiler published since the PR ran cannot break the release.
-    # The same artifact carries the tree the PR's run tested. Branch
-    # protection requires a pull request to be up to date with main before
-    # it merges, and the merge is a squash, so the commit that lands is
-    # the tree the pull request's run checked out and tested, with the
-    # same bootstrap compiler. When the two trees match, the suite has
-    # already passed on exactly this source and is not run again: the
-    # release build bootstraps, smoke-tests the package, and publishes.
-    # When they do not match - a direct push, a run that could not be
-    # found, a carry that failed - nothing is known about this tree and
-    # the full suite runs as it does on a pull request.
+    # On the merge queue's run: the same resolution, and the full suite.
+    # The queue tests the group's combined tree, and what it packs is what
+    # the release publishes, so this run also waits for any release build
+    # still in flight on main before choosing a version: the version is
+    # the patch bump of the latest tag, and a release that has not tagged
+    # yet would otherwise be given the same number.
     #
-    # Both values are published as the `bootstrap-compiler-version`
-    # artifact; on a release run that is the diagnostic record of what
-    # compiled the release, for as long as the artifact is retained.
+    # On a push to main (the release build): the merge queue fast-forwards
+    # main to the very commit its run tested, so that run is found by this
+    # commit's sha. When it passed and packed this run's version, its
+    # packages are carried into this run as the release artefacts and
+    # nothing is built or tested again: what was tested is what ships.
+    # When it cannot be found, failed, or packed another version - a direct
+    # push, a version taken by a release that tagged after the queue run
+    # chose - nothing is known about this tree, and the full suite runs and
+    # packs the release here as it would have in the queue.
+    #
+    # The bootstrap compiler version is published as the
+    # `bootstrap-compiler-version` artifact; on a release run that is the
+    # diagnostic record of what compiled the release, for as long as the
+    # artifact is retained.
     - name: Determine bootstrap compiler version
       id: compiler_version
       shell: bash
@@ -115,8 +151,6 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-
-        tree=$(git rev-parse 'HEAD^{tree}')
 
         resolve_latest() {
           local versions v
@@ -140,59 +174,64 @@ jobs:
         }
 
         compiler=""
+        build=true
         full_suite=true
-        if [ "${{ github.event_name }}" = "push" ]; then
-          # Release build: carry the version the merged PR's CI resolved,
-          # and the tree it tested.
-          pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
-                 --jq 'first(.[].number) // empty' 2>/dev/null || true)
-          if [ -n "${pr}" ]; then
-            head=$(gh api "repos/${{ github.repository }}/pulls/${pr}" --jq '.head.sha' 2>/dev/null || true)
-            run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${head}&event=pull_request" \
-                    --jq 'first(.workflow_runs[].id) // empty' 2>/dev/null || true)
-            # The merge fires when the required checks pass, and this run
-            # starts seconds later - while the pull request's run is still
-            # finishing its beta publish. Wait for it to complete before
-            # judging it; a run that never does, or fails, carries nothing.
-            conclusion=""
-            if [ -n "${run}" ]; then
-              for _ in $(seq 1 30); do
-                status=$(gh api "repos/${{ github.repository }}/actions/runs/${run}" --jq '.status' 2>/dev/null || true)
-                [ "${status}" = completed ] && break
-                echo "waiting for run ${run} (${status:-unknown})"
-                sleep 10
-              done
-              conclusion=$(gh api "repos/${{ github.repository }}/actions/runs/${run}" --jq '.conclusion' 2>/dev/null || true)
-            fi
-            if [ "${conclusion}" = success ] && gh run download "${run}" -n bootstrap-compiler-version -D carried 2>/dev/null; then
-              compiler=$(tr -d '[:space:]' < carried/bootstrap-compiler-version.txt)
-              tested=$(tr -d '[:space:]' < carried/tested-tree.txt 2>/dev/null || true)
-              if [ -n "${tested}" ] && [ "${tested}" = "${tree}" ]; then
-                full_suite=false
-                echo "tree ${tree} passed the suite in run ${run} for PR #${pr}; not running it again"
-              else
-                echo "::warning::tree ${tree} is not the tree PR #${pr}'s run ${run} tested (${tested:-unknown}); running the full suite"
-              fi
-            fi
-          fi
-          if [ -z "${compiler}" ]; then
-            echo "::warning::could not carry the bootstrap compiler version from PR #${pr:-unknown}; re-resolving latest"
+        case "${{ github.event_name }}" in
+        pull_request)
+          full_suite=false
+          compiler=$(resolve_latest)
+          ;;
+        merge_group)
+          compiler=$(resolve_latest)
+          ;;
+        push)
+          # Release build: carry what the merge queue built and tested for
+          # this commit.
+          run=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&event=merge_group" \
+                  --jq 'first(.workflow_runs[] | select(.conclusion == "success") | .id) // empty' 2>/dev/null || true)
+          if [ -n "${run}" ] \
+             && gh run download "${run}" -n bootstrap-compiler-version -D carried 2>/dev/null \
+             && gh run download "${run}" -n ghul-compiler-package -D carried/nupkg 2>/dev/null \
+             && gh run download "${run}" -n ghul-analysis-protocol-package -D carried/nupkg 2>/dev/null \
+             && [ -f "carried/nupkg/ghul.compiler.${{ steps.version.outputs.package }}.nupkg" ] \
+             && [ -f "carried/nupkg/ghul.analysis.protocol.${{ steps.version.outputs.package }}.nupkg" ]; then
+            compiler=$(tr -d '[:space:]' < carried/bootstrap-compiler-version.txt)
+            build=false
+            full_suite=false
+            echo "carrying the packages the merge queue built and tested in run ${run}"
+          else
+            echo "::warning::no successful merge queue run packed ${{ steps.version.outputs.package }} for ${{ github.sha }} (run ${run:-not found}); building and testing here"
             compiler=$(resolve_latest)
           fi
-        else
-          compiler=$(resolve_latest)
-        fi
+          ;;
+        esac
 
         echo "compiler=${compiler}" >> "$GITHUB_OUTPUT"
+        echo "build=${build}" >> "$GITHUB_OUTPUT"
         echo "full_suite=${full_suite}" >> "$GITHUB_OUTPUT"
         echo "Bootstrap compiler: ${compiler}"
         echo "Bootstrap compiler: \`${compiler}\`" >> "$GITHUB_STEP_SUMMARY"
-        if [ "${full_suite}" = false ]; then
-          echo "Test suite: already passed on this tree in run ${run} (PR #${pr}); smoke tests only" >> "$GITHUB_STEP_SUMMARY"
+        if [ "${build}" = false ]; then
+          echo "Packages: carried from merge queue run ${run}; nothing built or tested here" >> "$GITHUB_STEP_SUMMARY"
+        elif [ "${full_suite}" = false ]; then
+          echo "Test suite: entry gate only (bootstrap, unit, analysis, smoke)" >> "$GITHUB_STEP_SUMMARY"
         fi
         mkdir -p artifact
         printf '%s\n' "${compiler}" > artifact/bootstrap-compiler-version.txt
-        printf '%s\n' "${tree}" > artifact/tested-tree.txt
+
+    - name: Upload the carried compiler package
+      if: steps.compiler_version.outputs.build == 'false'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ghul-compiler-package
+        path: carried/nupkg/ghul.compiler.${{ steps.version.outputs.package }}.nupkg
+
+    - name: Upload the carried analysis protocol package
+      if: steps.compiler_version.outputs.build == 'false'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ghul-analysis-protocol-package
+        path: carried/nupkg/ghul.analysis.protocol.${{ steps.version.outputs.package }}.nupkg
 
     - name: Upload bootstrap compiler version
       uses: actions/upload-artifact@v7
@@ -211,7 +250,7 @@ jobs:
   unit_tests:
     name: Run unit tests
     needs: [version, bootstrap]
-    if: needs.version.outputs.full_suite == 'true'
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
@@ -265,6 +304,7 @@ jobs:
   bootstrap:
     needs: [version]
     name: Bootstrap compiler
+    if: needs.version.outputs.build == 'true'
 
     # Three sequential compiler passes, and the compiler does not
     # parallelise its source walk, so cores past the second buy nothing
@@ -446,7 +486,7 @@ jobs:
   # while that library came out empty.
   analysis_tests:
     needs: [version, bootstrap]
-    if: needs.version.outputs.full_suite == 'true'
+    if: needs.version.outputs.build == 'true'
     name: Run analysis tests
 
     runs-on: ubuntu-latest
@@ -1005,7 +1045,7 @@ jobs:
   # skips this.
   smoke_tests:
     needs: [version, bootstrap]
-    if: github.event_name != 'pull_request'
+    if: needs.version.outputs.build == 'true'
     name: Run smoke tests
 
     runs-on: ubuntu-latest
@@ -1052,10 +1092,11 @@ jobs:
         name: smoke-test-results
         path: smoke-test-results.txt
 
-  # The one verdict the publish jobs wait on. On a pull request every test
-  # job ran and must have passed; on a release run whose tree the pull
-  # request already tested, the suite was skipped and the smoke tests must
-  # have passed instead. A `needs` list cannot say that: a skipped job in
+  # The one verdict the publish jobs wait on. In the merge queue every test
+  # job ran and must have passed; on a pull request only the entry gate
+  # ran and the rest was skipped; on a release build carrying the queue's
+  # packages nothing ran at all, and `version` having carried them is the
+  # verdict. A `needs` list cannot say that: a skipped job in
   # it skips the dependent too unless the dependent runs `always()`, and
   # then a skipped job satisfies it. This job runs regardless and checks
   # that nothing was skipped that should have run.
@@ -1072,20 +1113,24 @@ jobs:
     steps:
     - name: Check every required job passed
       env:
+        BUILD: ${{ needs.version.outputs.build }}
         FULL_SUITE: ${{ needs.version.outputs.full_suite }}
-        EVENT: ${{ github.event_name }}
         RESULTS: ${{ toJSON(needs) }}
       run: |
         set -euo pipefail
-        echo "full suite: ${FULL_SUITE}"
+        echo "build: ${BUILD}, full suite: ${FULL_SUITE}"
         ok=true
         for job in $(echo "${RESULTS}" | jq -r 'keys[]'); do
           result=$(echo "${RESULTS}" | jq -r --arg j "${job}" '.[$j].result')
           echo "${job}: ${result}"
           case "${job}:${result}" in
             *:success) continue ;;
-            smoke_tests:skipped) [ "${EVENT}" = pull_request ] && continue ;;
-            *:skipped) [ "${FULL_SUITE}" != true ] && continue ;;
+            *:skipped)
+              [ "${BUILD}" != true ] && continue
+              case "${job}" in
+                bootstrap|unit_tests|analysis_tests|smoke_tests) ;;
+                *) [ "${FULL_SUITE}" != true ] && continue ;;
+              esac ;;
           esac
           echo "::error::${job}: ${result}"
           ok=false
@@ -1094,8 +1139,8 @@ jobs:
 
   # These three condition on the gate explicitly rather than through `needs`
   # alone: a job's default condition is false when any job upstream of it
-  # was skipped, however far upstream, and a release run that trusts the
-  # pull request's suite skips every test job. `!cancelled()` opts out of
+  # was skipped, however far upstream, and a release run that carries the
+  # merge queue's packages skips every build and test job. `!cancelled()` opts out of
   # that rule and the gate's own result is what stands in for it.
   publish_beta_package:
     needs: [version, gate]
@@ -1153,7 +1198,7 @@ jobs:
       contents: read
       packages: write
 
-    if: ${{ !cancelled() && needs.gate.result == 'success' && github.event_name != 'pull_request' }}
+    if: ${{ !cancelled() && needs.gate.result == 'success' && github.event_name == 'push' }}
 
     steps:
     - uses: actions/checkout@v7
@@ -1196,7 +1241,7 @@ jobs:
     runs-on: ubuntu-latest
 
     timeout-minutes: 5
-    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.publish_release_package.result == 'success' && github.event_name != 'pull_request' }}
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.publish_release_package.result == 'success' && github.event_name == 'push' }}
 
     permissions:
       contents: write
@@ -1212,8 +1257,13 @@ jobs:
         name: ghul-compiler-package
         path: nupkg
 
+    # A push from the merge queue can carry several squashed pull requests,
+    # one commit each; the notes list every one of them.
     - name: Create changelog
-      run: git log -1 --format="%s%n%n%b%n%n" >changelog.txt
+      run: |
+        range="${{ github.event.before }}..${{ github.sha }}"
+        git rev-parse -q --verify "${{ github.event.before }}^{commit}" >/dev/null || range="-1"
+        git log --format="%s%n%n%b%n%n" ${range} >changelog.txt
 
     - name: Create a release
       env:
