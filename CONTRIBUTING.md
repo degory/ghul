@@ -119,12 +119,11 @@ compiler's own emission looks like.
 ## Testing
 
 Everything below must pass before a pull request can merge. A pull request's
-own CI run is the entry check for the merge queue - the bootstrap, the unit
-tests, the analysis tests and a smoke subset of the integration tests - and
-the merge queue then runs all of it on the pull request merged with `main`
-and with anything queued ahead of it, before the merge happens. Run what is
-relevant to your change locally; there is no need to run the whole suite
-yourself, because the queue will.
+own CI run is the entry check for the merge queue - the bootstrap, with the
+unit tests running beside it - and the merge queue then runs all of it on the
+pull request merged with `main` and with anything queued ahead of it, before
+the merge happens. Run what is relevant to your change locally; there is no
+need to run the whole suite yourself, because the queue will.
 
 | Suite | Command | Time | Notes |
 |---|---|---|---|
