@@ -31,8 +31,8 @@ concurrency:
 # because the bottleneck is per-test compiler-subprocess IPC.
 #
 # Three events, three shapes. A pull request runs the entry gate for the
-# merge queue: bootstrap, unit tests, analysis tests and the smoke-tagged
-# integration subset. The merge queue's run (`merge_group`) is the one whose
+# merge queue, sized against the code review it runs beside: the bootstrap,
+# and the unit tests built with the bootstrap compiler alongside it. The merge queue's run (`merge_group`) is the one whose
 # result binds: the full suite, on the group's combined tree, and the
 # packages it packs are the release. A push to main is the release build,
 # and on the happy path it builds nothing: `version` finds the merge queue's
@@ -121,7 +121,7 @@ jobs:
     #
     # On a pull request: the latest published version that is actually
     # downloadable from NuGet (skipping a release still propagating), and
-    # the entry gate - bootstrap, unit, analysis and smoke tests.
+    # the entry gate - the bootstrap, and the unit tests beside it.
     #
     # On the merge queue's run: the same resolution, and the full suite.
     # The queue tests the group's combined tree, and what it packs is what
@@ -214,7 +214,7 @@ jobs:
         if [ "${build}" = false ]; then
           echo "Packages: carried from merge queue run ${run}; nothing built or tested here" >> "$GITHUB_STEP_SUMMARY"
         elif [ "${full_suite}" = false ]; then
-          echo "Test suite: entry gate only (bootstrap, unit, analysis, smoke)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Test suite: entry gate only (bootstrap, and unit tests beside it)" >> "$GITHUB_STEP_SUMMARY"
         fi
         mkdir -p artifact
         printf '%s\n' "${compiler}" > artifact/bootstrap-compiler-version.txt
@@ -250,7 +250,7 @@ jobs:
   unit_tests:
     name: Run unit tests
     needs: [version, bootstrap]
-    if: needs.version.outputs.build == 'true'
+    if: needs.version.outputs.full_suite == 'true'
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
@@ -301,6 +301,56 @@ jobs:
   # A failure here therefore stops the test jobs rather than merely
   # reporting alongside them. That is deliberate: a compiler that cannot
   # reproduce itself makes the suite's verdict meaningless.
+  # The entry gate's half of the unit tests. A pull request's run is sized
+  # against the code review, which is the one check the queue cannot take
+  # over, so it waits on nothing: the tests are built with the compiler
+  # that bootstraps this commit and run alongside the bootstrap. Source
+  # has to build under that compiler anyway, so the only thing this
+  # cannot see is a change to what the compiler accepts, and the queue's
+  # `unit_tests` above, built by the compiler this commit produces, sees
+  # exactly that.
+  unit_tests_gate:
+    name: Run unit tests at the gate
+    needs: [version]
+    if: needs.version.outputs.build == 'true' && needs.version.outputs.full_suite != 'true'
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '10.0.x'
+        cache: true
+        cache-dependency-path: |
+          **/Directory.Packages.props
+          **/.config/dotnet-tools.json
+
+    - name: Restore local .NET tools
+      run: dotnet tool restore
+
+    - name: Install the bootstrap compiler
+      run: |
+        for attempt in 1 2 3 4 5; do
+          if dotnet tool update --local ghul.compiler --version ${{ needs.version.outputs.compiler }}; then
+            exit 0
+          fi
+          echo "install attempt ${attempt} failed; retrying in 15s..."
+          sleep 15
+        done
+        exit 1
+
+    - name: Set build number
+      run: |
+        echo "namespace Source is class BUILD is number: string static => \"${{ needs.version.outputs.tag }}\"; si si" >src/source/build.ghul
+
+    - name: Run unit tests
+      run: dotnet test unit-tests
+
+
   bootstrap:
     needs: [version]
     name: Bootstrap compiler
@@ -486,7 +536,7 @@ jobs:
   # while that library came out empty.
   analysis_tests:
     needs: [version, bootstrap]
-    if: needs.version.outputs.build == 'true'
+    if: needs.version.outputs.full_suite == 'true'
     name: Run analysis tests
 
     runs-on: ubuntu-latest
@@ -1040,12 +1090,11 @@ jobs:
   # and the `smoke` subset of the integration tests - one representative
   # per feature and group - passes under it. The bootstrap has already
   # shown the compiler reproduces itself; this shows the package it was
-  # put in is whole and runs. It runs wherever a package was built: on a
-  # pull request it is the integration half of the entry gate, and in the
-  # merge queue it checks the package the release will publish.
+  # put in is whole and runs. It runs in the merge queue, on the package
+  # the release will publish, and on a release build that had to rebuild.
   smoke_tests:
     needs: [version, bootstrap]
-    if: needs.version.outputs.build == 'true'
+    if: needs.version.outputs.full_suite == 'true'
     name: Run smoke tests
 
     runs-on: ubuntu-latest
@@ -1093,15 +1142,15 @@ jobs:
         path: smoke-test-results.txt
 
   # The one verdict the publish jobs wait on. In the merge queue every test
-  # job ran and must have passed; on a pull request only the entry gate
-  # ran and the rest was skipped; on a release build carrying the queue's
-  # packages nothing ran at all, and `version` having carried them is the
-  # verdict. A `needs` list cannot say that: a skipped job in
-  # it skips the dependent too unless the dependent runs `always()`, and
+  # job but the gate's own unit tests ran and must have passed; on a pull
+  # request only the entry gate ran and the rest was skipped; on a release
+  # build carrying the queue's packages nothing ran at all, and `version`
+  # having carried them is the verdict. A `needs` list cannot say that: a
+  # skipped job in it skips the dependent too unless the dependent runs `always()`, and
   # then a skipped job satisfies it. This job runs regardless and checks
   # that nothing was skipped that should have run.
   gate:
-    needs: [version, bootstrap, unit_tests, analysis_tests, integration_tests, cross_assembly_tests, bare_invocation_test, runtime_tests, examples_tests, format_round_trip, rosetta_tests, smoke_tests]
+    needs: [version, bootstrap, unit_tests, unit_tests_gate, analysis_tests, integration_tests, cross_assembly_tests, bare_invocation_test, runtime_tests, examples_tests, format_round_trip, rosetta_tests, smoke_tests]
     name: Gate
 
     if: always()
@@ -1128,7 +1177,8 @@ jobs:
             *:skipped)
               [ "${BUILD}" != true ] && continue
               case "${job}" in
-                bootstrap|unit_tests|analysis_tests|smoke_tests) ;;
+                bootstrap) ;;
+                unit_tests_gate) [ "${FULL_SUITE}" = true ] && continue ;;
                 *) [ "${FULL_SUITE}" != true ] && continue ;;
               esac ;;
           esac
