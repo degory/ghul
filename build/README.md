@@ -15,7 +15,7 @@ build/coverage.sh --suite all                       # every suite
 build/coverage.sh --filter integration-tests/parse  # one subdirectory
 ```
 
-Turning the captured reports into the HTML report is [degory/ghul-coverage-report](https://github.com/degory/ghul-coverage-report)'s job, not this script's: its own scheduled workflow checks out this repo, runs this script, and builds+deploys the report to [GitHub Pages](https://degory.github.io/ghul-coverage-report/) — `coverage-data-tool` builds the namespace/type/method breakdown and drives the compiler's own analyser for syntax highlighting and hover info, and `site/` (a VitePress project) renders that into the report.
+Turning the captured reports into the HTML report is [degory/ghul-coverage-report](https://github.com/degory/ghul-coverage-report)'s job, not this script's: its own scheduled workflow checks out this repo, runs this script, and builds+deploys the report to [GitHub Pages](https://ghul-lang.github.io/ghul-coverage-report/) — `coverage-data-tool` builds the namespace/type/method breakdown and drives the compiler's own analyser for syntax highlighting and hover info, and `site/` (a VitePress project) renders that into the report.
 
 Instrumentation slows the integration suite by roughly an order of magnitude, so coverage capture is a periodic job rather than part of the pull-request gate. Debug information is turned on per invocation through MSBuild properties, so ordinary builds and the released package are unaffected.
 
