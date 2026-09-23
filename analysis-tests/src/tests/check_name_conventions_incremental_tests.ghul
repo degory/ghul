@@ -1,0 +1,312 @@
+namespace Analysis.Tests is
+    use Collections.LIST;
+
+    use Analysis.Protocol.ANALYSER_PROCESS;
+    use Analysis.Protocol.DIAGNOSTIC;
+    use Analysis.Protocol.Response;
+
+    use Microsoft.VisualStudio.TestTools.UnitTesting.Assert;
+    use TestClass = Microsoft.VisualStudio.TestTools.UnitTesting.TestClassAttribute;
+    use Test = Microsoft.VisualStudio.TestTools.UnitTesting.TestMethodAttribute;
+    use Assertions;
+
+    // check-name-conventions (non-snake-case-name and friends) is a
+    // whole-file declaration-level walk that only runs as part of the
+    // batch build_passes list — it is not among the passes any of the
+    // three incremental EDIT paths (body re-walk, interface-append,
+    // narrow window-replace) replay for an edited file. Each of those
+    // paths clears or bypasses the analysis-mode diagnostics it does not
+    // itself regenerate, on the assumption that what it does re-run will
+    // replace what is lost or was never produced. definition-virtuality's
+    // hints are re-run for exactly this reason at every one of these
+    // sites; check-name-conventions was missing from all three.
+    @TestClass()
+    class CHECK_NAME_CONVENTIONS_INCREMENTAL_TESTS is
+        init() is si
+
+        // `badName` is camelCase — a non-snake-case-name local.
+        baseline() -> string =>
+            "namespace CheckNameConv is\n"
+            "    run() -> int is\n"
+            "        let badName = 1;\n"
+            "        return badName;\n"
+            "    si\n"
+            "si\n";
+
+        // Interface-preserving: `run`'s signature is unchanged, only its
+        // body grew a line. `badName` is untouched by the edit.
+        body_edited() -> string =>
+            "namespace CheckNameConv is\n"
+            "    run() -> int is\n"
+            "        let badName = 1;\n"
+            "        let other = 2;\n"
+            "        return badName + other;\n"
+            "    si\n"
+            "si\n";
+
+        // A second interface-preserving edit, so the regression is
+        // checked to stay fixed across more than one incremental step.
+        body_edited_again() -> string =>
+            "namespace CheckNameConv is\n"
+            "    run() -> int is\n"
+            "        let badName = 1;\n"
+            "        let other = 2;\n"
+            "        return badName + other + 1;\n"
+            "    si\n"
+            "si\n";
+
+        diagnostics_for(analyser: ANALYSER_PROCESS, file_name: string) -> LIST[DIAGNOSTIC] is
+            let diagnostics = analyser.read_response();
+            assert isa Response.DIAGNOSTICS(diagnostics) else "expected DIAGNOSTICS response";
+
+            let result = LIST[DIAGNOSTIC]();
+
+            for d in user_diagnostics_of(diagnostics) do
+                if d.path.ends_with(file_name) then
+                    result.add(d);
+                fi
+            od
+
+            return result;
+        si
+
+        has_non_snake_case_name(diagnostics: Collections.Iterable[DIAGNOSTIC]) -> bool is
+            for d in diagnostics do
+                if d.code =~ "non-snake-case-name" then
+                    return true;
+                fi
+            od
+
+            return false;
+        si
+
+        // The baseline EDIT is a cold start, so it takes the
+        // whole-project rebuild and check-name-conventions runs — the
+        // warning for `badName` must be present.
+        @Test()
+        cold_start_reports_non_snake_case_local() is
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("conv.ghul", baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "conv.ghul");
+
+            is_true(
+                has_non_snake_case_name(baseline_diagnostics),
+                "{diagnostics_summary("conv.ghul cold start", baseline_diagnostics)}"
+                "expected a non-snake-case-name warning for `badName`\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // A later interface-preserving edit takes the incremental body
+        // re-walk, which does not re-run check-name-conventions — but it
+        // must not silently drop a warning the cold-start build already
+        // reported for a declaration the edit never touched.
+        @Test()
+        body_only_edit_does_not_lose_an_existing_non_snake_case_warning() is
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("conv.ghul", baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "conv.ghul");
+            is_true(
+                has_non_snake_case_name(baseline_diagnostics),
+                "{diagnostics_summary("conv.ghul cold start", baseline_diagnostics)}"
+                "expected a non-snake-case-name warning for `badName`\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let edited_diagnostics mut = LIST[DIAGNOSTIC]();
+
+            assert_work(
+                analyser,
+                "body edit",
+                [
+                    exactly(edit_path_body_rewalk, 1),
+                    exactly(edit_path_interface_incremental, 0),
+                    exactly(edit_path_full_rebuild, 0)
+                ],
+                () is
+                    analyser.send_edit("conv.ghul", body_edited());
+                    edited_diagnostics = diagnostics_for(analyser, "conv.ghul");
+                si
+            );
+
+            is_true(
+                has_non_snake_case_name(edited_diagnostics),
+                "{diagnostics_summary("conv.ghul after interface-preserving body edit", edited_diagnostics)}"
+                "a body-only edit that leaves `badName` untouched must not "
+                "drop its non-snake-case-name warning\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let edited_again_diagnostics mut = LIST[DIAGNOSTIC]();
+
+            assert_work(
+                analyser,
+                "second body edit",
+                [
+                    exactly(edit_path_body_rewalk, 1),
+                    exactly(edit_path_interface_incremental, 0),
+                    exactly(edit_path_full_rebuild, 0)
+                ],
+                () is
+                    analyser.send_edit("conv.ghul", body_edited_again());
+                    edited_again_diagnostics = diagnostics_for(analyser, "conv.ghul");
+                si
+            );
+
+            is_true(
+                has_non_snake_case_name(edited_again_diagnostics),
+                "{diagnostics_summary("conv.ghul after a second interface-preserving body edit", edited_again_diagnostics)}"
+                "the non-snake-case-name warning must survive further "
+                "incremental body edits, not just the first\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // build_appended handles an interface-affecting edit that only
+        // appends new definitions. A badly-named appended method must be
+        // flagged on the same EDIT that appends it, not left unflagged
+        // until a full rebuild happens to run.
+        append_baseline() -> string =>
+            "namespace CheckNameConvAppend is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "\n"
+            "        alpha() -> int is\n"
+            "            return 1;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        // `BetaMethod` is PascalCase — a non-snake-case-name method.
+        append_with_bad_name() -> string =>
+            "namespace CheckNameConvAppend is\n"
+            "    class HOLDER is\n"
+            "        init() is si\n"
+            "\n"
+            "        alpha() -> int is\n"
+            "            return 1;\n"
+            "        si\n"
+            "\n"
+            "        BetaMethod() -> int is\n"
+            "            return 2;\n"
+            "        si\n"
+            "    si\n"
+            "si\n";
+
+        @Test()
+        appending_a_badly_named_member_is_flagged_on_the_appending_edit() is
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("append.ghul", append_baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "append.ghul");
+            is_false(
+                has_non_snake_case_name(baseline_diagnostics),
+                "{diagnostics_summary("append.ghul baseline", baseline_diagnostics)}"
+                "expected no non-snake-case-name warning before the append\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let appended_diagnostics mut = LIST[DIAGNOSTIC]();
+
+            assert_work(
+                analyser,
+                "appending a badly-named member",
+                [
+                    exactly(edit_path_interface_incremental, 1),
+                    exactly(edit_path_body_rewalk, 0),
+                    exactly(edit_path_full_rebuild, 0)
+                ],
+                () is
+                    analyser.send_edit("append.ghul", append_with_bad_name());
+                    appended_diagnostics = diagnostics_for(analyser, "append.ghul");
+                si
+            );
+
+            is_true(
+                has_non_snake_case_name(appended_diagnostics),
+                "{diagnostics_summary("append.ghul after appending BetaMethod", appended_diagnostics)}"
+                "appending a PascalCase method should be flagged on the same "
+                "EDIT that appends it\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+
+        // The narrow window-replace path (build_members_interface /
+        // build_members_expressions) replaces one changed function in
+        // place, leaving its siblings untouched. A signature change that
+        // also renames the function to something badly-cased must be
+        // flagged on that same edit.
+        window_baseline() -> string =>
+            "namespace CheckNameConvWindow is\n"
+            "    class HOLDER is\n"
+            "        _count: int;\n"
+            "\n"
+            "        init() is _count = 0; si\n"
+            "\n"
+            "        alpha() -> int is\n"
+            "            return 1;\n"
+            "        si\n"
+            "\n"
+            "        total: int => _count;\n"
+            "    si\n"
+            "si\n";
+
+        // `alpha` renamed to PascalCase `AlphaMethod`, and its signature
+        // changed (gains a parameter) so the edit is interface-affecting
+        // rather than a body-only rename.
+        window_replaced_with_bad_name() -> string =>
+            "namespace CheckNameConvWindow is\n"
+            "    class HOLDER is\n"
+            "        _count: int;\n"
+            "\n"
+            "        init() is _count = 0; si\n"
+            "\n"
+            "        AlphaMethod(n: int) -> int is\n"
+            "            return n;\n"
+            "        si\n"
+            "\n"
+            "        total: int => _count;\n"
+            "    si\n"
+            "si\n";
+
+        @Test()
+        replacing_a_function_with_a_badly_named_one_is_flagged_on_the_replacing_edit() is
+            let use analyser = ANALYSER_PROCESS();
+
+            analyser.send_edit("window.ghul", window_baseline());
+            let baseline_diagnostics = diagnostics_for(analyser, "window.ghul");
+            is_false(
+                has_non_snake_case_name(baseline_diagnostics),
+                "{diagnostics_summary("window.ghul baseline", baseline_diagnostics)}"
+                "expected no non-snake-case-name warning before the replace\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+
+            let replaced_diagnostics mut = LIST[DIAGNOSTIC]();
+
+            assert_work(
+                analyser,
+                "replacing alpha with a badly-named AlphaMethod",
+                [
+                    exactly(edit_path_interface_incremental, 1),
+                    exactly(edit_path_body_rewalk, 0),
+                    exactly(edit_path_full_rebuild, 0)
+                ],
+                () is
+                    analyser.send_edit("window.ghul", window_replaced_with_bad_name());
+                    replaced_diagnostics = diagnostics_for(analyser, "window.ghul");
+                si
+            );
+
+            is_true(
+                has_non_snake_case_name(replaced_diagnostics),
+                "{diagnostics_summary("window.ghul after replacing alpha with AlphaMethod", replaced_diagnostics)}"
+                "replacing a function with a PascalCase one should be "
+                "flagged on the same edit that replaces it\n"
+                "--- analyser stderr ---\n{analyser.stderr_capture}"
+            );
+        si
+    si
+si
