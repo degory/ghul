@@ -338,8 +338,8 @@ namespace Syntax.Process is
 
         // True when the call carries at least one argument still
         // awaiting a type from its context.
-        has_argument_awaiting_context_type(argument_expressions: Collections.List[Trees.Expressions.Expression]) -> bool static =>
-            argument_expressions |> any(a => COMPILE_CALLS.is_argument_awaiting_context_type(a))
+        has_argument_awaiting_context_type(argument_expressions: Collections.List[Trees.Expressions.Expression?]) -> bool static =>
+            argument_expressions |> any(a => a? /\ COMPILE_CALLS.is_argument_awaiting_context_type(a))
 
         // True for an argument that is a bare reference to an
         // overloaded function or method group and stayed a
@@ -360,8 +360,8 @@ namespace Syntax.Process is
 
         // True when the call carries at least one unresolved group
         // reference among its arguments.
-        has_unresolved_group_argument(argument_expressions: Collections.List[Trees.Expressions.Expression]) -> bool static =>
-            argument_expressions |> any(a => COMPILE_CALLS.is_unresolved_group_argument(a))
+        has_unresolved_group_argument(argument_expressions: Collections.List[Trees.Expressions.Expression?]) -> bool static =>
+            argument_expressions |> any(a => a? /\ COMPILE_CALLS.is_unresolved_group_argument(a))
 
         // Once overload resolution has settled on a single, unambiguous
         // `function`, retry any argument that had no type to infer
@@ -403,7 +403,7 @@ namespace Syntax.Process is
         // bind from the delegate's shape rather than staying open.
         _resolve_deferred_defaults(
             function: Semantic.Symbols.Function,
-            argument_expressions: Collections.List[Trees.Expressions.Expression],
+            argument_expressions: Collections.List[Trees.Expressions.Expression?],
             arguments: Collections.LIST[Value],
             argument_types: Collections.LIST[Type]
         ) -> bool is
@@ -421,7 +421,13 @@ namespace Syntax.Process is
 
             let resolved_group mut = false
 
-            for (index, a) in argument_expressions |> index() do
+            for (index, slot) in argument_expressions |> index() do
+                let a = slot
+
+                if !a? then
+                    continue
+                fi
+
                 if
                     COMPILE_CALLS.is_unresolved_group_argument(a) /\
                     index < function.arguments.count /\
@@ -1244,18 +1250,20 @@ namespace Syntax.Process is
                 return
             fi
 
-            let arity = Semantic.ARGUMENT_PACK.parameter_count(expected)
+            let fixed = Semantic.ARGUMENT_PACK.fixed_count(returned)
+
+            let arity = Semantic.ARGUMENT_PACK.parameter_count(expected) - fixed
 
             if arity < 2 \/ arity > Semantic.ARGUMENT_PACK.MAXIMUM_ARITY then
                 return
             fi
 
-            if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = returned.arguments[0] then
+            if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = returned.arguments[fixed] then
                 if let origin: Semantic.Symbols.INFERRED_TYPE_ARG_ORIGIN = placeholder.origin /\ origin.is_argument_pack then
                     let elements = Collections.LIST[Semantic.Types.Type]()
 
                     for i in 0..arity do
-                        elements.add(expected.arguments[i])
+                        elements.add(expected.arguments[fixed + i])
                     od
 
                     let tuple = _innate_symbol_lookup.get_tuple_type(elements, null)
@@ -1304,14 +1312,16 @@ namespace Syntax.Process is
         // formal's element type, which a later walk settles it from.
         _bound_awaiting_sequence_elements(
             candidate: Semantic.Symbols.Function,
-            argument_expressions: Collections.List[Trees.Expressions.Expression]
+            argument_expressions: Collections.List[Trees.Expressions.Expression?]
         ) is
             if candidate.arguments.count != argument_expressions.count then
                 return
             fi
 
             for index in 0..argument_expressions.count do
-                _bound_sequence_elements(argument_expressions[index], candidate.arguments[index])
+                if let argument = argument_expressions[index] then
+                    _bound_sequence_elements(argument, candidate.arguments[index])
+                fi
             od
         si
 
@@ -1368,10 +1378,12 @@ namespace Syntax.Process is
             argument_types: Collections.LIST[Type],
             want_instance: bool,
             named_restrict: Collections.List[Semantic.Symbols.Function]?,
-            argument_expressions: Collections.List[Trees.Expressions.Expression],
+            slots: ARGUMENT_SLOTS,
             argument_location: LOCATION,
             cache_key: Trees.Node
         ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
+            let argument_expressions = slots.expressions
+
             let candidate =
                 _try_find_single_arity_candidate(function_group, argument_types.count, want_instance) ??
                 _async_literal_candidates.find(function_group, argument_expressions, want_instance)
@@ -1446,9 +1458,16 @@ namespace Syntax.Process is
                 // Indexed rather than iterated: an argument may be
                 // replaced in place below, and the list being walked is
                 // the call's own.
-                for index in 0..argument_expressions.count do
-                    let original = argument_expressions[index]
+                for index in 0..slots.count do
                     let f = push_candidate!.arguments[index]
+
+                    if slots.is_spread(index) then
+                        _fill_spread_slot(slots, index, f, arguments, argument_types)
+
+                        continue
+                    fi
+
+                    let original = slots.expression(index)!
 
                     // A named function reference whose shape differs
                     // from the formal only in an optional position's
@@ -1461,14 +1480,7 @@ namespace Syntax.Process is
 
                     _take_spread_reading(push_candidate!, index, original, arguments, argument_types)
 
-                    if let outer_arity = _nested_pack_adaptation_arity(push_candidate!, index, original, argument_types[index]) then
-                        if
-                            let literal = _function_reference_adapter.try_adapt(original, outer_arity) /\
-                            _splice(cache_key, original, index, literal)
-                        then
-                            a = literal
-                        fi
-                    elif _is_packable_literal(push_candidate!, index, original, argument_types[index], cache_key) then
+                    if _is_packable_literal(push_candidate!, index, original, argument_types[index], cache_key) then
                         // compiled taking the tuple, under the formal pushed below
                     elif let presented = _presented_pack_type(cache_key, push_candidate!, index, original, argument_types[index]) then
                         // A function value of the pack's elements is judged as
@@ -1661,12 +1673,22 @@ namespace Syntax.Process is
         // before the pack.
         _fixed_count_of(candidate: Semantic.Symbols.Function, index: int) -> int is
             if index < candidate.arguments.count then
-                if let shape = _target_shape_of(candidate.arguments[index]) /\ Semantic.ARGUMENT_PACK.is_pack_slot(shape) then
-                    return Semantic.ARGUMENT_PACK.fixed_count(shape)
+                if let slot = _marked_slot_of(candidate, index) then
+                    return Semantic.ARGUMENT_PACK.fixed_count(slot)
                 fi
             fi
 
             return 0
+        si
+
+        // The function type at the hop the formal at `index` marked, and
+        // absent where the formal marks none.
+        _marked_slot_of(candidate: Semantic.Symbols.Function, index: int) -> Type? is
+            if index >= candidate.arguments.count \/ !candidate.get_argument_is_pack(index) then
+                return null
+            fi
+
+            return Semantic.ARGUMENT_PACK.marked_slot(_target_shape_of(candidate.arguments[index]), candidate.get_argument_pack_depth(index))
         si
 
         _walk_under_spread_reading(
@@ -1754,14 +1776,21 @@ namespace Syntax.Process is
         // The value of `expression`, a function of an argument pack's
         // elements, presented as a function of their tuple. Absent where
         // the value is not such a function.
-        present_function_value(expression: Trees.Expressions.Expression) -> Value? is
+        present_function_value(expression: Trees.Expressions.Expression, depth: int) -> Value? is
             let value = expression.value
 
             if !value? \/ !value.type? \/ isa IR.Values.PACK_WRAP(value) then
                 return null
             fi
 
-            return _pack_wrap_builder.unpack(expression, 0, expression.location, value, 0)
+            let fixed =
+                if let slot = expression.pack_slot /\ Semantic.ARGUMENT_PACK.is_pack_slot(slot) then
+                    Semantic.ARGUMENT_PACK.fixed_count(slot)
+                else
+                    0
+                fi
+
+            return _pack_wrap_builder.unpack(expression, 0, expression.location, value, fixed, depth)
         si
 
 
@@ -1807,11 +1836,24 @@ namespace Syntax.Process is
                 fi
             fi
 
+            let fixed = _fixed_count_of(candidate, index)
+
+            // Marked past the formal's own function type, the argument is a
+            // function that returns the N-ary one that many returns in, and
+            // is judged as the same function returning its packed form.
+            let depth = candidate.get_argument_pack_depth(index)
+
+            if depth > 0 then
+                if !_nested_pack_adaptation_arity(candidate, index, argument, argument_type)? then
+                    return null
+                fi
+
+                return _pack_wrap_builder.packed_spine(argument_type, depth, fixed)
+            fi
+
             if !_pack_adaptation_value_arity(candidate, index, argument, argument_type)? then
                 return null
             fi
-
-            let fixed = _fixed_count_of(candidate, index)
 
             if let settled = _pack_wrap_builder.packed_type(argument_type, fixed) then
                 return settled
@@ -1850,22 +1892,36 @@ namespace Syntax.Process is
         // the pack's elements going into a formal that takes their tuple.
         present_pack_arguments(
             key: Trees.Node,
-            expressions: Collections.List[Trees.Expressions.Expression],
+            expressions: Collections.List[Trees.Expressions.Expression?],
             function: Semantic.Symbols.Function,
             arguments: Collections.LIST[Value]
         ) is
             for index in 0..arguments.count do
-                if !function.get_argument_is_pack(index) \/ function.get_argument_pack_depth(index) != 0 then
+                if !function.get_argument_is_pack(index) then
                     continue
                 fi
 
                 let expression = expressions[index]
 
-                if !Semantic.ARGUMENT_PACK.adaptation_arity(_target_shape_of(function.arguments[index]), arguments[index].type)? then
+                // The slot a spread fills holds a tuple, never a function.
+                if !expression? then
                     continue
                 fi
 
-                if let wrapped = _pack_wrap_builder.unpack(key, index, expression.location, arguments[index], _fixed_count_of(function, index)) then
+                let depth = function.get_argument_pack_depth(index)
+
+                let applies =
+                    if depth > 0 then
+                        _nested_pack_adaptation_arity(function, index, expression, arguments[index].type)?
+                    else
+                        Semantic.ARGUMENT_PACK.adaptation_arity(_target_shape_of(function.arguments[index]), arguments[index].type)?
+                    fi
+
+                if !applies then
+                    continue
+                fi
+
+                if let wrapped = _pack_wrap_builder.unpack(key, index, expression.location, arguments[index], _fixed_count_of(function, index), depth) then
                     arguments[index] = wrapped
 
                     // Whatever reads the argument.s value afterwards - a fused
@@ -1914,7 +1970,7 @@ namespace Syntax.Process is
             fi
 
             if parenthesised_literal(argument)? then
-                argument.set_expects_pack(depth)
+                argument.set_expects_pack(depth, _marked_slot_of(candidate, index))
             fi
         si
 
@@ -2144,7 +2200,7 @@ namespace Syntax.Process is
         // literal. Where the two differ in nothing but those names, the
         // literal's one physical parameter takes the formal's, as it
         // would have had the call been written with its type arguments.
-        _settle_packed_literal_names(function: Semantic.Symbols.Function, argument_expressions: Collections.List[Trees.Expressions.Expression]) is
+        _settle_packed_literal_names(function: Semantic.Symbols.Function, argument_expressions: Collections.List[Trees.Expressions.Expression?]) is
             for index in 0..argument_expressions.count do
                 if let literal = parenthesised_literal(argument_expressions[index]) then
                     if
@@ -2176,16 +2232,17 @@ namespace Syntax.Process is
 
         // A call written with the pack spread out - `apply(f, "a", "b")`
         // - describes the same call as the written-out tuple form the
-        // formal takes. The trailing actuals are collected into a tuple
-        // literal here, so that everything downstream sees the form it
-        // already resolves.
-        _try_normalise_spread(
+        // formal takes. The trailing actuals fill that formal between
+        // them: their values are built into the tuple, and from here on
+        // the call's arguments are read one slot per formal, with the
+        // written argument list left as it is.
+        _try_spread(
             function_group: Semantic.Symbols.FUNCTION_GROUP,
             arguments: Collections.LIST[Value],
             argument_types: Collections.LIST[Type],
             argument_expressions: Trees.Expressions.LIST,
             want_instance: bool
-        ) -> bool is
+        ) -> ARGUMENT_SLOTS? is
             let candidate: Semantic.Symbols.Function? mut = null
             let count mut = 0
 
@@ -2203,23 +2260,16 @@ namespace Syntax.Process is
             od
 
             if count != 1 then
-                return false
+                return null
             fi
 
             let first = candidate!.spread_argument_index
 
             if !Semantic.ARGUMENT_PACK.spread_arity(first, argument_expressions.expressions.count)? then
-                return false
+                return null
             fi
 
-            let elements = Collections.LIST[Trees.Expressions.Expression]()
-
-            for i in first..argument_expressions.expressions.count do
-                elements.add(argument_expressions.expressions[i])
-            od
-
-            let span = argument_expressions.location
-            let tuple = Trees.Expressions.TUPLE(span, Trees.Expressions.LIST(span, elements), false)
+            let slots = ARGUMENT_SLOTS(argument_expressions.expressions, first)
 
             // The trailing actuals are walked a second time below, so
             // the failed resolve's diagnostics and the flow state it
@@ -2250,28 +2300,95 @@ namespace Syntax.Process is
                 fi
             od
 
-            while argument_expressions.expressions.count > first do
-                argument_expressions.expressions.remove_at(argument_expressions.expressions.count - 1)
+            while arguments.count > first do
                 arguments.remove_at(arguments.count - 1)
                 argument_types.remove_at(argument_types.count - 1)
             od
 
-            _visitor.rewalk(tuple)
+            arguments.add(DUMMY(Semantic.Types.ERROR(), slots.location(first)))
+            argument_types.add(Semantic.Types.ERROR())
 
-            argument_expressions.expressions.add(tuple)
+            _fill_spread_slot(slots, first, null, arguments, argument_types)
 
-            if let tuple.value? /\ value.type? then
-                arguments.add(value)
-                argument_types.add(value.type!)
+            return slots
+        si
+
+        // Fills the slot a spread stands in: each trailing expression is
+        // walked under the element type the formal's tuple gives it, where
+        // the formal has settled one, and their values are built into the
+        // tuple. An element without a value leaves the slot in error.
+        _fill_spread_slot(
+            slots: ARGUMENT_SLOTS,
+            index: int,
+            formal: Type?,
+            arguments: Collections.LIST[Value],
+            argument_types: Collections.LIST[Type]
+        ) is
+            if let value = _rewalk_spread(slots, formal) then
+                arguments[index] = value
+                argument_types[index] = value.type!
             else
                 let t = Semantic.Types.ERROR()
 
-                arguments.add(DUMMY(t, span))
-                argument_types.add(t)
+                arguments[index] = DUMMY(t, slots.location(index))
+                argument_types[index] = t
             fi
-
-            return true
         si
+
+        _rewalk_spread(slots: ARGUMENT_SLOTS, formal: Type?) -> Value? is
+            let elements = slots.elements
+
+            let settled = if formal? then Semantic.SETTLED_PLACEHOLDER_RESOLVER.instance.resolve(formal) else null fi
+
+            let constraints: Collections.List[Type]? =
+                if settled? /\ settled.is_value_tuple /\ settled.arguments.count == elements.count then
+                    settled.arguments
+                else
+                    null
+                fi
+
+            let values = Collections.LIST[Value]()
+            let types = Collections.LIST[Type]()
+
+            let boxer = IR.VALUE_BOXER(_logger)
+
+            for i in 0..elements.count do
+                let element = elements[i]
+
+                if let known = constraints then
+                    element.set_expected_type(known[i], "{{0}} is not assignable to {{1}}")
+                else
+                    element.clear_expected_type()
+                fi
+
+                _visitor.rewalk(element)
+
+                let value = element.value
+
+                if !value? \/ !value.type? \/ !value.check_is_consumable(_logger, element.location) then
+                    return null
+                fi
+
+                let value_type = value.type!
+
+                if let known = constraints then
+                    let constraint = known[i]
+
+                    if !constraint.is_assignable_from(value_type) then
+                        _logger.error(element.location, "{value_type} is not assignable to {constraint}")
+                    fi
+
+                    types.add(constraint)
+                    values.add(boxer.box_if_needed(value, constraint))
+                else
+                    types.add(value_type)
+                    values.add(value)
+                fi
+            od
+
+            return TUPLE(_innate_symbol_lookup.get_tuple_type(types, null), values)
+        si
+
 
         // True when at least one argument is one the pack adaptation
         // applies to - the signal that a failed resolve is recoverable
@@ -2279,22 +2396,28 @@ namespace Syntax.Process is
         _has_pack_mismatch_argument(
             candidate: Semantic.Symbols.Function,
             argument_types: Collections.LIST[Type],
-            argument_expressions: Collections.List[Trees.Expressions.Expression]
+            argument_expressions: Collections.List[Trees.Expressions.Expression?]
         ) -> bool is
             if candidate.arguments.count != argument_expressions.count then
                 return false
             fi
 
             for i in 0..argument_expressions.count do
-                if _pack_adaptation_arity(candidate, i, argument_expressions[i], argument_types[i], null)? then
+                let argument = argument_expressions[i]
+
+                if !argument? then
+                    continue
+                fi
+
+                if _pack_adaptation_arity(candidate, i, argument, argument_types[i], null)? then
                     return true
                 fi
 
-                if _pack_adaptation_value_arity(candidate, i, argument_expressions[i], argument_types[i])? then
+                if _pack_adaptation_value_arity(candidate, i, argument, argument_types[i])? then
                     return true
                 fi
 
-                if _nested_pack_adaptation_arity(candidate, i, argument_expressions[i], argument_types[i])? then
+                if _nested_pack_adaptation_arity(candidate, i, argument, argument_types[i])? then
                     return true
                 fi
             od
@@ -2359,15 +2482,17 @@ namespace Syntax.Process is
         _has_carrier_mismatch_reference(
             candidate: Semantic.Symbols.Function,
             argument_types: Collections.LIST[Type],
-            argument_expressions: Collections.List[Trees.Expressions.Expression]
+            argument_expressions: Collections.List[Trees.Expressions.Expression?]
         ) -> bool is
             if candidate.arguments.count != argument_expressions.count then
                 return false
             fi
 
             for i in 0..argument_expressions.count do
-                if _carrier_mismatch_shape(argument_expressions[i], argument_types[i], candidate.arguments[i])? then
-                    return true
+                if let argument = argument_expressions[i] then
+                    if _carrier_mismatch_shape(argument, argument_types[i], candidate.arguments[i])? then
+                        return true
+                    fi
                 fi
             od
 
@@ -2405,10 +2530,12 @@ namespace Syntax.Process is
             argument_types: Collections.LIST[Type],
             want_instance: bool,
             named_restrict: Collections.List[Semantic.Symbols.Function]?,
-            argument_expressions: Collections.List[Trees.Expressions.Expression],
+            slots: ARGUMENT_SLOTS,
             argument_location: LOCATION,
             cache_key: Trees.Node
         ) -> Semantic.OVERLOAD_RESOLVE_RESULT? is
+            let argument_expressions = slots.expressions
+
             let push_function mut = overload_result.function
 
             // An asynchronous literal with no declared return type
@@ -2453,8 +2580,14 @@ namespace Syntax.Process is
 
             // Indexed rather than iterated: an argument may be replaced
             // in place below, and the list being walked is the call's own.
-            for index in 0..argument_expressions.count do
-                let a mut = argument_expressions[index]
+            for index in 0..slots.count do
+                if slots.is_spread(index) then
+                    _fill_spread_slot(slots, index, push_function.arguments[index], arguments, argument_types)
+
+                    continue
+                fi
+
+                let a mut = slots.expression(index)!
 
                 // A splice from the after-null retry may have replaced
                 // the original operand in the tree while this list still
@@ -2537,7 +2670,7 @@ namespace Syntax.Process is
                 if _delegate_shape.is_named_delegate(formal, _innate_symbol_lookup) /\ !formal.is_assignable_from(argument_types[index]) then
                     let use qualified = IoC.CONTAINER.instance.name_display.qualifying_alike(argument_types[index], formal)
                     _logger.error(
-                        argument_expressions[index].location,
+                        slots.location(index),
                         "{argument_types[index]} is not assignable to {formal}")
 
                     return null
@@ -2729,14 +2862,17 @@ namespace Syntax.Process is
                     // generic one.
                     let overload_result mut = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict, call.expected_type)
 
+                    let slots mut = ARGUMENT_SLOTS.plain(call.arguments.expressions)
+
                     if !overload_result? then
-                        if _try_normalise_spread(function_group, arguments, argument_types, call.arguments, want_instance) then
+                        if let spread = _try_spread(function_group, arguments, argument_types, call.arguments, want_instance) then
+                            slots = spread
                             overload_result = _overload_resolver.resolve(call.arguments.location, function_group, argument_types, true, want_instance, false, named_restrict, call.expected_type)
                         fi
                     fi
 
                     if !overload_result? then
-                        overload_result = try_overload_after_null(function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call)
+                        overload_result = try_overload_after_null(function_group, arguments, argument_types, want_instance, named_restrict, slots, call.arguments.location, call)
                     fi
 
                     if overload_result == null then
@@ -2745,7 +2881,7 @@ namespace Syntax.Process is
                     fi
 
                     if overload_result.needs_retry then
-                        overload_result = try_overload_on_partial(overload_result, function_group, arguments, argument_types, want_instance, named_restrict, call.arguments.expressions, call.arguments.location, call)
+                        overload_result = try_overload_on_partial(overload_result, function_group, arguments, argument_types, want_instance, named_restrict, slots, call.arguments.location, call)
 
                         if !overload_result? then
                             call.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), call.location)
@@ -2755,7 +2891,7 @@ namespace Syntax.Process is
 
                     let function mut = overload_result.function
 
-                    if _resolve_deferred_defaults(function, call.arguments.expressions, arguments, argument_types) then
+                    if _resolve_deferred_defaults(function, slots.expressions, arguments, argument_types) then
                         // A bare group argument resolved to a delegate
                         // only now that the formal was known - re-resolve
                         // so the callee's own type variables bind from the
@@ -2769,7 +2905,7 @@ namespace Syntax.Process is
 
                     _visitor.note_reference_arguments(call, function)
                     _feed_pack_from_expected(function, call.expected_type)
-                    _bound_awaiting_sequence_elements(function, call.arguments.expressions)
+                    _bound_awaiting_sequence_elements(function, slots.expressions)
 
                     if function.is_unsafe_constraints then
                         _logger.warn(call.location, "unchecked-constraints", "call to {function} has unchecked constraints")
@@ -2793,8 +2929,8 @@ namespace Syntax.Process is
                         )
                     fi
 
-                    _settle_packed_literal_names(function, call.arguments.expressions)
-                    present_pack_arguments(call, call.arguments.expressions, function, arguments)
+                    _settle_packed_literal_names(function, slots.expressions)
+                    present_pack_arguments(call, slots.expressions, function, arguments)
 
                     let accessor_class = _symbol_table.current_accessor
 
@@ -3118,13 +3254,19 @@ namespace Syntax.Process is
             // to be inferred takes its arguments as the tuple the pack binds
             // to: `let safe = retry((a, b) => a + b, 1); safe(2, 3)` says
             // the pack is `(int, int)`, and nothing else does.
-            if formal_count == 1 /\ argument_count >= 2 then
-                if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = ft_args[0] then
+            if formal_count >= 1 /\ argument_count > formal_count then
+                if let placeholder: Semantic.Types.INFERRED_VARIABLE_TYPE = ft_args[formal_count - 1] then
                     if let origin: Semantic.Symbols.INFERRED_TYPE_ARG_ORIGIN = placeholder.origin /\ origin.is_argument_pack then
                         let elements = Collections.LIST[Semantic.Types.Type]()
 
-                        for actual in argument_types do
-                            elements.add(Semantic.INFERENCE_HELPERS.widen_to_closed_root(actual)!)
+                        for i in formal_count - 1..argument_count do
+                            elements.add(Semantic.INFERENCE_HELPERS.widen_to_closed_root(argument_types[i])!)
+                        od
+
+                        for i in 0..formal_count - 1 do
+                            if let leading: Semantic.Types.INFERRED_VARIABLE_TYPE = ft_args[i] then
+                                _logger.mark_consumed_any_if(Semantic.INFERENCE_TRACE.add_lower_bound("calls.placeholder_formal", leading.origin, Semantic.INFERENCE_HELPERS.widen_to_closed_root(argument_types[i])!))
+                            fi
                         od
 
                         let tuple = _innate_symbol_lookup.get_tuple_type(elements, null)

@@ -34,7 +34,7 @@ namespace Syntax.Process is
         _delegate_shape: Semantic.DELEGATE_SHAPE
         _attribute_resolver: ATTRIBUTE_RESOLVER
         _composite_spill_state: COMPOSITE_SPILL_STORE
-        _function_reference_adapter: FUNCTION_REFERENCE_ADAPTER
+        _pack_wrap_builder: PACK_WRAP_BUILDER
 
         init(
             logger: Logger,
@@ -49,12 +49,9 @@ namespace Syntax.Process is
             build_flags: Compiler.GLOBAL_BUILD_FLAGS,
             visitor: ScopedVisitor,
             attribute_resolver: ATTRIBUTE_RESOLVER,
-            composite_spill_state: COMPOSITE_SPILL_STORE,
-            function_reference_adapter: FUNCTION_REFERENCE_ADAPTER
+            composite_spill_state: COMPOSITE_SPILL_STORE
         ) is
             super.init()
-
-            _function_reference_adapter = function_reference_adapter
 
             _logger = logger
             _symbol_table = symbol_table
@@ -72,6 +69,7 @@ namespace Syntax.Process is
             _attribute_resolver = attribute_resolver
             _composite_spill_state = composite_spill_state
             _delegate_shape = Semantic.DELEGATE_SHAPE()
+            _pack_wrap_builder = PACK_WRAP_BUILDER(symbol_table, symbol_loader, innate_symbol_lookup)
         si
 
         visit_function_definition(function: Trees.Definitions.FUNCTION) is
@@ -518,49 +516,6 @@ namespace Syntax.Process is
             return false
         si
 
-        // A literal two or more returns from the marker whose body is not
-        // itself a literal - a name, a local, a call - evaluates to a
-        // function that returns the N-ary one. It is expanded into a
-        // literal over its own parameters, so that the marker has a body
-        // to go on to, and the body is walked again around it.
-        _expand_deeper_pack_body(function: Trees.Expressions.FUNCTION, closure: Semantic.Symbols.Closure) -> bool is
-            let depth = function.nested_pack_depth
-
-            if depth < 2 then
-                return false
-            fi
-
-            let body = cast Trees.Bodies.EXPRESSION?(function.body)
-
-            if !body? \/ isa Trees.Expressions.FUNCTION(body.expression) then
-                return false
-            fi
-
-            let type = body.expression.value?.type
-
-            if !type? \/ !type.is_function \/ type.is_action then
-                return false
-            fi
-
-            let inner = _function_reference_adapter.try_adapt(body.expression, Semantic.ARGUMENT_PACK.parameter_count(type))
-
-            if !inner? then
-                return false
-            fi
-
-            body.expression = inner
-
-            inner.set_expects_pack(depth - 1)
-
-            if closure.return_type_was_inferred then
-                closure.set_return_type(Semantic.Types.INFERRED_RETURN_TYPE())
-            else
-                _present_declared_return_as_packed(function, depth - 1)
-            fi
-
-            return true
-        si
-
         // A literal at a marked position may write its return as the
         // N-ary function type the marker licenses there, at whatever
         // depth the marker sits. What it returns is the wrapper, so
@@ -580,64 +535,11 @@ namespace Syntax.Process is
                 return
             fi
 
-            if let packed = _pack_spine(declared, depth) then
+            if let packed = _pack_wrap_builder.packed_spine(declared, depth, _slot_fixed_count(function.pack_slot)) then
                 closure.set_return_type(packed)
             fi
         si
 
-        // `type` with the function `depth` returns along its spine
-        // rewritten to take its parameters as one tuple. Absent where
-        // the spine is shorter than that, or where what it arrives at
-        // is not a function of two to seven parameters.
-        _pack_spine(type: Type, depth: int) -> Type? is
-            if !type.is_function then
-                return null
-            fi
-
-            let count = Semantic.ARGUMENT_PACK.parameter_count(type)
-            let types = Collections.LIST[Type]()
-
-            if depth > 0 then
-                if type.is_action then
-                    return null
-                fi
-
-                let inner = _pack_spine(type.arguments[count], depth - 1)
-
-                if !inner? then
-                    return null
-                fi
-
-                for i in 0..count do
-                    types.add(type.arguments[i])
-                od
-
-                types.add(inner)
-
-                return _innate_symbol_lookup.get_function_type(types, type.is_pure_function)
-            fi
-
-            if count < 2 \/ count > Semantic.ARGUMENT_PACK.MAXIMUM_ARITY then
-                return null
-            fi
-
-            let elements = Collections.LIST[Type]()
-
-            for i in 0..count do
-                elements.add(type.arguments[i])
-            od
-
-            types.add(_innate_symbol_lookup.get_tuple_type(elements, null))
-            types.add(
-                if type.is_action then
-                    _innate_symbol_lookup.get_void_type()
-                else
-                    type.arguments[count]
-                fi
-            )
-
-            return _innate_symbol_lookup.get_function_type(types, type.is_pure_function)
-        si
 
         // What the slot a literal goes into says it returns, where the
         // slot is known and says anything a body could be held to.
@@ -695,14 +597,19 @@ namespace Syntax.Process is
                 return false
             fi
 
+            // With no expected type yet, the slot the marker names says how
+            // many parameters come before the pack.
             if !expected_type? then
-                return PACKED_LITERAL.is_eligible(function)
+                return PACKED_LITERAL.is_eligible(function, _slot_fixed_count(function.pack_slot))
             fi
 
             return
                 Semantic.ARGUMENT_PACK.is_pack_slot(expected_type) /\
                 PACKED_LITERAL.is_eligible(function, Semantic.ARGUMENT_PACK.fixed_count(expected_type))
         si
+
+        _slot_fixed_count(slot: Type?) -> int =>
+            if slot? /\ Semantic.ARGUMENT_PACK.is_pack_slot(slot) then Semantic.ARGUMENT_PACK.fixed_count(slot) else 0 fi
 
         // The types of the parameters a pack slot takes of its own before
         // the pack.
@@ -861,7 +768,7 @@ namespace Syntax.Process is
 
             let arguments_resolved =
                 if is_packed then
-                    _closure_arg_resolver.resolve_packed(function.arguments.expressions, closure, packed_tuple, _fixed_parameter_types(expected_type))
+                    _closure_arg_resolver.resolve_packed(function.arguments.expressions, closure, packed_tuple, _fixed_parameter_types(expected_type ?? function.pack_slot))
                 else
                     _closure_arg_resolver.resolve(function.arguments.expressions, closure, implied_argument_types)
                 fi
@@ -1010,7 +917,20 @@ namespace Syntax.Process is
             // takes.
             if function.nested_pack_depth > 0 then
                 if let body: Trees.Bodies.EXPRESSION = function.body then
-                    body.expression.set_expects_pack(function.nested_pack_depth - 1)
+                    // A body that is not a literal is a function of the
+                    // pack's elements, or returns one, and is expected in
+                    // that shape: the marker's hop spread out.
+                    if
+                        constraint_return_type? /\
+                        !function.type_expression.type? /\
+                        !COMPILE_CALLS.parenthesised_literal(body.expression)?
+                    then
+                        if let spread = Semantic.ARGUMENT_PACK.spread_spine(constraint_return_type, function.nested_pack_depth - 1) then
+                            body.expression.set_expected_type(spread, "cannot return value of type {{0}} where {{1}} expected")
+                        fi
+                    fi
+
+                    body.expression.set_expects_pack(function.nested_pack_depth - 1, function.pack_slot)
                 fi
 
                 _present_declared_return_as_packed(function, function.nested_pack_depth - 1)
@@ -1096,21 +1016,6 @@ namespace Syntax.Process is
             let use flow_speculation = _flow.speculate_then_commit()
 
             _walk_literal_body(function, closure)
-
-            if _expand_deeper_pack_body(function, closure) then
-                let use retry_site = RETRY_SITE_STATS.enter("lambdas.carry_nested_pack", RetrySiteKind.REWALK_WITH_INFORMATION)
-                _logger.roll_back()
-                _logger.speculate()
-
-                _symbol_use_locations.roll_back()
-                _symbol_use_locations.speculate()
-
-                _flow.restore()
-
-                CLEAR_STATE_VISITOR(true, true).apply(function.body)
-
-                _walk_literal_body(function, closure)
-            fi
 
             let reported_inference_failure = false
 
