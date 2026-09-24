@@ -9,21 +9,25 @@ namespace Syntax.Process is
     // unpacks it and calls the function; the other direction packs the
     // elements into the tuple the function takes.
     //
-    // The function value is evaluated once, where it stands, into a local
-    // the thunk captures, so an operand with effects of its own - a call
-    // that builds state - runs once however often the thunk is called.
+    // A thunk is a static closure symbol with no literal behind it, whose
+    // body is emitted from the description recorded on it. Its first
+    // parameter is the function it stands for, and its delegate is built
+    // closed over that parameter, so the value is evaluated once, where
+    // it stands, and nothing is captured. A pack marked past the
+    // function's own type - `make: (int) -> T.. -> U` - takes a chain:
+    // each thunk above the pack calls its function and returns the next
+    // thunk's delegate, closed over the result.
     //
-    // Nothing here touches a syntax tree. The thunk is a closure symbol
-    // with no literal behind it, and its body is emitted from the
-    // description recorded on it. A call is compiled once for every walk
-    // of the body it stands in, so the thunk made for a given argument of
-    // a given call is kept and reused rather than declared again.
+    // Nothing here touches a syntax tree. A call is compiled once for
+    // every walk of the body it stands in, so the thunks made for a given
+    // argument of a given call are kept and reused rather than declared
+    // again.
     class PACK_WRAP_BUILDER is
         _symbol_table: Semantic.SYMBOL_TABLE
         _symbol_loader: Semantic.SYMBOL_LOADER
         _innate_symbol_lookup: Semantic.Lookups.InnateSymbolLookup
 
-        _thunks: Collections.MAP[Trees.Node, Collections.MAP[int, THUNK_PARTS]]
+        _thunks: Collections.MAP[Trees.Node, Collections.MAP[int, Collections.LIST[Semantic.Symbols.Closure]]]
 
         _index: int
 
@@ -36,7 +40,7 @@ namespace Syntax.Process is
             _symbol_loader = symbol_loader
             _innate_symbol_lookup = innate_symbol_lookup
 
-            _thunks = Collections.MAP[Trees.Node, Collections.MAP[int, THUNK_PARTS]]()
+            _thunks = Collections.MAP[Trees.Node, Collections.MAP[int, Collections.LIST[Semantic.Symbols.Closure]]]()
         si
 
         // The type `function_type` has once its parameters after the
@@ -91,6 +95,36 @@ namespace Syntax.Process is
             return _innate_symbol_lookup.get_function_type(parameters, function_type.is_pure_function)
         si
 
+        // `function_type` with the function `depth` returns along its
+        // spine packed as above, and every hop before it kept as it is.
+        // Absent where the spine is shorter than that.
+        packed_spine(function_type: Type?, depth: int, fixed_count: int) -> Type? is
+            if depth == 0 then
+                return packed_type(function_type, fixed_count)
+            fi
+
+            if !function_type? \/ !function_type.is_function \/ function_type.is_action then
+                return null
+            fi
+
+            let count = Semantic.ARGUMENT_PACK.parameter_count(function_type)
+
+            let inner = packed_spine(function_type.arguments[count], depth - 1, fixed_count)
+
+            if !inner? then
+                return null
+            fi
+
+            let parameters = Collections.LIST[Type]()
+
+            for i in 0..count do
+                parameters.add(function_type.arguments[i])
+            od
+
+            parameters.add(inner)
+
+            return _innate_symbol_lookup.get_function_type(parameters, function_type.is_pure_function)
+        si
 
         // The type `function_type` has once the tuple it takes after its
         // first `fixed_count` parameters is spread out as parameters of
@@ -147,22 +181,78 @@ namespace Syntax.Process is
             location: Source.LOCATION,
             value: Value,
             fixed_count: int
+        ) -> Value? =>
+            unpack(key, index, location, value, fixed_count, 0)
+
+        // As above, for a pack `depth` returns past the value's own type:
+        // the value is a function that, called that many times, gives the
+        // function of the pack's elements.
+        unpack(
+            key: Trees.Node,
+            index: int,
+            location: Source.LOCATION,
+            value: Value,
+            fixed_count: int,
+            depth: int
         ) -> Value? is
             let callee_type = value.type
 
-            let presented = packed_type(callee_type, fixed_count, true)
-
-            if !callee_type? \/ !presented? then
+            if !callee_type? then
                 return null
             fi
 
+            let presented = packed_spine(callee_type, depth, fixed_count)
+
+            if !presented? then
+                return null
+            fi
+
+            let enclosing = _symbol_table.current_function
+
+            if !enclosing? then
+                return null
+            fi
+
+            let thunks = _thunks_for(key, index, location, enclosing, depth + 1)
+
+            if !thunks? then
+                return null
+            fi
+
+            // The chain is built from the pack upwards: the thunk at depth
+            // zero packs, and each above it hands its result down.
+            let hop_types = _hops(callee_type, depth)
+            let hop_presented = _hops(presented, depth)
+
+            let innermost_type = hop_types[depth]
+
             let elements = Collections.LIST[Type]()
 
-            for i in fixed_count..Semantic.ARGUMENT_PACK.parameter_count(callee_type) do
-                elements.add(callee_type.arguments[i])
+            for i in fixed_count..Semantic.ARGUMENT_PACK.parameter_count(innermost_type) do
+                elements.add(innermost_type.arguments[i])
             od
 
-            return _wrap(key, index, location, value, callee_type, presented, true, fixed_count, elements)
+            let target = if depth == 0 then _direct_target(value) else null fi
+
+            _describe(
+                thunks[0],
+                location,
+                innermost_type,
+                hop_presented[depth],
+                Semantic.Symbols.PACK_THUNK(true, fixed_count, elements, innermost_type, target)
+            )
+
+            for d in 1..depth + 1 do
+                _describe(
+                    thunks[d],
+                    location,
+                    hop_types[depth - d],
+                    hop_presented[depth - d],
+                    Semantic.Symbols.PACK_THUNK.chain(hop_types[depth - d], d, thunks[d - 1], hop_presented[depth - d + 1])
+                )
+            od
+
+            return _present(thunks[depth], location, value, presented)
         si
 
         // Wraps `value`, a function of the pack's tuple, as a function of
@@ -182,48 +272,78 @@ namespace Syntax.Process is
                 return null
             fi
 
-            let elements = Collections.LIST[Type]()
-
-            for element in callee_type.arguments[fixed_count].arguments do
-                elements.add(element)
-            od
-
-            return _wrap(key, index, location, value, callee_type, presented, false, fixed_count, elements)
-        si
-
-        _wrap(
-            key: Trees.Node,
-            index: int,
-            location: Source.LOCATION,
-            value: Value,
-            callee_type: Type,
-            presented: Type,
-            is_unpack: bool,
-            fixed_count: int,
-            elements: Collections.List[Type]
-        ) -> Value? is
             let enclosing = _symbol_table.current_function
 
             if !enclosing? then
                 return null
             fi
 
-            let parts = _parts_for(key, index, location, enclosing)
+            let thunks = _thunks_for(key, index, location, enclosing, 1)
 
-            if !parts? then
+            if !thunks? then
                 return null
             fi
 
-            let thunk = parts.thunk
+            let elements = Collections.LIST[Type]()
 
+            for element in callee_type.arguments[fixed_count].arguments do
+                elements.add(element)
+            od
+
+            _describe(
+                thunks[0],
+                location,
+                callee_type,
+                presented,
+                Semantic.Symbols.PACK_THUNK(false, fixed_count, elements, callee_type, _direct_target(value))
+            )
+
+            return _present(thunks[0], location, value, presented)
+        si
+
+        // `function_type` and the type each of `depth` returns along its
+        // spine gives, outermost first.
+        _hops(function_type: Type, depth: int) -> Collections.LIST[Type] is
+            let result = Collections.LIST[Type]()
+
+            let hop mut = function_type
+
+            result.add(hop)
+
+            for _ in 0..depth do
+                hop = hop.arguments[hop.arguments.count - 1]
+
+                result.add(hop)
+            od
+
+            return result
+        si
+
+        // Gives `thunk` the parameters of `presented`, its function as a
+        // parameter before them where it is not called by name, its
+        // return, and `description` as what its body does.
+        _describe(
+            thunk: Semantic.Symbols.Closure,
+            location: Source.LOCATION,
+            callee_type: Type,
+            presented: Type,
+            description: Semantic.Symbols.PACK_THUNK
+        ) is
             let parameter_types = Collections.LIST[Type]()
             let parameter_names = Collections.LIST[string]()
+
+            if description.takes_callee then
+                parameter_types.add(callee_type)
+                parameter_names.add("$pack_callee")
+
+                _parameter(thunk, location, "$pack_callee").set_type(callee_type)
+            fi
 
             for i in 0..Semantic.ARGUMENT_PACK.parameter_count(presented) do
                 parameter_types.add(presented.arguments[i])
                 parameter_names.add("$pack_{i}")
 
-                _parameter(thunk, location, i).set_type(presented.arguments[i])
+                _parameter(thunk, location, "$pack_{i}").set_type(presented.arguments[i])
             od
 
             thunk.arguments = parameter_types
@@ -243,34 +363,25 @@ namespace Syntax.Process is
 
             _record_type_arguments(thunk, thunk.return_type!)
 
+            thunk.pack_thunk = description
+        si
+
+        // The presented value: `thunk`'s delegate, closed over `value`
+        // where the thunk takes its function as a parameter, and built
+        // once and kept where it calls one by name.
+        _present(
+            thunk: Semantic.Symbols.Closure,
+            location: Source.LOCATION,
+            value: Value,
+            presented: Type
+        ) -> Value is
             let block = IR.Values.PACK_WRAP(presented, value)
 
-            // A function named where it stands, needing no receiver and no
-            // type arguments, is called directly: the thunk captures
-            // nothing, so its delegate is built once and kept.
-            if let target = _direct_target(value) then
-                thunk.pack_thunk = Semantic.Symbols.PACK_THUNK(is_unpack, fixed_count, elements, null, callee_type, target)
-
+            if thunk.pack_thunk!.takes_callee then
+                block.add(thunk.load_closed_over(location, value, presented))
+            else
                 block.add(thunk.load(location, _symbol_loader))
-
-                return block
             fi
-
-            parts.hoist.set_type(callee_type)
-
-            thunk.pack_thunk =
-                Semantic.Symbols.PACK_THUNK(
-                    is_unpack,
-                    fixed_count,
-                    elements,
-                    thunk.load_captured_value(location, parts.hoist, _symbol_loader),
-                    callee_type,
-                    null
-                )
-
-            block.add(IR.Values.DECLARE_LOCAL(parts.hoist.il_name, callee_type))
-            block.add(IR.Values.Store.LOCAL_VARIABLE(parts.hoist, value))
-            block.add(thunk.load(location, _symbol_loader))
 
             return block
         si
@@ -294,10 +405,8 @@ namespace Syntax.Process is
         _parameter(
             thunk: Semantic.Symbols.Closure,
             location: Source.LOCATION,
-            index: int
+            name: string
         ) -> Semantic.Symbols.Variable is
-            let name = "$pack_{index}"
-
             if let existing: Semantic.Symbols.Variable = thunk.find_direct(name) then
                 return existing
             fi
@@ -324,75 +433,56 @@ namespace Syntax.Process is
             od
         si
 
-        _parts_for(
+        // The thunks for argument `index` of the call `key` is, `count` of
+        // them from the pack upwards, declared on first use and kept.
+        _thunks_for(
             key: Trees.Node,
             index: int,
             location: Source.LOCATION,
-            enclosing: Semantic.Symbols.Function
-        ) -> THUNK_PARTS? is
-            let for_key: Collections.MAP[int, THUNK_PARTS] mut
+            enclosing: Semantic.Symbols.Function,
+            count: int
+        ) -> Collections.LIST[Semantic.Symbols.Closure]? is
+            let for_key: Collections.MAP[int, Collections.LIST[Semantic.Symbols.Closure]] mut
 
             if !_thunks.try_get_value(key, for_key ref) then
-                for_key = Collections.MAP[int, THUNK_PARTS]()
+                for_key = Collections.MAP[int, Collections.LIST[Semantic.Symbols.Closure]]()
                 _thunks[key] = for_key
             fi
 
-            let existing: THUNK_PARTS mut
+            let thunks: Collections.LIST[Semantic.Symbols.Closure] mut
 
-            if for_key.try_get_value(index, existing ref) then
-                return existing
+            if !for_key.try_get_value(index, thunks ref) then
+                thunks = Collections.LIST[Semantic.Symbols.Closure]()
+                for_key[index] = thunks
             fi
 
-            let scope = Semantic.BLOCK_SCOPE(_symbol_table.current_scope)
-
-            let local_id_generator = IoC.CONTAINER.instance.local_id_generator
-
-            local_id_generator.enter_function()
-
-            let hoist = cast Semantic.Symbols.Variable?(scope.declare_variable(location, "$pack_callee_{_index}", false, null))
-
-            local_id_generator.leave_function()
-
-            let thunk =
-                cast Semantic.Symbols.Closure?(
-                    enclosing.declare_closure(
-                        location,
-                        "$pack_thunk_{_index}",
-                        cast Semantic.Scope?(_symbol_table.current_closure_context)!,
-                        scope,
-                        false,
-                        null
+            while thunks.count < count do
+                let thunk =
+                    cast Semantic.Symbols.Closure?(
+                        enclosing.declare_closure(
+                            location,
+                            "$pack_thunk_{_index}",
+                            cast Semantic.Scope?(_symbol_table.current_closure_context)!,
+                            _symbol_table.current_scope,
+                            false,
+                            null
+                        )
                     )
-                )
 
-            _index = _index + 1
+                _index = _index + 1
 
-            if !hoist? \/ !thunk? then
-                return null
-            fi
+                if !thunk? then
+                    return null
+                fi
 
-            hoist.mark_synthesized()
-            hoist.define()
+                thunk.mark_synthesized()
 
-            thunk.mark_synthesized()
+                _symbol_table.current_closure_context.add_closure(thunk)
 
-            _symbol_table.current_closure_context.add_closure(thunk)
+                thunks.add(thunk)
+            od
 
-            let parts = THUNK_PARTS(thunk, hoist)
-
-            for_key[index] = parts
-
-            return parts
-        si
-    si
-
-    class THUNK_PARTS is
-        thunk: Semantic.Symbols.Closure
-        hoist: Semantic.Symbols.Variable
-
-        init(thunk: Semantic.Symbols.Closure, hoist: Semantic.Symbols.Variable) is
-            self.thunk = thunk
-            self.hoist = hoist
+            return thunks
         si
     si
 si
