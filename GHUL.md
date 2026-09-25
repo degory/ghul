@@ -154,6 +154,24 @@ Importing something the set already carries is how a file adds to the set rather
 
 Compiling with `--implicit-default-use` gives every file that declares no namespace an implicit `use default`, placed after the file's pragmas and before everything else, which is how a one-file script run directly gets `write_line`, the pipes and the collections without asking for them. A file that declares a namespace gets nothing implicit, since its namespace blocks choose their own imports. A `use default` the file writes as well is harmless, and a definition of its own still wins over one the set brings in.
 
+## comments
+
+`//` starts a comment that runs to the end of the line, and `/*` ... `*/` encloses one that can span lines. Either counts as the whitespace it sits in.
+
+A line comment starting with exactly three slashes, `///`, and with nothing before it on its line, is a **doc comment**. A block of them written directly above a declaration documents it, and an editor shows the text in hover and completion wherever the declaration is used, including from another assembly:
+
+```ghul
+/// Joins `parts` with `separator` between each pair.
+///
+/// - parts: the strings to join, in order
+/// - separator: placed between adjacent parts, not at either end
+join(parts: string[], separator: string) -> string => string.join(separator, parts)
+```
+
+The block is the run of `///` lines ending on the line directly above the declaration, or, where the declaration has pragmas, directly above its first pragma. A blank line or any other comment or code in between means the block documents nothing. Classes, structs, traits, unions and their variants, enums and their members, functions, methods, properties and global variables take a doc comment; members added in a `partial` or `impl` block take one like any other.
+
+The text is Markdown. Each line loses its `///` and one following space, and is otherwise shown as written, so a `///` line with nothing else on it is a paragraph break. Arguments are described in a bullet list, one `- name: description` line each. Four or more slashes make an ordinary comment, which leaves a row of slashes free to use as a divider.
+
 ## statement terminators
 
 A `;` separates two statements or simple declarations written on one line. At the end of a line it is not needed: wherever the grammar could accept a `;` and the next token opens a new line, the boundary is inferred. End of file ends a line too, so the last construct in a file needs no terminator either.
