@@ -1828,7 +1828,7 @@ let total = scores["alice"];
 
 A map computed from a sequence takes a key and a value function instead, `words |> collect_map(w => w, w => w.length)`, and one that starts empty and is filled later is constructed with no arguments, `MAP()`, its types taken from how it is used.
 
-The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `sum`, `product`, `collect` / `collect_list` / `collect_array` / `collect_set` / `collect_map`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`.
+The sequence combinators are global functions in `Ghul.Pipes`, each taking the sequence as its first argument, so the thread-first operator `|>` chains them. ghūl provides the usual set, in the manner of LINQ, and none of them mutate the source. They split into lazy stages that return a new sequence — `map`, `filter`, `flat_map`, `skip`, `take`, `cat`, `index`, `zip`, `sort` — and terminals that consume it and produce a value: `reduce`, `sum`, `product`, `collect` / `collect_mutable` / `collect_set` / `collect_map`, `count`, `find`, `find_map`, `first`, `only`, `any`, `all`, `each`, `join`, `append_to`. `collect` produces an array, and `collect_mutable` a `LIST` that can be changed.
 
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
@@ -1863,7 +1863,7 @@ od
 A pipe can also be started from nothing. `repeat(value)` yields `value` without end and `repeat(value, count)` yields it `count` times; `from(start)` counts upwards from `start` without end, and `from(start, step)` counts in steps of `step`. Collected, a bounded `repeat` is how a list of a given size is made:
 
 ```ghul
-let seen = repeat(false, 100) |> collect_list();      // LIST[bool], a hundred of them
+let seen = repeat(false, 100) |> collect_mutable();      // LIST[bool], a hundred of them
 let squares = from(1) |> map(n => n * n) |> take(5);  // 1, 4, 9, 16, 25
 ```
 
@@ -1884,7 +1884,7 @@ let c = 5 |> double() |> add(1); // add(double(5), 1) is 11
 
 A prefix operator applies to its operand before the chain does, so `!xs |> any(p)` negates `xs` rather than the answer, and `await t |> f()` is `f(await t)`. Parenthesise the chain for the other reading: `!(xs |> any(p))`.
 
-The subject goes into the last call written on the right-hand side, so `x |> box.combine(a)` is `box.combine(x, a)` and `x |> BOX(1).combine(a)` is `BOX(1).combine(x, a)`. Member access, indexing, `!` and `?` written after that call apply to its result, as they would after any call: `xs |> collect_list()[0]` is the first element and `xs |> collect_list().count` the count. An operator written after the call applies to the result of the whole chain, so `xs |> count() % 2` is `count(xs) % 2`.
+The subject goes into the last call written on the right-hand side, so `x |> box.combine(a)` is `box.combine(x, a)` and `x |> BOX(1).combine(a)` is `BOX(1).combine(x, a)`. Member access, indexing, `!` and `?` written after that call apply to its result, as they would after any call: `xs |> collect_mutable()[0]` is the first element and `xs |> collect_mutable().count` the count. An operator written after the call applies to the result of the whole chain, so `xs |> count() % 2` is `count(xs) % 2`.
 
 A function named with an operator is the one right-hand side that can be written without an argument list, since there is nothing else the bare name could mean. The threaded value is then the only argument, and an argument list is still accepted alongside it:
 
