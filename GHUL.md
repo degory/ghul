@@ -735,6 +735,28 @@ class HOLDER is
 si
 ```
 
+A function literal written inside a struct's instance member cannot read `self`
+or any of the struct's instance members, and doing so is an error at the read.
+A literal becomes a delegate, whose target is an object, and a struct's
+instance member holds `self` as a pointer to the value rather than as a
+reference to an object, so there is nothing for the literal to bind to. Copy
+what the literal needs into a local first, and the literal captures the local
+as it captures any other:
+
+```ghul
+struct SCALER(factor: int) is
+    scale(xs: List[int]) -> Pipe[int] is
+        let by = factor
+
+        return xs |> map(x => x * by)
+    si
+si
+```
+
+Static members are unaffected, since they have no `self`, and so is a struct
+reached through anything other than `self` - a local, a parameter, a field of
+some other object - which is an ordinary value the literal captures.
+
 ### primary constructors
 
 A class or struct may declare its constructor parameters directly in the header. Each parameter becomes a parameter of the synthesised `init`. A primary parameter without an explicit body declaration **auto-generates** a same-named body field/property mirroring its declared visibility:
