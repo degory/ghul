@@ -2028,6 +2028,20 @@ build[T: Named class init](name: string) -> T;
 build[T: Named /\ Sized class init](name: string) -> T;   // two bounds plus kinds
 ```
 
+A trait's type parameter can also declare its **variance**, written after any other constraints: `out` makes it covariant and `in` contravariant. A covariant trait of a subtype is assignable to the same trait of its supertype, so a `Source[CAT]` is a `Source[Animal]`; a contravariant one goes the other way, so a `Sink[Animal]` is a `Sink[CAT]`:
+
+```ghul
+trait Source[T: out] is
+    next() -> T
+si
+
+trait Sink[T: in] is
+    take(value: T)
+si
+```
+
+The compiler checks how the parameter is used: a covariant parameter in an input position, such as a method parameter, is an error, and so is a contravariant one in an output position, such as a return type. Only a trait can declare variance, because .NET allows it only on interfaces; `out` or `in` on a class or struct type parameter is an error. The variance of an imported type, a function type or an array comes from .NET.
+
 The CLR kind constraints on an imported generic (`where T : class`, `struct`, `new()`) are enforced too, at the point a type argument is resolved. Type arguments can be given explicitly (`print_something[int](1234)`) but are usually inferred — from the call arguments of a function or method, from the constructor arguments of a generic class, struct, or variant, from the enclosing context (return type, let-init type, assignment LHS, or the argument slot the call itself fills) when the arguments alone don't pin every slot, from how an untyped immutable local initialized with the call is used later in the body, and — for a generic function referred to as a value — from the function type of the slot it goes into:
 
 ```ghul
@@ -2332,6 +2346,17 @@ Because ghūl has no default argument values, a .NET **optional parameter** has 
 
 ```ghul
 let text = await IO.File.read_all_text_async(path, System.Threading.CancellationToken.none);
+```
+
+`@IL.name("Name")` sets the name a function, method or property has in the compiled assembly, for a .NET library that finds members by name - Entity Framework Core, for example, looks for an `Id` property and a `DbSet` property named after the table. On a property it also names the accessors `get_Name` and `set_Name`; `@IL.name.read("...")` or `@IL.name.assign("...")` names one accessor on its own. The argument is a single string literal and cannot contain a quote. The ghūl name is unchanged, so ghūl code still calls the member by the name it declares:
+
+```ghul
+class PRODUCT is
+    @IL.name("Id")
+    id: int public
+
+    init() is si
+si
 ```
 
 A pragma whose name doesn't match a compiler built-in is taken to name a .NET **attribute**, and emits the attribute on whatever it's written against: a class, trait, struct, union, variant, or enum; a function or method; or a single parameter in a function or method's parameter list, including a lambda literal's. The `Foo` short form resolves to `FooAttribute` when no plain `Foo` exists, in a `use` clause as well as in the pragma — so `use System.Obsolete` brings `System.ObsoleteAttribute` into scope, and `use Marker = System.Obsolete` brings it in as `Marker`. Arguments are positional, named (`name = value`), array-valued, or `typeof`:
