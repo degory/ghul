@@ -1972,7 +1972,7 @@ let lengths = [name.length for name in names if name?]
 
 A `for` clause reads a source the way a `for` loop does, so anything a loop can iterate works, and its variable can destructure (`for (key, value) in map`). Each clause sees the variables of the clauses before it, and the element sees them all. An `if` clause keeps only the elements for which its condition holds, and narrows what it tests, so `name.length` above reads `name` as a `string`. Clauses need no separator, so a long comprehension can be written across several lines.
 
-The result is an array of the element's type, or of the type the context expects: `let objects: object[] = [x for x in ints]`. The `: T[]` annotation a list literal takes works here too. The closing bracket ends the comprehension, so it composes with pipes on either side: `[x for x in xs |> filter(odd)] |> sum()`.
+The result is an array of the element's type, or of the type the context expects: `let objects: object[] = [x for x in ints]`. The `: T[]` annotation a list literal takes works here too. The closing bracket ends the comprehension, so it composes with pipes on either side: `[x for x in xs |> filter(odd)] |> sum()`. A comprehension builds its whole array before anything reads it, so it needs a source that ends: `[n * n for n in from(1)]` never finishes, and draws an `unbounded-comprehension-source` warning. An unbounded or lazily read sequence takes a pipe: `from(1) |> map(n => n * n) |> take(10)`.
 
 A comprehension's loops belong to it. A `break` or `continue` inside one cannot leave it, and it cannot contain a `yield`, an `await` or a `try`. A function literal written inside it is a body of its own and is not restricted.
 
