@@ -55,6 +55,12 @@ namespace IR.Emitter is
         _il_output_stack: Collections.LIST[(string, int, int)]
         _il_outputs: Collections.LIST[SRM_IL_OUTPUT_RANGE]?
 
+        // The instructions so far that can leave the evaluation stack
+        // deeper than they found it, and whether any handler is entered
+        // with the exception already on the stack. See max_stack.
+        _pushes: int
+        _has_catch: bool
+
         init() is
             _encoder = InstructionEncoder(BlobBuilder(32), ControlFlowBuilder())
 
@@ -94,6 +100,8 @@ namespace IR.Emitter is
         ) is
             // Only called for a method that has a try/catch, so the
             // encoder was built with a control-flow builder.
+            _has_catch = true
+
             _encoder.control_flow_builder!.add_catch_region(
                 _region_labels[try_start],
                 _region_labels[try_end],
@@ -170,25 +178,26 @@ namespace IR.Emitter is
         has_locals: bool => _local_types.count > 0
         local_types: Collections.List[Type] => _local_types
 
-        ldloc(name: string) is _encoder.load_local(_slot(name)); si
+        ldloc(name: string) is _push(); _encoder.load_local(_slot(name)); si
         stloc(name: string) is _encoder.store_local(_slot(name)); si
-        ldloca(name: string) is _encoder.load_local_address(_slot(name)); si
+        ldloca(name: string) is _push(); _encoder.load_local_address(_slot(name)); si
 
-        ldarg(index: int) is _encoder.load_argument(index); si
+        ldarg(index: int) is _push(); _encoder.load_argument(index); si
         starg(index: int) is _encoder.store_argument(index); si
-        ldarga(index: int) is _encoder.load_argument_address(index); si
+        ldarga(index: int) is _push(); _encoder.load_argument_address(index); si
 
         ldstr(metadata: SRM_ASSEMBLY_EMITTER, value: string) is
+            _push()
             _encoder.load_string(metadata.get_or_add_user_string(value))
         si
 
-        ldc_i4(value: int) is _encoder.load_constant_i4(value); si
-        ldc_i8(value: long) is _encoder.load_constant_i8(value); si
-        ldc_r4(value: single) is _encoder.load_constant_r4(value); si
-        ldc_r8(value: double) is _encoder.load_constant_r8(value); si
-        ldnull() is _encoder.op_code(ILOpCode.LDNULL); si
+        ldc_i4(value: int) is _push(); _encoder.load_constant_i4(value); si
+        ldc_i8(value: long) is _push(); _encoder.load_constant_i8(value); si
+        ldc_r4(value: single) is _push(); _encoder.load_constant_r4(value); si
+        ldc_r8(value: double) is _push(); _encoder.load_constant_r8(value); si
+        ldnull() is _push(); _encoder.op_code(ILOpCode.LDNULL); si
 
-        call(target: EntityHandle) is _encoder.call(target); si
+        call(target: EntityHandle) is _push(); _encoder.call(target); si
 
         // Prefixes the following call with the type its receiver is
         // reached through, which is how a call on a value whose type is
@@ -198,8 +207,8 @@ namespace IR.Emitter is
             _encoder.op_code(ILOpCode.CONSTRAINED)
             _encoder.token(type)
         si
-        call_virtual(target: EntityHandle) is _encoder.op_code(ILOpCode.CALLVIRT); _encoder.token(target); si
-        new_object(constructor: EntityHandle) is _encoder.op_code(ILOpCode.NEWOBJ); _encoder.token(constructor); si
+        call_virtual(target: EntityHandle) is _push(); _encoder.op_code(ILOpCode.CALLVIRT); _encoder.token(target); si
+        new_object(constructor: EntityHandle) is _push(); _encoder.op_code(ILOpCode.NEWOBJ); _encoder.token(constructor); si
 
         ldfld(`field: EntityHandle) is _field_instruction(ILOpCode.LDFLD, `field); si
         ldflda(`field: EntityHandle) is _field_instruction(ILOpCode.LDFLDA, `field); si
@@ -209,11 +218,15 @@ namespace IR.Emitter is
         stsfld(`field: EntityHandle) is _field_instruction(ILOpCode.STSFLD, `field); si
 
         _field_instruction(op_code: ILOpCode, `field: EntityHandle) is
+            if op_code == ILOpCode.LDSFLD \/ op_code == ILOpCode.LDSFLDA then
+                _push()
+            fi
+
             _encoder.op_code(op_code)
             _encoder.token(`field)
         si
 
-        ldtoken(type: EntityHandle) is _encoder.op_code(ILOpCode.LDTOKEN); _encoder.token(type); si
+        ldtoken(type: EntityHandle) is _push(); _encoder.op_code(ILOpCode.LDTOKEN); _encoder.token(type); si
 
         box(type: EntityHandle) is _encoder.op_code(ILOpCode.BOX); _encoder.token(type); si
         unbox_any(type: EntityHandle) is _encoder.op_code(ILOpCode.UNBOX_ANY); _encoder.token(type); si
@@ -239,6 +252,7 @@ namespace IR.Emitter is
         store_object(type: EntityHandle) is _encoder.op_code(ILOpCode.STOBJ); _encoder.token(type); si
 
         load_function_pointer(method: EntityHandle) is
+            _push()
             _encoder.op_code(ILOpCode.LDFTN)
             _encoder.token(method)
         si
@@ -248,9 +262,57 @@ namespace IR.Emitter is
             _encoder.token(method)
         si
 
-        op(op_code: ILOpCode) is _encoder.op_code(op_code); si
+        op(op_code: ILOpCode) is
+            if _is_push(op_code) then
+                _push()
+            fi
+
+            _encoder.op_code(op_code)
+        si
 
         ret() is _encoder.op_code(ILOpCode.RET); si
+
+        // An upper bound on the evaluation stack depth anywhere in the
+        // body, for the header's max stack. The depth only grows at an
+        // instruction that pushes more than it pops, and by at most one
+        // there. Every path to an instruction arrives at the same depth,
+        // so a path that repeats an instruction has come back to the
+        // depth it had the first time, and no path can go deeper than
+        // one push from each such instruction. A catch handler starts
+        // with its exception on the stack, which is one more.
+        //
+        // A body that declares a large max stack is never inlined by the
+        // JIT, however small it is, so the bound has to be tight for
+        // small bodies rather than a generous constant.
+        max_stack: int => _pushes + (if _has_catch then 1 else 0 fi)
+
+        _push() is
+            _pushes = _pushes + 1
+        si
+
+        // The instructions that can leave the stack deeper than they found
+        // it. A call or newobj can push one more than it pops at most; every
+        // opcode not listed pops at least as much as it pushes.
+        _is_push(op_code: ILOpCode) -> bool =>
+            case op_code
+            when
+                ILOpCode.LDARG_0, ILOpCode.LDARG_1, ILOpCode.LDARG_2, ILOpCode.LDARG_3,
+                ILOpCode.LDARG_S, ILOpCode.LDARG, ILOpCode.LDARGA_S, ILOpCode.LDARGA,
+                ILOpCode.LDLOC_0, ILOpCode.LDLOC_1, ILOpCode.LDLOC_2, ILOpCode.LDLOC_3,
+                ILOpCode.LDLOC_S, ILOpCode.LDLOC, ILOpCode.LDLOCA_S, ILOpCode.LDLOCA,
+                ILOpCode.LDNULL, ILOpCode.LDSTR, ILOpCode.DUP,
+                ILOpCode.LDC_I4_M1, ILOpCode.LDC_I4_0, ILOpCode.LDC_I4_1, ILOpCode.LDC_I4_2,
+                ILOpCode.LDC_I4_3, ILOpCode.LDC_I4_4, ILOpCode.LDC_I4_5, ILOpCode.LDC_I4_6,
+                ILOpCode.LDC_I4_7, ILOpCode.LDC_I4_8, ILOpCode.LDC_I4_S, ILOpCode.LDC_I4,
+                ILOpCode.LDC_I8, ILOpCode.LDC_R4, ILOpCode.LDC_R8,
+                ILOpCode.LDSFLD, ILOpCode.LDSFLDA, ILOpCode.LDTOKEN, ILOpCode.LDFTN,
+                ILOpCode.ARGLIST, ILOpCode.SIZEOF,
+                ILOpCode.CALL, ILOpCode.CALLI, ILOpCode.CALLVIRT, ILOpCode.NEWOBJ
+            then
+                true
+            else
+                false
+            esac
 
         // Note that the instructions emitted from here on belong to a
         // new source position. Called once per statement.
