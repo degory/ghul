@@ -1776,9 +1776,9 @@ The operand of `await` need not be a task. Anything following .NET's awaiter pat
 use System.Runtime.CompilerServices.ICriticalNotifyCompletion;
 
 struct PAUSE: ICriticalNotifyCompletion is
-    _ready: Collections.QUEUE[() -> void];
+    _ready: Collections.Queue[() -> void];
 
-    init(ready: Collections.QUEUE[() -> void]) is _ready = ready; si
+    init(ready: Collections.Queue[() -> void]) is _ready = ready; si
 
     get_awaiter() -> PAUSE => self;
     is_completed: bool => false;
@@ -1868,7 +1868,7 @@ A generator's return type has to be `Pipe[T]` — `yield` in a function declared
 
 See <https://ghul.dev/functional-programming.html>.
 
-`Collections.List[T]` is the read-only list trait (the .NET `IReadOnlyList<T>`); `Collections.LIST[T]` is the mutable list. `MAP`/`Map` pair the same way for dictionaries, and `SET` is the mutable hash set, with `Set` (the .NET `IReadOnlySet<T>`) as its read-only trait and `MutableSet` (`ISet<T>`) as its mutable one. `MutableList`, `MutableMap`, `Bag`, `MutableBag`, `STACK` and `QUEUE` round out the mapping. There is no map literal syntax. A map with fixed contents is written as a list literal of key and value pairs, collected with `collect_map()`, which throws if a key is given twice:
+`Collections.List[T]` is the read-only list trait (the .NET `IReadOnlyList<T>`); `Collections.LIST[T]` is the mutable list. `MAP`/`Map` pair the same way for dictionaries, and `SET` is the mutable hash set, with `Set` (the .NET `IReadOnlySet<T>`) as its read-only trait and `MutableSet` (`ISet<T>`) as its mutable one. `MutableList`, `MutableMap`, `Bag`, `MutableBag` and `STACK` round out the mapping. There is no map literal syntax. A map with fixed contents is written as a list literal of key and value pairs, collected with `collect_map()`, which throws if a key is given twice:
 
 ```ghul
 let scores = [("alice", 1), ("bob", 2)] |> collect_map();
