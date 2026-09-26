@@ -15,13 +15,18 @@ namespace Syntax.Parsers.Expressions is
         statement_parser: Parser[Trees.Statements.Statement],
         statement_list_parser: Parser[Trees.Statements.LIST],
         variable_list_parser: Parser[Trees.Variables.LIST],
-        pragma_parser: Parser[Trees.Pragmas.PRAGMA]
+        pragma_parser: Parser[Trees.Pragmas.PRAGMA],
+        variable_parser: Parser[Trees.Variables.VARIABLE]
     ): Base[Trees.Expressions.Expression] is
         description: string => "primary expression"
+
+        _list_parser: Parsers.Expressions.LIST
 
         super()
 
         init(..) is
+            _list_parser = Parsers.Expressions.LIST(expression_parser)
+
             add_parsers()
         si
 
@@ -134,6 +139,142 @@ namespace Syntax.Parsers.Expressions is
             return null
         si
 
+        // `[element for p in source if condition ...]`, entered with the
+        // element parsed and `for` current. Clauses need no separator:
+        // each starts with its own keyword, and a source or condition
+        // ends at the next one or at the closing bracket.
+        _parse_comprehension(context: CONTEXT, start: LOCATION, element: Trees.Expressions.Expression) -> Trees.Expressions.Expression is
+            let use open =
+                context.open_construct(
+                    Collections.LIST[Lexical.TOKEN]([
+                        Lexical.TOKEN.FOR,
+                        Lexical.TOKEN.IF,
+                        Lexical.TOKEN.SQUARE_CLOSE
+                    ])
+                )
+
+            let clauses = Collections.LIST[Trees.Expressions.COMPREHENSION_CLAUSE]()
+            let first_for: Trees.Expressions.COMPREHENSION_FOR? mut = null
+            let should_poison mut = element.is_poisoned
+            let clause_failed mut = false
+
+            while
+                context.current.token == Lexical.TOKEN.FOR \/ context.current.token == Lexical.TOKEN.IF
+            do
+                let clause_start = context.location
+
+                if context.current.token == Lexical.TOKEN.FOR then
+                    context.next_token()
+
+                    let variable = variable_parser.parse(context)
+
+                    if !variable? \/ variable.is_poisoned then
+                        should_poison = true
+                        clause_failed = true
+                        break
+                    fi
+
+                    if !context.next_token(Lexical.TOKEN.IN, "in list comprehension") then
+                        should_poison = true
+                        clause_failed = true
+                        break
+                    fi
+
+                    let source = expression_parser.parse(context)!
+
+                    should_poison = should_poison \/ variable.is_poisoned \/ source.is_poisoned
+
+                    let clause = Trees.Expressions.COMPREHENSION_FOR(clause_start::source.location, variable, source)
+
+                    if clauses.count == 0 then
+                        first_for = clause
+                    fi
+
+                    clauses.add(clause)
+                else
+                    context.next_token()
+
+                    let condition = expression_parser.parse(context)!
+
+                    should_poison = should_poison \/ condition.is_poisoned
+
+                    clauses.add(Trees.Expressions.COMPREHENSION_IF(clause_start::condition.location, condition))
+                fi
+            od
+
+            let end mut = context.location
+
+            // A clause that failed has already said what it expected;
+            // anything else short of the bracket is reported here. Either
+            // way the remains are skipped as far as the closing bracket.
+            // If the bracket never comes, the skip stops at whatever an
+            // enclosing construct is waiting for, or at the next line
+            // written level with the one the comprehension started on.
+            if context.current.token != Lexical.TOKEN.SQUARE_CLOSE then
+                if !clause_failed then
+                    context.error(context.location, "expected for, if or ']' in list comprehension")
+                    should_poison = true
+                fi
+
+                while
+                    !context.is_end_of_file /\
+                    context.current.token != Lexical.TOKEN.SQUARE_CLOSE /\
+                    !context.is_awaited_ender(context.current.token) /\
+                    !context.is_level_with_open_construct
+                do
+                    context.next_token()
+                od
+
+                end = context.location
+            fi
+
+            if context.current.token == Lexical.TOKEN.SQUARE_CLOSE then
+                context.next_token()
+            fi
+
+            let type_expression: Trees.TypeExpressions.TypeExpression =
+                if context.current.token == Lexical.TOKEN.COLON then
+                    context.next_token()
+                    let parsed = type_parser.parse(context)!
+                    end = parsed.location
+                    parsed
+                else
+                    Trees.TypeExpressions.INFER(start::end)
+                fi
+
+            // A clause that failed before it was built leaves nothing to
+            // hang the element on, and the element would name variables
+            // nothing declares, so the recovery is an empty list literal.
+            if !first_for? then
+                let recovered =
+                    Trees.Expressions.SEQUENCE(
+                        start::end,
+                        Trees.Expressions.LIST(element.location, Collections.LIST[Trees.Expressions.Expression]()),
+                        type_expression
+                    )
+
+                recovered.poison()
+
+                return recovered
+            fi
+
+            for i in 1..clauses.count do
+                clauses[i - 1].inner = clauses[i]
+            od
+
+            let result =
+                Trees.Expressions.COMPREHENSION(
+                    start::end,
+                    element,
+                    first_for,
+                    type_expression
+                )
+
+            result.poison(should_poison)
+
+            return result
+        si
+
         add_parsers() is
             add_parser(
                 (context) -> Trees.Expressions.Expression is
@@ -238,11 +379,25 @@ namespace Syntax.Parsers.Expressions is
                     // `[ ]` with the brackets tokenized separately is the
                     // empty list literal, the same as the `[]` single token;
                     // its element type comes from the surrounding context.
-                    let elements =
+                    // Otherwise the token after the first element decides:
+                    // `for` makes it a comprehension, anything else a list.
+                    let elements_start = context.location
+                    let first =
                         if context.current.token == Lexical.TOKEN.SQUARE_CLOSE then
-                            Trees.Expressions.LIST(context.location, Collections.LIST[Trees.Expressions.Expression]())
+                            null
                         else
-                            expression_list_parser.parse(context)!
+                            _list_parser.parse_element(context)
+                        fi
+
+                    if first? /\ context.current.token == Lexical.TOKEN.FOR then
+                        return _parse_comprehension(context, start, first)
+                    fi
+
+                    let elements =
+                        if first? then
+                            _list_parser.parse_after(context, elements_start, first)
+                        else
+                            Trees.Expressions.LIST(context.location, Collections.LIST[Trees.Expressions.Expression]())
                         fi
 
                     let end mut = context.location

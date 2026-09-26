@@ -1960,6 +1960,22 @@ The two operators chain together — a `|>` stage runs unconditionally, a `~>` s
 
 A `|>` or `~>` at the end of a line carries the chain onto the next one, which is how a long chain is wrapped. Only a name continues it that way, so a line beginning with anything else leaves the operator without a right side and is reported as one — the next statement is never read as the call.
 
+### list comprehensions
+
+A list comprehension builds an array from one or more sources, in square brackets: the element first, then one or more `for` clauses, each optionally followed by `if` clauses:
+
+```ghul
+let squares = [x * x for x in 1::5]                  // [1, 4, 9, 16, 25]
+let pairs = [(a, b) for a in 1::3 for b in a::3 if a != b]
+let lengths = [name.length for name in names if name?]
+```
+
+A `for` clause reads a source the way a `for` loop does, so anything a loop can iterate works, and its variable can destructure (`for (key, value) in map`). Each clause sees the variables of the clauses before it, and the element sees them all. An `if` clause keeps only the elements for which its condition holds, and narrows what it tests, so `name.length` above reads `name` as a `string`. Clauses need no separator, so a long comprehension can be written across several lines.
+
+The result is an array of the element's type, or of the type the context expects: `let objects: object[] = [x for x in ints]`. The `: T[]` annotation a list literal takes works here too. The closing bracket ends the comprehension, so it composes with pipes on either side: `[x for x in xs |> filter(odd)] |> sum()`. A comprehension builds its whole array before anything reads it, so it needs a source that ends: `[n * n for n in from(1)]` never finishes, and draws an `unbounded-comprehension-source` warning. An unbounded or lazily read sequence takes a pipe: `from(1) |> map(n => n * n) |> take(10)`.
+
+A comprehension's loops belong to it. A `break` or `continue` inside one cannot leave it, and it cannot contain a `yield`, an `await` or a `try`. A function literal written inside it is a body of its own and is not restricted.
+
 ## displaying values
 
 The runtime formats any value as text in two ways. `$(value)` gives the text a program shows its user, and is what string interpolation uses for a value its type gives no text of its own (see [types and literals](#types-and-literals)). `inspect(value)` gives the detailed form a REPL or a debugging session wants: the same structure, with strings and characters quoted wherever they appear inside a value. Both take anything, including an absent value, which reads `null`. `$` needs no `use`; `inspect` is in `Ghul`.
