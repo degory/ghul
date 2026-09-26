@@ -7,8 +7,10 @@ namespace Syntax.Process is
     // A list comprehension emits its loops directly into the BLOCK that
     // compile-expressions left as its value: one iterator loop per `for`
     // clause, outermost first, a branch past the rest of the body for each
-    // `if` clause, and at the innermost point the element added to a list,
-    // which is turned into the resulting array after the loops finish.
+    // `if` clause, and at the innermost point the element stored. Where the
+    // length is known up front the element goes straight into an array
+    // allocated at that length; otherwise it is added to a list, which is
+    // turned into the array after the loops finish.
     partial GENERATE_IL is
         pre(comprehension: Expressions.COMPREHENSION) -> bool is
             super.pre(comprehension)
@@ -38,24 +40,54 @@ namespace Syntax.Process is
                 // stream as their bodies.
                 let brancher = get_brancher_for_block()
 
-                let result =
-                    TEMP(
-                        current_block,
-                        "comprehension",
-                        Values.NEW(comprehension.list_type!, comprehension.list_constructor!, Collections.LIST[Value](0))
-                    )
+                if
+                    let count = comprehension.presize_count,
+                    source_name = comprehension.presize_source_name,
+                    source_type = comprehension.presize_source_type
+                then
+                    let source = comprehension.first.source
 
-                _gen_comprehension_clause(comprehension, comprehension.first, result, brancher)
+                    source.walk(self)
 
-                spiller.emit_value(
-                    comprehension.list_to_array!.call(
-                        comprehension.location,
-                        result.load(),
-                        Collections.LIST[Value](0),
-                        null,
-                        _function_caller
+                    add(Values.DECLARE_LOCAL(source_name, source_type))
+                    add(source.value!)
+                    add(Values.STORE_TEMP(source_name, source_type))
+
+                    let array_type = comprehension.value!.type!
+                    let int_type = _innate_symbol_lookup.get_int_type()
+
+                    let fill =
+                        COMPREHENSION_FILL(
+                            TEMP(current_block, "comprehension", Values.NEW_ARRAY(array_type, comprehension.element_type!, count)),
+                            TEMP(current_block, "comprehension_index", Values.Literal.NUMBER(0, int_type)),
+                            int_type
+                        )
+
+                    _gen_comprehension_for(comprehension, comprehension.first, fill, brancher, Values.Load.TEMP(source_name, source_type))
+
+                    spiller.emit_value(fill.result.load())
+                else
+                    let fill =
+                        COMPREHENSION_FILL(
+                            TEMP(
+                                current_block,
+                                "comprehension",
+                                Values.NEW(comprehension.list_type!, comprehension.list_constructor!, Collections.LIST[Value](0))
+                            )
+                        )
+
+                    _gen_comprehension_clause(comprehension, comprehension.first, fill, brancher)
+
+                    spiller.emit_value(
+                        comprehension.list_to_array!.call(
+                            comprehension.location,
+                            fill.result.load(),
+                            Collections.LIST[Value](0),
+                            null,
+                            _function_caller
+                        )
                     )
-                )
+                fi
             finally
                 spiller.leave()
             yrt
@@ -69,59 +101,81 @@ namespace Syntax.Process is
         _gen_comprehension_clause(
             comprehension: Expressions.COMPREHENSION,
             clause: Expressions.COMPREHENSION_CLAUSE?,
-            result: TEMP,
+            fill: COMPREHENSION_FILL,
             brancher: BLOCK_BRANCHER
         ) is
             if !clause? then
-                _gen_comprehension_element(comprehension, result)
+                _gen_comprehension_element(comprehension, fill)
             elif let for_clause: Expressions.COMPREHENSION_FOR = clause then
-                _gen_comprehension_for(comprehension, for_clause, result, brancher)
+                _gen_comprehension_for(comprehension, for_clause, fill, brancher, null)
             elif let if_clause: Expressions.COMPREHENSION_IF = clause then
-                _gen_comprehension_if(comprehension, if_clause, result, brancher)
+                _gen_comprehension_if(comprehension, if_clause, fill, brancher)
             fi
         si
 
-        _gen_comprehension_element(comprehension: Expressions.COMPREHENSION, result: TEMP) is
+        _gen_comprehension_element(comprehension: Expressions.COMPREHENSION, fill: COMPREHENSION_FILL) is
             let element = comprehension.element
 
             // Walked for what it contains - a function literal's body, a
             // block's captured IL - before its value is emitted.
             element.walk(self)
 
-            // The call converts the element to the list's element type,
-            // boxing or wrapping it as its parameter needs.
-            let arguments = Collections.LIST[Value]()
-            arguments.add(element.value!)
+            if let index = fill.index then
+                add(Values.STORE_ARRAY_ELEMENT(fill.result.load(), index.load(), element.value!, comprehension.element_type!))
 
-            add(
-                comprehension.list_add!.call(
-                    element.location,
-                    result.load(),
-                    arguments,
-                    null,
-                    _function_caller
+                index.store(
+                    Values.INT_ARITHMETIC(
+                        System.Reflection.Metadata.ILOpCode.ADD,
+                        index.load(),
+                        Values.Literal.NUMBER(1, fill.int_type!),
+                        fill.int_type!
+                    )
                 )
-            )
+            else
+                // The call converts the element to the list's element type,
+                // boxing or wrapping it as its parameter needs.
+                let arguments = Collections.LIST[Value]()
+                arguments.add(element.value!)
+
+                add(
+                    comprehension.list_add!.call(
+                        element.location,
+                        fill.result.load(),
+                        arguments,
+                        null,
+                        _function_caller
+                    )
+                )
+            fi
         si
 
         _gen_comprehension_for(
             comprehension: Expressions.COMPREHENSION,
             clause: Expressions.COMPREHENSION_FOR,
-            result: TEMP,
-            brancher: BLOCK_BRANCHER
+            fill: COMPREHENSION_FILL,
+            brancher: BLOCK_BRANCHER,
+            evaluated_source: Value?
         ) is
             super.pre(clause)
 
             try
                 let source = clause.source
 
-                source.walk(self)
+                // A source already evaluated into a local, for its count,
+                // has been walked too.
+                let source_value: Value =
+                    if let evaluated = evaluated_source then
+                        evaluated
+                    else
+                        source.walk(self)
+                        source.value!
+                    fi
 
                 let iterator: Value =
                     if let read_iterator = clause.read_iterator then
-                        read_iterator.call(source.location, source.value!, Collections.LIST[Value](0), null, _function_caller)
+                        read_iterator.call(source.location, source_value, Collections.LIST[Value](0), null, _function_caller)
                     else
-                        source.value!
+                        source_value
                     fi
 
                 clause.variable.walk(self)
@@ -141,7 +195,7 @@ namespace Syntax.Process is
 
                 gen_destructuring_initialize(clause.variable.left, current)
 
-                _gen_comprehension_clause(comprehension, clause.inner, result, brancher)
+                _gen_comprehension_clause(comprehension, clause.inner, fill, brancher)
 
                 brancher.branch(start)
                 brancher.label(end)
@@ -153,7 +207,7 @@ namespace Syntax.Process is
         _gen_comprehension_if(
             comprehension: Expressions.COMPREHENSION,
             clause: Expressions.COMPREHENSION_IF,
-            result: TEMP,
+            fill: COMPREHENSION_FILL,
             brancher: BLOCK_BRANCHER
         ) is
             let condition = clause.condition
@@ -164,9 +218,27 @@ namespace Syntax.Process is
 
             brancher.branch(BRANCH.Z, condition.value!, skip)
 
-            _gen_comprehension_clause(comprehension, clause.inner, result, brancher)
+            _gen_comprehension_clause(comprehension, clause.inner, fill, brancher)
 
             brancher.label(skip)
+        si
+    si
+
+    // Where a comprehension's elements go: straight into an array at a
+    // running index when its length is known up front, or into a list.
+    class COMPREHENSION_FILL is
+        result: TEMP
+        index: TEMP?
+        int_type: Semantic.Types.Type?
+
+        init(result: TEMP) is
+            self.result = result
+        si
+
+        init(result: TEMP, index: TEMP, int_type: Semantic.Types.Type) is
+            self.result = result
+            self.index = index
+            self.int_type = int_type
         si
     si
 si
