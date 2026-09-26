@@ -1,0 +1,221 @@
+namespace Syntax.Process is
+    use System.Exception
+
+    use IR.Values.Value
+    use Semantic.Types.Type
+
+    // `[element for p in source if condition ...]`. The clauses are
+    // compiled outermost first, each inside the scope of the ones before
+    // it: a `for` clause types its source and pattern the way a `for`
+    // statement does, and an `if` clause narrows everything after it the
+    // way an `if` narrows its then-arm. The element comes last, and its
+    // type is the element type of the resulting array. generate-il emits
+    // the loops into the BLOCK left as the node's value.
+    partial COMPILE_EXPRESSIONS is
+        pre(comprehension: Trees.Expressions.COMPREHENSION) -> bool is
+            super.pre(comprehension)
+
+            try
+                _compile_comprehension(comprehension)
+            catch ex: Exception
+                comprehension.compile_expressions_state.value = IR.Values.DUMMY(Semantic.Types.ERROR(), comprehension.location)
+                _logger.exception(comprehension.location, ex, "exception compiling list comprehension")
+            yrt
+
+            return true
+        si
+
+        visit(comprehension: Trees.Expressions.COMPREHENSION) is
+        si
+
+        pre(clause: Trees.Expressions.COMPREHENSION_FOR) -> bool => true
+        visit(clause: Trees.Expressions.COMPREHENSION_FOR) is si
+
+        pre(clause: Trees.Expressions.COMPREHENSION_IF) -> bool => true
+        visit(clause: Trees.Expressions.COMPREHENSION_IF) is si
+
+        _compile_comprehension(comprehension: Trees.Expressions.COMPREHENSION) is
+            comprehension.type_expression.walk(self)
+
+            let explicit_type =
+                if !isa Trees.TypeExpressions.INFER(comprehension.type_expression) then
+                    comprehension.type_expression.type
+                else
+                    null
+                fi
+
+            let element_constraint =
+                if let explicit = explicit_type then
+                    explicit.get_element_type()
+                elif let comprehension.expected_type? then
+                    expected_type.get_element_type()
+                else
+                    null
+                fi
+
+            if let constraint = element_constraint then
+                comprehension.element.set_expected_type(
+                    constraint,
+                    "element type {0} not compatible with list comprehension type {1}"
+                )
+            else
+                comprehension.element.clear_expected_type()
+            fi
+
+            // Nothing the clauses prove about a variable outlives the
+            // comprehension.
+            let outside = _flow.current_env.copy()
+
+            _compile_clause(comprehension, comprehension.first)
+
+            _flow.set_env(outside)
+
+            COMPREHENSION_RESTRICTIONS(_logger).check(comprehension, loop_value_frames.count > 0)
+
+            let value_type = comprehension.element.value?.type
+
+            let element_type: Type =
+                if let constraint = element_constraint then
+                    constraint
+                elif let vt = value_type /\ !vt.is_error then
+                    if vt.is_null then
+                        _logger.error(comprehension.element.location, "cannot infer the element type of this list comprehension")
+                        Semantic.Types.ERROR()
+                    else
+                        vt
+                    fi
+                else
+                    Semantic.Types.ERROR()
+                fi
+
+            if element_constraint? /\ !element_type.is_error then
+                if let vt = value_type /\ !vt.is_error then
+                    if !element_type.is_assignable_from(vt) then
+                        _logger.error(
+                            comprehension.element.location,
+                            "element type {vt} not compatible with list comprehension type {element_type}"
+                        )
+                    fi
+                fi
+            fi
+
+            let array_type =
+                if let explicit = explicit_type then
+                    explicit
+                else
+                    _innate_symbol_lookup.get_array_type(element_type)
+                fi
+
+            comprehension.element_type = element_type
+
+            if !element_type.is_error then
+                _resolve_comprehension_list(comprehension, element_type)
+            fi
+
+            comprehension.compile_expressions_state.value = IR.Values.BLOCK(array_type)
+        si
+
+        _resolve_comprehension_list(comprehension: Trees.Expressions.COMPREHENSION, element_type: Type) is
+            let list_type = _innate_symbol_lookup.get_list_type(element_type)
+
+            if !list_type? then
+                _logger.error(comprehension.location, "cannot resolve the list type a list comprehension is built with")
+                return
+            fi
+
+            comprehension.list_type = list_type
+            comprehension.list_constructor = _resolve_ctor_by_arity(list_type, 0)
+            comprehension.list_add = _resolve_member_by_arity(list_type, "add", 1)
+            comprehension.list_to_array = _resolve_member_by_arity(list_type, "to_array", 0)
+        si
+
+        _compile_clause(comprehension: Trees.Expressions.COMPREHENSION, clause: Trees.Expressions.COMPREHENSION_CLAUSE?) is
+            if !clause? then
+                comprehension.element.walk(self)
+                return
+            fi
+
+            if let for_clause: Trees.Expressions.COMPREHENSION_FOR = clause then
+                _compile_for_clause(comprehension, for_clause)
+            elif let if_clause: Trees.Expressions.COMPREHENSION_IF = clause then
+                _compile_if_clause(comprehension, if_clause)
+            fi
+        si
+
+        _compile_for_clause(comprehension: Trees.Expressions.COMPREHENSION, clause: Trees.Expressions.COMPREHENSION_FOR) is
+            super.pre(clause)
+
+            try
+                let source = clause.source
+                let variable = clause.variable
+                let type: Type mut = Semantic.Types.ERROR()
+
+                if !source.is_poisoned then
+                    source.walk(self)
+
+                    record_iterable_constraint(source)
+
+                    if let sv = source.value, sv_type = sv.type /\ set_iterator_for(clause, sv_type, false) then
+                        check_receiver_present(source)
+
+                        let current = clause.read_current!.return_type!
+
+                        if let
+                            te = variable.type_expression,
+                            te_type = te.type /\
+                        !isa Trees.TypeExpressions.INFER(te)
+                        then
+                            if te_type.is_assignable_from(current) then
+                                type = te_type
+                            else
+                                _logger.error(variable.location, "type mismatch")
+                            fi
+                        else
+                            type = current
+                        fi
+                    fi
+                fi
+
+                if !variable.is_poisoned then
+                    set_symbol_type(variable.left, type)
+                    declare_state_machine_local_fields(variable.left)
+                fi
+
+                // The clauses after this one run once per element, so a
+                // narrow on anything they write cannot be assumed on the
+                // way round.
+                _flow.set_env(_loops.loop_kept_env(comprehension))
+
+                _compile_clause(comprehension, clause.inner)
+            finally
+                super.visit(clause)
+            yrt
+        si
+
+        _compile_if_clause(comprehension: Trees.Expressions.COMPREHENSION, clause: Trees.Expressions.COMPREHENSION_IF) is
+            let condition = clause.condition
+            let epoch = _flow.heap_epoch
+            let mark = _flow.crossing_mark
+
+            condition.walk(self)
+
+            if Value.check_is_consumable(_logger, condition.location, condition.value) then
+                if !condition.value!.type!.matches(_innate_symbol_lookup.get_bool_type()) then
+                    _logger.error(condition.location, "list comprehension condition must be bool")
+                fi
+            fi
+
+            let facts = _condition_analyzer.analyze_condition(condition, _flow.current_env)
+
+            if _flow.heap_killed_since(epoch) then
+                facts.then_env.drop_heap_facts()
+            else
+                _flow.adopt_crossings_since(facts.then_env, mark)
+            fi
+
+            _flow.set_env(facts.then_env)
+
+            _compile_clause(comprehension, clause.inner)
+        si
+    si
+si
