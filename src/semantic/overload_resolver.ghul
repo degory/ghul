@@ -27,6 +27,9 @@ namespace Semantic is
     si
 
     class OVERLOAD_RESOLVER(_logger: Logger) is
+        _legacy_scoring: bool
+        T117_LOG: string? static => System.Environment.get_environment_variable("GHUL_T117")
+
         match_propagator: MATCH_PROPAGATOR public
         _callee_parameter_slot: CALLEE_PARAMETER_SLOT
         _delegate_shape: DELEGATE_SHAPE
@@ -85,6 +88,22 @@ namespace Semantic is
             let mark = _logger.mark()
 
             try
+                if T117_LOG? /\ !_legacy_scoring then
+                    let legacy_mark = _logger.mark()
+                    _legacy_scoring = true
+                    let old = _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to, return_constraint)
+                    _legacy_scoring = false
+                    _logger.release(legacy_mark)
+
+                    let now = _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to, return_constraint)
+
+                    if "{old?.function}" != "{now?.function}" then
+                        IO.Std.error.write_line("T117 {location}: {group.name}({arguments |> join(", ")}) old={old?.function} new={now?.function}")
+                    fi
+
+                    return now
+                fi
+
                 return _resolve(location, group, arguments, want_infer, want_instance, is_constructor_call, restrict_to, return_constraint)
             catch e: Exception
                 _logger.release(mark)
@@ -115,6 +134,32 @@ namespace Semantic is
             finally
                 _logger.release(mark)
             yrt
+        si
+
+        // Whether some specialized generic candidate in the same tie takes a
+        // formal that `candidate`'s formal in the same position does not
+        // convert to. A non-generic candidate wins an equal fit only when
+        // each of its formals converts to the generic's, so it is at least
+        // as specific: a legacy overload taking a catch-all type (`object`,
+        // `List[object]`) doesn't capture a call the generic serves more
+        // precisely.
+        _is_dominated_by_generic(candidate: Symbols.Function, candidates: Collections.List[Symbols.Function]) -> bool =>
+            candidates |> any(g => g.specialized_from? /\ !_converts_to(candidate, g))
+
+        _converts_to(from: Symbols.Function, to: Symbols.Function) -> bool is
+            if from.arguments.count != to.arguments.count then
+                return false
+            fi
+
+            for i in 0..from.arguments.count do
+                let match = to.arguments[i].compare(from.arguments[i])
+
+                if match != Types.MATCH.SAME /\ match != Types.MATCH.ASSIGNABLE then
+                    return false
+                fi
+            od
+
+            return true
         si
 
         _resolve(
@@ -431,6 +476,23 @@ namespace Semantic is
                         fi
                     fi
 
+                    // A generic candidate that bound its type arguments scored its
+                    // wild formals as exact before binding. Score it again against
+                    // the specialized formals, as a non-generic candidate is scored,
+                    // so the two compare on the conversion each actually needs.
+                    if
+                        !_legacy_scoring /\
+                        actual? /\ actual != f /\
+                        score != cast int(Types.MATCH.DIFFERENT) /\ !needs_second_call /\ !saw_delegate_target /\
+                        !(arguments |> any(a => !a? \/ a.is_sentinel \/ a.is_error \/ a.contains_inferred))
+                    then
+                        let refit = FORMAL_FIT_FILTER.fit(actual, arguments)
+
+                        if refit >= 0 then
+                            score = refit
+                        fi
+                    fi
+
                     if score == best_score /\ score != cast int(Types.MATCH.DIFFERENT) /\ actual? then
                         if !ambiguous_matches? then
                             ambiguous_matches = Collections.LIST[Symbols.Function]()
@@ -537,6 +599,25 @@ namespace Semantic is
                 fi
             fi
 
+            // A non-generic candidate whose formals don't convert to a tied
+            // generic's specialized formals is less specific than the generic,
+            // so it leaves the tie rather than reaching the specificity ranking
+            // below, which compares inheritance depth and would prefer
+            // `List[object]` to `Iterable[string]`.
+            if is_ambiguous /\ safe_to_narrow_tie /\ !_legacy_scoring then
+                let kept =
+                    ambiguous_matches! |>
+                        filter(f => f.specialized_from? \/ f.generic_arguments.count != 0 \/ !_is_dominated_by_generic(f, ambiguous_matches!)) |>
+                        collect_mutable()
+
+                if kept.count == 1 then
+                    result = kept[0]
+                    is_ambiguous = false
+                elif kept.count > 1 then
+                    ambiguous_matches = kept
+                fi
+            fi
+
             if is_ambiguous /\ safe_to_narrow_tie then
                 // Prefer non-generic candidates over function-generic
                 // ones (concrete `<>(int, int)` beats specialized
@@ -548,7 +629,8 @@ namespace Semantic is
                     ambiguous_matches! |>
                         filter(f =>
                             !f.specialized_from? /\
-                            f.generic_arguments.count == 0)
+                            f.generic_arguments.count == 0 /\
+                            (_legacy_scoring \/ !_is_dominated_by_generic(f, ambiguous_matches!)))
 
                 let count = non_generic_matches |> count()
 
@@ -645,9 +727,11 @@ namespace Semantic is
                 // above - said nothing about what the call means, and
                 // the lower bound it would have pushed is never
                 // withdrawn.
-                SELECTED_CANDIDATE_BINDINGS.offer(result, candidate_bindings)
+                if !_legacy_scoring then
+                    SELECTED_CANDIDATE_BINDINGS.offer(result, candidate_bindings)
 
-                _propagate_chosen_match_args(result, arguments)
+                    _propagate_chosen_match_args(result, arguments)
+                fi
 
                 if needs_second_call then
                     best_score = cast int(Types.MATCH.PARTIAL)
