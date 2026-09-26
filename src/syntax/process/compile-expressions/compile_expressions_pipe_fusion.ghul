@@ -20,6 +20,55 @@ namespace Syntax.Process is
 
     // Iterator setup for for loops and the pipe-fusion recognizer and stage builder.
     partial COMPILE_EXPRESSIONS is
+        // Why the last _resolve_chain_fusion declined, for the
+        // pipe-fusion study. Nothing the compiler decides reads it.
+        _chain_resolve_reason: string?
+
+        // The owner of the Ghul.Pipes free functions, taken from a
+        // combinator fusion already knows, so a call to a Pipes function
+        // fusion does not recognise can still be told from any other
+        // global call. Null when the runtime is unavailable, or before
+        // the first lookup.
+        _pipes_owner: Semantic.Scope?
+        _pipes_owner_known: bool
+
+        _pipes_owner_symbol: Semantic.Scope? is
+            if !_pipes_owner_known then
+                for combinator in _innate_symbol_lookup.get_pipes_fusion_functions().keys do
+                    _pipes_owner = combinator.owner
+
+                    break
+                od
+
+                _pipes_owner_known = true
+            fi
+
+            return _pipes_owner
+        si
+
+        // Whether `function` is declared in Ghul.Pipes.
+        _is_pipes_function(function: Semantic.Symbols.Function?) -> bool is
+            let owner = _pipes_owner_symbol
+
+            return function? /\ owner? /\ function.root_specialized_from.owner == owner
+        si
+
+        // The name of the Ghul.Pipes function `call` resolved to, or null
+        // for any other call.
+        _pipes_function_name(call: Trees.Expressions.CALL) -> string? is
+            if !isa IR.Values.Call.GLOBAL(call.value) then
+                return null
+            fi
+
+            let function = (cast IR.Values.Call.GLOBAL(call.value)).function
+
+            if !_is_pipes_function(function) then
+                return null
+            fi
+
+            return function.name
+        si
+
         // Iterable inference: a still-placeholder iterated expression
         // records an ITERABLE_CONSTRAINT on its origin so the body-retry
         // loop can filter candidate types to those that actually
@@ -98,13 +147,107 @@ namespace Syntax.Process is
                 return null
             fi
 
-            let fusion = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup.get_pipes_fusion_functions()).recognize(`for)
+            let recognizer = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup.get_pipes_fusion_functions())
+            let fusion = recognizer.recognize(`for)
 
             if !_resolve_chain_fusion(fusion) then
+                _note_fusion_site(`for.location, "for", true, recognizer, false)
+
                 return null
             fi
 
+            _note_fusion_site(`for.location, "for", true, recognizer, true)
+
             return fusion
+        si
+
+        // Record for the pipe-fusion study what a consumption site
+        // decided, with the reason the recogniser or the resolver gave.
+        // Inert unless the study is enabled.
+        //
+        // A site that peeled no stage is recorded only when the peel
+        // stopped at a Ghul.Pipes function - a combinator fusion has no
+        // stage for, which is what teaching the fuser a new stage would
+        // recover. Stopping anywhere else means the expression was never
+        // a chain, which every ordinary `for` loop does.
+        _note_fusion_site(
+            location: Source.LOCATION,
+            consumer: string,
+            consumer_fusible: bool,
+            recognizer: PIPE_FUSION_RECOGNIZER,
+            fused: bool
+        ) is
+            if !PIPE_FUSION_STUDY.enabled then
+                return
+            fi
+
+            let roles = recognizer.peeled_roles ?? ""
+
+            if roles.length == 0 /\ !_is_pipes_function(recognizer.boundary_function) then
+                return
+            fi
+
+            PIPE_FUSION_STUDY.note_site(
+                location,
+                consumer,
+                consumer_fusible,
+                roles,
+                fused,
+                if fused then
+                    ""
+                else
+                    recognizer.decline_reason ?? _chain_resolve_reason ?? "unknown"
+                fi)
+        si
+
+        // Record a call to a Ghul.Pipes function for the study, whether or
+        // not fusion recognises it, so the sites fusion reaches can be read
+        // as a fraction of the whole combinator surface.
+        _note_pipes_call(call: Trees.Expressions.CALL) is
+            if !PIPE_FUSION_STUDY.enabled then
+                return
+            fi
+
+            if let name = _pipes_function_name(call) then
+                PIPE_FUSION_STUDY.note_call(call.location, name)
+            fi
+        si
+
+        // Record a Ghul.Pipes call that consumes a chain but that fusion
+        // has no consumer for - `collect`, `join`, `sum` and the rest -
+        // naming the chain it would have consumed. This is where teaching
+        // the fuser a new consumer pays, so the shapes are worth counting
+        // even though nothing here declined on their account.
+        _note_unfusible_consumer(call: Trees.Expressions.CALL) is
+            if !PIPE_FUSION_STUDY.enabled then
+                return
+            fi
+
+            let name = _pipes_function_name(call)
+
+            if !name? \/ call.arguments.expressions.count == 0 then
+                return
+            fi
+
+            let fusion_functions = _innate_symbol_lookup.get_pipes_fusion_functions()
+            let role: string mut
+
+            if
+                isa IR.Values.Call.GLOBAL(call.value) /\
+                fusion_functions.try_get_value(
+                    (cast IR.Values.Call.GLOBAL(call.value)).function.root_specialized_from, role ref) /\
+                PIPE_CONSUMER_KIND.is_stage_role(role)
+            then
+                return
+            fi
+
+            let recognizer = PIPE_FUSION_RECOGNIZER(fusion_functions)
+
+            let _ = recognizer.recognize_any(call.arguments.expressions[0])
+
+            _chain_resolve_reason = "consumer-not-fusible"
+
+            _note_fusion_site(call.location, name, false, recognizer, false)
         si
 
         // Finish a recognised chain plan: resolve the source's own iterator
@@ -119,6 +262,8 @@ namespace Syntax.Process is
         // inlining them, and the re-walk can disturb a stage lambda whose
         // body nests a capturing closure.
         _resolve_chain_fusion(fusion: PIPE_FUSION?, inline_stages: bool) -> bool is
+            _chain_resolve_reason = null
+
             if !fusion? then
                 return false
             fi
@@ -126,10 +271,14 @@ namespace Syntax.Process is
             let source_value = fusion.source.value
 
             if !source_value? \/ !source_value.type? then
+                _chain_resolve_reason = "source-not-compiled"
+
                 return false
             fi
 
             if !_resolve_fusion_source_iterator(fusion, source_value.type, false) then
+                _chain_resolve_reason = "source-iterator-unresolved"
+
                 return false
             fi
 
@@ -141,6 +290,8 @@ namespace Syntax.Process is
                     let count_value = stage.argument!.value
 
                     if !count_value? \/ !count_value.type? then
+                        _chain_resolve_reason = "count-not-compiled"
+
                         return false
                     fi
                 elif stage.is_index then
@@ -149,6 +300,8 @@ namespace Syntax.Process is
                     // return, so it is read off the call rather than
                     // rebuilt from the element type flowing into the stage.
                     if !_resolve_index_stage(stage) then
+                        _chain_resolve_reason = "index-stage-unresolved"
+
                         return false
                     fi
                 else
@@ -169,6 +322,8 @@ namespace Syntax.Process is
                         !stage_argument.type.is_function \/
                         stage_argument.type.arguments.count == 0
                     then
+                        _chain_resolve_reason = "stage-argument-not-a-function"
+
                         return false
                     fi
 
@@ -219,6 +374,8 @@ namespace Syntax.Process is
         // inlined). A `memo` stage is elided - the consumer is the memo's
         // only reader, so the cache would never be consulted.
         _recognize_consumer_fusion(call: Trees.Expressions.CALL) -> IR.Values.FUSED_CONSUMER? is
+            _note_pipes_call(call)
+
             if _logger.is_suppressed("pipe-fusion", call.location) then
                 return null
             fi
@@ -226,6 +383,8 @@ namespace Syntax.Process is
             let shape = _consumer_call_shape(call)
 
             if !shape? then
+                _note_unfusible_consumer(call)
+
                 return null
             fi
 
@@ -236,6 +395,8 @@ namespace Syntax.Process is
             let recognized_kind = PIPE_CONSUMER_KIND.of(name, arg_count)
 
             if !recognized_kind? then
+                _note_unfusible_consumer(call)
+
                 return null
             fi
 
@@ -245,11 +406,16 @@ namespace Syntax.Process is
                 return null
             fi
 
-            let fusion = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup.get_pipes_fusion_functions()).recognize_any(chain_before)
+            let recognizer = PIPE_FUSION_RECOGNIZER(_innate_symbol_lookup.get_pipes_fusion_functions())
+            let fusion = recognizer.recognize_any(chain_before)
 
             if !_resolve_chain_fusion(fusion, false) then
+                _note_fusion_site(call.location, _pipes_function_name(call) ?? consumer_kind, true, recognizer, false)
+
                 return null
             fi
+
+            _note_fusion_site(call.location, _pipes_function_name(call) ?? consumer_kind, true, recognizer, true)
 
             let plan = fusion!
 
