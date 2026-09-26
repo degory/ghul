@@ -107,13 +107,11 @@ namespace Semantic.Symbols is
 
         is_stateless_delegate: bool
 
-        // Latched when the load site emits this delegate as a static
-        // method with a null target instead of an instance method bound
-        // to self. The load-site IL is frozen at load time while the
-        // method definition is emitted later by generate-il, so the
-        // decision is recorded here rather than recomputed - both must
-        // agree on the calling convention.
-        is_static_delegate: bool
+        // Set once a cacheable literal that captures nothing has been given an
+        // empty frame, so that the delegate it caches targets an instance
+        // method. The frame makes the literal look like one that captures, so
+        // the decision to cache it is latched here rather than re-derived.
+        is_cached_on_frame: bool
 
         // Set when the delegate's body loads self (its `ldarg.0` target).
         // Such a delegate, e.g. `() => self`, returns a self-dependent
@@ -251,12 +249,14 @@ namespace Semantic.Symbols is
         // qualify, both with no captured type arguments and a fully-settled,
         // ground function type:
         //
-        //   - a static or global anonymous function (`ldnull` target, no
-        //     captures), cached on the enclosing namespace's `$globals`;
+        //   - a static or global anonymous function with no captures, cached
+        //     on the enclosing namespace's `$globals`;
         //   - an instance-context delegate that captures no values and never
-        //     loads self in its body: it is emitted as a static method with
-        //     a null target and cached on its enclosing non-generic class,
-        //     so the cache retains no receiver instance.
+        //     loads self in its body, cached on its enclosing non-generic
+        //     class, so the cache retains no receiver instance.
+        //
+        // Either way the cached delegate targets an empty frame: see
+        // _load_cached_on_frame.
         //
         // The settled/ground-type gate excludes literals whose inference
         // never resolved or whose type mentions a type variable (either
@@ -264,6 +264,10 @@ namespace Semantic.Symbols is
         // excludes a delegate like `() => self` whose result depends on the
         // receiver even though it captures nothing.
         is_memoizable_delegate: bool is
+            if is_cached_on_frame then
+                return true
+            fi
+
             if captured_type_arguments? then
                 return false
             fi
@@ -374,6 +378,31 @@ namespace Semantic.Symbols is
             return IR.Values.MEMOIZED_DELEGATE(
                 value, delegate_cache_field, constructed_delegate_type)
         si
+
+        // A cacheable literal that captures nothing: its cached delegate targets
+        // one instance of an empty frame, built when the cache is first filled,
+        // so the method the delegate calls is an instance method. The JIT does
+        // not devirtualise or inline a call through a delegate over a static
+        // method.
+        _load_cached_on_frame(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            // Fetched before the frame exists: building the frame moves the
+            // literal's owner, and the cache stays where it has always been.
+            let cache = delegate_cache_field
+
+            is_cached_on_frame = true
+
+            _ensure_frame()
+
+            // Straight to the frame, not through load_closure: a literal already
+            // converted to a delegate would be bound to self there.
+            let delegate = _load_closure_non_generic(_get_actual_arguments(loader), loader)
+
+            return IR.Values.MEMOIZED_DELEGATE(delegate, cache, constructed_delegate_type)
+        si
+
+        // Whether this load is one to route through _load_cached_on_frame.
+        _is_cached_on_frame_load: bool =>
+            is_cached_on_frame \/ (!frame? /\ !captured_type_arguments? /\ is_memoizable_delegate)
 
         _enclosing_namespace() -> NAMESPACE? is
             let scope: Scope? mut = owner
@@ -1241,18 +1270,6 @@ namespace Semantic.Symbols is
 
             let function_pointer = IR.Values.Load.FUNCTION_POINTER(self)
 
-            // A stateless delegate that never reads self doesn't need a
-            // receiver at all: emit it as a static method with a null
-            // target (the same shape as a static anonymous function) and
-            // cache it, so no receiver instance is retained by the cache.
-            is_static_delegate = is_memoizable_delegate
-
-            if is_static_delegate then
-                let delegate = IR.Values.Load.DELEGATE(constructed_delegate_type, function_pointer, IR.Values.NULL(Types.NULL()))
-
-                return memoize_delegate(delegate)
-            fi
-
             return IR.Values.Load.DELEGATE(constructed_delegate_type, function_pointer, _load_delegate_target(loader))
         si
 
@@ -1651,7 +1668,7 @@ namespace Semantic.Symbols is
         //
         // Its flags and its calling convention both turn on this, and
         // they have to agree.
-        is_emitted_with_receiver: bool => !is_anon_func /\ !is_static_delegate
+        is_emitted_with_receiver: bool => !is_anon_func
 
         to_string() -> string => "[closure {name}]"
     si
@@ -1702,6 +1719,10 @@ namespace Semantic.Symbols is
             declare_closure_symbol(location, Symbols.INSTANCE_ASYNC_CLOSURE(location, owner, name, enclosing, is_recursive))
 
         load(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            if _is_cached_on_frame_load then
+                return _load_cached_on_frame(location, loader)
+            fi
+
             if frame? then
                 return super.load_closure(location, loader)
             fi
@@ -1728,6 +1749,10 @@ namespace Semantic.Symbols is
             declare_closure_symbol(location, Symbols.STATIC_ASYNC_CLOSURE(location, owner, name, enclosing, is_recursive))
 
         load(location: LOCATION, loader: SYMBOL_LOADER) -> Value is
+            if _is_cached_on_frame_load then
+                return _load_cached_on_frame(location, loader)
+            fi
+
             if frame? then
                 return super.load_closure(location, loader)
             fi
@@ -1758,6 +1783,10 @@ namespace Semantic.Symbols is
 
             if closure_type.is_error then
                 return IR.Values.DUMMY(closure_type, LOCATION.internal)
+            fi
+
+            if _is_cached_on_frame_load then
+                return _load_cached_on_frame(location, loader)
             fi
 
             if frame? then
