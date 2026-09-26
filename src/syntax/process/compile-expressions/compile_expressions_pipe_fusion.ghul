@@ -635,9 +635,236 @@ namespace Syntax.Process is
                     _function_caller)
             fi
 
+            if consumer_kind =~ "collect" \/ consumer_kind =~ "collect_array" then
+                _try_presize(fused, plan, call, consumer_kind, built.final_type)
+            fi
+
             _note_fusion_site(call.location, _pipes_function_name(call) ?? consumer_kind, true, recognizer, true)
 
             return fused
+        si
+
+        // Size a fused collect's result up front where the source's count
+        // is known before the loop and every stage keeps it. The source is
+        // then read twice - for its iterator and for its count - so it is
+        // evaluated once into a local and the iterator rebuilt over that.
+        // A list result is constructed at the count as its capacity; an
+        // array result is allocated at the count and written by index,
+        // with no list and no copy. Nothing changes where the count is not
+        // known or a stage can drop or add elements.
+        _try_presize(
+            fused: IR.Values.FUSED_CONSUMER,
+            plan: PIPE_FUSION,
+            call: Trees.Expressions.CALL,
+            consumer_kind: string,
+            element_type: Type
+        ) is
+            if !_stages_keep_count(plan) then
+                return
+            fi
+
+            let source_value = plan.source.value!
+            let source_type = source_value.type!
+
+            let source_il_name = ".fc_source.{_next_fused_local_id()}"
+            let source_load = cast IR.Values.Value(IR.Values.Load.TEMP(source_il_name, source_type))
+
+            let count = _known_count(plan, source_load, source_type, call.location)
+
+            if !count? then
+                return
+            fi
+
+            fused.source_il_name = source_il_name
+            fused.source_type = source_type
+            fused.source_init = source_value
+
+            fused.iterator_init =
+                if let read_iterator = plan.source_read_iterator then
+                    read_iterator.call(plan.source.location, source_load, Collections.LIST[IR.Values.Value](0), null, _function_caller)
+                else
+                    source_load
+                fi
+
+            if consumer_kind =~ "collect_array" then
+                fused.presize_array = true
+                fused.presize_count = count
+                fused.presize_index_il_name = ".fc_fill.{_next_fused_local_id()}"
+                fused.presize_element_type = element_type
+                fused.result_local_type = null
+                fused.seed_init = null
+                fused.add_element = null
+                fused.finish = null
+            else
+                let list_type = fused.result_local_type ?? call.value!.type!
+                let ctor = _resolve_ctor_taking_int(list_type)
+
+                if !ctor? then
+                    return
+                fi
+
+                let capacity = Collections.LIST[IR.Values.Value]()
+                capacity.add(count)
+
+                fused.seed_init = IR.Values.NEW(list_type, ctor, capacity)
+            fi
+        si
+
+        // Whether every stage passes each element through: map and index
+        // do, filter, take and skip do not.
+        _stages_keep_count(plan: PIPE_FUSION) -> bool is
+            for stage in plan.stages_outermost_first do
+                if stage.is_filter \/ stage.is_countdown then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
+        // The source's element count as a value over `source_load`, or
+        // null where it is not known before the loop: an array's or list's
+        // count, a range's `to - from` (plus one when inclusive), or the
+        // count `repeat(value, count)` was given where that is a literal
+        // or a variable, since it is evaluated again here.
+        _known_count(plan: PIPE_FUSION, source_load: IR.Values.Value, source_type: Type, location: Source.LOCATION) -> IR.Values.Value? is
+            let int_type = _innate_symbol_lookup.get_int_type()
+            let no_arguments = Collections.LIST[IR.Values.Value](0)
+
+            if isa Semantic.Types.ARRAY(source_type) \/
+                _is_same_generic(source_type, _innate_symbol_lookup.get_unspecialized_mutable_list_type()) \/
+                _is_same_generic(source_type, _innate_symbol_lookup.get_unspecialized_list_type())
+            then
+                if let count = get_zero_argument_function(source_type, "$get_count") then
+                    return count.call(location, source_load, no_arguments, null, _function_caller)
+                fi
+
+                return null
+            fi
+
+            // The range types resolve only as reflected ghul-runtime types,
+            // and are absent while compiling the runtime itself, where they
+            // are source symbols in the project. Pre-sizing is an
+            // optimisation and nothing may throw out of it, so it asks for
+            // them in the form that can decline.
+            let ranges = _innate_symbol_lookup.get_int_range_types()
+
+            if !ranges? then
+                return null
+            fi
+
+            let is_range = _is_same_generic(source_type, ranges.exclusive)
+            let is_inclusive = _is_same_generic(source_type, ranges.inclusive)
+
+            if is_range \/ is_inclusive then
+                let to = get_zero_argument_function(source_type, "$get_to")
+                let from = get_zero_argument_function(source_type, "$get_from")
+
+                if !to? \/ !from? then
+                    return null
+                fi
+
+                let span =
+                    cast IR.Values.Value(
+                        IR.Values.INT_ARITHMETIC(
+                            System.Reflection.Metadata.ILOpCode.SUB,
+                            to.call(location, source_load, no_arguments, null, _function_caller),
+                            from.call(location, source_load, no_arguments, null, _function_caller),
+                            int_type))
+
+                let extent =
+                    if is_inclusive then
+                        cast IR.Values.Value(
+                            IR.Values.INT_ARITHMETIC(
+                                System.Reflection.Metadata.ILOpCode.ADD,
+                                span,
+                                IR.Values.Literal.NUMBER(1, int_type),
+                                int_type))
+                    else
+                        span
+                    fi
+
+                // A range whose end precedes its start yields nothing, so
+                // its extent is negative and has to allocate nothing
+                // rather than ask for a negative length. A collection's
+                // own count needs no such guard.
+                return IR.Values.INT_MAX_ZERO(extent, int_type)
+            fi
+
+            if let source_call = cast Trees.Expressions.CALL?(plan.source) then
+                if let name = _pipes_function_name(source_call) then
+                    let arguments = source_call.arguments.expressions
+
+                    if name =~ "repeat" /\ arguments.count == 2 then
+                        let given = arguments[1].value
+
+                        // The count is evaluated a second time here, so
+                        // only a literal or a variable read qualifies.
+                        // A negative one yields nothing, as a range does.
+                        if isa IR.Values.Literal.NUMBER(given) \/ isa IR.Values.Load.SYMBOL(given) then
+                            return IR.Values.INT_MAX_ZERO(given, int_type)
+                        fi
+                    fi
+                fi
+            fi
+
+            return null
+        si
+
+        // Whether `type` is an instantiation of the generic `generic`
+        // stands for, by the identity of the Classy each is over.
+        _is_same_generic(type: Type, generic: Type?) -> bool is
+            if !generic? then
+                return false
+            fi
+
+            let a = _classy_of(type)
+            let b = _classy_of(generic)
+
+            return a? /\ b? /\ a == b
+        si
+
+        _classy_of(type: Type) -> Semantic.Symbols.Classy? is
+            if !isa Semantic.Types.NAMED(type) then
+                return null
+            fi
+
+            let symbol mut = (cast Semantic.Types.NAMED(type)).symbol
+
+            if isa Semantic.Symbols.GENERIC(symbol) then
+                symbol = (cast Semantic.Symbols.GENERIC(symbol)).symbol
+            fi
+
+            if isa Semantic.Symbols.Classy(symbol) then
+                return cast Semantic.Symbols.Classy(symbol)
+            fi
+
+            return null
+        si
+
+        // The constructor of `type` taking one int - a list's capacity.
+        _resolve_ctor_taking_int(type: Type) -> Semantic.Symbols.Function? is
+            let member = type.find_member("init")
+
+            if !member? \/ !isa Semantic.Symbols.FUNCTION_GROUP(member) then
+                return null
+            fi
+
+            let int_type = _innate_symbol_lookup.get_int_type()
+
+            for f in (cast Semantic.Symbols.FUNCTION_GROUP(member)).functions do
+                if f.arguments.count != 1 then
+                    continue
+                fi
+
+                if let parameter_type = f.arguments[0].type then
+                    if int_type.is_assignable_from(parameter_type) /\ parameter_type.is_assignable_from(int_type) then
+                        return f
+                    fi
+                fi
+            od
+
+            return null
         si
 
         // Decline a consumer whose chain resolved but whose own shape did
