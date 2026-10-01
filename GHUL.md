@@ -952,6 +952,8 @@ A separate block, which can be in a separate file, can add members to a type tha
 
 A property is a name and a type, with optional getter and setter bodies. A property with no bodies is stored in a hidden field. Any code can read a property. Only code in the type that defines the property can assign it. A property name that starts with `_` is non-public for reading too. How far non-public reaches depends on the `--underscore-access` policy (see [language details](docs/details.md#naming-conventions)).
 
+A member written as an assignment, `x = y`, is not a property and is reported as one. It reads as a property with a written assign accessor and no type, but no assignment is a member form, so where a member belongs it is an assignment statement and nothing else.
+
 The storage and visibility modifiers of a primary-constructor parameter also apply to a declaration in the body: `x: int public` for public read and write, `x: int field` for a plain field instead of an auto-property, and `x: int static` for a static member. The `field` modifier matters most on value types (see [structs](#structs)). `private` is the exception. On a primary-constructor parameter, `private` gives the member a different name from the parameter. A declaration in the body has no second name, so `private` on a body declaration with no accessor body is an error. Name the member `_x` instead.
 
 ```ghul
