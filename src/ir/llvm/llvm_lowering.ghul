@@ -72,6 +72,10 @@ namespace IR.LLVMTarget is
         // records its number in and the numbers given out.
         _finally_exits: MAP[int, (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING)]
 
+        // The block of each resume point, made where a dispatch or the point
+        // itself is first lowered.
+        _resume_blocks: MAP[IR.LABEL, BLOCK]
+
         _unsupported: LIST[string]
 
         /// The kinds of construct the lowered values used that this target
@@ -141,6 +145,7 @@ namespace IR.LLVMTarget is
             _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
             _caught = LIST[LLVM.Value]()
             _finally_exits = MAP[int, (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING)]()
+            _resume_blocks = MAP[IR.LABEL, BLOCK]()
             _unsupported = LIST[string]()
 
             _entry = function.add_block("entry")
@@ -447,8 +452,8 @@ namespace IR.LLVMTarget is
         visit(load: Values.Load.LOCAL_ARGUMENT) is
             let symbol = load.symbol
 
-            if Values.state_machine_field_for(symbol)? then
-                _report("a generator or asynchronous function")
+            if let state_machine_field = Values.state_machine_field_for(symbol) then
+                gen(_frame_field_load(state_machine_field))
             elif let packed_local = Values.packed_parameter_local_for(symbol) then
                 _load_local(packed_local)
             elif let index = _argument_index(symbol) then
@@ -461,8 +466,8 @@ namespace IR.LLVMTarget is
         visit_address(load: Values.Load.LOCAL_ARGUMENT) is _report("the address of an argument") si
 
         visit(load: Values.Load.LOCAL_VARIABLE) is
-            if Values.state_machine_field_for(load.symbol)? then
-                _report("a generator or asynchronous function")
+            if let state_machine_field = Values.state_machine_field_for(load.symbol) then
+                gen(_frame_field_load(state_machine_field))
             elif let variable = cast Semantic.Symbols.Variable?(load.symbol) then
                 _load_local(variable.ir_local)
             else
@@ -1134,6 +1139,8 @@ namespace IR.LLVMTarget is
                 else
                     _report("a try with no handler")
                 fi
+            elif let resumable: Values.RESUMABLE = node then
+                _lower_resumable(resumable)
             else
                 _report("a generator or asynchronous function")
             fi
@@ -1371,8 +1378,89 @@ namespace IR.LLVMTarget is
             return null
         si
 
-        visit(dispatch: Values.DISPATCH) is _report("a generator or asynchronous function") si
-        visit(resume: Values.RESUME_POINT) is _report("a generator or asynchronous function") si
+        /// A resumed state machine finds its place through one `switch` on its
+        /// state, which can enter a resume point's block wherever it is,
+        /// inside a try included: the try's landing pad belongs to its calls,
+        /// not to how control reached them. Any other state carries on.
+        visit(dispatch: Values.DISPATCH) is
+            // An enclosing dispatch reaches a resume point inside a try by
+            // jumping to the try's own dispatch, at its top.
+            let top = _resume_block(dispatch.top)
+
+            if !_is_terminated then
+                _current.branch(top)
+            fi
+
+            _start(top)
+
+            if let state = _local(dispatch.state_local) then
+                let carry_on = _new_block()
+                let cases = LIST[(LLVM.Value, BLOCK)]()
+
+                for (value, target) in dispatch.entries do
+                    cases.add((LLVM.Values.integer(state.type, bigint(value)), _resume_block(target)))
+                od
+
+                _current.switch(_current.load(state.type, state.pointer, 0), carry_on, cases.to_array())
+                _is_terminated = true
+
+                _start(carry_on)
+            else
+                _report("a dispatch on a state with no local")
+            fi
+        si
+
+        /// A resume point is a block of its own, which control falls into
+        /// and a dispatch can jump to.
+        visit(resume: Values.RESUME_POINT) is
+            let block = _resume_block(resume.label)
+
+            if !_is_terminated then
+                _current.branch(block)
+            fi
+
+            _start(block)
+        si
+
+        _resume_block(label: IR.LABEL) -> BLOCK is
+            let found: BLOCK mut
+
+            if _resume_blocks.try_get_value(label, found ref) then
+                return found
+            fi
+
+            let block = _new_block()
+
+            _resume_blocks[label] = block
+
+            return block
+        si
+
+        // A state machine's resumable body is a region that a suspend inside a
+        // try leaves, continuing after it where the method returns.
+        _lower_resumable(resumable: Values.RESUMABLE) is
+            let end = _new_block()
+
+            _labels.add((resumable, false, end, null, _stack.count))
+
+            for value in resumable.body.values do
+                gen(value)
+            od
+
+            if !_is_terminated then
+                _branch(end)
+            fi
+
+            _labels.remove_at(_labels.count - 1)
+
+            _start(end)
+        si
+
+        _frame_field_load(`field: Semantic.Symbols.Field) -> Value =>
+            Values.Load.INSTANCE_FIELD(Values.Load.REFERENCE_SELF(cast Semantic.Symbols.Classy(`field.owner)), `field)
+
+        _frame_field_store(`field: Semantic.Symbols.Field, value: Value) -> Value =>
+            Values.Store.INSTANCE_FIELD(Values.Load.REFERENCE_SELF(cast Semantic.Symbols.Classy(`field.owner)), `field, value)
 
         visit(call: Values.Call.GLOBAL) is
             _call(call.function, call.arguments)
@@ -1527,8 +1615,8 @@ namespace IR.LLVMTarget is
         visit(store: Values.Store.SYMBOL) is _report("a store to {store.symbol.name}") si
 
         visit(store: Values.Store.LOCAL_VARIABLE) is
-            if Values.state_machine_field_for(store.symbol)? then
-                _report("a generator or asynchronous function")
+            if let state_machine_field = Values.state_machine_field_for(store.symbol) then
+                gen(_frame_field_store(state_machine_field, store.value))
             elif let variable = cast Semantic.Symbols.Variable?(store.symbol) then
                 _store_local(variable.ir_local, _value_of(store.value))
             else
@@ -1539,8 +1627,8 @@ namespace IR.LLVMTarget is
         visit(store: Values.Store.LOCAL_ARGUMENT) is
             let symbol = store.symbol
 
-            if Values.state_machine_field_for(symbol)? then
-                _report("a generator or asynchronous function")
+            if let state_machine_field = Values.state_machine_field_for(symbol) then
+                gen(_frame_field_store(state_machine_field, store.value))
             elif let packed_local = Values.packed_parameter_local_for(symbol) then
                 _store_local(packed_local, _value_of(store.value))
             elif let index = _argument_index(symbol) then
@@ -1844,8 +1932,8 @@ namespace IR.LLVMTarget is
 
             // A generator's or asynchronous function's frame is the one place
             // such a function shows itself to its caller.
-            if isa Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type.definition) then
-                _report("a generator or asynchronous function")
+            if isa Semantic.Symbols.ASYNC_STATE_MACHINE_FRAME(type.definition) then
+                _report("an asynchronous function")
                 return null
             fi
 
