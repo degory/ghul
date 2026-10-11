@@ -145,10 +145,20 @@ A run under `llvm` links with ghul-llvm, which is not on every machine. So the
 `local` configuration, and `ci` through it, lists only `dotnet` and `wasm` in
 its `run_targets`, and passes over every llvm run: a `targets` file's `llvm`
 variant and a test whose `ghulflags` name `--target llvm` alike, reporting how
-many it passed over. Those runs are made only by a configuration whose
-`run_targets` names `llvm`, on a machine with ghul-llvm on the PATH. A test
-author adding `llvm` to a `targets` file runs it that way;
-neither the shards nor `build/llvm-validate.sh` reach it.
+many it passed over. Those runs are made by the `llvm` configuration, which
+runs them alone, on a machine with ghul-llvm on the PATH; in CI that is the
+llvm job. A test author adding `llvm` to a `targets` file runs it that way:
+
+```sh
+PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
+    dotnet ghul-test --config llvm integration-tests
+```
+
+`build/ghul-llvm.sh` fetches the release the tests are run with, the one
+`build/ghul-llvm.version` names, as a user's build fetches it, and prints where
+its executable is. The CI job runs the tests in an image with no C compiler,
+linker or C library, and then runs each program again in an empty image with
+`build/llvm-programs.sh`, which fails any program that is not fully static.
 
 `build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
 compiler writes for their target to an engine. They select tests by the target
@@ -157,21 +167,6 @@ the `ghulflags` name, wherever the test lives, so a target test outside
 `targets` file is left to ghul-test: under `wasm`, the configuration that runs
 the suite builds it with the core library and runs it; under `llvm`, only a
 configuration whose `run_targets` names `llvm` does, as described above.
-
-A run under `llvm` links a native executable with `ghul-llvm`, so the `local`
-and `ci` configurations pass every llvm run over and the `llvm` configuration
-runs those alone. `build/ghul-llvm.sh` fetches the
-release the tests are run with, the one `build/ghul-llvm.version` names, as a
-user's build fetches it, and prints where its executable is:
-
-```sh
-PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
-    dotnet ghul-test --config llvm integration-tests
-```
-
-CI runs them in an image with no C compiler, linker or C library, and then
-runs each program again in an empty image with `build/llvm-programs.sh`, which
-fails any program that is not fully static.
 
 ## Generated tests
 
