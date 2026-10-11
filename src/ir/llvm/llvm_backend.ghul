@@ -126,20 +126,15 @@ namespace IR.LLVMTarget is
             _bodies[function] = _current!
         si
 
-        finish_frame_member_body(frame: Classy, member: FrameMember) is
-            let location =
-                if let state_machine: Semantic.Symbols.STATE_MACHINE_FRAME_BASE = frame then
-                    state_machine.owning_function.location
-                else
-                    frame.location
-                fi
+        /// Drops the body: this target compiles no generator or asynchronous
+        /// function yet, and one the program reaches is reported where a body
+        /// that uses it is lowered.
+        finish_frame_member_body(frame: Classy, member: FrameMember) is si
 
-            _report(location, "a generator or asynchronous function")
-        si
-
-        finish_unit_variant_initializer(variant: Classy) is
-            _report(variant.location, "a union")
-        si
+        /// Drops the initializer: this target compiles no unions yet, and one
+        /// the program reaches is reported where a body that uses it is
+        /// lowered.
+        finish_unit_variant_initializer(variant: Classy) is si
 
         end_body() is
             assert _enclosing.count > 0 else "body ended without one begun"
@@ -207,9 +202,11 @@ namespace IR.LLVMTarget is
                 od
             fi
 
+            let classes = CLASS_SET(null, element => LLVM_ARRAYS.holds_element(element), INNATE_CORE_CLASSES())
+
             let plan =
                 PROGRAM_PLAN(
-                    CLASS_SET(null, _ => false, INNATE_CORE_CLASSES()),
+                    classes,
                     worklist,
                     DISPATCHED_METHODS(),
                     null,
@@ -217,15 +214,17 @@ namespace IR.LLVMTarget is
 
             let discovery_module = MODULE()
             let discovery_strings = LLVM_STRINGS(discovery_module)
+            let discovery_arrays = LLVM_ARRAYS(discovery_module, discovery_strings, classes)
 
             plan.discover(
                 LLVM_DISCOVERY(
-                    instance => _reach(discovery_module, discovery_strings, instance, declared, declare),
+                    instance => _reach(discovery_module, discovery_strings, discovery_arrays, instance, declared, declare),
                     (location, construct) => _report(location, construct)))
 
             worklist.seal()
 
             let strings = LLVM_STRINGS(module)
+            let arrays = LLVM_ARRAYS(module, strings, classes)
 
             let callee = (instance: FUNCTION_INSTANCE) -> FUNCTION? is
                 let found: FUNCTION? mut
@@ -245,14 +244,15 @@ namespace IR.LLVMTarget is
 
                     module.add_function(function)
 
-                    _lower(module, strings, instance, function, callee)
+                    _lower(module, strings, arrays, instance, function, callee)
                 fi
             od
 
             if let entry = _entry_point then
-                _add_entry(module, entry, callee(FUNCTION_INSTANCE.of(entry)))
+                _add_entry(module, strings, arrays, entry, callee(FUNCTION_INSTANCE.of(entry)))
 
                 strings.add_exports()
+                arrays.add_exports()
             fi
 
             return module
@@ -263,6 +263,7 @@ namespace IR.LLVMTarget is
         _reach(
             module: MODULE,
             strings: LLVM_STRINGS,
+            arrays: LLVM_ARRAYS,
             instance: FUNCTION_INSTANCE,
             declared: MAP[FUNCTION_INSTANCE, FUNCTION?],
             declare: (FUNCTION_INSTANCE) -> FUNCTION?
@@ -272,7 +273,7 @@ namespace IR.LLVMTarget is
             if declared.try_get_value(instance, found ref) /\ found? then
                 let copy = FUNCTION(found.name, found.result, found.parameters |> Ghul.Pipes.collect())
 
-                LLVM_LOWERING(module, copy, instance, instance.specialize(instance.definition.return_type), declare, strings)
+                LLVM_LOWERING(module, copy, instance, instance.specialize(instance.definition.return_type), declare, strings, arrays)
                     .lower(_bodies[instance.definition])
             fi
         si
@@ -287,12 +288,23 @@ namespace IR.LLVMTarget is
 
         // Exports `$ghul_entry`, which calls the entry point and returns the
         // exit status it answers, or zero for an entry point that answers
-        // nothing. It reads the runtime's ABI marker, so a program linked
-        // against a runtime of another ABI version fails to link rather than
-        // failing when it runs.
-        _add_entry(module: MODULE, entry: Function, compiled: FUNCTION?) is
-            if entry.arguments.count > 0 then
-                _report(entry.location, "an entry point that takes arguments")
+        // nothing. An entry point taking a `string[]` is handed the
+        // command-line arguments, read through the runtime's host operations.
+        // It reads the runtime's ABI marker, so a program linked against a
+        // runtime of another ABI version fails to link rather than failing
+        // when it runs.
+        _add_entry(module: MODULE, strings: LLVM_STRINGS, arrays: LLVM_ARRAYS, entry: Function, compiled: FUNCTION?) is
+            let string_array: CLASS_INSTANCE? mut
+
+            if entry.arguments.count == 1 then
+                string_array = arrays.array_of(entry.arguments[0])
+
+                if !string_array? \/ !LLVM_TYPES.is_string(arrays.element_of(string_array)) then
+                    _report(entry.location, "an entry point taking {entry.arguments[0]}")
+                    return
+                fi
+            elif entry.arguments.count > 1 then
+                _report(entry.location, "an entry point that takes more than one argument")
                 return
             fi
 
@@ -301,7 +313,7 @@ namespace IR.LLVMTarget is
             fi
 
             let wrapper = FUNCTION(ENTRY_NAME, LLVM.Types.i32, [])
-            let block = wrapper.add_block("entry")
+            let block mut = wrapper.add_block("entry")
 
             let marker = LLVM.GLOBAL_VARIABLE(ABI_CHECK_NAME, LLVM.Types.i32, null, true)
 
@@ -311,13 +323,53 @@ namespace IR.LLVMTarget is
 
             block.append(LLVM.Operation.LOAD(read, LLVM.Types.i32, marker.reference, 4, true), LLVM.Values.local(LLVM.Types.i32, read))
 
-            if let result = block.call(compiled, []) then
+            let arguments = LIST[LLVM.Value]()
+
+            if let type = string_array then
+                arguments.add(_command_line(wrapper, block, strings, arrays, type))
+
+                block = wrapper.blocks[wrapper.blocks.count - 1]
+            fi
+
+            if let result = block.call(compiled, arguments.to_array()) then
                 block.return_value(result)
             else
                 block.return_value(LLVM.Values.integer(LLVM.Types.i32, bigint.zero))
             fi
 
             module.add_function(wrapper)
+        si
+
+        // Builds a `string[]` of the command-line arguments, starting in
+        // `block` and leaving the wrapper's last block to carry on in.
+        _command_line(wrapper: FUNCTION, block: LLVM.BLOCK, strings: LLVM_STRINGS, arrays: LLVM_ARRAYS, type: CLASS_INSTANCE) -> LLVM.Value is
+            let i32 = LLVM.Types.i32
+
+            let count = block.call(strings.runtime(LLVM_STRINGS.host_name("argument_count"), i32, []), [])!
+            let result = arrays.allocate(block, type, count)
+            let index = block.alloca(i32, 4)
+
+            block.store(LLVM.Values.i32(0), index, 4)
+
+            let test = wrapper.add_block("test")
+            let body = wrapper.add_block("body")
+            let done = wrapper.add_block("done")
+
+            block.branch(test)
+
+            let at = test.load(i32, index, 4)
+
+            test.branch(test.compare(LLVM.IntegerPredicate.SLT, at, count), body, done)
+
+            let current = body.load(i32, index, 4)
+            let argument = body.call(strings.runtime(LLVM_STRINGS.host_name("argument"), LLVM.Types.pointer, [i32]), [current])!
+
+            arrays.store(body, type, result, current, argument)
+
+            body.store(body.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, current, LLVM.Values.i32(1)), index, 4)
+            body.branch(test)
+
+            return result
         si
 
         // The LLVM function an instance is compiled into, with no body yet,
@@ -352,10 +404,10 @@ namespace IR.LLVMTarget is
             return FUNCTION(name, result, parameters.to_array())
         si
 
-        _lower(module: MODULE, strings: LLVM_STRINGS, instance: FUNCTION_INSTANCE, function: FUNCTION, callee: (FUNCTION_INSTANCE) -> FUNCTION?) is
+        _lower(module: MODULE, strings: LLVM_STRINGS, arrays: LLVM_ARRAYS, instance: FUNCTION_INSTANCE, function: FUNCTION, callee: (FUNCTION_INSTANCE) -> FUNCTION?) is
             let definition = instance.definition
 
-            let lowering = LLVM_LOWERING(module, function, instance, instance.specialize(definition.return_type), callee, strings)
+            let lowering = LLVM_LOWERING(module, function, instance, instance.specialize(definition.return_type), callee, strings, arrays)
 
             lowering.lower(_bodies[definition])
 

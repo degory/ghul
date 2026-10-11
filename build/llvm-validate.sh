@@ -10,7 +10,8 @@
 # This script builds each test's module again, with the compiler in
 # publish/, and has ghul-llvm verify and compile it to an object. A test
 # with an `exit.expected` is also built as an executable and run, with its
-# `input` as standard input where it has one; its exit status is compared,
+# `input` as standard input where it has one and each line of its
+# `arguments` as a command-line argument; its exit status is compared,
 # and its standard output too where it has an `output.expected`.
 #
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
@@ -118,7 +119,13 @@ while IFS=$'\t' read -r dir flags_text; do
         input="$dir/input"
     fi
 
-    "$out/program" < "$input" > "$out/output" 2> "$out/errors"
+    arguments=()
+
+    if [ -f "$dir/arguments" ]; then
+        mapfile -t arguments < "$dir/arguments"
+    fi
+
+    "$out/program" "${arguments[@]}" < "$input" > "$out/output" 2> "$out/errors"
     status=$?
     expected="$(tr -d '[:space:]' < "$dir/exit.expected")"
 
