@@ -133,7 +133,7 @@ while IFS=$'\t' read -r dir flags_text; do
         echo "llvm-validate: $dir wrote other output than output.expected" >&2
         failed=$((failed + 1))
     fi
-done < <(find "$root" -name ghulflags -exec grep -l -- '--target llvm' {} + | sort)
+done < <(tests_for_target)
 
 echo "llvm-validate: $checked modules checked, $ran run, $failed failed"
 
