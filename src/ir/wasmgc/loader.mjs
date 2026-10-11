@@ -130,7 +130,7 @@ export async function run(options = {}) {
         bigint_from_double: (value) => BigInt(Math.trunc(value)),
         bigint_to_long: (value) => BigInt.asIntN(64, value),
         bigint_fits_long: (value) => BigInt.asIntN(64, value) === value,
-        bigint_to_double: (value) => Number(value),
+        bigint_to_double,
         bigint_to_string: (value) => value.toString(),
         bigint_add: (a, b) => a + b,
         bigint_subtract: (a, b) => a - b,
@@ -343,6 +343,27 @@ function input_reader(source) {
         },
     };
 }
+
+// The double a bigint converts to, as .NET converts one: the magnitude
+// truncated to the 53 bits a double holds, rather than rounded to the
+// nearest, and infinity only from 2^1024 up. Number() rounds to the nearest,
+// so where it lands above the magnitude the double below is the truncation.
+function bigint_to_double(value) {
+    const magnitude = value < 0n ? -value : value;
+    let result = Number(magnitude);
+
+    if (result === Infinity ? magnitude < DOUBLE_LIMIT : BigInt(result) > magnitude) {
+        double_bits[0] = result;
+        double_words[0] -= 1n;
+        result = double_bits[0];
+    }
+
+    return value < 0n ? -result : result;
+}
+
+const DOUBLE_LIMIT = 2n ** 1024n;
+const double_bits = new Float64Array(1);
+const double_words = new BigUint64Array(double_bits.buffer);
 
 // The bytes a file's content stands for: text is UTF-8, and bytes are as
 // they are.
