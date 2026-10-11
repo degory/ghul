@@ -1,0 +1,1211 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Collections.LIST
+    use Collections.MAP
+
+    use Semantic.Types.Type
+    use Semantic.Symbols.Function
+
+    use LLVM.BinaryOperator
+    use LLVM.BLOCK
+    use LLVM.Conversion
+    use LLVM.FloatPredicate
+    use LLVM.FUNCTION
+    use LLVM.IntegerFlags
+    use LLVM.IntegerPredicate
+    use LLVM.Intrinsics
+    use LLVM.MODULE
+    use LLVM.Types
+    use LLVM.FastMath
+
+    use Values.Value
+
+    /// Lowers the IR values of one function body into the blocks of an
+    /// LLVM function. A construct it cannot lower yet is recorded in
+    /// `unsupported` rather than thrown.
+    ///
+    /// Every local, argument and temporary lives in an `alloca` in the entry
+    /// block, which LLVM promotes to registers, so nothing here builds SSA
+    /// form. The values the IR leaves on CIL's evaluation stack are kept on
+    /// a stack of LLVM values while the body is lowered.
+    class LLVM_LOWERING: Values.Visitor is
+        _module: MODULE
+        _function: FUNCTION
+        _instance: FUNCTION_INSTANCE?
+        _type_map: Collections.Map[Semantic.Symbols.Symbol, Type]
+        _return_type: Type?
+        _callee: (FUNCTION_INSTANCE) -> FUNCTION?
+        _scalars: (Type?) -> Scalar?
+
+        _entry: BLOCK
+        _block: BLOCK
+        _is_terminated: bool
+        _next_block: int
+
+        _stack: LIST[LLVM.Value]
+        _locals: MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]
+        _arguments: LIST[(pointer: LLVM.Value, type: LLVM.Type)]
+
+        // The structured nodes open at the point being lowered, innermost
+        // last: each node's continuation, and a loop's header after it, which
+        // is where a CONTINUE goes. A region that produces a value has an
+        // `alloca` each arm stores it into, and `depth` is how deep the value
+        // stack was when the node began.
+        _labels: LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]
+
+        _unsupported: LIST[string]
+
+        /// The kinds of construct the lowered values used that this target
+        /// cannot generate yet, each once, in the order they were met. A body
+        /// with any is not a valid function.
+        unsupported: Collections.List[string] => _unsupported
+
+        /// - module: where intrinsics the body calls are declared
+        /// - function: the function the body is lowered into, with no blocks yet
+        /// - instance: the function instance the body belongs to, or null where it belongs to none
+        /// - return_type: the type the function returns
+        /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
+        init(
+            module: MODULE,
+            function: FUNCTION,
+            instance: FUNCTION_INSTANCE?,
+            return_type: Type?,
+            callee: (FUNCTION_INSTANCE) -> FUNCTION?
+        ) is
+            self.init(module, function, instance, return_type, callee, t => LLVM_TYPES.scalar(t))
+        si
+
+        /// - module: where intrinsics the body calls are declared
+        /// - function: the function the body is lowered into, with no blocks yet
+        /// - instance: the function instance the body belongs to, or null where it belongs to none
+        /// - return_type: the type the function returns
+        /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
+        /// - scalars: the scalar kind a value of a type is, or null where it is not a scalar
+        init(
+            module: MODULE,
+            function: FUNCTION,
+            instance: FUNCTION_INSTANCE?,
+            return_type: Type?,
+            callee: (FUNCTION_INSTANCE) -> FUNCTION?,
+            scalars: (Type?) -> Scalar?
+        ) is
+            _scalars = scalars
+            _module = module
+            _function = function
+            _instance = instance
+            _type_map = if let i = instance then i.type_map else MAP[Semantic.Symbols.Symbol, Type]() fi
+            _return_type = return_type
+            _callee = callee
+
+            _stack = LIST[LLVM.Value]()
+            _locals = MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]()
+            _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type)]()
+            _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
+            _unsupported = LIST[string]()
+
+            _entry = function.add_block("entry")
+            _block = _entry
+        si
+
+        /// Lowers the body into the function. Afterwards every block ends in
+        /// exactly one terminator.
+        lower(values: Collections.Iterable[Value]) is
+            for parameter in _function.parameters do
+                let pointer = _entry.alloca(parameter.type, 0)
+
+                _entry.store(parameter.value, pointer, 0)
+                _arguments.add((pointer, parameter.type))
+            od
+
+            let start = _new_block()
+
+            _start(start)
+
+            for value in values do
+                gen(value)
+            od
+
+            // A body that falls off its end returns what it leaves, or the
+            // default value of its result where it leaves nothing.
+            if !_is_terminated then
+                _return()
+            fi
+
+            _entry.branch(start)
+        si
+
+        /// Lowers one value. An absent value lowers to nothing.
+        gen(value: Value?) is
+            if value? then
+                value.accept(self)
+            fi
+        si
+
+        _report(construct: string) is
+            if !_unsupported.contains(construct) then
+                _unsupported.add(construct)
+            fi
+        si
+
+        _specialize(type: Type?) -> Type? => TYPE_MAPS.specialize(type, _type_map)
+
+        _scalar_of(type: Type?) -> Scalar? => _scalars(type)
+
+        _scalar(type: Type?) -> Scalar? => _scalar_of(_specialize(type))
+
+        _held(type: Type?) -> LLVM.Type? =>
+            if let scalar = _scalar(type) then LLVM_TYPES.value_type(scalar) else null fi
+
+        // The block instructions go into, opened afresh where the last one
+        // ended in a terminator: code after an unconditional exit is
+        // unreachable, but every block needs exactly one terminator.
+        _current: BLOCK is
+            if _is_terminated then
+                _start(_new_block())
+            fi
+
+            return _block
+        si
+
+        _new_block() -> BLOCK is
+            let block = _function.add_block("b{_next_block}")
+
+            _next_block = _next_block + 1
+
+            return block
+        si
+
+        _start(block: BLOCK) is
+            _block = block
+            _is_terminated = false
+        si
+
+        _branch(target: BLOCK) is
+            _current.branch(target)
+            _is_terminated = true
+        si
+
+        _push(value: LLVM.Value) is
+            _stack.add(value)
+        si
+
+        _pop() -> LLVM.Value? is
+            if _stack.count == 0 then
+                _report("a value the lowering did not produce")
+                return null
+            fi
+
+            let value = _stack[_stack.count - 1]
+
+            _stack.remove_at(_stack.count - 1)
+
+            return value
+        si
+
+        _peek() -> LLVM.Value? =>
+            if _stack.count > 0 then _stack[_stack.count - 1] else null fi
+
+        // Lowers `value` and takes what it produces off the stack.
+        _value_of(value: Value) -> LLVM.Value? is
+            let depth = _stack.count
+
+            gen(value)
+
+            if _stack.count <= depth then
+                if _unsupported.count == 0 then
+                    _report("a value that produces nothing")
+                fi
+
+                return null
+            fi
+
+            return _pop()
+        si
+
+        // An `alloca` in the entry block, holding the zero of `type` from the
+        // start, as a .NET local holds a zeroed value.
+        _slot(type: LLVM.Type) -> LLVM.Value is
+            let pointer = _entry.alloca(type, 0)
+
+            _entry.store(LLVM_TYPES.zero(type), pointer, 0)
+
+            return pointer
+        si
+
+        _local(local: LOCAL) -> (pointer: LLVM.Value, type: LLVM.Type)? is
+            let found: (pointer: LLVM.Value, type: LLVM.Type) mut
+
+            if _locals.try_get_value(local, found ref) then
+                return found
+            fi
+
+            if let type = _held(local.type) then
+                let slot = (pointer = _slot(type), type = type)
+
+                _locals[local] = slot
+
+                return slot
+            fi
+
+            _report("a local of type {local.type}")
+
+            return null
+        si
+
+        _load_local(local: LOCAL) is
+            if let (pointer, type) = _local(local) then
+                _push(_current.load(type, pointer, 0))
+            fi
+        si
+
+        _store_local(local: LOCAL, value: LLVM.Value?) is
+            if let (pointer, type) = _local(local) /\ value? then
+                _current.store(_normalise_for(value, local.type), pointer, 0)
+            fi
+        si
+
+        // The position of the parameter `symbol` among the arguments of the
+        // function being lowered, or null where it belongs to another.
+        _argument_index(symbol: Semantic.Symbols.Symbol) -> int? is
+            if let instance = _instance /\ symbol.owner == instance.definition then
+                let names = instance.definition.argument_names
+
+                for i in 0..names.count do
+                    if names[i] =~ symbol.name then
+                        return i
+                    fi
+                od
+            fi
+
+            return null
+        si
+
+        _load_argument(index: int) is
+            if index < _arguments.count then
+                let (pointer, type) = _arguments[index]
+
+                _push(_current.load(type, pointer, 0))
+            else
+                _report("an argument the function does not take")
+            fi
+        si
+
+        _store_argument(index: int, value: LLVM.Value?, type: Type?) is
+            if index < _arguments.count /\ value? then
+                let (pointer, _) = _arguments[index]
+
+                _current.store(_normalise_for(value, type), pointer, 0)
+            else
+                _report("an argument the function does not take")
+            fi
+        si
+
+        // Returns the value on the stack, or the default value of the result
+        // where the stack is empty.
+        _return() is
+            if LLVM_TYPES.is_void(_return_type) then
+                _current.return_void()
+            elif let type = _held(_return_type) then
+                let value = if _stack.count > 0 then _pop()! else LLVM_TYPES.zero(type) fi
+
+                _current.return_value(_normalise_for(value, _return_type))
+            else
+                _report("a result of type {_return_type}")
+                _current.unreachable()
+            fi
+
+            _is_terminated = true
+        si
+
+        // Brings a value of a narrow kind back into its range: sign-extended
+        // for a signed kind and masked for an unsigned one, which is what
+        // CIL's narrowing conversions and narrow stores do.
+        _normalise(value: LLVM.Value, scalar: Scalar) -> LLVM.Value =>
+            case scalar
+            when Scalar.INT8 then _sign_extend_from(value, 8)
+            when Scalar.INT16 then _sign_extend_from(value, 16)
+            when Scalar.UINT8, Scalar.BOOL then _current.binary(BinaryOperator.AND, IntegerFlags.NONE, value, _i32(0xFF))
+            when Scalar.UINT16, Scalar.CHAR then _current.binary(BinaryOperator.AND, IntegerFlags.NONE, value, _i32(0xFFFF))
+            else value
+            esac
+
+        _sign_extend_from(value: LLVM.Value, width: int) -> LLVM.Value =>
+            _current.convert(
+                Conversion.SIGN_EXTEND,
+                _current.convert(Conversion.TRUNCATE, value, LLVM.Type.INTEGER(width)),
+                Types.i32)
+
+        _normalise_for(value: LLVM.Value, type: Type?) -> LLVM.Value =>
+            if let scalar = _scalar(type) /\ LLVM_TYPES.is_narrow(scalar) then
+                _normalise(value, scalar)
+            else
+                value
+            fi
+
+        _i32(value: int) -> LLVM.Value => LLVM.Values.integer(Types.i32, bigint(value))
+
+        // A comparison's `i1` widened to the `i32` a bool is held in.
+        _bool(value: LLVM.Value) -> LLVM.Value =>
+            _current.convert(Conversion.ZERO_EXTEND, value, Types.i32)
+
+        visit_value(value: Value) is
+            _report("{value.get_type().name}")
+        si
+
+        visit_address_of_value(value: Value) is
+            _report("the address of {value.get_type().name}")
+        si
+
+        visit(number: Values.Literal.NUMBER) is
+            let (value, from) =
+                case number.constant
+                when i4: Values.Literal.CONSTANT.I4 then (LLVM.Values.integer(Types.i32, bigint(i4.value)), Scalar.INT32)
+                when i8: Values.Literal.CONSTANT.I8 then (LLVM.Values.integer(Types.i64, bigint(i8.value)), Scalar.INT64)
+                when r4: Values.Literal.CONSTANT.R4 then (LLVM.Values.of_single(r4.value), Scalar.FLOAT32)
+                when r8: Values.Literal.CONSTANT.R8 then (LLVM.Values.of_double(r8.value), Scalar.FLOAT64)
+                esac
+
+            if let to = number.narrowing then
+                _push(_convert(value, from, to))
+            else
+                _push(value)
+            fi
+        si
+
+        visit(string: Values.Literal.STRING) is _report("a string literal") si
+        visit(decimal: Values.Literal.DECIMAL) is _report("a decimal literal") si
+        visit(bigint: Values.Literal.BIGINT) is _report("a bigint literal") si
+
+        visit(load: Values.Load.SYMBOL) is _report("a load of {load.symbol.name}") si
+        visit_address(load: Values.Load.SYMBOL) is _report("the address of {load.symbol.name}") si
+        visit(load: Values.Load.INSTANCE_FIELD) is _report("a field") si
+        visit_address(load: Values.Load.INSTANCE_FIELD) is _report("the address of a field") si
+        visit(load: Values.Load.STATIC_ANONYMOUS_FUNCTION) is _report("a function value") si
+        visit(load: Values.Load.GLOBAL_ANONYMOUS_FUNCTION) is _report("a function value") si
+        visit(load: Values.Load.INSTANCE_ANONYMOUS_FUNCTION) is _report("a function value") si
+
+        visit(load: Values.Load.TEMP) is
+            _load_local(load.local)
+        si
+
+        visit_address(load: Values.Load.TEMP) is _report("the address of a local") si
+        visit(load: Values.Load.STATIC_FIELD) is _report("a static field") si
+        visit_address(load: Values.Load.STATIC_FIELD) is _report("the address of a static field") si
+        visit(load: Values.Load.GLOBAL_FIELD) is _report("a global variable") si
+        visit_address(load: Values.Load.GLOBAL_FIELD) is _report("the address of a global variable") si
+
+        visit(load: Values.Load.LOCAL_ARGUMENT) is
+            let symbol = load.symbol
+
+            if Values.state_machine_field_for(symbol)? then
+                _report("a generator or asynchronous function")
+            elif let packed_local = Values.packed_parameter_local_for(symbol) then
+                _load_local(packed_local)
+            elif let index = _argument_index(symbol) then
+                _load_argument(index)
+            else
+                _report("an argument of another function")
+            fi
+        si
+
+        visit_address(load: Values.Load.LOCAL_ARGUMENT) is _report("the address of an argument") si
+
+        visit(load: Values.Load.LOCAL_VARIABLE) is
+            if Values.state_machine_field_for(load.symbol)? then
+                _report("a generator or asynchronous function")
+            elif let variable = cast Semantic.Symbols.Variable?(load.symbol) then
+                _load_local(variable.ir_local)
+            else
+                _report("a load of {load.symbol.name}")
+            fi
+        si
+
+        visit_address(load: Values.Load.LOCAL_VARIABLE) is _report("the address of a local") si
+
+        visit(load: Values.Load.ARGUMENT) is
+            _load_argument(load.index)
+        si
+
+        visit(load: Values.Load.RECEIVER) is _report("self") si
+
+        /// A composite value's structured expansion is lowered as any other
+        /// structured IR is.
+        visit(composite: Values.Composite) is
+            for value in composite.expand().values do
+                gen(value)
+            od
+        si
+
+        visit_address(coalesce: Values.COALESCE_LOAD) is _report("the address of a coalesced load") si
+
+        visit(launch: Values.ASYNC_METHOD_LAUNCH) is _report("an asynchronous function") si
+        visit(completion: Values.ASYNC_COMPLETION) is _report("an asynchronous function") si
+        visit(completed: Values.COMPLETED_TASK_LIKE) is _report("an asynchronous function") si
+        visit(suspend: Values.AWAIT_SUSPEND) is _report("an await") si
+        visit(step: Values.AWAIT_SUSPEND_STEP) is _report("an await") si
+
+        visit(max_stack: Values.MAX_STACK) is si
+        visit(equality: Values.REFERENCE_EQUALITY) is _report("a reference comparison") si
+        visit(construct: Values.CONSTRUCT_MAYBE) is _report("an optional value") si
+
+        // The value is already on the stack, where whatever reads it finds it.
+        visit(stack_top: Values.STACK_TOP) is si
+        visit(stack_top: Values.STACK_TOP_ADDRESS) is _report("the address of a value") si
+        visit_address(stack_top: Values.STACK_TOP_ADDRESS) is _report("the address of a value") si
+
+        /// A block lowers each of its values in turn. One that produces a
+        /// value and ends in a region produces it through that region.
+        visit(block: Values.BLOCK) is
+            let values = block.values
+
+            for i in 0..values.count do
+                let value = values[i]
+
+                if i == values.count - 1 /\ _produces_value(block) /\ isa Values.REGION(value) then
+                    let result = _held(block.type)
+
+                    if !result? then
+                        _report("a value of type {block.type}")
+                    fi
+
+                    _lower_region(cast Values.REGION(value), result)
+                else
+                    gen(value)
+                fi
+            od
+        si
+
+        // A body every path out of which diverges, by a throw or a return,
+        // is typed as an error, and produces no value.
+        _produces_value(block: Values.BLOCK) -> bool =>
+            !LLVM_TYPES.is_void(block.type) /\ !(block.type?.is_error ?? false)
+
+        visit(block: Values.DUMMY_BLOCK) is
+            throw System.InvalidOperationException("dummy block generated, created at: {block.location} because: {block.why}")
+        si
+
+        visit(self_load: Values.Load.REFERENCE_SELF) is _report("self") si
+        visit_address(self_load: Values.Load.REFERENCE_SELF) is _report("self") si
+        visit(self_load: Values.Load.OUTER_SELF) is _report("self") si
+        visit_address(self_load: Values.Load.OUTER_SELF) is _report("self") si
+        visit(self_load: Values.Load.VALUE_SELF) is _report("self") si
+        visit_address(self_load: Values.Load.VALUE_SELF) is _report("self") si
+        visit(runtime: Values.RUNTIME) is _report("a runtime operation") si
+        visit(creation: Values.CREATE_UNIT_VARIANT_INSTANCE) is _report("a union") si
+
+        visit(dummy: Values.DUMMY) is _report("a placeholder value") si
+        visit(type_expression: Values.TYPE_EXPRESSION) is _report("a type used as a value") si
+        visit(store: Values.Need.STORE) is _report("an indirect store") si
+        visit(store: Values.Store.INDIRECT) is _report("an indirect store") si
+        visit(wrapper: Values.TYPE_WRAPPER) is gen(wrapper.value) si
+        visit_address(wrapper: Values.TYPE_WRAPPER) is _report("the address of a value") si
+        visit(wrapper: Values.WRAPPER) is
+            assert wrapper.value? else "generate wrapper without value"
+
+            gen(wrapper.value)
+        si
+        visit_address(wrapper: Values.WRAPPER) is _report("the address of a value") si
+        visit(wrap: Values.WRAP_OPTIONAL) is _report("an optional value") si
+        visit(projection: Values.NARROW_PROJECT) is _report("a narrowed value") si
+        visit(view: Values.NARROW_VIEW) is _report("a narrowed value") si
+        visit_address(view: Values.NARROW_VIEW) is _report("the address of a value") si
+        visit(enter: Values.ENTER_FILE) is si
+        visit(leave: Values.LEAVE_FILE) is si
+        visit(closure: Values.MAKE_CLOSURE) is _report("a function value") si
+
+        visit(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("an array") si
+        visit_address(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("an array") si
+        visit(array: Values.NEW_ARRAY) is _report("an array") si
+        visit(store: Values.STORE_ARRAY_ELEMENT) is _report("an array") si
+        visit(sequence: Values.SEQUENCE) is _report("a sequence") si
+
+        visit(compare: Values.COMPARE_ORDER_TO_ZERO) is
+            if let value = _value_of(compare.value) then
+                _push(_bool(_compare(compare.comparison, value, _i32(0), false)))
+            fi
+        si
+
+        visit(receiver: Values.CONSTRAINED) is _report("a constrained call") si
+        visit(arithmetic: Values.DECIMAL_ARITHMETIC) is _report("decimal arithmetic") si
+        visit(compare: Values.DECIMAL_COMPARE) is _report("decimal arithmetic") si
+        visit(convert: Values.DECIMAL_CONVERT) is _report("a decimal conversion") si
+        visit(equality: Values.EQUALITY_COMPARISON) is _report("an equality comparison") si
+        visit(test: Values.HAS_VALUE) is _report("an optional value") si
+        visit(check: Values.REFERENCE_NULL_CHECK) is _report("a null check") si
+
+        visit(conversion: Values.SCALAR_CONVERSION) is
+            gen(conversion.converted)
+        si
+
+        visit(declaration: Values.DECLARE_LOCAL) is
+            _local(declaration.local)
+        si
+
+        visit(store: Values.STORE_TEMP) is
+            _store_local(store.local, _pop())
+        si
+
+        visit(tee: Values.TEE_TEMP) is
+            if let value = _value_of(tee.value) then
+                let held = _normalise_for(value, tee.local.type)
+
+                _store_local(tee.local, held)
+                _push(held)
+            fi
+        si
+
+        visit(discard: Values.DISCARD) is
+            if let value = discard.value then
+                let depth = _stack.count
+
+                gen(value)
+
+                while _stack.count > depth do
+                    _pop()
+                od
+            else
+                _pop()
+            fi
+        si
+
+        visit(thrown: Values.THROW) is _report("a throw") si
+
+        visit(ret: Values.RET) is
+            _return()
+        si
+
+        visit(default_return: Values.DEFAULT_RETURN) is
+            _default(default_return.type)
+        si
+
+        visit(default_value: Values.DEFAULT) is
+            _default(default_value.type)
+        si
+
+        _default(type: Type?) is
+            if LLVM_TYPES.is_void(type) then
+                return
+            elif let value_type = _held(type) then
+                _push(LLVM_TYPES.zero(value_type))
+            else
+                _report("the default value of {type}")
+            fi
+        si
+
+        visit_address(default_value: Values.DEFAULT) is _report("the address of a value") si
+        visit(deref: Values.DEREF) is _report("a reference") si
+        visit_address(deref: Values.DEREF) is _report("a reference") si
+        visit(address: Values.ADDRESS) is _report("a reference") si
+        visit_address(address: Values.ADDRESS) is _report("a reference") si
+        visit(steps: Values.STEPS) is _report("a range") si
+        visit(decrement: Values.DECREMENT) is _report("a decrement") si
+        visit(increment: Values.POST_INCREMENT) is _report("an increment") si
+        visit(decrement: Values.PRE_DECREMENT) is _report("a decrement") si
+        visit(repack: Values.TUPLE_REPACK) is _report("a tuple") si
+        visit(spilled: Values.SPILLED_SUBJECT) is _report("a spilled value") si
+
+        visit(null_value: Values.NULL) is _report("null") si
+        visit(box: Values.BOX) is _report("a boxed value") si
+        visit(unbox: Values.UNBOX) is _report("a boxed value") si
+        visit(conversion: Values.CAST) is _report("a cast") si
+        visit(test: Values.ISA) is _report("a type test") si
+        visit(type_of: Values.TYPEOF) is _report("typeof") si
+        visit(tuple: Values.TUPLE) is _report("a tuple") si
+        visit(construction: Values.NEW) is _report("a constructor call") si
+
+        visit(negation: Values.NOT) is
+            if let value = _value_of(negation.value) then
+                _push(_bool(_current.compare(IntegerPredicate.EQ, value, LLVM_TYPES.zero(value.type))))
+            fi
+        si
+
+        visit(arithmetic: Values.ARITHMETIC) is
+            let type = _specialize(arithmetic.type)
+            let held = if let scalar = _scalar_of(type) then LLVM_TYPES.value_type(scalar) else null fi
+
+            if !held? then
+                _report("arithmetic on {arithmetic.type}")
+                return
+            fi
+
+            let operation = arithmetic.operation
+            let is_floating = LLVM_TYPES.is_floating(held)
+
+            let result =
+                if operation == ArithmeticOperation.NEGATE then
+                    _negate(arithmetic.operands[0], is_floating)
+                elif operation == ArithmeticOperation.COMPLEMENT then
+                    _complement(arithmetic.operands[0], is_floating)
+                elif _is_shift(operation) then
+                    _shift(operation, arithmetic.operands[0], arithmetic.operands[1], held, _scalar_of(type))
+                else
+                    _binary(operation, arithmetic.operands[0], arithmetic.operands[1], is_floating)
+                fi
+
+            if !result? then
+                return
+            fi
+
+            // A narrow kind's arithmetic runs at 32 bits, so its result is
+            // wrapped back to the kind's width as CIL's narrow stores do.
+            if let scalar = _scalar_of(type) /\ LLVM_TYPES.is_narrow(scalar) then
+                _push(_normalise(result, scalar))
+            else
+                _push(result)
+            fi
+        si
+
+        _is_shift(operation: ArithmeticOperation) -> bool =>
+            operation == ArithmeticOperation.SHIFT_LEFT \/
+            operation == ArithmeticOperation.SHIFT_RIGHT \/
+            operation == ArithmeticOperation.SHIFT_RIGHT_UNSIGNED
+
+        _negate(operand: Value, is_floating: bool) -> LLVM.Value? is
+            if let value = _value_of(operand) then
+                if is_floating then
+                    return _current.negate(value)
+                fi
+
+                return _current.binary(BinaryOperator.SUB, IntegerFlags.NONE, LLVM_TYPES.zero(value.type), value)
+            fi
+
+            return null
+        si
+
+        _complement(operand: Value, is_floating: bool) -> LLVM.Value? is
+            if is_floating then
+                _report("complement of a floating point value")
+                return null
+            fi
+
+            if let value = _value_of(operand) then
+                return _current.binary(BinaryOperator.XOR, IntegerFlags.NONE, value, LLVM.Values.integer(value.type, bigint.minus_one))
+            fi
+
+            return null
+        si
+
+        // A shift count is an int whatever the shifted value is, and only its
+        // low bits count, as CIL's and wasm's shifts use them: LLVM makes a
+        // count at or past the width poison instead.
+        _shift(operation: ArithmeticOperation, operand: Value, count: Value, held: LLVM.Type, scalar: Scalar?) -> LLVM.Value? is
+            let value_found = _value_of(operand)
+            let count_found = _value_of(count)
+
+            if !value_found? \/ !count_found? then
+                return null
+            fi
+
+            let value mut = value_found
+            let amount mut = count_found
+
+            // An unsigned shift of a narrow signed kind shifts in zeros at the
+            // kind's own width, so its sign-extended operand is first cut back
+            // to that width.
+            if operation == ArithmeticOperation.SHIFT_RIGHT_UNSIGNED then
+                if scalar =~ Scalar.INT8 then
+                    value = _normalise(value, Scalar.UINT8)
+                elif scalar =~ Scalar.INT16 then
+                    value = _normalise(value, Scalar.UINT16)
+                fi
+            fi
+
+            let width = LLVM_TYPES.width(held)
+
+            if LLVM_TYPES.width(amount.type) < width then
+                amount = _current.convert(Conversion.ZERO_EXTEND, amount, held)
+            elif LLVM_TYPES.width(amount.type) > width then
+                amount = _current.convert(Conversion.TRUNCATE, amount, held)
+            fi
+
+            amount = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, amount, LLVM.Values.integer(held, bigint(width - 1)))
+
+            let operator =
+                case operation
+                when ArithmeticOperation.SHIFT_LEFT then BinaryOperator.SHL
+                when ArithmeticOperation.SHIFT_RIGHT then BinaryOperator.ASHR
+                else BinaryOperator.LSHR
+                esac
+
+            return _current.binary(operator, IntegerFlags.NONE, value, amount)
+        si
+
+        _binary(operation: ArithmeticOperation, left: Value, right: Value, is_floating: bool) -> LLVM.Value? is
+            let operator = _operator(operation, is_floating)
+
+            if !operator? then
+                return null
+            fi
+
+            let l = _value_of(left)
+            let r = _value_of(right)
+
+            if !l? \/ !r? then
+                return null
+            fi
+
+            if is_floating then
+                return _current.floating(operator, FastMath.NONE, l, r)
+            fi
+
+            return _current.binary(operator, IntegerFlags.NONE, l, r)
+        si
+
+        // Integer division and remainder are not lowered until they check
+        // for a zero divisor and for overflow, as .NET's do.
+        _operator(operation: ArithmeticOperation, is_floating: bool) -> BinaryOperator? is
+            let result: BinaryOperator? =
+                if is_floating then
+                    case operation
+                    when ArithmeticOperation.ADD then BinaryOperator.FADD
+                    when ArithmeticOperation.SUBTRACT then BinaryOperator.FSUB
+                    when ArithmeticOperation.MULTIPLY then BinaryOperator.FMUL
+                    when ArithmeticOperation.DIVIDE then BinaryOperator.FDIV
+                    when ArithmeticOperation.REMAINDER then BinaryOperator.FREM
+                    else null
+                    esac
+                else
+                    case operation
+                    when ArithmeticOperation.ADD then BinaryOperator.ADD
+                    when ArithmeticOperation.SUBTRACT then BinaryOperator.SUB
+                    when ArithmeticOperation.MULTIPLY then BinaryOperator.MUL
+                    when ArithmeticOperation.AND then BinaryOperator.AND
+                    when ArithmeticOperation.OR then BinaryOperator.OR
+                    when ArithmeticOperation.XOR then BinaryOperator.XOR
+                    else null
+                    esac
+                fi
+
+            if !result? then
+                if !is_floating /\ _is_division(operation) then
+                    _report("integer division")
+                else
+                    _report("{operation}")
+                fi
+            fi
+
+            return result
+        si
+
+        _is_division(operation: ArithmeticOperation) -> bool =>
+            operation == ArithmeticOperation.DIVIDE \/
+            operation == ArithmeticOperation.DIVIDE_UNSIGNED \/
+            operation == ArithmeticOperation.REMAINDER \/
+            operation == ArithmeticOperation.REMAINDER_UNSIGNED
+
+        visit(compare: Values.COMPARE) is
+            if !_held(compare.left.type)? then
+                _report("a comparison of {compare.left.type}")
+                return
+            fi
+
+            let left = _value_of(compare.left)
+            let right = _value_of(compare.right)
+
+            if left? /\ right? then
+                _push(_bool(_compare(compare.comparison, left, right, compare.is_unsigned)))
+            fi
+        si
+
+        // An unsigned comparison orders integers as unsigned, and answers true
+        // for floating values with unordered operands, as CIL's `.un`
+        // comparisons do. Inequality of floating values is always unordered,
+        // since it is the negation of an ordered equality.
+        _compare(comparison: Comparison, left: LLVM.Value, right: LLVM.Value, is_unsigned: bool) -> LLVM.Value is
+            if LLVM_TYPES.is_floating(left.type) then
+                let predicate =
+                    case comparison
+                    when Comparison.EQUAL then if is_unsigned then FloatPredicate.UEQ else FloatPredicate.OEQ fi
+                    when Comparison.NOT_EQUAL then FloatPredicate.UNE
+                    when Comparison.LESS then if is_unsigned then FloatPredicate.ULT else FloatPredicate.OLT fi
+                    when Comparison.LESS_OR_EQUAL then if is_unsigned then FloatPredicate.ULE else FloatPredicate.OLE fi
+                    when Comparison.GREATER then if is_unsigned then FloatPredicate.UGT else FloatPredicate.OGT fi
+                    when Comparison.GREATER_OR_EQUAL then if is_unsigned then FloatPredicate.UGE else FloatPredicate.OGE fi
+                    esac
+
+                return _current.compare(predicate, left, right)
+            fi
+
+            let predicate =
+                case comparison
+                when Comparison.EQUAL then IntegerPredicate.EQ
+                when Comparison.NOT_EQUAL then IntegerPredicate.NE
+                when Comparison.LESS then if is_unsigned then IntegerPredicate.ULT else IntegerPredicate.SLT fi
+                when Comparison.LESS_OR_EQUAL then if is_unsigned then IntegerPredicate.ULE else IntegerPredicate.SLE fi
+                when Comparison.GREATER then if is_unsigned then IntegerPredicate.UGT else IntegerPredicate.SGT fi
+                when Comparison.GREATER_OR_EQUAL then if is_unsigned then IntegerPredicate.UGE else IntegerPredicate.SGE fi
+                esac
+
+            return _current.compare(predicate, left, right)
+        si
+
+        visit(convert: Values.CONVERT) is
+            if !convert.from? /\ !_scalar(convert.value.type)? then
+                _report("unboxing a {convert.type}")
+                return
+            fi
+
+            if let value = _value_of(convert.value) then
+                _push(_convert(value, convert.from ?? Scalar.INT32, convert.to))
+            fi
+        si
+
+        // The conversion of a value of kind `from` to kind `to`, saturating
+        // from floating to integer as .NET does.
+        _convert(value: LLVM.Value, from: Scalar, to: Scalar) -> LLVM.Value is
+            let source = LLVM_TYPES.value_type(from)
+            let target = LLVM_TYPES.value_type(to)
+            let source_unsigned = LLVM_TYPES.is_unsigned(from)
+            let target_unsigned = LLVM_TYPES.is_unsigned(to)
+
+            let changed mut = value
+
+            if LLVM_TYPES.is_floating(source) then
+                if LLVM_TYPES.is_floating(target) then
+                    if source =~ LLVM.Type.DOUBLE /\ target =~ LLVM.Type.FLOAT then
+                        changed = _current.convert(Conversion.FLOAT_TRUNCATE, value, target)
+                    elif source =~ LLVM.Type.FLOAT /\ target =~ LLVM.Type.DOUBLE then
+                        changed = _current.convert(Conversion.FLOAT_EXTEND, value, target)
+                    fi
+                else
+                    let intrinsic =
+                        if target_unsigned then
+                            Intrinsics.float_to_unsigned_saturating(target, source)
+                        else
+                            Intrinsics.float_to_signed_saturating(target, source)
+                        fi
+
+                    changed = _current.call(_module.declare_intrinsic(intrinsic), [value])!
+                fi
+            elif LLVM_TYPES.is_floating(target) then
+                changed =
+                    _current.convert(
+                        if source_unsigned then Conversion.UNSIGNED_TO_FLOAT else Conversion.SIGNED_TO_FLOAT fi,
+                        value,
+                        target)
+            else
+                let source_width = LLVM_TYPES.width(source)
+                let target_width = LLVM_TYPES.width(target)
+
+                if source_width > target_width then
+                    changed = _current.convert(Conversion.TRUNCATE, value, target)
+                elif source_width < target_width then
+                    changed =
+                        _current.convert(
+                            if source_unsigned then Conversion.ZERO_EXTEND else Conversion.SIGN_EXTEND fi,
+                            value,
+                            target)
+                fi
+            fi
+
+            if LLVM_TYPES.is_narrow(to) then
+                return _normalise(changed, to)
+            fi
+
+            return changed
+        si
+
+        visit(node: Values.Breakable) is
+            assert node.is_closed else "structured node generated before it was closed"
+
+            if let region: Values.REGION = node then
+                _lower_region(region, null)
+            elif let loop: Values.LOOP = node then
+                _lower_loop(loop)
+            elif isa Values.TRY(node) then
+                _report("a try")
+            else
+                _report("a generator or asynchronous function")
+            fi
+        si
+
+        // A region continues at a block of its own. One that produces a value
+        // has each arm store the value into an `alloca` before it leaves,
+        // and the value is read back where the region continues.
+        _lower_region(region: Values.REGION, result_type: LLVM.Type?) is
+            let end = _new_block()
+            let result = if let type = result_type then _slot(type) else null fi
+            let depth = _stack.count
+
+            _labels.add((region, false, end, result, depth))
+
+            let values = region.body.values
+
+            // A region that ends in another produces its value through that
+            // one: a block expression's statements end with the value they
+            // leave, and that region falls through holding it.
+            let last_region =
+                if result_type? /\ values.count > 0 then
+                    cast Values.REGION?(values[values.count - 1])
+                else
+                    null
+                fi
+
+            if let last = last_region then
+                for i in 0..values.count - 1 do
+                    gen(values[i])
+                od
+
+                _lower_region(last, result_type)
+            else
+                for value in values do
+                    gen(value)
+                od
+            fi
+
+            if !_is_terminated then
+                _leave_with_result(result, depth)
+                _branch(end)
+            fi
+
+            _labels.remove_at(_labels.count - 1)
+
+            _start(end)
+
+            _check_depth(depth, "region")
+
+            if let pointer = result, type = result_type then
+                _push(_current.load(type, pointer, 0))
+            fi
+        si
+
+        // Stores the value an arm leaves into its region's result.
+        _leave_with_result(result: LLVM.Value?, depth: int) is
+            if let pointer = result /\ _stack.count > depth then
+                _current.store(_pop()!, pointer, 0)
+            fi
+        si
+
+        // The IR never leaves a value on the stack across a branch, so the
+        // stack is as deep where a node continues as where it began.
+        _check_depth(depth: int, construct: string) is
+            if _stack.count != depth then
+                _report("a value left on the stack across a {construct}")
+
+                while _stack.count > depth do
+                    _pop()
+                od
+            fi
+        si
+
+        // A loop has a header, where its body starts and where reaching the
+        // end of the body and a CONTINUE both go, and a continuation a BREAK
+        // goes to.
+        _lower_loop(loop: Values.LOOP) is
+            let header = _new_block()
+            let end = _new_block()
+            let depth = _stack.count
+
+            _labels.add((loop, false, end, null, depth))
+            _labels.add((loop, true, header, null, depth))
+
+            _branch(header)
+            _start(header)
+
+            for value in loop.body.values do
+                gen(value)
+            od
+
+            if !_is_terminated then
+                _branch(header)
+            fi
+
+            _labels.remove_at(_labels.count - 1)
+            _labels.remove_at(_labels.count - 1)
+
+            _start(end)
+
+            _check_depth(depth, "loop")
+        si
+
+        visit(exit: Values.Exit) is
+            let is_continue = isa Values.CONTINUE(exit)
+
+            let i mut = _labels.count - 1
+
+            while i >= 0 do
+                let label = _labels[i]
+
+                if label.node == exit.target /\ label.is_loop_head == is_continue then
+                    _exit(exit, label.target, label.result, label.depth)
+                    return
+                fi
+
+                i = i - 1
+            od
+
+            _report("an exit from a construct the lowering does not handle")
+        si
+
+        _exit(exit: Values.Exit, target: BLOCK, result: LLVM.Value?, depth: int) is
+            if exit.condition == IR.BRANCH.ALWAYS then
+                _leave_with_result(result, depth)
+                _branch(target)
+                return
+            fi
+
+            // A conditional exit from a region that produces a value leaves
+            // the value on the stack for the path that carries on.
+            if let pointer = result /\ _stack.count > depth then
+                _current.store(_peek()!, pointer, 0)
+            fi
+
+            if let condition = _test(exit.condition, exit.operands) then
+                let next = _new_block()
+
+                _current.branch(condition, target, next)
+                _start(next)
+            fi
+        si
+
+        // The `i1` a conditional exit branches on.
+        _test(condition: IR.BRANCH, operands: Collections.List[Value]) -> LLVM.Value? is
+            let first = _value_of(operands[0])
+
+            if !first? then
+                return null
+            fi
+
+            if condition == IR.BRANCH.Z \/ condition == IR.BRANCH.NZ then
+                if LLVM_TYPES.is_floating(first.type) then
+                    _report("a condition on {operands[0].type}")
+                    return null
+                fi
+
+                return _current.compare(
+                    if condition == IR.BRANCH.Z then IntegerPredicate.EQ else IntegerPredicate.NE fi,
+                    first,
+                    LLVM_TYPES.zero(first.type))
+            fi
+
+            if operands.count < 2 then
+                _report("the condition {condition}")
+                return null
+            fi
+
+            let second = _value_of(operands[1])
+
+            if !second? then
+                return null
+            fi
+
+            let comparison: (Comparison, bool)? =
+                case condition
+                when IR.BRANCH.EQ then (Comparison.EQUAL, false)
+                when IR.BRANCH.NE then (Comparison.NOT_EQUAL, true)
+                when IR.BRANCH.GE then (Comparison.GREATER_OR_EQUAL, false)
+                when IR.BRANCH.GEU then (Comparison.GREATER_OR_EQUAL, true)
+                when IR.BRANCH.GT then (Comparison.GREATER, false)
+                when IR.BRANCH.GTU then (Comparison.GREATER, true)
+                when IR.BRANCH.LE then (Comparison.LESS_OR_EQUAL, false)
+                when IR.BRANCH.LEU then (Comparison.LESS_OR_EQUAL, true)
+                when IR.BRANCH.LT then (Comparison.LESS, false)
+                when IR.BRANCH.LTU then (Comparison.LESS, true)
+                else null
+                esac
+
+            if let (operation, is_unsigned) = comparison then
+                return _compare(operation, first, second, is_unsigned)
+            fi
+
+            _report("the condition {condition}")
+
+            return null
+        si
+
+        visit(dispatch: Values.DISPATCH) is _report("a generator or asynchronous function") si
+        visit(resume: Values.RESUME_POINT) is _report("a generator or asynchronous function") si
+
+        visit(call: Values.Call.GLOBAL) is
+            _call(call.function, call.arguments)
+        si
+
+        /// A static method takes no receiver, so it is called as a global
+        /// function is.
+        visit(call: Values.Call.STATIC) is
+            _call(call.function, call.arguments)
+        si
+
+        visit(call: Values.Call.STRUCT) is _report("a method of a struct") si
+        visit(call: Values.Call.INSTANCE) is _report("an instance method") si
+        visit(call: Values.Call.CLOSURE) is _report("a function value") si
+        /// A built-in operation lowers to the IR the operation stands for,
+        /// made once and reused by every later lowering of the same body.
+        visit(call: Values.Call.INNATE) is
+            if call.innate_name.starts_with("host.") \/ call.innate_name.starts_with("nullable.") then
+                _report("the operation {call.innate_name}")
+            elif call.is_lowered then
+                gen(call.lowering)
+            else
+                gen(call.lower())
+            fi
+        si
+
+        // The instance a call from this body names: a reference from inside a
+        // generic body takes its type arguments from the body's own.
+        _instance_of(function: Function) -> FUNCTION_INSTANCE =>
+            FUNCTION_INSTANCE(
+                cast Function?(function.root_specialized_from)!,
+                TYPE_MAPS.function_map(function, _type_map))
+
+        _call(function: Function, arguments: Collections.List[Value]) is
+            if function.intrinsic_operation? then
+                _report("the intrinsic {function.intrinsic_operation}")
+                return
+            fi
+
+            let callee = _callee(_instance_of(function))
+
+            if !callee? then
+                _report("a call to {function.name}")
+                return
+            fi
+
+            let values = LIST[LLVM.Value]()
+            let parameters = function.arguments
+
+            for i in 0..arguments.count do
+                if let value = _value_of(arguments[i]) then
+                    values.add(if i < parameters.count then _normalise_for(value, parameters[i]) else value fi)
+                else
+                    return
+                fi
+            od
+
+            if let result = _current.call(callee, values.to_array()) then
+                _push(result)
+            fi
+        si
+
+        visit(store: Values.Store.SYMBOL) is _report("a store to {store.symbol.name}") si
+
+        visit(store: Values.Store.LOCAL_VARIABLE) is
+            if Values.state_machine_field_for(store.symbol)? then
+                _report("a generator or asynchronous function")
+            elif let variable = cast Semantic.Symbols.Variable?(store.symbol) then
+                _store_local(variable.ir_local, _value_of(store.value))
+            else
+                _report("a store to {store.symbol.name}")
+            fi
+        si
+
+        visit(store: Values.Store.LOCAL_ARGUMENT) is
+            let symbol = store.symbol
+
+            if Values.state_machine_field_for(symbol)? then
+                _report("a generator or asynchronous function")
+            elif let packed_local = Values.packed_parameter_local_for(symbol) then
+                _store_local(packed_local, _value_of(store.value))
+            elif let index = _argument_index(symbol) then
+                _store_argument(index, _value_of(store.value), symbol.type)
+            else
+                _report("a store to an argument of another function")
+            fi
+        si
+
+        visit(store: Values.Store.STATIC_FIELD) is _report("a static field") si
+        visit(store: Values.Store.GLOBAL_FIELD) is _report("a global variable") si
+        visit(store: Values.Store.INSTANCE_FIELD) is _report("a field") si
+    si
+si
