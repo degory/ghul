@@ -158,6 +158,20 @@ the `ghulflags` name, wherever the test lives, so a target test outside
 the suite builds it with the core library and runs it; under `llvm`, only a
 configuration whose `run_targets` names `llvm` does, as described above.
 
+A run under `llvm` links a native executable with `ghul-llvm`, which nothing
+but the `llvm` configurations expect to find. `build/ghul-llvm.sh` fetches the
+release the tests are run with, the one `build/ghul-llvm.version` names, as a
+user's build fetches it, and prints where its executable is:
+
+```sh
+PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
+    dotnet ghul-test --config llvm integration-tests
+```
+
+CI runs them in an image with no C compiler, linker or C library, and then
+runs each program again in an empty image with `build/llvm-programs.sh`, which
+fails any program that is not fully static.
+
 ## Generated tests
 
 `execution/argument-pack-grid` holds one test per cell of a conformance grid

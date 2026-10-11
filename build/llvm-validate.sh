@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 #
 # llvm-validate.sh - hand every module the llvm integration tests build
-# to LLVM, and run the ones that say what they exit with.
+# to LLVM.
 #
-# ghul-test compiles each test built for the llvm target and compares
-# what the compiler said, but it does not assemble the module the compiler
-# wrote, and it does not run a native executable on CI, which has no
-# ghul-llvm. So a module the tests accept may still be one LLVM rejects.
-# This script builds each test's module again, with the compiler in
-# publish/, and has ghul-llvm verify and compile it to an object. A test
-# with an `exit.expected` is also built as an executable and run, with its
-# `input` as standard input where it has one and each line of its
-# `arguments` as a command-line argument; its exit status is compared,
-# and its standard output too where it has an `output.expected`.
+# ghul-test builds and runs each test built for the llvm target where
+# ghul-llvm is present, but a test that is a library build, or one whose
+# compilation is the subject, never reaches LLVM there. This script builds
+# each test's module again as a library, with the compiler in publish/, and
+# has ghul-llvm verify and compile it to an object, so a module the
+# compiler accepts is one LLVM accepts too.
 #
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
 #
@@ -21,8 +17,7 @@
 #        after `dotnet publish --output publish/`)
 #
 # Fails when ghul-llvm is missing, when a test that should build a module
-# does not, when any module is rejected, or when an executable exits with
-# a status other than the one its test expects.
+# does not, or when any module is rejected.
 
 set -uo pipefail
 
@@ -45,7 +40,6 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
 checked=0
-ran=0
 failed=0
 
 # Every test under $root whose ghulflags name `--target $target`, printed
@@ -89,57 +83,9 @@ while IFS=$'\t' read -r dir flags_text; do
         echo "llvm-validate: LLVM rejected the module built from $dir:" >&2
         head -10 "$out/ghul-llvm.out" >&2
         failed=$((failed + 1))
-        continue
-    fi
-
-    if [ ! -f "$dir/exit.expected" ]; then
-        continue
-    fi
-
-    executable=()
-
-    for flag in "${flags[@]}"; do
-        if [ "$flag" != "--library" ]; then
-            executable+=("$flag")
-        fi
-    done
-
-    if ! (cd "$dir" && GHUL_LLVM="$ghul_llvm" dotnet "$compiler" "${executable[@]}" -o "$out/program" ./*.ghul) >"$out/link.out" 2>&1; then
-        echo "llvm-validate: $dir did not link:" >&2
-        head -10 "$out/link.out" >&2
-        failed=$((failed + 1))
-        continue
-    fi
-
-    ran=$((ran + 1))
-
-    input="/dev/null"
-
-    if [ -f "$dir/input" ]; then
-        input="$dir/input"
-    fi
-
-    arguments=()
-
-    if [ -f "$dir/arguments" ]; then
-        mapfile -t arguments < "$dir/arguments"
-    fi
-
-    "$out/program" "${arguments[@]}" < "$input" > "$out/output" 2> "$out/errors"
-    status=$?
-    expected="$(tr -d '[:space:]' < "$dir/exit.expected")"
-
-    if [ "$status" != "$expected" ]; then
-        echo "llvm-validate: $dir exited with $status, expected $expected" >&2
-        failed=$((failed + 1))
-    fi
-
-    if [ -f "$dir/output.expected" ] && ! diff -u "$dir/output.expected" "$out/output" >&2; then
-        echo "llvm-validate: $dir wrote other output than output.expected" >&2
-        failed=$((failed + 1))
     fi
 done < <(tests_for_target)
 
-echo "llvm-validate: $checked modules checked, $ran run, $failed failed"
+echo "llvm-validate: $checked modules checked, $failed failed"
 
 [ "$failed" = 0 ]
