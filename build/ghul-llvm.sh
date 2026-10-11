@@ -21,6 +21,10 @@ if [ $# -ne 1 ]; then
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# The tests link with exactly the release requirements.json names, the
+# floor, rather than the newest above it as the libraries are chosen: a
+# ghul-llvm release changes what every llvm test links, so moving to a newer
+# one is a change of its own.
 tag="v$(sed -n 's/.*"ghul-llvm": *"\([^"]*\)".*/\1/p' "$here/requirements.json")"
 triple=x86_64-unknown-linux-musl
 archive="ghul-llvm-$triple.tar.gz"
