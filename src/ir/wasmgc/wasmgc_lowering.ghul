@@ -1994,6 +1994,7 @@ namespace IR.WasmGC is
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, storage.struct_index, 1))
 
             gen(index)
+            _check_index(storage.data_index)
 
             gen(element)
             _normalise_for(_registry.array_element(type))
@@ -2007,6 +2008,30 @@ namespace IR.WasmGC is
             fi
 
             _emit(TYPE_INSTRUCTION(Opcode.ARRAY_SET, storage.data_index))
+        si
+
+        // With the data array and an index on the stack, throws the core
+        // library's IndexOutOfRangeException where the index is outside the
+        // array, which the engine would otherwise trap on, and leaves the two
+        // as they were. An index compares unsigned, so a negative one is
+        // outside too.
+        _check_index(data_index: int) is
+            if !_can_throw("Ghul.IndexOutOfRangeException") then
+                return
+            fi
+
+            let index = _temp(VALUE_TYPE.of_numeric(NumericType.I32))
+            let data = _temp(VALUE_TYPE.of_type_index(data_index, true))
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, index))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, data))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, index))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, data))
+            _emit(Opcode.ARRAY_LEN)
+            _emit(Opcode.I32_GE_U)
+            _throw_if("Ghul.IndexOutOfRangeException", LIST[Value]())
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, data))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, index))
         si
 
         // The descriptor of the class an array of `type` is made to hold, or
@@ -2138,6 +2163,7 @@ namespace IR.WasmGC is
                 _emit(Opcode.ARRAY_LEN)
             elif operation =~ "array.get" then
                 gen(call.arguments[0])
+                _check_index(storage.data_index)
 
                 _emit(TYPE_INSTRUCTION(Opcode.ARRAY_GET, storage.data_index))
 
@@ -2402,10 +2428,7 @@ namespace IR.WasmGC is
                 return
             fi
 
-            let tag = _exceptions?.tag_index
-            let exception_type = _exceptions?.exception
-
-            if !tag? \/ !exception_type? \/ !CORE_LIBRARY.find_class("Ghul.NullReferenceException")? \/ _registry.discovering then
+            if !_can_throw("Ghul.NullReferenceException") then
                 _emit(Opcode.REF_AS_NON_NULL)
                 return
             fi
@@ -2414,17 +2437,39 @@ namespace IR.WasmGC is
 
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, value))
             _emit(Opcode.REF_IS_NULL)
+            _throw_if("Ghul.NullReferenceException", LIST[Value]())
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, value))
+            _emit(Opcode.REF_AS_NON_NULL)
+        si
+
+        // Whether the module can throw the core library's exception `name`:
+        // the library declares the class, and the module has an exception tag,
+        // which is asked for only then, since a library that declares no
+        // exceptions has none. Where it cannot, the operation is left to trap.
+        _can_throw(name: string) -> bool =>
+            CORE_LIBRARY.find_class(name)? /\ !_registry.discovering /\
+            _exceptions?.tag_index? /\ _exceptions?.exception?
+
+        // Takes the i32 condition on the stack and, where it holds, throws
+        // the core library's exception `name` built from `operands`. Only
+        // called where `_can_throw(name)`.
+        _throw_if(name: string, operands: Collections.List[Value]) is
+            let tag = _exceptions?.tag_index
+            let exception_type = _exceptions?.exception
+
+            if !tag? \/ !exception_type? then
+                _emit(Opcode.DROP)
+                return
+            fi
 
             _begin()
-            _construct_runtime_exception("Ghul.NullReferenceException", LIST[Value]())
+            _construct_runtime_exception(name, operands)
             _coerce_top(exception_type)
             _emit(Opcode.REF_AS_NON_NULL)
             _emit(THROW_INSTRUCTION(tag))
-            let absent = _end()
+            let raised = _end()
 
-            _emit(IF_INSTRUCTION(BLOCK_TYPE(), absent, LIST[INSTRUCTION]()))
-            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, value))
-            _emit(Opcode.REF_AS_NON_NULL)
+            _emit(IF_INSTRUCTION(BLOCK_TYPE(), raised, LIST[INSTRUCTION]()))
         si
 
         visit(conversion: Values.SCALAR_CONVERSION) is
@@ -3155,6 +3200,10 @@ namespace IR.WasmGC is
                     _emit(Opcode.I64_EXTEND_I32_U)
                 fi
 
+                if _is_division(operation) /\ (numeric == NumericType.I32 \/ numeric == NumericType.I64) then
+                    _check_division(operation, numeric, arithmetic.type)
+                fi
+
                 _emit(opcode)
             else
                 _report("{operation} on {arithmetic.type}")
@@ -3168,6 +3217,75 @@ namespace IR.WasmGC is
                     _emit_all(WASMGC_OPERATIONS.normalise(scalar))
                 fi
             fi
+        si
+
+        _is_division(operation: ArithmeticOperation) -> bool =>
+            operation == ArithmeticOperation.DIVIDE \/
+            operation == ArithmeticOperation.DIVIDE_UNSIGNED \/
+            operation == ArithmeticOperation.REMAINDER \/
+            operation == ArithmeticOperation.REMAINDER_UNSIGNED
+
+        // With an integer division's two operands on the stack, throws the
+        // core library's DivideByZeroException where the divisor is zero, and
+        // its OverflowException where a signed 32- or 64-bit division or
+        // remainder divides the type's least value by -1, as .NET does; the
+        // engine would trap on the first and the second, and a narrow kind
+        // divides at 32 bits, where its least value does not overflow. Leaves
+        // the operands as they were.
+        _check_division(operation: ArithmeticOperation, numeric: NumericType, type: Type?) is
+            let zero = _can_throw("Ghul.DivideByZeroException")
+
+            let narrow =
+                if let scalar = WASMGC_TYPES.scalar(_specialize(type)) then WASMGC_TYPES.is_narrow(scalar) else false fi
+
+            let overflow =
+                _can_throw("Ghul.OverflowException") /\ !narrow /\
+                (operation == ArithmeticOperation.DIVIDE \/ operation == ArithmeticOperation.REMAINDER)
+
+            if !zero /\ !overflow then
+                return
+            fi
+
+            let wide = numeric == NumericType.I64
+            let divisor = _temp(VALUE_TYPE.of_numeric(numeric))
+            let dividend = _temp(VALUE_TYPE.of_numeric(numeric))
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, divisor))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, dividend))
+
+            if zero then
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, divisor))
+                _emit(if wide then Opcode.I64_EQZ else Opcode.I32_EQZ fi)
+                _throw_if("Ghul.DivideByZeroException", LIST[Value]())
+            fi
+
+            if overflow then
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, dividend))
+
+                if wide then
+                    _emit(I64_CONSTANT(-9223372036854775807L - 1L))
+                    _emit(Opcode.I64_EQ)
+                else
+                    _emit(I32_CONSTANT(-2147483647 - 1))
+                    _emit(Opcode.I32_EQ)
+                fi
+
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, divisor))
+
+                if wide then
+                    _emit(I64_CONSTANT(-1L))
+                    _emit(Opcode.I64_EQ)
+                else
+                    _emit(I32_CONSTANT(-1))
+                    _emit(Opcode.I32_EQ)
+                fi
+
+                _emit(Opcode.I32_AND)
+                _throw_if("Ghul.OverflowException", LIST[Value]())
+            fi
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, dividend))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, divisor))
         si
 
         _is_shift(operation: ArithmeticOperation) -> bool =>
@@ -4510,6 +4628,7 @@ namespace IR.WasmGC is
                 _emit(Opcode.I32_EQZ)
             elif operation =~ "nullable.value" /\ inner? then
                 _gen_optional(receiver)
+                _check_present()
 
                 if let index = _registry.box_index(_specialize(inner)) then
                     _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(index)))
@@ -4523,6 +4642,25 @@ namespace IR.WasmGC is
             else
                 _report("the operation {operation}")
             fi
+        si
+
+        // With a value-type optional's box on the stack, throws the core
+        // library's InvalidOperationException where it is absent, with the
+        // message .NET gives, rather than letting the cast to the box trap.
+        _check_present() is
+            let held = _top
+
+            if !held? \/ !_can_throw("Ghul.InvalidOperationException") then
+                return
+            fi
+
+            let box = _temp(held)
+            let string_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type()
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, box))
+            _emit(Opcode.REF_IS_NULL)
+            _throw_if("Ghul.InvalidOperationException", LIST[Value]([Values.Literal.STRING("Nullable object must have a value.", string_type)]))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, box))
         si
 
         // The value type a value-type optional `type`, or a reference to
