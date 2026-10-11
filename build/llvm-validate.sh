@@ -8,8 +8,9 @@
 # wrote, and it does not run a native executable on CI, which has no
 # ghul-llvm. So a module the tests accept may still be one LLVM rejects.
 # This script builds each test's module again, with the compiler in
-# publish/, and has ghul-llvm verify and compile it to an object. A test with an `exit.expected` is
-# also built as an executable, run, and its exit status compared.
+# publish/, and has ghul-llvm verify and compile it to an object. A test
+# with an `exit.expected` is also built as an executable, run, and its exit
+# status compared.
 #
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
 #
