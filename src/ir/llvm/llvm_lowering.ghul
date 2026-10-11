@@ -194,12 +194,14 @@ namespace IR.LLVMTarget is
         _scalar(type: Type?) -> Scalar? => _scalar_of(_specialize(type))
 
         _held(type: Type?) -> LLVM.Type? =>
-            if let scalar = _scalar(type) then
+            if let inner = _value_optional_inner(type) then
+                _optional_type(inner)
+            elif let scalar = _scalar(type) then
                 LLVM_TYPES.value_type(scalar)
             elif _is_string(_specialize(type)) \/ LLVM_TYPES.is_array(_specialize(type)) \/ LLVM_TYPES.is_object_reference(_specialize(type)) then
                 Types.pointer
             else
-                null
+                _objects?.held_type(_specialize(type))
             fi
 
         // The block instructions go into, opened afresh where the last one
@@ -296,6 +298,58 @@ namespace IR.LLVMTarget is
             _report("a local of type {local.type}")
 
             return null
+        si
+
+        _local_address(local: LOCAL) is
+            if let (pointer, _) = _local(local) then
+                _push(pointer)
+            fi
+        si
+
+        // The address of `value`, for a struct method's receiver or a field
+        // of a struct. A value with a place of its own is reached where it
+        // is, so a method changes it there; any other is copied into a new
+        // place first, as .NET copies a temporary.
+        _address_of(value: Value) -> LLVM.Value? is
+            if isa Values.STACK_TOP_ADDRESS(value) then
+                return _pop()
+            fi
+
+            // A receiver the IR already gives as an address is that address.
+            if isa Values.ADDRESS(value) then
+                return _value_of(value)
+            fi
+
+            if value.has_address then
+                let depth = _stack.count
+
+                value.accept_address(self)
+
+                if _stack.count > depth then
+                    return _pop()
+                fi
+
+                return null
+            fi
+
+            let held = _held(value.type)
+
+            if !held? then
+                _report("the address of a value of type {value.type}")
+                return null
+            fi
+
+            let result = _value_of(value)
+
+            if !result? then
+                return null
+            fi
+
+            let slot = _slot(held)
+
+            _current.store(result, slot, 0)
+
+            return slot
         si
 
         _load_local(local: LOCAL) is
@@ -430,13 +484,17 @@ namespace IR.LLVMTarget is
 
         visit(load: Values.Load.SYMBOL) is _report("a load of {load.symbol.name}") si
         visit_address(load: Values.Load.SYMBOL) is _report("the address of {load.symbol.name}") si
-        visit_address(load: Values.Load.INSTANCE_FIELD) is _report("the address of a field") si
+        visit_address(load: Values.Load.INSTANCE_FIELD) is
+            if let address = _field_address(load.from, load.symbol) then
+                _push(address)
+            fi
+        si
 
         visit(load: Values.Load.TEMP) is
             _load_local(load.local)
         si
 
-        visit_address(load: Values.Load.TEMP) is _report("the address of a local") si
+        visit_address(load: Values.Load.TEMP) is _local_address(load.local) si
         visit_address(load: Values.Load.STATIC_FIELD) is _report("the address of a static field") si
         visit_address(load: Values.Load.GLOBAL_FIELD) is _report("the address of a global variable") si
 
@@ -454,7 +512,19 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        visit_address(load: Values.Load.LOCAL_ARGUMENT) is _report("the address of an argument") si
+        visit_address(load: Values.Load.LOCAL_ARGUMENT) is
+            let symbol = load.symbol
+
+            if Values.state_machine_field_for(symbol)? then
+                _report("a generator or asynchronous function")
+            elif let packed_local = Values.packed_parameter_local_for(symbol) then
+                _local_address(packed_local)
+            elif let index = _argument_index(symbol) /\ index < _arguments.count then
+                _push(_arguments[index].pointer)
+            else
+                _report("the address of an argument of another function")
+            fi
+        si
 
         visit(load: Values.Load.LOCAL_VARIABLE) is
             if Values.state_machine_field_for(load.symbol)? then
@@ -466,7 +536,15 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        visit_address(load: Values.Load.LOCAL_VARIABLE) is _report("the address of a local") si
+        visit_address(load: Values.Load.LOCAL_VARIABLE) is
+            if Values.state_machine_field_for(load.symbol)? then
+                _report("a generator or asynchronous function")
+            elif let variable = cast Semantic.Symbols.Variable?(load.symbol) then
+                _local_address(variable.ir_local)
+            else
+                _report("the address of {load.symbol.name}")
+            fi
+        si
 
         visit(load: Values.Load.ARGUMENT) is
             _load_argument(load.index + _receiver_offset)
@@ -493,8 +571,9 @@ namespace IR.LLVMTarget is
 
         // The value is already on the stack, where whatever reads it finds it.
         visit(stack_top: Values.STACK_TOP) is si
-        visit(stack_top: Values.STACK_TOP_ADDRESS) is _report("the address of a value") si
-        visit_address(stack_top: Values.STACK_TOP_ADDRESS) is _report("the address of a value") si
+        // An address already on top of the stack, which stays where it is.
+        visit(stack_top: Values.STACK_TOP_ADDRESS) is si
+        visit_address(stack_top: Values.STACK_TOP_ADDRESS) is si
 
         /// A block lowers each of its values in turn. One that produces a
         /// value and ends in a region produces it through that region.
@@ -527,11 +606,43 @@ namespace IR.LLVMTarget is
             throw System.InvalidOperationException("dummy block generated, created at: {block.location} because: {block.why}")
         si
 
-        visit_address(self_load: Values.Load.REFERENCE_SELF) is _report("self") si
+        // Only a struct method reaches its receiver by address, and its
+        // receiver is already the address of the struct.
+        visit_address(self_load: Values.Load.REFERENCE_SELF) is
+            if let pointer = _receiver_address() then
+                _push(pointer)
+            fi
+        si
         visit(self_load: Values.Load.OUTER_SELF) is _report("self") si
         visit_address(self_load: Values.Load.OUTER_SELF) is _report("self") si
-        visit(self_load: Values.Load.VALUE_SELF) is _report("self") si
-        visit_address(self_load: Values.Load.VALUE_SELF) is _report("self") si
+        // A struct method's receiver is the address of its struct.
+        visit(self_load: Values.Load.VALUE_SELF) is
+            let held = _held(self_load.type)
+
+            if !held? then
+                _report("self of type {self_load.type}")
+                return
+            fi
+
+            if let pointer = _receiver_address() then
+                _push(_current.load(held, pointer, 0))
+            fi
+        si
+
+        visit_address(self_load: Values.Load.VALUE_SELF) is
+            if let pointer = _receiver_address() then
+                _push(pointer)
+            fi
+        si
+
+        _receiver_address() -> LLVM.Value? is
+            if _receiver_offset == 0 \/ _arguments.count == 0 then
+                _report("self outside an instance method")
+                return null
+            fi
+
+            return _current.load(Types.pointer, _arguments[0].pointer, 0)
+        si
         /// An object is allocated whole where it is constructed, so there
         /// is nothing for its constructor to initialise first, and a program
         /// runs on one thread.
@@ -540,11 +651,22 @@ namespace IR.LLVMTarget is
                 return
             elif runtime.operation == IR.RuntimeOperation.CURRENT_THREAD_ID then
                 _push(_i32(0))
+            elif runtime.operation == IR.RuntimeOperation.NEW_RANGE then
+                // A range is constructed from its two endpoints.
+                if let constructor = INTERPOLATION_CALLS.method(runtime.type, "init", 2) then
+                    gen(Values.NEW(runtime.type!, constructor, LIST[Value](runtime.operands)))
+                else
+                    _report("a range, whose type has no constructor taking its endpoints")
+                fi
             elif let name = _runtime_exception(runtime.operation) then
                 if let exception = _new_exception(name, runtime.operands) then
                     _push(exception)
                 fi
-            else
+            elif runtime.operation == IR.RuntimeOperation.STRINGS_EQUAL then
+                _call_string_helper(_strings?.equals_function, runtime.operands)
+            elif runtime.operation == IR.RuntimeOperation.CONCAT_STRINGS then
+                _call_string_helper(_strings?.concat_function, runtime.operands)
+            elif !_lower_builder(runtime) then
                 _report("the runtime operation {runtime.operation}")
             fi
         si
@@ -555,17 +677,134 @@ namespace IR.LLVMTarget is
         visit(store: Values.Need.STORE) is _report("an indirect store") si
         visit(store: Values.Store.INDIRECT) is _report("an indirect store") si
         visit(wrapper: Values.TYPE_WRAPPER) is gen(wrapper.value) si
-        visit_address(wrapper: Values.TYPE_WRAPPER) is _report("the address of a value") si
+        visit_address(wrapper: Values.TYPE_WRAPPER) is _push_address_of(wrapper.value) si
         visit(wrapper: Values.WRAPPER) is
             assert wrapper.value? else "generate wrapper without value"
 
             gen(wrapper.value)
         si
-        visit_address(wrapper: Values.WRAPPER) is _report("the address of a value") si
-        visit(wrap: Values.WRAP_OPTIONAL) is _report("an optional value") si
-        visit(projection: Values.NARROW_PROJECT) is _report("a narrowed value") si
-        visit(view: Values.NARROW_VIEW) is _report("a narrowed value") si
-        visit_address(view: Values.NARROW_VIEW) is _report("the address of a value") si
+        visit_address(wrapper: Values.WRAPPER) is
+            if let value = wrapper.value then
+                _push_address_of(value)
+            else
+                _report("the address of a value")
+            fi
+        si
+
+        // The value type `type` is an optional of, or null where it is not
+        // one. A reference to an optional, which a method of the optional
+        // receives, counts as the optional.
+        _value_optional_inner(type: Type?) -> Type? is
+            let specialized mut = _specialize(type)
+
+            if let reference: Semantic.Types.REFERENCE = specialized then
+                specialized = reference.arguments[0]
+            fi
+
+            if specialized? /\ specialized.is_optional /\ specialized.is_value_type then
+                return specialized.optional_inner_type
+            fi
+
+            return null
+        si
+
+        // An optional value type is held in place as whether it is present
+        // and its value: `{ i1, T }`, zeroed where absent.
+        _optional_type(inner: Type) -> LLVM.Type? =>
+            if let held = _held(inner) then Types.structure([Types.i1, held]) else null fi
+
+        // The present optional of type `optional` holding `value`.
+        _wrap(value: LLVM.Value, optional: LLVM.Type) -> LLVM.Value =>
+            _current.insert_value(_current.insert_value(LLVM_TYPES.zero(optional), LLVM.Values.boolean(true), [0]), value, [1])
+
+        visit(wrap: Values.WRAP_OPTIONAL) is
+            let optional = _held(wrap.type)
+
+            if !optional? \/ !_value_optional_inner(wrap.type)? then
+                _report("an optional value of type {wrap.type}")
+                return
+            fi
+
+            if let value = _value_of(wrap.value) then
+                _push(_wrap(_normalise_for(value, _value_optional_inner(wrap.type)), optional))
+            fi
+        si
+
+        // `has_value` and `value` of an optional value type, called on where
+        // it is held. Reading the value of an absent optional throws, as .NET
+        // does.
+        _lower_nullable(operation: string, from: Value?) is
+            let inner = if let f = from then _value_optional_inner(f.type) else null fi
+            let optional = if let i = inner then _optional_type(i) else null fi
+
+            if !from? \/ !optional? then
+                _report("the operation {operation}")
+                return
+            fi
+
+            let pointer = _optional_pointer(from)
+
+            if !pointer? then
+                return
+            fi
+
+            let held = _current.load(optional, pointer, 0)
+            let present = _current.extract_value(Types.i1, held, [0])
+
+            if operation =~ "nullable.has_value" then
+                _push(_bool(present))
+            elif operation =~ "nullable.value" then
+                let absent = _new_block()
+                let carry_on = _new_block()
+
+                _current.branch(present, carry_on, absent)
+
+                _start(absent)
+
+                let message = Values.Literal.STRING("Nullable object must have a value.", IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type())
+
+                _throw(_new_exception("Ghul.InvalidOperationException", LIST[Value]([message])) ?? LLVM.Values.null_pointer)
+
+                _start(carry_on)
+
+                _push(_current.extract_value(_held(inner)!, held, [1]))
+            else
+                _report("the operation {operation}")
+            fi
+        si
+
+        // Where the optional `from` stands for is held: `from` itself where
+        // it is a reference to one, otherwise its address.
+        _optional_pointer(from: Value) -> LLVM.Value? =>
+            if isa Semantic.Types.REFERENCE(_specialize(from.type)) then _value_of(from) else _address_of(from) fi
+        // A narrowed value is the value it narrows, read as its narrower
+        // type: the IR already holds what that reading is.
+        visit(projection: Values.NARROW_PROJECT) is gen(projection.projected) si
+        visit(view: Values.NARROW_VIEW) is gen(view.underlying) si
+        // A view held as its underlying value is where that value is; one
+        // held otherwise, such as an optional value type viewed as the value
+        // it holds, is copied into a place of its own.
+        visit_address(view: Values.NARROW_VIEW) is
+            let viewed = _held(view.type)
+            let underlying = _held(view.underlying.type)
+
+            if viewed? /\ underlying? /\ viewed =~ underlying then
+                _push_address_of(view.underlying)
+            elif let held = viewed, value = _value_of(view) then
+                let slot = _slot(held)
+
+                _current.store(value, slot, 0)
+                _push(slot)
+            else
+                _report("the address of a value of type {view.type}")
+            fi
+        si
+
+        _push_address_of(value: Value) is
+            if let address = _address_of(value) then
+                _push(address)
+            fi
+        si
         visit(enter: Values.ENTER_FILE) is si
         visit(leave: Values.LEAVE_FILE) is si
 
@@ -668,6 +907,8 @@ namespace IR.LLVMTarget is
             if let value = _value_of(test.value) then
                 if value.type =~ Types.pointer then
                     _push(_bool(_current.compare(IntegerPredicate.NE, value, LLVM.Values.null_pointer)))
+                elif _value_optional_inner(test.value.type)? then
+                    _push(_bool(_current.extract_value(Types.i1, value, [0])))
                 else
                     _report("an optional value of type {test.value.type}")
                 fi
@@ -732,16 +973,49 @@ namespace IR.LLVMTarget is
         si
 
         visit_address(default_value: Values.DEFAULT) is _report("the address of a value") si
-        visit(deref: Values.DEREF) is _report("a reference") si
-        visit_address(deref: Values.DEREF) is _report("a reference") si
-        visit(address: Values.ADDRESS) is _report("a reference") si
-        visit_address(address: Values.ADDRESS) is _report("a reference") si
-        visit(steps: Values.STEPS) is _report("a range") si
+        // A reference is a pointer to where its value is held.
+        visit(deref: Values.DEREF) is
+            let held = _held(deref.type)
+
+            if !held? then
+                _report("a reference to {deref.type}")
+                return
+            fi
+
+            if let pointer = _value_of(deref.value) then
+                _push(_current.load(held, pointer, 0))
+            fi
+        si
+
+        visit_address(deref: Values.DEREF) is gen(deref.value) si
+
+        visit(address: Values.ADDRESS) is
+            if let pointer = _address_of(address.value) then
+                _push(pointer)
+            fi
+        si
+
+        visit_address(address: Values.ADDRESS) is _report("the address of a reference") si
+        // Each step in turn, the last leaving the value.
+        visit(steps: Values.STEPS) is
+            for step in steps.steps do
+                gen(step)
+            od
+        si
         visit(decrement: Values.DECREMENT) is _report("a decrement") si
         visit(increment: Values.POST_INCREMENT) is _report("an increment") si
         visit(decrement: Values.PRE_DECREMENT) is _report("a decrement") si
-        visit(repack: Values.TUPLE_REPACK) is _report("a tuple") si
-        visit(spilled: Values.SPILLED_SUBJECT) is _report("a spilled value") si
+        // The source is held in a local, which the rebuilt tuple reads.
+        visit(repack: Values.TUPLE_REPACK) is
+            _store_local(repack.temp, _value_of(repack.source))
+            gen(repack.built)
+        si
+        // The subject already on the stack is held in a local, which what is
+        // built from it reads.
+        visit(spilled: Values.SPILLED_SUBJECT) is
+            _store_local(spilled.temp, _pop())
+            gen(spilled.built)
+        si
 
         visit(null_value: Values.NULL) is
             _push(LLVM.Values.null_pointer)
@@ -752,18 +1026,11 @@ namespace IR.LLVMTarget is
         visit(box: Values.BOX) is
             let value = box.value
 
-            if let objects = _objects, box_type = objects.box_type(_specialize(value.type)) then
-                objects.note_boxed(box_type)
-
+            if _value_optional_inner(value.type)? then
+                _box_optional(value)
+            elif let objects = _objects, box_type = objects.box_type(_specialize(value.type)) then
                 if let held = _value_of(value) then
-                    let object =
-                        _current.call(
-                            _strings!.runtime("$ghul_alloc_atomic", Types.pointer, [Types.pointer, Types.i64]),
-                            [LLVM.Values.global(objects.descriptor_name(box_type)), LLVM.Values.i64(cast long(objects.size_of(box_type)))])!
-
-                    _current.store(_normalise_for(held, value.type), _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
-
-                    _push(object)
+                    _push(_box_value(objects, box_type, _normalise_for(held, value.type)))
                 fi
             elif let held = _held(value.type) /\ isa LLVM.Type.POINTER(held) then
                 gen(value)
@@ -772,10 +1039,165 @@ namespace IR.LLVMTarget is
             fi
         si
 
+
+        // A new box of `box_type` holding `held`.
+        // A box holding something the collector must follow is one it scans.
+        _box_value(objects: LLVM_OBJECTS, box_type: CLASS_INSTANCE, held: LLVM.Value) -> LLVM.Value is
+            objects.note_boxed(box_type)
+
+            let allocator = if LLVM_TYPES.holds_pointer(held.type) then "$ghul_alloc" else "$ghul_alloc_atomic" fi
+
+            let object =
+                _current.call(
+                    _strings!.runtime(allocator, Types.pointer, [Types.pointer, Types.i64]),
+                    [LLVM.Values.global(objects.descriptor_name(box_type)), LLVM.Values.i64(cast long(objects.size_of(box_type)))])!
+
+            _current.store(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
+
+            return object
+        si
+
+        // An optional value type boxes as .NET boxes one: an absent value is
+        // null, and a present one is a box of the value it holds.
+        _box_optional(value: Value) is
+            let inner = _value_optional_inner(value.type)!
+            let objects = _objects
+            let box_type = if let o = objects then o.box_type(_specialize(inner)) else null fi
+            let optional = _held(value.type)
+
+            if !objects? \/ !box_type? \/ !optional? then
+                _report("boxing a {value.type}")
+                return
+            fi
+
+            let held = _value_of(value)
+
+            if !held? then
+                return
+            fi
+
+            let slot = _slot(Types.pointer)
+
+            _current.store(LLVM.Values.null_pointer, slot, 0)
+
+            let present = _new_block()
+            let join = _new_block()
+
+            _current.branch(_current.extract_value(Types.i1, held, [0]), present, join)
+
+            _start(present)
+
+            let inner_value = _current.extract_value(_held(inner)!, held, [1])
+            let object = _box_value(objects, box_type, inner_value)
+
+            _current.store(object, slot, 0)
+            _current.branch(join)
+
+            _start(join)
+
+            _push(_current.load(Types.pointer, slot, 0))
+        si
+
+        // Unboxing to an optional value type answers absent for a null, and
+        // otherwise unboxes the value, throwing where the box is of another
+        // type.
+        _unbox_optional(value: Value, type: Type?) is
+            let inner = _value_optional_inner(type)!
+            let optional = _held(type)
+
+            if !optional? then
+                _report("unboxing a {type}")
+                return
+            fi
+
+            let object = _value_of(value)
+
+            if !object? then
+                return
+            fi
+
+            let slot = _slot(optional)
+
+            _current.store(LLVM_TYPES.zero(optional), slot, 0)
+
+            let present = _new_block()
+            let join = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.NE, object, LLVM.Values.null_pointer), present, join)
+
+            _start(present)
+
+            if let unboxed = _unbox_value(object, inner) then
+                let wrapped = _wrap(unboxed, optional)
+
+                _current.store(wrapped, slot, 0)
+            fi
+
+            _current.branch(join)
+
+            _start(join)
+
+            _push(_current.load(optional, slot, 0))
+        si
+
+        // A cast to an optional value type never throws: it answers the
+        // unboxed value where the object is a box of the inner type, and
+        // absent otherwise, a null included.
+        _cast_to_optional(conversion: Values.CAST, target: Type) is
+            let inner = _value_optional_inner(target)!
+            let objects = _objects
+            let box_type = if let o = objects then o.box_type(_specialize(inner)) else null fi
+            let optional = _held(target)
+            let held_inner = _held(inner)
+
+            if !objects? \/ !box_type? \/ !optional? \/ !held_inner? then
+                _report("a cast to {conversion.type}")
+                return
+            fi
+
+            let object = _value_of(conversion.value)
+
+            if !object? then
+                return
+            fi
+
+            let slot = _slot(optional)
+
+            _current.store(LLVM_TYPES.zero(optional), slot, 0)
+
+            let range = LIST[(first: int, last: int)]()
+
+            range.add(objects.class_range(box_type))
+
+            let id = _class_id(object)
+            let fits = _in_ranges(id, range)
+
+            let present = _new_block()
+            let join = _new_block()
+
+            _current.branch(fits, present, join)
+
+            _start(present)
+
+            let unboxed = _current.load(held_inner, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
+            let wrapped = _wrap(unboxed, optional)
+
+            _current.store(wrapped, slot, 0)
+            _current.branch(join)
+
+            _start(join)
+
+            _push(_current.load(optional, slot, 0))
+        si
         /// A null, or a box of another type, throws, as .NET does.
         visit(unbox: Values.UNBOX) is _unbox(unbox.value, unbox.type) si
 
         _unbox(value: Value, type: Type?) is
+            if _value_optional_inner(type)? then
+                _unbox_optional(value, type)
+                return
+            fi
+
             if let object = _value_of(value), unboxed = _unbox_value(object, type) then
                 _push(unboxed)
             fi
@@ -806,7 +1228,27 @@ namespace IR.LLVMTarget is
         si
 
         visit(type_of: Values.TYPEOF) is _report("typeof") si
-        visit(tuple: Values.TUPLE) is _report("a tuple") si
+        // A tuple is a struct of its elements, in order, held in place.
+        visit(tuple: Values.TUPLE) is
+            let held = _held(tuple.type)
+
+            if !isa LLVM.Type.STRUCT(held) then
+                _report("a tuple of type {tuple.type}")
+                return
+            fi
+
+            let result mut = LLVM_TYPES.zero(held!)
+
+            for (i, element) in tuple.values |> Ghul.Pipes.index() do
+                if let value = _value_of(element) then
+                    result = _current.insert_value(result, value, [i])
+                else
+                    return
+                fi
+            od
+
+            _push(result)
+        si
 
         visit(negation: Values.NOT) is
             if let value = _value_of(negation.value) then
@@ -926,6 +1368,10 @@ namespace IR.LLVMTarget is
         si
 
         _binary(operation: ArithmeticOperation, left: Value, right: Value, is_floating: bool) -> LLVM.Value? is
+            if !is_floating /\ _is_division(operation) then
+                return _divide(operation, left, right)
+            fi
+
             let operator = _operator(operation, is_floating)
 
             if !operator? then
@@ -946,8 +1392,44 @@ namespace IR.LLVMTarget is
             return _current.binary(operator, IntegerFlags.NONE, l, r)
         si
 
-        // Integer division and remainder are not lowered until they check
-        // for a zero divisor and for overflow, as .NET's do.
+
+        // Integer division and remainder throw where .NET's do: on a zero
+        // divisor, and, signed, on the one quotient that does not fit, the
+        // most negative value divided by -1.
+        _divide(operation: ArithmeticOperation, left: Value, right: Value) -> LLVM.Value? is
+            let l = _value_of(left)
+            let r = _value_of(right)
+
+            if !l? \/ !r? then
+                return null
+            fi
+
+            let is_zero = _current.compare(IntegerPredicate.EQ, r, LLVM.Values.integer(r.type, bigint.zero))
+
+            _throw_if(is_zero, "Ghul.DivideByZeroException")
+
+            let is_signed = operation == ArithmeticOperation.DIVIDE \/ operation == ArithmeticOperation.REMAINDER
+
+            if is_signed then
+                let lowest = -(bigint.one << (LLVM_TYPES.width(l.type) - 1))
+                let is_lowest = _current.compare(IntegerPredicate.EQ, l, LLVM.Values.integer(l.type, lowest))
+                let is_minus_one = _current.compare(IntegerPredicate.EQ, r, LLVM.Values.integer(r.type, -bigint.one))
+                let overflows = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, is_lowest, is_minus_one)
+
+                _throw_if(overflows, "Ghul.OverflowException")
+            fi
+
+            let operator =
+                case operation
+                when ArithmeticOperation.DIVIDE then BinaryOperator.SDIV
+                when ArithmeticOperation.DIVIDE_UNSIGNED then BinaryOperator.UDIV
+                when ArithmeticOperation.REMAINDER then BinaryOperator.SREM
+                else BinaryOperator.UREM
+                esac
+
+            return _current.binary(operator, IntegerFlags.NONE, l, r)
+        si
+        // Integer division and remainder are lowered by `_divide`.
         _operator(operation: ArithmeticOperation, is_floating: bool) -> BinaryOperator? is
             let result: BinaryOperator? =
                 if is_floating then
@@ -1380,7 +1862,40 @@ namespace IR.LLVMTarget is
             _call(call.function, call.arguments)
         si
 
-        visit(call: Values.Call.STRUCT) is _report("a method of a struct") si
+        // A struct method is called with the address of its receiver, so it
+        // changes the struct where it is held.
+        visit(call: Values.Call.STRUCT) is
+            _call_struct(call.from, call.function, call.arguments)
+        si
+
+        _call_struct(from: Value, function: Function, arguments: Collections.List[Value]) is
+
+            if function.intrinsic_operation? then
+                _report("the intrinsic {function.intrinsic_operation} on a value")
+                return
+            fi
+
+            let callee = _callee(_instance_of(function))
+
+            if !callee? then
+                _report("a call to {function.name}")
+                return
+            fi
+
+            let receiver = _address_of(from)
+
+            if !receiver? then
+                return
+            fi
+
+            if let values = _arguments_for(function, arguments) then
+                values.insert(0, receiver)
+
+                if let result = _emit_call(callee, values.to_array()) then
+                    _push(result)
+                fi
+            fi
+        si
 
         /// An array's count and indexer lower to the operations they stand
         /// for. No other instance method can be called yet.
@@ -1405,8 +1920,12 @@ namespace IR.LLVMTarget is
         /// A built-in operation lowers to the IR the operation stands for,
         /// made once and reused by every later lowering of the same body.
         visit(call: Values.Call.INNATE) is
-            if call.innate_name.starts_with("host.") \/ call.innate_name.starts_with("nullable.") then
+            if call.innate_name.starts_with("host.") then
                 _report("the operation {call.innate_name}")
+            elif call.innate_name.starts_with("nullable.") then
+                _lower_nullable(call.innate_name, call.from)
+            elif call.innate_name.starts_with("string.") then
+                _call_string(call.innate_name, call.arguments)
             elif call.is_lowered then
                 gen(call.lowering)
             else
@@ -1429,6 +1948,8 @@ namespace IR.LLVMTarget is
                     _new_array(_instance_of(function).specialize(cast Function?(function.root_specialized_from)!.return_type), arguments[0])
                 elif operation =~ "array.set" then
                     _store_array_element(arguments[0], arguments[1], arguments[2])
+                elif operation.starts_with("string.") then
+                    _call_string(operation, arguments)
                 else
                     _report("the intrinsic {operation}")
                 fi
@@ -1456,6 +1977,114 @@ namespace IR.LLVMTarget is
 
             if let result = _emit_call(callee, values.to_array()) then
                 _push(result)
+            fi
+        si
+
+
+        // An interpolation's builder operations, as INTERPOLATION_CALLS gives
+        // them. Answers false for any other operation.
+        _lower_builder(runtime: Values.RUNTIME) -> bool is
+            let operands = runtime.operands
+            let calls = INTERPOLATION_CALLS(construct => _report(construct))
+
+            case runtime.operation
+            when IR.RuntimeOperation.NEW_STRING_BUILDER then
+                _gen_call(calls.new_builder(runtime.type), false)
+
+            when IR.RuntimeOperation.APPEND_TEXT then
+                _gen_call(calls.append(operands[0], operands[1]), true)
+
+            when IR.RuntimeOperation.APPEND_VALUE then
+                _gen_call(calls.append(operands[0], calls.text_of(operands[1], _specialize(operands[1].type))), true)
+
+            when IR.RuntimeOperation.BUILD_STRING then
+                _gen_call(calls.build(operands[0]), false)
+
+            when IR.RuntimeOperation.APPEND_ALIGNED_VALUE then
+                _gen_call(calls.append_aligned(operands[0], calls.text_of(operands[1], _specialize(operands[1].type)), operands[2]), true)
+
+            when IR.RuntimeOperation.APPEND_FORMATTED_VALUE then
+                _gen_call(calls.append(operands[0], calls.formatted_text_of(operands[1], operands[2], _specialize(operands[1].type))), true)
+
+            when IR.RuntimeOperation.APPEND_ALIGNED_FORMATTED_VALUE then
+                _gen_call(calls.append_aligned(operands[0], calls.formatted_text_of(operands[1], operands[3], _specialize(operands[1].type)), operands[2]), true)
+
+            else
+                return false
+            esac
+
+            return true
+        si
+
+        // Lowers `call`, dropping any result it leaves where `discard` says
+        // to.
+        _gen_call(call: Value?, discard: bool) is
+            if let c = call then
+                let depth = _stack.count
+
+                gen(c)
+
+                if discard /\ _stack.count > depth then
+                    _pop()
+                fi
+            fi
+        si
+        // The core library's string intrinsics. A string's length is where an
+        // array's count is, so an index into one is checked as an array
+        // index is.
+        _call_string(operation: string, arguments: Collections.List[Value]) is
+            let strings = _strings
+
+            if !strings? then
+                _report("the intrinsic {operation}")
+                return
+            fi
+
+            if operation =~ "string.length" then
+                if let text = _value_of(arguments[0]) then
+                    _push(strings.length(_current, text))
+                fi
+            elif operation =~ "string.char_at" then
+                let text = _value_of(arguments[0])
+                let index = _value_of(arguments[1])
+
+                if text? /\ index? then
+                    _check_index(text, index)
+                    _push(strings.char_at(_current, text, index))
+                fi
+            elif operation =~ "string.concat" then
+                _call_string_helper(strings.concat_function, arguments)
+            elif operation =~ "string.equals" then
+                _call_string_helper(strings.equals_function, arguments)
+            elif operation =~ "string.substring" then
+                _call_string_helper(strings.substring_function, arguments)
+            elif operation =~ "string.from_char" then
+                _call_string_helper(strings.from_char_function, arguments)
+            else
+                _report("the intrinsic {operation}")
+            fi
+        si
+
+        // Calls one of the string helpers the module defines, with `arguments`
+        // as they are held. A helper answering an `i1` answers a `bool`.
+        _call_string_helper(helper: LLVM.FUNCTION?, arguments: Collections.List[Value]) is
+            if !helper? then
+                _report("a string operation")
+                return
+            fi
+
+            let values = LIST[LLVM.Value]()
+
+            for argument in arguments do
+                if let value = _value_of(argument) then
+                    values.add(value)
+                else
+                    return
+                fi
+            od
+
+            if let result = _current.call(helper, values.to_array()) then
+                _push(if helper.result =~ Types.i1 then _bool(result) else result fi)
             fi
         si
 
@@ -1711,16 +2340,25 @@ namespace IR.LLVMTarget is
                 return null
             fi
 
-            if from.is_value_type then
-                _report("a field of a value type")
-                return null
-            fi
-
             let owner = _owner_class(symbol.owner)
             let position = objects.field_position(symbol)
 
             if !owner? \/ !position? then
                 _report("a field of {symbol.owner}")
+                return null
+            fi
+
+            // A struct's field is within the struct, wherever that is held.
+            if from.is_value_type then
+                if !objects.is_struct(owner) then
+                    _report("a field of {symbol.owner}")
+                    return null
+                fi
+
+                if let address = _address_of(from) then
+                    return _current.element_pointer(objects.struct_type(owner), address, [_i32(0), _i32(position)], true)
+                fi
+
                 return null
             fi
 
@@ -1814,12 +2452,46 @@ namespace IR.LLVMTarget is
             fi
         si
 
+        // A new struct is zeroed in a place of its own and its constructor
+        // called on that place; the value is what the constructor leaves.
+        _construct_struct(objects: LLVM_OBJECTS, type: CLASS_INSTANCE, constructor: Function, arguments: Collections.List[Value]) -> LLVM.Value? is
+            let callee = _callee(_instance_of(constructor))
+
+            if !callee? then
+                _report("a call to {constructor.name}")
+                return null
+            fi
+
+            let values = _arguments_for(constructor, arguments)
+
+            if !values? then
+                return null
+            fi
+
+            _ensure_initialised(constructor.owner)
+
+            let struct_type = objects.struct_type(type)
+            let slot = _slot(struct_type)
+
+            _current.store(LLVM_TYPES.zero(struct_type), slot, 0)
+
+            values.insert(0, slot)
+
+            _emit_call(callee, values.to_array())
+
+            return _current.load(struct_type, slot, 0)
+        si
+
         // A new instance of `constructor`'s class, built from `arguments`, or
         // null, reported, where the target cannot build one. The arguments
         // are evaluated before the object is allocated, as on .NET.
         _construct(constructor: Function, arguments: Collections.List[Value], description: string) -> LLVM.Value? is
             let objects = _objects
             let type = _owner_class(constructor.owner)
+
+            if let o = objects, t = type /\ o.is_struct(t) /\ !constructor.intrinsic_operation? then
+                return _construct_struct(o, t, constructor, arguments)
+            fi
 
             if constructor.intrinsic_operation? \/ !objects? \/ !type? \/ !(objects.is_object_type(type) \/ objects.is_object(type)) then
                 _report("constructing a {description}")
@@ -1896,6 +2568,13 @@ namespace IR.LLVMTarget is
         _call_instance(call: Values.Call.INSTANCE) is
             let function = call.function
             let dispatch = call.dispatch
+
+            // A value's own method, of a struct or a scalar held in place,
+            // is called as a struct's is.
+            if isa Semantic.Symbols.STRUCT(function.root_specialized_from.owner) /\ _held(call.from.type)? /\ !isa LLVM.Type.POINTER(_held(call.from.type)!) then
+                _call_struct(call.from, function, call.arguments)
+                return
+            fi
 
             if _is_object_constructor(function) then
                 return
@@ -2158,6 +2837,11 @@ namespace IR.LLVMTarget is
         // type answers null. A cast to `object` cannot fail.
         visit(conversion: Values.CAST) is
             let target = _specialize(conversion.type)
+
+            if let t = target /\ _value_optional_inner(t)? then
+                _cast_to_optional(conversion, t)
+                return
+            fi
 
             let held = _held(conversion.value.type)
 
