@@ -881,7 +881,13 @@ namespace IR.LLVMTarget is
 
                 let message = Values.Literal.STRING("Nullable object must have a value.", IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type())
 
-                _throw(_new_exception("Ghul.InvalidOperationException", LIST[Value]([message])) ?? LLVM.Values.null_pointer)
+                // Where the program has no such class, what is thrown carries
+                // no type or message, as for any exception the runtime makes.
+                if IR.Program.CORE_LIBRARY.find_class("Ghul.InvalidOperationException")? then
+                    _throw(_new_exception("Ghul.InvalidOperationException", LIST[Value]([message])) ?? LLVM.Values.null_pointer)
+                else
+                    _throw(LLVM.Values.null_pointer)
+                fi
 
                 _start(carry_on)
 
@@ -1359,7 +1365,20 @@ namespace IR.LLVMTarget is
             return _current.load(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
         si
 
-        visit(type_of: Values.TYPEOF) is _report("typeof") si
+        /// The type object of a type named in the program: the one its
+        /// descriptor stands for, or, for a value type, its box's.
+        visit(type_of: Values.TYPEOF) is
+            let objects = _objects!
+            let type = _specialize(type_of.typeof_type)
+            let held = if let box = objects.box_type(type) then box else objects.class_of(type) fi
+
+            if !held? \/ objects.is_struct(held) then
+                _report("typeof {type}")
+            elif let t = _type_object(LLVM.Values.global(objects.descriptor_name(held))) then
+                _push(t)
+            fi
+        si
+
         // A tuple is a struct of its elements, in order, held in place.
         visit(tuple: Values.TUPLE) is
             let held = _held(tuple.type)
@@ -2135,10 +2154,12 @@ namespace IR.LLVMTarget is
         /// A built-in operation lowers to the IR the operation stands for,
         /// made once and reused by every later lowering of the same body.
         visit(call: Values.Call.INNATE) is
-            // An object's type name needs the type objects the target does
-            // not build yet.
             if call.innate_name =~ "object.type_name" then
                 _type_name(call.arguments[0])
+            elif call.innate_name =~ "object.get_type" then
+                if let from = call.from, value = _value_of(from), t = _type_object_of(value) then
+                    _push(t)
+                fi
             elif call.innate_name.starts_with("host.") \/ call.innate_name.starts_with("object.") then
                 _report("the operation {call.innate_name}")
             elif call.innate_name.starts_with("nullable.") then
@@ -2180,6 +2201,12 @@ namespace IR.LLVMTarget is
                     if let value = _value_of(arguments[0]) then
                         _push(_current.convert(Conversion.BIT_CAST, value, if operation =~ "double.bits" then Types.i64 else Types.i32 fi))
                     fi
+                elif operation =~ "object.get_type" then
+                    if let value = _value_of(arguments[0]), t = _type_object_of(value) then
+                        _push(t)
+                    fi
+                elif operation =~ "object.display" then
+                    _display(arguments[0], arguments[1])
                 else
                     _report("the intrinsic {operation}")
                 fi
@@ -2616,6 +2643,143 @@ namespace IR.LLVMTarget is
             fi
         si
 
+        // The type object `descriptor` stands for: the one it caches, or, the
+        // first time, a new core library type object made from the
+        // descriptor's name and cached there, so a type has one type object
+        // however it is asked for. Null, reported, where the core library
+        // declares no type object.
+        _type_object(descriptor: LLVM.Value) -> LLVM.Value? is
+            let found = _type_object_constructor()
+
+            if !found? then
+                _report("a type object")
+                return null
+            fi
+
+            let (type, constructor) = found
+            let objects = _objects!
+            let callee = _callee(_instance_of(constructor))
+
+            if !callee? then
+                _report("a call to {constructor.name}")
+                return null
+            fi
+
+            let cache = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_TYPE_OBJECT)], true)
+            let result = _slot(Types.pointer)
+            let cached = _current.load(Types.pointer, cache, 8)
+
+            _current.store(cached, result, 8)
+
+            let make = _new_block()
+            let carry_on = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.EQ, cached, LLVM.Values.null_pointer), make, carry_on)
+
+            _start(make)
+
+            let name = _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_NAME)], true), 8)
+            let made = _allocate(objects, type, constructor, callee, LIST[LLVM.Value]([name]))
+
+            _current.store(made, cache, 8)
+            _current.store(made, result, 8)
+            _current.branch(carry_on)
+
+            _start(carry_on)
+
+            return _current.load(Types.pointer, result, 8)
+        si
+
+        // The core library's type object class and its constructor taking
+        // the type's name, or null where the library declares none.
+        _type_object_constructor() -> (CLASS_INSTANCE, Function)? is
+            if let declared = IR.Program.CORE_LIBRARY.find_class("Ghul.Type"), group = cast Semantic.Symbols.FUNCTION_GROUP?(declared.find_direct("init")) then
+                for constructor in group.functions do
+                    if constructor.arguments.count == 1 then
+                        if let type = _owner_class(constructor.owner), objects = _objects /\ objects.is_object_type(type) then
+                            return (type, constructor)
+                        fi
+                    fi
+                od
+            fi
+
+            return null
+        si
+
+        // The type object of the object `value` points to.
+        _type_object_of(value: LLVM.Value) -> LLVM.Value? =>
+            _type_object(_current.load(Types.pointer, value, 8))
+
+        // Whether a call to `function` asks for its receiver's type object,
+        // which no type can override: a member declaring the same name
+        // hides it.
+        _is_get_type(function: Function) -> bool =>
+            cast Function?(function.root_specialized_from)?.intrinsic_operation =~ "object.get_type"
+
+        // The type object of `call`'s receiver: the one its descriptor stands
+        // for, or, for a value held in place, the one its box's does.
+        _get_type(call: Values.Call.INSTANCE) is
+            let receiver: Value mut = call.from
+
+            if let constrained: Values.CONSTRAINED = receiver then
+                receiver = if let address: Values.ADDRESS = constrained.value then address.value else constrained.value fi
+
+                let type = _specialize(constrained.type)
+
+                if !_held(type)? \/ !isa LLVM.Type.POINTER(_held(type)!) then
+                    _value_of(receiver)
+
+                    if let box = _objects!.box_type(type) then
+                        if let t = _type_object(LLVM.Values.global(_objects!.descriptor_name(box))) then
+                            _push(t)
+                        fi
+                    else
+                        _report("the type of a {type}")
+                    fi
+
+                    return
+                fi
+            fi
+
+            if let value = _value_of(receiver), t = _type_object_of(value) then
+                _push(t)
+            fi
+        si
+
+        // Writes `value` for display through `state`, a core library display
+        // state, with the function its descriptor holds: true where it has
+        // one, and false, leaving `state` as it was, where it has none.
+        _display(value: Value, state: Value) is
+            let objects = _objects!
+
+            if let state_class = objects.class_of(_specialize(state.type)) then
+                objects.note_display(state_class)
+            fi
+
+            if let v = _value_of(value), s = _value_of(state) then
+                let descriptor = _current.load(Types.pointer, v, 8)
+                let displayer = _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_DISPLAY)], true), 8)
+                let result = _slot(Types.i32)
+
+                _current.store(_i32(0), result, 4)
+
+                let call = _new_block()
+                let carry_on = _new_block()
+
+                _current.branch(_current.compare(IntegerPredicate.NE, displayer, LLVM.Values.null_pointer), call, carry_on)
+
+                _start(call)
+
+                _current.call(LLVM.Type.FUNCTION(LLVM.Type.VOID, [Types.pointer, Types.pointer], false), displayer, [v, s])
+                _current.store(_i32(1), result, 4)
+                _current.branch(carry_on)
+
+                _start(carry_on)
+
+                _push(_current.load(Types.i32, result, 4))
+            fi
+        si
+
         // Throws a new instance of the core library's exception class
         // `exception`, such as `Ghul.InvalidCastException`, where `condition`,
         // an `i1`, holds. Where the program has no such class, what is thrown
@@ -2915,6 +3079,13 @@ namespace IR.LLVMTarget is
                 return null
             fi
 
+            return _allocate(objects, type, constructor, callee, values)
+        si
+
+        // Allocates an instance of `type` and calls `callee`, its constructor,
+        // on it with `values`, already lowered. The root's constructor has no
+        // body, so `callee` is null for it.
+        _allocate(objects: LLVM_OBJECTS, type: CLASS_INSTANCE, constructor: Function, callee: FUNCTION?, values: LIST[LLVM.Value]) -> LLVM.Value is
             _ensure_initialised(constructor.owner)
 
             let object =
@@ -2959,6 +3130,11 @@ namespace IR.LLVMTarget is
         _call_instance(call: Values.Call.INSTANCE) is
             let function = call.function
             let dispatch = call.dispatch
+
+            if _is_get_type(function) then
+                _get_type(call)
+                return
+            fi
 
             if let constrained: Values.CONSTRAINED = call.from then
                 _call_constrained(call, constrained)
