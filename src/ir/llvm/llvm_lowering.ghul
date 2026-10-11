@@ -3731,49 +3731,108 @@ namespace IR.LLVMTarget is
         si
 
         // `left =~ right` over values of the concrete type the comparer's
-        // type parameter is: by value for a scalar, a NaN equal to another as
-        // .NET's comparer has it, through the type's own `=~` where it
-        // declares one, and by reference otherwise. An absent value is equal
-        // only to another.
+        // type parameter is.
         visit(equality: Values.EQUALITY_COMPARISON) is
             let type = _specialize(equality.left.type)
-
-            if let scalar = _scalar_of(type) then
-                if let left = _value_of(equality.left), right = _value_of(equality.right) then
-                    if LLVM_TYPES.is_floating(left.type) then
-                        let equal = _current.compare(FloatPredicate.OEQ, left, right)
-                        let left_nan = _current.compare(FloatPredicate.UNO, left, left)
-                        let right_nan = _current.compare(FloatPredicate.UNO, right, right)
-                        let both_nan = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, left_nan, right_nan)
-
-                        _push(_bool(_current.binary(BinaryOperator.OR, IntegerFlags.NONE, equal, both_nan)))
-                    else
-                        _push(_bool(_current.compare(IntegerPredicate.EQ, left, right)))
-                    fi
-                fi
-
-                return
-            fi
-
-            if !type? \/ _is_string(type) \/ !LLVM_TYPES.is_object_reference(type) then
-                _report("an equality comparison of {type}")
-                return
-            fi
-
             let left = _value_of(equality.left)
             let right = _value_of(equality.right)
 
-            if !left? \/ !right? then
-                return
+            if left? /\ right? then
+                if let equal = _equal_held(left, right, type) then
+                    _push(_bool(equal))
+                fi
+            fi
+        si
+
+        // Whether `left` and `right`, held values of `type`, are equal as `=~`
+        // compares them, as an `i1`, or null where reported:
+        // - a scalar by value, a NaN equal to another as .NET's comparer has it
+        // - a string by its code units
+        // - a tuple element by element
+        // - a type through the `=~` it declares, with two absent references
+        //   equal and an absent one equal to nothing
+        // - any other reference by identity
+        _equal_held(left: LLVM.Value, right: LLVM.Value, type: Type?) -> LLVM.Value? is
+            if _scalar_of(type)? then
+                if LLVM_TYPES.is_floating(left.type) then
+                    let equal = _current.compare(FloatPredicate.OEQ, left, right)
+                    let left_nan = _current.compare(FloatPredicate.UNO, left, left)
+                    let right_nan = _current.compare(FloatPredicate.UNO, right, right)
+                    let both_nan = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, left_nan, right_nan)
+
+                    return _current.binary(BinaryOperator.OR, IntegerFlags.NONE, equal, both_nan)
+                fi
+
+                return _current.compare(IntegerPredicate.EQ, left, right)
             fi
 
-            let operator = _declared_equals(type)
-
-            if !operator? then
-                _push(_bool(_current.compare(IntegerPredicate.EQ, left, right)))
-                return
+            if let strings = _strings /\ _is_string(type) then
+                return _current.call(strings.equals_function, [left, right])
             fi
 
+            if let tuple: Semantic.Types.TUPLE = type then
+                let result mut = LLVM.Values.boolean(true)
+
+                for (i, element) in tuple.arguments |> Ghul.Pipes.index() do
+                    let held = _held(element)
+
+                    if !held? then
+                        _report("an equality comparison of {type}")
+                        return null
+                    fi
+
+                    let equal = _equal_held(_current.extract_value(held!, left, [i]), _current.extract_value(held!, right, [i]), element)
+
+                    if !equal? then
+                        return null
+                    fi
+
+                    result = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, result, equal!)
+                od
+
+                return result
+            fi
+
+            let operator = if let t = type then EQUALITY_OPERATOR.declared(t) else null fi
+
+            if let t = type /\ t.is_value_type, o = operator then
+                return _equal_values_through(o, left, right, t)
+            elif let t = type, o = operator /\ isa LLVM.Type.POINTER(left.type) then
+                return _equal_references_through(o, left, right, t)
+            elif isa LLVM.Type.POINTER(left.type) then
+                return _current.compare(IntegerPredicate.EQ, left, right)
+            fi
+
+            _report("an equality comparison of {type}")
+
+            return null
+        si
+
+        // `left =~ right` through a value type's own `=~`, which takes the
+        // address of its receiver.
+        _equal_values_through(operator: Function, left: LLVM.Value, right: LLVM.Value, type: Type) -> LLVM.Value? is
+            let callee = _callee(_instance_of(operator))
+
+            if !callee? then
+                _report("a call to {operator.name}")
+                return null
+            fi
+
+            let slot = _slot(left.type)
+
+            _current.store(left, slot, 0)
+
+            if let answer = _emit_call(callee!, [slot, right]) then
+                return _current.compare(IntegerPredicate.NE, answer, LLVM_TYPES.zero(answer.type))
+            fi
+
+            return null
+        si
+
+        // `left =~ right` through a reference type's `=~`, called as any
+        // instance method is, so an override is the one reached, and only
+        // where both are present.
+        _equal_references_through(operator: Function, left: LLVM.Value, right: LLVM.Value, type: Type) -> LLVM.Value is
             let result = _slot(Types.i32)
             let left_absent = _new_block()
             let left_present = _new_block()
@@ -3802,21 +3861,7 @@ namespace IR.LLVMTarget is
 
             _start(done)
 
-            _push(_current.load(Types.i32, result, 4))
-        si
-
-        // The `=~` a type declares taking a value of itself, or null where it
-        // declares none.
-        _declared_equals(type: Type) -> Function? is
-            if let group: Semantic.Symbols.FUNCTION_GROUP = type.find_member("=~") then
-                for function in group.functions do
-                    if function.arguments.count == 1 /\ function.arguments[0].is_assignable_from(type) then
-                        return function
-                    fi
-                od
-            fi
-
-            return null
+            return _current.compare(IntegerPredicate.NE, _current.load(Types.i32, result, 4), _i32(0))
         si
 
         // A constrained call on a reference is an ordinary call on it, once
