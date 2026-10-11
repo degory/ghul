@@ -16,7 +16,7 @@ Run the suite with:
 
 ```sh
 dotnet publish --output publish/
-dotnet ghul-test --use-dotnet-build source-library-tests
+dotnet ghul-test --config cross-assembly source-library-tests
 ```
 
 As with `../cross-assembly-tests/`, the runner hands MSBuild the compiler
