@@ -416,9 +416,6 @@ namespace IR.LLVMTarget is
         visit(load: Values.Load.SYMBOL) is _report("a load of {load.symbol.name}") si
         visit_address(load: Values.Load.SYMBOL) is _report("the address of {load.symbol.name}") si
         visit_address(load: Values.Load.INSTANCE_FIELD) is _report("the address of a field") si
-        visit(load: Values.Load.STATIC_ANONYMOUS_FUNCTION) is _report("a function value") si
-        visit(load: Values.Load.GLOBAL_ANONYMOUS_FUNCTION) is _report("a function value") si
-        visit(load: Values.Load.INSTANCE_ANONYMOUS_FUNCTION) is _report("a function value") si
 
         visit(load: Values.Load.TEMP) is
             _load_local(load.local)
@@ -553,7 +550,6 @@ namespace IR.LLVMTarget is
         visit_address(view: Values.NARROW_VIEW) is _report("the address of a value") si
         visit(enter: Values.ENTER_FILE) is si
         visit(leave: Values.LEAVE_FILE) is si
-        visit(closure: Values.MAKE_CLOSURE) is _report("a function value") si
 
         visit(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("the address of an array element") si
         visit_address(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("the address of an array element") si
@@ -1335,7 +1331,6 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        visit(call: Values.Call.CLOSURE) is _report("a function value") si
         /// A built-in operation lowers to the IR the operation stands for,
         /// made once and reused by every later lowering of the same body.
         visit(call: Values.Call.INNATE) is
@@ -1686,6 +1681,13 @@ namespace IR.LLVMTarget is
 
             if type.definition.is_union \/ type.definition.is_variant then
                 _report("a union")
+                return
+            fi
+
+            // A generator's or asynchronous function's frame is the one place
+            // such a function shows itself to its caller.
+            if isa Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type.definition) then
+                _report("a generator or asynchronous function")
                 return
             fi
 
@@ -2066,6 +2068,220 @@ namespace IR.LLVMTarget is
             if let value = _value_of(check.inner) then
                 _check_not_null(value)
                 _push(value)
+            fi
+        si
+
+        // The signature a call through a function value of `type` has: the
+        // closure's receiver, then the function type's own parameters, then
+        // its result. Null where `type` is not a function type the target
+        // holds values of.
+        _closure_signature(type: Type?) -> LLVM.Type.FUNCTION? is
+            let specialized = _specialize(type)
+
+            if !specialized? \/ !(specialized.is_function \/ specialized.is_action) then
+                return null
+            fi
+
+            let arguments = specialized.arguments
+            let count = if specialized.is_action then arguments.count else arguments.count - 1 fi
+
+            let parameters = LIST[LLVM.Type]()
+
+            parameters.add(Types.pointer)
+
+            for i in 0..count do
+                if let held = _held(arguments[i]) then
+                    parameters.add(held)
+                else
+                    return null
+                fi
+            od
+
+            let result =
+                if specialized.is_action \/ LLVM_TYPES.is_void(arguments[count]) then
+                    LLVM.Type.VOID
+                else
+                    _held(arguments[count])
+                fi
+
+            if !result? then
+                return null
+            fi
+
+            return cast LLVM.Type.FUNCTION(LLVM.Type.FUNCTION(result, parameters.to_array(), false))
+        si
+
+        visit(load: Values.Load.STATIC_ANONYMOUS_FUNCTION) is _anonymous_function(load.symbol, load.func_type) si
+        visit(load: Values.Load.GLOBAL_ANONYMOUS_FUNCTION) is _anonymous_function(load.symbol, load.func_type) si
+        visit(load: Values.Load.INSTANCE_ANONYMOUS_FUNCTION) is _report("a function value") si
+
+        // A literal that captures nothing but its enclosing body's type
+        // parameters is a function value with no receiver.
+        _anonymous_function(symbol: Semantic.Symbols.Symbol, type: Type) is
+            if let function: Function = symbol then
+                gen(Values.MAKE_CLOSURE(type, function, Values.NULL(Semantic.Types.NULL())))
+            else
+                _report("a function value")
+            fi
+        si
+
+        /// A function value holds the function a call through it reaches,
+        /// directly or through a thunk, and the receiver or frame it passes.
+        visit(closure: Values.MAKE_CLOSURE) is
+            let objects = _objects
+
+            if !objects? then
+                _report("a function value")
+                return
+            fi
+
+            let function = closure.function
+            let instance = _instance_of(function)
+            let root = cast Function?(function.root_specialized_from)!
+            let is_trait = (closure.is_virtual \/ function.is_abstract) /\ _is_trait_method(function)
+            let is_virtual = !is_trait /\ closure.is_virtual /\ !function.has_no_overriders
+            let has_receiver = !isa Values.NULL(closure.receiver)
+
+            if !objects.is_built then
+                if is_trait then
+                    objects.note_dispatched(function)
+
+                    if let t = _trait_instance(function.owner) then
+                        objects.selector_of(root, t)
+                    fi
+                elif is_virtual then
+                    objects.note_dispatched(function)
+                else
+                    _callee(instance)
+                fi
+
+                if has_receiver then
+                    _value_of(closure.receiver)
+                fi
+
+                _push(LLVM.Values.null_pointer)
+                return
+            fi
+
+            let signature = _closure_signature(closure.type)
+
+            if !signature? then
+                _report("a function value of type {closure.type}")
+                return
+            fi
+
+            let target: FUNCTION? mut = null
+            let kind mut = ThunkKind.PASS_RECEIVER
+            let offset mut = 0
+
+            if is_trait then
+                let selector = if let t = _trait_instance(function.owner) then objects.selector_of(root, t) else null fi
+
+                if !selector? then
+                    _report("a function value of a trait method nothing implements")
+                    return
+                fi
+
+                kind = ThunkKind.INTERFACE
+                offset = selector.offset
+            elif is_virtual then
+                let slot = objects.slot_of(instance)
+
+                if !slot? then
+                    _report("a function value of an overridden method")
+                    return
+                fi
+
+                kind = ThunkKind.VIRTUAL
+                offset = slot.index
+            else
+                target = _callee(instance)
+
+                if !target? then
+                    _report("a function value of {function.name}")
+                    return
+                fi
+
+                // A function with no receiver can still be held closed over
+                // its first argument, which the value carries where a
+                // receiver would go.
+                if !function.is_emitted_with_receiver then
+                    if !has_receiver then
+                        kind = ThunkKind.DROP_RECEIVER
+                    elif target.parameters.count == 0 \/ !isa LLVM.Type.POINTER(target.parameters[0].type) then
+                        _report("a function value closed over a value that is not a reference")
+                        return
+                    fi
+                fi
+            fi
+
+            let thunk = objects.closures!.thunk(signature, instance, target, kind, offset)
+
+            if !thunk? then
+                _report("a function value of {function.name}")
+                return
+            fi
+
+            let receiver: LLVM.Value mut = LLVM.Values.null_pointer
+
+            if has_receiver /\ kind != ThunkKind.DROP_RECEIVER then
+                if let value = _value_of(closure.receiver) then
+                    receiver = value
+                else
+                    return
+                fi
+            fi
+
+            let value =
+                _current.call(
+                    _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
+                    [objects.closures!.descriptor, LLVM.Values.i64(cast long(LLVM_CLOSURES.SIZE))])!
+
+            _current.store(thunk.reference, _current.element_pointer(Types.i8, value, [_i32(LLVM_CLOSURES.FUNCTION_OFFSET)], true), 8)
+            _current.store(receiver, _current.element_pointer(Types.i8, value, [_i32(LLVM_CLOSURES.RECEIVER_OFFSET)], true), 8)
+
+            _push(value)
+        si
+
+        /// A call through a function value passes the receiver it holds,
+        /// then the call's arguments.
+        visit(call: Values.Call.CLOSURE) is
+            let func_type = call.func_type ?? call.from.type
+            let signature = _closure_signature(func_type)
+
+            if !signature? then
+                _report("a call to a function value of type {func_type}")
+                return
+            fi
+
+            let closure = _value_of(call.from)
+
+            if !closure? then
+                return
+            fi
+
+            let parameters = _specialize(func_type)!.arguments
+            let values = LIST[LLVM.Value]()
+
+            for i in 0..call.arguments.count do
+                if let value = _value_of(call.arguments[i]) then
+                    values.add(if i < parameters.count then _normalise_for(value, parameters[i]) else value fi)
+                else
+                    return
+                fi
+            od
+
+            _check_not_null(closure)
+
+            let function = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.FUNCTION_OFFSET)], true), 8)
+            let receiver = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.RECEIVER_OFFSET)], true), 8)
+
+            values.insert(0, receiver)
+
+            if let result = _current.call(signature, function, values.to_array()) then
+                if !(signature.result =~ LLVM.Type.VOID) then
+                    _push(result)
+                fi
             fi
         si
     si
