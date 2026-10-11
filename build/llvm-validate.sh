@@ -4,11 +4,11 @@
 # to LLVM, and run the ones that say what they exit with.
 #
 # ghul-test compiles each test under integration-tests/llvm and compares
-# what the compiler said and the module text it wrote, but it does not
-# assemble the text, and it cannot run a native executable. So a module
-# the tests accept may still be one LLVM rejects. This script builds each
-# test's module again, with the compiler in publish/, and has ghul-llvm
-# verify and compile it to an object. A test with an `exit.expected` is
+# what the compiler said, but it does not assemble the module the compiler
+# wrote, and it does not run a native executable on CI, which has no
+# ghul-llvm. So a module the tests accept may still be one LLVM rejects.
+# This script builds each test's module again, with the compiler in
+# publish/, and has ghul-llvm verify and compile it to an object. A test with an `exit.expected` is
 # also built as an executable, run, and its exit status compared.
 #
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
@@ -54,21 +54,7 @@ while IFS= read -r flags_file; do
     out="$scratch/$checked"
     mkdir -p "$out"
 
-    # The test's own flags, less the module text it writes for ghul-test to
-    # compare, which this run has no use for.
-    read -r -a test_flags < "$flags_file"
-    flags=()
-
-    skip_next=0
-    for flag in "${test_flags[@]}"; do
-        if [ "$skip_next" = 1 ]; then
-            skip_next=0
-        elif [ "$flag" = "--llvm-output" ]; then
-            skip_next=1
-        else
-            flags+=("$flag")
-        fi
-    done
+    read -r -a flags < "$flags_file"
 
     checked=$((checked + 1))
 
