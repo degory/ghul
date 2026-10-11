@@ -37,47 +37,18 @@ namespace IR.WasmGC is
     use IR.Emitter.SRM_MEMBER_ORDER
     use IR.Emitter.SRM_EMITTED_TYPE
 
-    /// A slot in the vtables of a class and everything derived from it.
+    /// The WasmGC side of how the program's virtual and trait calls
+    /// dispatch: the function and vtable types the planned slots and
+    /// selectors need, the trait table, and the thunks every vtable and
+    /// table entry calls through.
     ///
-    /// - owner: the class whose vtable first has the slot
-    /// - index: the slot's field in that vtable and every vtable derived from it
-    /// - signature: the function type every entry in the slot has, its receiver typed as `owner`
-    class WASMGC_SLOT(owner: CLASS_INSTANCE, index: int, signature: int)
-
-    /// A trait method, at one instantiation of its trait, called through the
-    /// trait table.
-    ///
-    /// - method: the trait method, which overrides no other trait method
-    /// - signature: the function type every entry in its row has, its receiver typed as the root
-    /// - offset: where its row starts in the table, once packed
-    class WASMGC_SELECTOR(method: FUNCTION_INSTANCE, signature: int) is
-        offset: int public
-    si
-
-    /// How the program's virtual and trait calls dispatch: the vtable slots
-    /// of each class, the trait selectors and their packed table, and the
-    /// thunks every vtable and table entry calls through.
-    ///
-    /// A class method that something overrides takes a slot in its class's
-    /// vtable, which the descriptor holds; an override fills the same slot.
-    /// A trait method takes a row in one table of function references,
-    /// indexed by the receiver's class number plus the row's offset, one row
-    /// for each instantiation of its trait. Every entry is a thunk with the
-    /// slot's or row's own signature, which casts the receiver to the
-    /// implementation's class and calls it.
-    class WASMGC_DISPATCH is
+    /// Every entry is a thunk with the slot's or row's own signature, which
+    /// casts the receiver to the implementation's class and calls it.
+    class WASMGC_DISPATCH: DispatchTarget is
         _registry: WASMGC_TYPE_REGISTRY
+        _plan: DISPATCH_PLAN
 
-        _slots: MAP[CLASS_INSTANCE, LIST[WASMGC_SLOT]]
-        _slot_of: MAP[FUNCTION_INSTANCE, WASMGC_SLOT]
-        _slot_entries: MAP[CLASS_INSTANCE, LIST[FUNCTION_INSTANCE?]]
         _vtable_types: MAP[CLASS_INSTANCE, int]
-
-        _traits: MAP[CLASS_INSTANCE, CLASS_INSTANCE]
-        _trait_classes: MAP[CLASS_INSTANCE, LIST[CLASS_INSTANCE]]
-        _class_traits: MAP[CLASS_INSTANCE, LIST[CLASS_INSTANCE]]
-        _selectors: MAP[FUNCTION_INSTANCE, WASMGC_SELECTOR]
-        _rows: MAP[FUNCTION_INSTANCE, MAP[int, FUNCTION_INSTANCE]]
 
         _types: LIST[SUB_TYPE]
         _next_type: int
@@ -85,21 +56,11 @@ namespace IR.WasmGC is
         _thunk_indices: MAP[int, MAP[FUNCTION_INSTANCE, int]]
         _box_hashes: MAP[CLASS_INSTANCE, int]
 
-        _table_size: int
-
         init(registry: WASMGC_TYPE_REGISTRY) is
             _registry = registry
+            _plan = DISPATCH_PLAN(self)
 
-            _slots = MAP[CLASS_INSTANCE, LIST[WASMGC_SLOT]]()
-            _slot_of = MAP[FUNCTION_INSTANCE, WASMGC_SLOT]()
-            _slot_entries = MAP[CLASS_INSTANCE, LIST[FUNCTION_INSTANCE?]]()
             _vtable_types = MAP[CLASS_INSTANCE, int]()
-
-            _traits = MAP[CLASS_INSTANCE, CLASS_INSTANCE]()
-            _trait_classes = MAP[CLASS_INSTANCE, LIST[CLASS_INSTANCE]]()
-            _class_traits = MAP[CLASS_INSTANCE, LIST[CLASS_INSTANCE]]()
-            _selectors = MAP[FUNCTION_INSTANCE, WASMGC_SELECTOR]()
-            _rows = MAP[FUNCTION_INSTANCE, MAP[int, FUNCTION_INSTANCE]]()
 
             _types = LIST[SUB_TYPE]()
 
@@ -107,8 +68,8 @@ namespace IR.WasmGC is
             _box_hashes = MAP[CLASS_INSTANCE, int]()
         si
 
-        /// The trait table's size, once `finish` has packed it.
-        table_size: int => _table_size
+        /// The trait table's size, once `plan` has packed it.
+        table_size: int => _plan.table_size
 
         /// Plans the slots and selectors of the classes in `ordered`, which
         /// lists parents before children, and answers the function and
@@ -116,54 +77,37 @@ namespace IR.WasmGC is
         plan(ordered: Collections.List[CLASS_INSTANCE], first_index: int) -> Collections.List[SUB_TYPE] is
             _next_type = first_index
 
-            for type in ordered do
-                // A box and the string type implement whatever traits an `impl`
-                // block gives their built-in type, so they take places in the
-                // trait table as a class does.
-                if _registry.is_object_type(type) \/ _registry.is_array(type) \/ _registry.is_box(type) \/ _registry.is_string(type) then
-                    _plan_slots(type)
-                    _collect_traits(type)
-                else
-                    _plan_slots(type)
-                fi
-            od
+            _plan.plan_slots(ordered)
 
             for type in ordered do
-                if _slots.contains_key(type) /\ _slots[type].count > 0 then
+                if _plan.has_slots(type) then
                     _add_vtable_type(type)
                 fi
             od
 
-            _close_over_variance()
-
-            for (trait_type, classes) in _trait_classes do
-                _plan_selectors(trait_type, classes)
-            od
-
-            _pack()
+            _plan.plan_traits()
 
             return _types
         si
 
-        // Every row takes its place in the table before any body is
-        // compiled, since a call bakes its row's offset into the code.
-        // Every implementation a row could hold is placed, whether or not
-        // anything reaches it: a call through a selector reaches them all.
-        _pack() is
-            let packing = ROW_DISPLACEMENT[FUNCTION_INSTANCE]()
+        root: CLASS_INSTANCE? => _registry.root
+        numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _registry.numbering
+        class_of(type: Type?) -> CLASS_INSTANCE? => _registry.class_of(type)
+        superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? => _registry.superclass_of(type)
+        methods_of(definition: Classy) -> Collections.List[Function] => _registry.methods_of(definition)
+        is_object(type: CLASS_INSTANCE) -> bool => _registry.is_object(type)
+        is_object_type(type: CLASS_INSTANCE) -> bool => _registry.is_object_type(type)
+        is_box(type: CLASS_INSTANCE) -> bool => _registry.is_box(type)
+        is_array(type: CLASS_INSTANCE) -> bool => _registry.is_array(type)
+        is_string(type: CLASS_INSTANCE) -> bool => _registry.is_string(type)
+        is_bigint(type: CLASS_INSTANCE) -> bool => _registry.is_bigint(type)
+        is_instantiated(type: CLASS_INSTANCE) -> bool => _registry.is_instantiated(type)
 
-            for (selector, row) in _rows do
-                packing.add(selector, row.keys)
-            od
+        slot_signature(owner: CLASS_INSTANCE, method: FUNCTION_INSTANCE) -> int? =>
+            _signature(VALUE_TYPE.of_type_index(_registry.type_index(owner)!, true), method)
 
-            packing.pack()
-
-            _table_size = packing.size
-
-            for (selector_method, _) in _rows do
-                _selectors[selector_method].offset = packing.offset(selector_method)
-            od
-        si
+        selector_signature(method: FUNCTION_INSTANCE) -> int? =>
+            _signature(_registry.object_reference, method)
 
         _add_type(sub_type: SUB_TYPE) -> int is
             _types.add(sub_type)
@@ -173,122 +117,6 @@ namespace IR.WasmGC is
             _next_type = _next_type + 1
 
             return index
-        si
-
-        // The class `type`'s vtable extends: its superclass, or the root.
-        _parent(type: CLASS_INSTANCE) -> CLASS_INSTANCE? is
-            if _registry.is_object(type) then
-                return null
-            fi
-
-            if let parent = _registry.superclass_of(type) /\ _registry.is_object_type(parent) then
-                return parent
-            fi
-
-            return _registry.root
-        si
-
-        _methods(definition: Classy) -> Collections.List[Function] =>
-            _registry.methods_of(definition)
-
-        _is_dispatched(method: Function) -> bool =>
-            method.is_instance /\ method.is_virtual /\ !method.is_constructor /\ method.generic_arguments.count == 0
-
-        // The instance of `definition`, one of `type`'s ancestors, that
-        // `type` derives from.
-        _ancestor(type: CLASS_INSTANCE, definition: Scope?) -> CLASS_INSTANCE? is
-            let current: CLASS_INSTANCE? mut = type
-
-            while current? do
-                if current.definition == definition then
-                    return current
-                fi
-
-                current = _parent(current)
-            od
-
-            return null
-        si
-
-        // A class's vtable starts as a copy of its parent's. A method
-        // overriding a class method fills that method's slot; one that
-        // something overrides and that overrides nothing opens a new slot.
-        _plan_slots(type: CLASS_INSTANCE) is
-            let slots = LIST[WASMGC_SLOT]()
-            let entries = LIST[FUNCTION_INSTANCE?]()
-
-            if let parent = _parent(type) then
-                slots.add_range(_slots[parent])
-                entries.add_range(_slot_entries[parent])
-            fi
-
-            // The root and the classes the program declares bring methods
-            // of their own, and the string type overrides the root's; a box
-            // answers the root's.
-            let is_string = _registry.is_string(type)
-            let has_own_methods = _registry.is_object(type) \/ _registry.is_object_type(type) \/ is_string
-
-            for method in if has_own_methods then _methods(type.definition) else LIST[Function]() fi do
-                if !_is_dispatched(method) then
-                    continue
-                fi
-
-                let key = FUNCTION_INSTANCE(method, type.type_map)
-
-                if let slot = _overridden_slot(type, method) then
-                    _slot_of[key] = slot
-                    entries[slot.index] = key
-                elif !is_string /\ !method.has_no_overriders then
-                    if let signature = _signature(VALUE_TYPE.of_type_index(_registry.type_index(type)!, true), key) then
-                        let slot = WASMGC_SLOT(type, slots.count, signature)
-
-                        slots.add(slot)
-                        entries.add(key)
-
-                        _slot_of[key] = slot
-                    fi
-                fi
-            od
-
-            // A box answers with its scalar's own methods where they override
-            // the root's, as the scalar would on .NET, and so does bigint.
-            // Their methods are not the box's own to dispatch, so they only
-            // fill the slots they override.
-            if _registry.is_box(type) \/ _registry.is_bigint(type) then
-                for method in _methods(type.definition) do
-                    if !method.is_instance \/ method.is_constructor then
-                        continue
-                    fi
-
-                    if let slot = _overridden_slot(type, method) then
-                        let key = FUNCTION_INSTANCE(method, type.type_map)
-
-                        _slot_of[key] = slot
-                        entries[slot.index] = key
-                    fi
-                od
-            fi
-
-            _slots[type] = slots
-            _slot_entries[type] = entries
-        si
-
-        _overridden_slot(type: CLASS_INSTANCE, method: Function) -> WASMGC_SLOT? is
-            if let overridees = method.overridees then
-                for overridee in overridees do
-                    if let function: Function = overridee then
-                        if let owner = _ancestor(type, function.owner) then
-                            let slot: WASMGC_SLOT mut
-
-                            if _slot_of.try_get_value(FUNCTION_INSTANCE(function, owner.type_map), slot ref) then
-                                return slot
-                            fi
-                        fi
-                    fi
-                od
-            fi
-
-            return null
         si
 
         // A function type in the recursion group: the receiver, then the
@@ -337,8 +165,8 @@ namespace IR.WasmGC is
                 return
             fi
 
-            for method in _methods(type.definition) do
-                if _is_dispatched(method) then
+            for method in _registry.methods_of(type.definition) do
+                if DISPATCH_PLAN.is_dispatched(method) then
                     let function = FUNCTION_INSTANCE(method, type.type_map)
 
                     for argument in method.arguments do
@@ -352,7 +180,7 @@ namespace IR.WasmGC is
             for ancestor in type.definition.ancestors do
                 let specialized = TYPE_MAPS.specialize(ancestor, type.type_map)!
 
-                if let ancestor_type = trait_of(specialized) ?? _registry.class_of(specialized) then
+                if let ancestor_type = _plan.trait_of(specialized) ?? _registry.class_of(specialized) then
                     _discover_reference_parameters(ancestor_type, seen)
                 fi
             od
@@ -361,13 +189,13 @@ namespace IR.WasmGC is
         _add_vtable_type(type: CLASS_INSTANCE) is
             let fields = LIST[FIELD_TYPE]()
 
-            for slot in _slots[type] do
+            for slot in _plan.slots(type) do
                 fields.add(FIELD_TYPE.of_reference(VALUE_TYPE.of_type_index(slot.signature, true), false))
             od
 
             let super_types = LIST[int]()
 
-            if let parent = _parent(type) then
+            if let parent = _plan.parent(type) then
                 let parent_vtable mut = 0
 
                 if _vtable_types.try_get_value(parent, parent_vtable ref) then
@@ -381,287 +209,16 @@ namespace IR.WasmGC is
 
         /// The one instance of the trait a value of `type` is, at its
         /// arguments.
-        trait_of(type: Type) -> CLASS_INSTANCE? is
-            let definition: Classy mut
-            let map: Collections.Map[Symbol, Type] mut
-
-            if let generic: GENERIC = type.symbol /\ isa Classy(generic.unspecialized_symbol) then
-                definition = cast Classy?(generic.unspecialized_symbol)!
-                map = generic.type_map
-            elif let classy: Classy = type.symbol then
-                definition = classy
-                map = MAP[Symbol, Type]()
-            else
-                return null
-            fi
-
-            if !definition.is_trait then
-                return null
-            fi
-
-            let key = CLASS_INSTANCE(definition, type.arguments, map)
-
-            let existing: CLASS_INSTANCE mut
-
-            if _traits.try_get_value(key, existing ref) then
-                return existing
-            fi
-
-            _traits[key] = key
-
-            return key
-        si
+        trait_of(type: Type) -> CLASS_INSTANCE? => _plan.trait_of(type)
 
         /// The one instance of the trait `definition` at the arguments
         /// `type_map` gives its parameters.
-        trait_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? is
-            if !definition.is_trait then
-                return null
-            fi
-
-            let map = MAP[Symbol, Type]()
-
-            for (parameter, argument) in type_map do
-                if parameter.owner == definition then
-                    map[parameter] = argument
-                fi
-            od
-
-            let key = CLASS_INSTANCE(definition, LIST[Type](map.values), map)
-
-            let existing: CLASS_INSTANCE mut
-
-            if _traits.try_get_value(key, existing ref) then
-                return existing
-            fi
-
-            _traits[key] = key
-
-            return key
-        si
-
-        // Each trait instance the program uses takes, as its implementors,
-        // the classes implementing any instance of the same trait that
-        // converts to it under the trait's declared variance, so a value
-        // reached through a variant instantiation dispatches and tests as
-        // it does on .NET. A row entry for the variant instance calls the
-        // same compiled member as the instance the class implements.
-        _close_over_variance() is
-            let implemented = LIST[CLASS_INSTANCE](_trait_classes.keys)
-
-            for used in LIST[CLASS_INSTANCE](_traits.values) do
-                for trait_type in implemented do
-                    if trait_type != used /\ trait_type.definition == used.definition /\ _converts_by_variance(trait_type, used) then
-                        if !_trait_classes.contains_key(used) then
-                            _trait_classes[used] = LIST[CLASS_INSTANCE]()
-                        fi
-
-                        let classes = _trait_classes[used]
-
-                        for type in _trait_classes[trait_type] do
-                            if !classes.contains(type) then
-                                classes.add(type)
-                                _class_traits[type].add(used)
-                            fi
-                        od
-                    fi
-                od
-            od
-        si
-
-        // Whether the trait instance `from` converts to `to`, an instance of
-        // the same trait: each type argument is the same, or, where the
-        // parameter is declared `out` or `in` and both arguments are
-        // reference types, a subtype or a supertype of `to`'s.
-        _converts_by_variance(from: CLASS_INSTANCE, to: CLASS_INSTANCE) -> bool is
-            if from.arguments.count != to.arguments.count then
-                return false
-            fi
-
-            for i in 0..from.arguments.count do
-                let source = from.arguments[i]
-                let target = to.arguments[i]
-
-                if source.is_assignable_from(target) /\ target.is_assignable_from(source) then
-                    continue
-                fi
-
-                if source.is_value_type \/ target.is_value_type then
-                    return false
-                fi
-
-                let variance = from.definition.get_argument_variance(i)
-
-                if variance == Semantic.Types.TypeVariance.COVARIANT then
-                    if !target.is_assignable_from(source) then
-                        return false
-                    fi
-                elif variance == Semantic.Types.TypeVariance.CONTRAVARIANT then
-                    if !source.is_assignable_from(target) then
-                        return false
-                    fi
-                else
-                    return false
-                fi
-            od
-
-            return true
-        si
-
-        // Every trait instance a class implements, through its own
-        // declarations, the traits those derive from, and its superclasses.
-        _collect_traits(type: CLASS_INSTANCE) is
-            let seen = SET[CLASS_INSTANCE]()
-
-            _class_traits[type] = LIST[CLASS_INSTANCE]()
-
-            _collect_traits(type, type.definition, type.type_map, seen)
-        si
-
-        _collect_traits(type: CLASS_INSTANCE, from: Classy, map: Collections.Map[Symbol, Type], seen: SET[CLASS_INSTANCE]) is
-            for ancestor in from.ancestors do
-                let specialized = TYPE_MAPS.specialize(ancestor, map)!
-
-                if ancestor.is_trait then
-                    if let trait_type = trait_of(specialized) /\ seen.add(trait_type) then
-                        if !_trait_classes.contains_key(trait_type) then
-                            _trait_classes[trait_type] = LIST[CLASS_INSTANCE]()
-                        fi
-
-                        _trait_classes[trait_type].add(type)
-                        _class_traits[type].add(trait_type)
-
-                        _collect_traits(type, trait_type.definition, trait_type.type_map, seen)
-                    fi
-                elif let superclass = _registry.class_of(specialized) /\ _registry.is_object_type(superclass) then
-                    _collect_traits(type, superclass.definition, superclass.type_map, seen)
-                fi
-            od
-        si
-
-        // A trait method that overrides no other trait method is a
-        // selector, one for each instantiation of its trait; one that does
-        // dispatches through the one it overrides.
-        _plan_selectors(trait_type: CLASS_INSTANCE, classes: LIST[CLASS_INSTANCE]) is
-            for method in _methods(trait_type.definition) do
-                if !_is_dispatched(method) \/ _root_trait_method(method) != method then
-                    continue
-                fi
-
-                let selector = FUNCTION_INSTANCE(method, trait_type.type_map)
-
-                if _selectors.contains_key(selector) then
-                    continue
-                fi
-
-                if let signature = _signature(_registry.object_reference, selector) then
-                    _selectors[selector] = WASMGC_SELECTOR(selector, signature)
-
-                    let row = MAP[int, FUNCTION_INSTANCE]()
-
-                    for type in classes do
-                        if let implementation = _implementation(type, method) then
-                            row[_registry.numbering.id(type)] = implementation
-                        fi
-                    od
-
-                    _rows[selector] = row
-                fi
-            od
-        si
-
-        _root_trait_method(method: Function) -> Function is
-            if let overridees = method.overridees then
-                for overridee in overridees do
-                    if let function: Function = overridee /\ (cast Classy?(function.owner)?.is_trait ?? false) then
-                        return _root_trait_method(function)
-                    fi
-                od
-            fi
-
-            return method
-        si
-
-        // The method a call to `selector` on an instance of `type` runs:
-        // the nearest one up the class chain that overrides it, or that
-        // implements it by name and signature where it is a trait method,
-        // else a trait's default.
-        _implementation(type: CLASS_INSTANCE, selector: Function) -> FUNCTION_INSTANCE? is
-            let current: CLASS_INSTANCE? mut = type
-
-            while current? do
-                for method in _methods(current.definition) do
-                    if _is_dispatched(method) /\ (_overrides(method, selector) \/ _implements_by_signature(method, selector)) then
-                        return FUNCTION_INSTANCE(method, current.type_map)
-                    fi
-                od
-
-                current = _parent(current)
-            od
-
-            for trait_type in _class_traits[type] do
-                for method in _methods(trait_type.definition) do
-                    if _is_dispatched(method) /\ !method.is_abstract /\ (method == selector \/ _overrides(method, selector)) then
-                        return FUNCTION_INSTANCE(method, trait_type.type_map)
-                    fi
-                od
-            od
-
-            return null
-        si
-
-        // Whether `method` implements the trait method `selector` because
-        // its name and signature are the same, as .NET binds an interface
-        // method to a class's, where the compiler recorded it overriding
-        // another trait's method of the same shape instead: one class
-        // method satisfies every trait that declares it. A parameter of the
-        // selector that is a type parameter matches whatever is given.
-        _implements_by_signature(method: Function, selector: Function) -> bool is
-            if !(cast Classy?(selector.owner)?.is_trait ?? false) \/ method.name !~ selector.name \/ !method.is_instance then
-                return false
-            fi
-
-            let mine = method.arguments
-            let theirs = selector.arguments
-
-            if mine.count != theirs.count then
-                return false
-            fi
-
-            for i in 0..mine.count do
-                if !theirs[i].is_type_variable /\ (!mine[i].matches(theirs[i]) \/ !theirs[i].matches(mine[i])) then
-                    return false
-                fi
-            od
-
-            return true
-        si
-
-        _overrides(method: Function, target: Function) -> bool is
-            if let overridees = method.overridees then
-                for overridee in overridees do
-                    if let function: Function = overridee then
-                        if function == target \/ _overrides(function, target) then
-                            return true
-                        fi
-                    fi
-                od
-            fi
-
-            return false
-        si
+        trait_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? =>
+            _plan.trait_of(definition, type_map)
 
         /// The vtable slot a call to `method` reads, or null where nothing
         /// overrides it.
-        slot_of(method: FUNCTION_INSTANCE) -> WASMGC_SLOT? is
-            let result: WASMGC_SLOT mut
-
-            if _slot_of.try_get_value(method, result ref) then
-                return result
-            fi
-
-            return null
-        si
+        slot_of(method: FUNCTION_INSTANCE) -> DISPATCH_SLOT? => _plan.slot_of(method)
 
         /// The vtable type of `type`, whose fields are its slots.
         vtable_type(type: CLASS_INSTANCE) -> int? is
@@ -677,96 +234,28 @@ namespace IR.WasmGC is
         /// The selector a call to the trait method `method` dispatches on,
         /// where `method` is called on an instance of `trait_type`, or null
         /// where it has none.
-        selector_of(method: Function, trait_type: CLASS_INSTANCE) -> WASMGC_SELECTOR? is
-            let root = _root_trait_method(method)
-            let owner = _trait_ancestor(trait_type, root.owner)
-
-            if !owner? then
-                return null
-            fi
-
-            let result: WASMGC_SELECTOR mut
-
-            if _selectors.try_get_value(FUNCTION_INSTANCE(root, owner.type_map), result ref) then
-                return result
-            fi
-
-            return null
-        si
-
-        // The instance of the trait `definition` that `trait_type` is or
-        // derives from.
-        _trait_ancestor(trait_type: CLASS_INSTANCE, definition: Scope?) -> CLASS_INSTANCE? is
-            if trait_type.definition == definition then
-                return trait_type
-            fi
-
-            for ancestor in trait_type.definition.ancestors do
-                if ancestor.is_trait then
-                    if let parent = trait_of(trait_type.specialize(ancestor)!) then
-                        if let found = _trait_ancestor(parent, definition) then
-                            return found
-                        fi
-                    fi
-                fi
-            od
-
-            return null
-        si
+        selector_of(method: Function, trait_type: CLASS_INSTANCE) -> TRAIT_SELECTOR? =>
+            _plan.selector_of(method, trait_type)
 
         /// The one method any call to `selector` can run, or null where the
         /// row has more than one, or none.
-        only_implementation(selector: WASMGC_SELECTOR) -> FUNCTION_INSTANCE? is
-            let implementations = SET[FUNCTION_INSTANCE]()
-
-            for (_, implementation) in _rows[selector.method] do
-                implementations.add(implementation)
-            od
-
-            if implementations.count == 1 then
-                for implementation in implementations do
-                    return implementation
-                od
-            fi
-
-            return null
-        si
+        only_implementation(selector: TRAIT_SELECTOR) -> FUNCTION_INSTANCE? =>
+            _plan.only_implementation(selector)
 
         /// The classes implementing `trait_type`, or null where the program
         /// has none.
-        implementors(trait_type: CLASS_INSTANCE) -> Collections.List[CLASS_INSTANCE]? is
-            let result: LIST[CLASS_INSTANCE] mut
-
-            if _trait_classes.try_get_value(trait_type, result ref) then
-                return result
-            fi
-
-            return null
-        si
+        implementors(trait_type: CLASS_INSTANCE) -> Collections.List[CLASS_INSTANCE]? =>
+            _plan.implementors(trait_type)
 
         /// Marks every implementation that can fill `slot` as reached, so
         /// the walk compiles it.
-        use_slot(slot: WASMGC_SLOT, numbering: WASMGC_FUNCTION_NUMBERING) is
-            for (type, slots) in _slots do
-                if !_registry.is_instantiated(type) then
-                    continue
-                fi
-
-                if slot.index < slots.count /\ slots[slot.index] == slot then
-                    if let implementation = _slot_entries[type][slot.index] then
-                        numbering.index_of(implementation)
-                    fi
-                fi
-            od
-        si
+        use_slot(slot: DISPATCH_SLOT, numbering: WASMGC_FUNCTION_NUMBERING) =>
+            _plan.use_slot(slot, implementation => numbering.index_of(implementation))
 
         /// Marks every implementation in `selector`'s row as reached, so the
         /// walk compiles it.
-        use_selector(selector: WASMGC_SELECTOR, numbering: WASMGC_FUNCTION_NUMBERING) is
-            for (_, implementation) in _rows[selector.method] do
-                numbering.index_of(implementation)
-            od
-        si
+        use_selector(selector: TRAIT_SELECTOR, numbering: WASMGC_FUNCTION_NUMBERING) =>
+            _plan.use_selector(selector, implementation => numbering.index_of(implementation))
 
         /// Adds the trait table to `module`, once the walk has reached
         /// everything. Entries whose implementation the walk did not reach
@@ -774,12 +263,12 @@ namespace IR.WasmGC is
         finish(module: MODULE, numbering: WASMGC_FUNCTION_NUMBERING) is
             let entries = LIST[Collections.List[INSTRUCTION]]()
 
-            for i in 0.._table_size do
+            for i in 0.._plan.table_size do
                 entries.add([HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.FUNC))]: INSTRUCTION)
             od
 
-            for (selector_method, row) in _rows do
-                let selector = _selectors[selector_method]
+            for (selector_method, row) in _plan.rows do
+                let selector = _plan.selector(selector_method)
 
                 for (column, implementation) in row do
                     if numbering.indexed(implementation)? then
@@ -790,10 +279,10 @@ namespace IR.WasmGC is
                 od
             od
 
-            if _table_size > 0 then
+            if _plan.table_size > 0 then
                 let funcref = VALUE_TYPE.of_abstract(AbstractHeapType.FUNC)
 
-                let table = module.add_table(TABLE(funcref, LIMITS(_table_size, _table_size)))
+                let table = module.add_table(TABLE(funcref, LIMITS(_plan.table_size, _plan.table_size)))
 
                 module.add_element_segment(
                     ELEMENT_SEGMENT.of_expressions(ElementMode.ACTIVE, table, [I32_CONSTANT(0)]: INSTRUCTION, funcref, entries))
@@ -810,8 +299,8 @@ namespace IR.WasmGC is
             fi
 
             let result = LIST[INSTRUCTION]()
-            let slots = _slots[type]
-            let entries = _slot_entries[type]
+            let slots = _plan.slots(type)
+            let entries = _plan.slot_entries(type)
 
             for i in 0..slots.count do
                 if let implementation = entries[i] /\ _is_box_hash(type, implementation) then
