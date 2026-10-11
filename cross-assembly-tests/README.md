@@ -15,7 +15,7 @@ assembly.
 Run the suite with:
 
 ```sh
-dotnet ghul-test --use-dotnet-build cross-assembly-tests
+dotnet ghul-test --config cross-assembly cross-assembly-tests
 ```
 
 The runner builds each project with `dotnet build`, then compares the compiler's
@@ -53,7 +53,7 @@ directory at or above the working directory. So
 
 ```sh
 dotnet publish --output publish/
-dotnet ghul-test --use-dotnet-build cross-assembly-tests
+dotnet ghul-test --config cross-assembly cross-assembly-tests
 ```
 
 tests the compiler in your working tree, and the run reports which compiler that

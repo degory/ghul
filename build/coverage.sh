@@ -141,19 +141,17 @@ run_out_of_process_suite() {
     esac
     [[ -e "$target" ]] || die "no such test path: $target"
 
-    local args="ghul-test --no-ci $target"
-    [[ "$suite" == "cross-assembly" ]] && args="ghul-test --use-dotnet-build $target"
+    local args="ghul-test --config published $target"
+    [[ "$suite" == "cross-assembly" ]] && args="ghul-test --config cross-assembly $target"
 
     echo "coverage: running $suite ($target)"
     local start=$SECONDS
     # A failing test still leaves usable coverage, so record the outcome and
     # carry on rather than losing the run to `set -e`.
     local status=0
-    # --no-ci makes the integration run use publish/ghul.dll, the file just
-    # instrumented above, although GitHub Actions sets CI=true for every
-    # job; the pinned ghul-compiler tool would run uninstrumented and leave
-    # coverage empty. --use-dotnet-build takes its compiler from the build,
-    # so the cross-assembly run needs neither.
+    # Both configurations run publish/ghul.dll, the file just instrumented
+    # above; the ghul-compiler tool would run uninstrumented and leave
+    # coverage empty.
     "$tools/coverlet" publish/ghul.dll \
         --target dotnet \
         --targetargs "$args" \
