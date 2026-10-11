@@ -129,6 +129,7 @@ export async function run(options = {}) {
         bigint_from_ulong: (value) => BigInt.asUintN(64, value),
         bigint_from_double: (value) => BigInt(Math.trunc(value)),
         bigint_to_long: (value) => BigInt.asIntN(64, value),
+        bigint_fits_long: (value) => BigInt.asIntN(64, value) === value,
         bigint_to_double: (value) => Number(value),
         bigint_to_string: (value) => value.toString(),
         bigint_add: (a, b) => a + b,

@@ -836,10 +836,17 @@ namespace IR.WasmGC is
             fi
         si
         visit(decimal: Values.Literal.DECIMAL) is _report("a decimal literal") si
-        // A bigint literal is built at run time from its decimal digits,
+        // A bigint literal that fits in a long is built into the box's i64
+        // field. A wider one is built at run time from its decimal digits,
         // through the static `parse` the core library gives `bigint`.
         visit(bigint: Values.Literal.BIGINT) is
-            if let parse = _static_method(bigint.type, "parse", 1) then
+            let small: long mut
+
+            if long.try_parse(bigint.value, small ref) then
+                let long_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_long_type()
+
+                _bigint_of_small(bigint.type, Values.Literal.NUMBER(Values.Literal.CONSTANT.I8(small), long_type))
+            elif let parse = _static_method(bigint.type, "parse", 1) then
                 let string_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type()
 
                 gen(Values.Call.STATIC(parse, LIST[Value]([Values.Literal.STRING(bigint.value, string_type)]), bigint.type, null))
@@ -1694,6 +1701,28 @@ namespace IR.WasmGC is
             _emit(INDEX_INSTRUCTION(Opcode.CALL, index))
         si
 
+        // Whether a bigint's value is in its i64 field, or that field.
+        _lower_bigint_field(name: string, value: Value) is
+            let held = _registry.class_of(value.type)
+
+            if !held? then
+                _report("{name} on a {value.type}")
+                return
+            fi
+
+            let index = _registry.type_index(held)!
+
+            gen(value)
+            _coerce_top(VALUE_TYPE.of_type_index(index, false))
+
+            if name =~ "bigint.small" then
+                _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BIGINT_SMALL))
+            else
+                _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BIGINT_BIG))
+                _emit(Opcode.REF_IS_NULL)
+            fi
+        si
+
         // The operations the core library declares on strings and objects
         // that read their representation, which no ghūl code can reach.
         _lower_representation(operation: string?, arguments: Collections.List[Value]) -> bool is
@@ -1714,6 +1743,11 @@ namespace IR.WasmGC is
 
             if name =~ "object.display" then
                 _lower_display(arguments)
+                return true
+            fi
+
+            if name =~ "bigint.is_small" \/ name =~ "bigint.small" then
+                _lower_bigint_field(name, arguments[0])
                 return true
             fi
 
@@ -3015,6 +3049,11 @@ namespace IR.WasmGC is
         // the one shared instance.
         visit(construction: Values.NEW) is
             let constructor = construction.constructor
+
+            if constructor.intrinsic_operation =~ "bigint.of_small" then
+                _bigint_of_small(construction.type, construction.arguments[0])
+                return
+            fi
 
             // A constructor the host provides answers the whole value, as a
             // bigint built from a scalar does.
@@ -4657,36 +4696,107 @@ namespace IR.WasmGC is
             fi
         si
 
-        // Unwraps the bigint on the stack to the host integer its box holds.
+        // Turns the bigint on the stack into the host's integer: the one
+        // its box holds, or, for a value its i64 field holds, one the host
+        // makes from it.
         _bigint_to_host(type: Type) is
-            if let held = _registry.class_of(type) then
-                let index = _registry.type_index(held)!
+            let held = _registry.class_of(type)
 
-                _coerce_top(VALUE_TYPE.of_type_index(index, false))
-                _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, 1))
-            else
+            if !held? then
                 _report("a bigint passed to the host")
+                return
             fi
+
+            let from_long = _imports.index_of("host.bigint_from_long")
+
+            if !from_long? then
+                _report("a bigint passed to the host, with no host.bigint_from_long")
+                return
+            fi
+
+            let index = _registry.type_index(held)!
+            let box = _temp(VALUE_TYPE.of_type_index(index, true))
+            let big = _temp(VALUE_TYPE.of_abstract(AbstractHeapType.EXTERN))
+
+            _coerce_top(VALUE_TYPE.of_type_index(index, true))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, box))
+            _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BIGINT_BIG))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, big))
+            _emit(Opcode.REF_IS_NULL)
+
+            let from_small = LIST[INSTRUCTION]()
+
+            from_small.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, box))
+            from_small.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BIGINT_SMALL))
+            from_small.add(INDEX_INSTRUCTION(Opcode.CALL, from_long))
+
+            let held_big = LIST[INSTRUCTION]()
+
+            held_big.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, big))
+
+            _emit(
+                IF_INSTRUCTION(
+                    BLOCK_TYPE.of_value(VALUE_TYPE.of_abstract(AbstractHeapType.EXTERN)),
+                    from_small,
+                    held_big))
+        si
+
+        // A bigint whose value its i64 field holds: `value`, a long or an int.
+        _bigint_of_small(type: Type?, value: Value) is
+            let held = _registry.class_of(type)
+
+            if !held? then
+                _report("a bigint made from a {value.type}")
+                return
+            fi
+
+            _emit(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.descriptor_global(held)))
+            gen(value)
+
+            if WASMGC_TYPES.scalar(value.type) =~ Scalar.INT32 then
+                _emit(Opcode.I64_EXTEND_I32_S)
+            fi
+
+            _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.NOEXTERN)))
+            _emit(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _registry.type_index(held)!))
         si
 
         // Wraps the host integer on the stack in a new bigint box.
         _bigint_from_host(type: Type) is
             let held = _registry.class_of(type)
 
-            if _registry.discovering then
+            // The core library's `_canonical` moves a value that fits in an
+            // i64 into the box's i64 field, which is where every other
+            // bigint operation looks for it first.
+            let canonical = _static_method(type, "_canonical", 1)
+
+            if !canonical? then
+                _report("a bigint the host answers with, with no bigint._canonical")
                 return
             fi
 
-            if held? then
-                let value = _temp(VALUE_TYPE.of_abstract(AbstractHeapType.EXTERN))
-
-                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, value))
-                _emit(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.descriptor_global(held)))
-                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, value))
-                _emit(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _registry.type_index(held)!))
-            else
-                _report("a bigint the host answers with")
+            if _registry.discovering then
+                _index_of(canonical)
+                return
             fi
+
+            if !held? then
+                _report("a bigint the host answers with")
+                return
+            fi
+
+            let value = _temp(VALUE_TYPE.of_abstract(AbstractHeapType.EXTERN))
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, value))
+            _emit(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.descriptor_global(held)))
+            _emit(I64_CONSTANT(0L))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, value))
+            _emit(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _registry.type_index(held)!))
+
+            let box = _temp(VALUE_TYPE.of_type_index(_registry.type_index(held)!, false))
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, box))
+            _call(canonical, LIST[Value]([WASMGC_LOCAL_VALUE(box, type)]))
         si
 
         // Converts the JavaScript string a host import answered with, which
