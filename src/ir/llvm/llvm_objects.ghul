@@ -55,6 +55,7 @@ namespace IR.LLVMTarget is
 
         _statics: MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]
         _globals: MAP[Symbol, (name: string, type: LLVM.Type)]
+        _box_hashes: MAP[CLASS_INSTANCE, LLVM.FUNCTION]
         _static_constructors: MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, flag: string)?]
         _unit_variants: Collections.SET[CLASS_INSTANCE]
         _instantiated: LIST[CLASS_INSTANCE]
@@ -120,6 +121,7 @@ namespace IR.LLVMTarget is
 
             _statics = MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]()
             _globals = MAP[Symbol, (name: string, type: LLVM.Type)]()
+            _box_hashes = MAP[CLASS_INSTANCE, LLVM.FUNCTION]()
             _static_constructors = MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, flag: string)?]()
             _unit_variants = Collections.SET[CLASS_INSTANCE]()
             _instantiated = LIST[CLASS_INSTANCE]()
@@ -228,14 +230,14 @@ namespace IR.LLVMTarget is
                 layout.add(Types.i64)
                 layout.add(Types.pointer)
             elif let boxed = _classes.boxed_type(type) then
-                layout.add(LLVM_TYPES.value_type(boxed) ?? Types.i32)
+                layout.add(LLVM_TYPES.stored_type(boxed) ?? LLVM_TYPES.value_type(boxed) ?? Types.i32)
             elif is_object_type(type) then
                 for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type.definition)) do
                     if `field.is_instance then
                         _field_positions[`field] = layout.count
 
-                        if let held = held_type(type.specialize(`field.type)) then
-                            layout.add(held)
+                        if let stored = stored_type(type.specialize(`field.type)) then
+                            layout.add(stored)
                         else
                             _unsupported.add((`field.location, "a field of type {type.specialize(`field.type)}"))
                             layout.add(Types.pointer)
@@ -256,8 +258,8 @@ namespace IR.LLVMTarget is
             if isa Semantic.Types.REFERENCE(type) then
                 return Types.pointer
             elif let t = type /\ t.is_optional /\ t.is_value_type /\ !t.is_maybe then
-                if let inner = held_type(t.optional_inner_type) then
-                    return Types.structure([Types.i1, inner])
+                if let inner = stored_type(t.optional_inner_type) then
+                    return Types.structure([Types.i8, inner])
                 fi
 
                 return null
@@ -272,6 +274,26 @@ namespace IR.LLVMTarget is
             fi
 
             return null
+        si
+
+        /// The LLVM type a value of `type` is stored as in memory: a scalar at
+        /// the width of its kind, anything else as it is held. Null where the
+        /// target holds no values of the type.
+        stored_type(type: Type?) -> LLVM.Type? => LLVM_TYPES.stored_type(type) ?? held_type(type)
+
+        /// A value of `type` loaded in `block` from `pointer`, where it is held
+        /// as stored, widened to the width it is computed with; null where the
+        /// target holds no values of the type.
+        load_stored(block: LLVM.BLOCK, type: Type?, pointer: LLVM.Value) -> LLVM.Value? is
+            let stored = stored_type(type)
+
+            if !stored? then
+                return null
+            fi
+
+            let value = block.load(stored, pointer, 0)
+
+            return if let scalar = LLVM_TYPES.scalar(type) then LLVM_TYPES.widen(block, value, scalar) else value fi
         si
 
         /// The struct a value of `type` is, held in place, or null where it
@@ -422,7 +444,7 @@ namespace IR.LLVMTarget is
         /// namespace-level variable `field` where `owner` is null, or null
         /// where its type is one the target holds no values of.
         global_of(`field: Symbol, owner: CLASS_INSTANCE?, type: Type?) -> (name: string, type: LLVM.Type)? is
-            let held = held_type(type)
+            let held = stored_type(type)
 
             if !held? then
                 return null
@@ -677,8 +699,12 @@ namespace IR.LLVMTarget is
 
                 for (class_id, implementation) in row do
                     // An entry a call can reach must be compiled, or the call would
-                    // go through a null pointer.
-                    if _dispatched.is_dispatched_to(method.definition) /\ !callee(implementation)? then
+                    // go through a null pointer. A call reaches it only where a
+                    // value of its class can exist, as for a vtable entry: a call
+                    // is recorded against the trait method rather than the
+                    // instance of the trait it goes through, so the rows of
+                    // every instance count as dispatched once any one is.
+                    if _dispatched.is_dispatched_to(method.definition) /\ (!by_number.contains_key(class_id) \/ is_instantiated(by_number[class_id])) /\ !callee(implementation)? then
                         _unsupported.add((implementation.definition.location, "a method called through a trait"))
                     fi
 
@@ -715,6 +741,10 @@ namespace IR.LLVMTarget is
         // rather than the box.
         _reference(instance: FUNCTION_INSTANCE?, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?, owner: CLASS_INSTANCE?) -> LLVM.Value is
             if let i = instance, function = callee(i) then
+                if let o = owner /\ is_box(o) /\ _is_root_hash(i), hash = _box_hash(o) then
+                    return hash.reference
+                fi
+
                 if let o = owner /\ (is_box(o) \/ is_struct(o)) /\ isa Semantic.Symbols.STRUCT(i.definition.owner), c = closures then
                     return c.unboxing_thunk(function).reference
                 fi
@@ -723,6 +753,44 @@ namespace IR.LLVMTarget is
             fi
 
             return Values.null_pointer
+        si
+
+        // Whether `instance` is the root's `get_hash_code`, which a box of a
+        // scalar answers with the hash of the scalar it holds instead.
+        _is_root_hash(instance: FUNCTION_INSTANCE) -> bool =>
+            instance.definition.name =~ "get_hash_code" /\
+            instance.definition.arguments.count == 0 /\
+            (cast Classy?(instance.definition.owner)?.is_object ?? false)
+
+        // The function the box `type` answers `get_hash_code` with: the hash
+        // of the scalar it holds, or null where it holds no scalar.
+        _box_hash(type: CLASS_INSTANCE) -> LLVM.FUNCTION? is
+            let found: LLVM.FUNCTION mut
+
+            if _box_hashes.try_get_value(type, found ref) then
+                return found
+            fi
+
+            let boxed = _classes.boxed_type(type)
+
+            if !LLVM_TYPES.value_type(boxed)? then
+                return null
+            fi
+
+            let function = LLVM.FUNCTION("\$ghul_box_hash_{_box_hashes.count}", Types.i32, [LLVM.PARAMETER(Types.pointer, "box")])
+
+            function.linkage = Linkage.INTERNAL
+
+            let block = function.add_block("entry")
+            let address = block.element_pointer(Types.i8, function.parameter(0), [Values.i32(BOX_VALUE_OFFSET)], true)
+
+            block.return_value(LLVM_SCALAR_HASH.hash(block, load_stored(block, boxed, address)!))
+
+            _module.add_function(function)
+
+            _box_hashes[type] = function
+
+            return function
         si
 
         root: CLASS_INSTANCE? => _classes.root
