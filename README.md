@@ -21,6 +21,8 @@ The compiler requires the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/downl
 
 The compiler produces standard .NET assemblies and packages targeting .NET 10.
 
+Two further targets are experimental: [WebAssembly](https://ghul.dev/webassembly.html), using WasmGC and built with the `ghul` command-line tool, and native executables through LLVM ([ghul-lang/ghul#3454](https://github.com/ghul-lang/ghul/issues/3454)). Both support less of the language and the core library than .NET does.
+
 ## Getting the compiler
 
 There are a few different ways to get the compiler
