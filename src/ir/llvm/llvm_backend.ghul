@@ -1,0 +1,295 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use IO.File
+
+    use Collections.LIST
+    use Collections.MAP
+    use Collections.STACK
+
+    use Semantic.Symbols.Symbol
+    use Semantic.Symbols.Classy
+    use Semantic.Symbols.Function
+
+    use LLVM.MODULE
+    use LLVM.FUNCTION
+    use LLVM.PARAMETER
+    use LLVM.WRITER
+
+    use Values.Value
+
+    /// Writes the program as an LLVM module, and links an executable from it
+    /// with `ghul-llvm` against the runtime.
+    ///
+    /// A body's lowering needs what only the whole program settles, so each
+    /// body is kept as it is finished and lowered once the last has been
+    /// handed over, in `end_assembly`.
+    class LLVM_BACKEND: Backend is
+        _bodies: MAP[Function, LIST[Value]]
+        _order: LIST[Function]
+        _enclosing: STACK[LIST[Value]?]
+        _current: LIST[Value]?
+
+        _entry_point: Function?
+        _module: MODULE?
+        _want_library: bool
+
+        init() is
+            _bodies = MAP[Function, LIST[Value]]()
+            _order = LIST[Function]()
+            _enclosing = STACK[LIST[Value]?]()
+        si
+
+        /// Starts a module, discarding anything kept from an earlier one.
+        install(module_name: string, module_version: string, want_library: bool) is
+            reset()
+
+            _want_library = want_library
+        si
+
+        reset() is
+            _bodies.clear()
+            _order.clear()
+            _enclosing.clear()
+            _current = null
+            _entry_point = null
+            _module = null
+        si
+
+        begin_assembly() is si
+
+        /// Lowers every kept body the program reaches into the module `write`
+        /// writes.
+        end_assembly() is
+            _module = _build_module()
+        si
+
+        add_resource(name: string, content: ubyte[]) is si
+
+        /// Writes the module's text to `<path>.ll` and, for an executable,
+        /// links it into `path` with `ghul-llvm`. The text is kept where
+        /// `--llvm-output` names a file for it.
+        write(path: string) is
+            let module = _module
+
+            if !module? then
+                return
+            fi
+
+            let text = WRITER.module_text(module)
+
+            if let output = IoC.CONTAINER.instance.build_flags.llvm_output then
+                File.write_all_text(output, text)
+            fi
+
+            if _want_library then
+                File.write_all_text(path, text)
+                return
+            fi
+
+            let ll_path = "{path}.ll"
+
+            File.write_all_text(ll_path, text)
+
+            try
+                LLVM_LINKER.link(ll_path, path)
+            finally
+                File.delete(ll_path)
+            yrt
+        si
+
+        begin_body() is
+            _enclosing.push(_current)
+            _current = LIST[Value]()
+        si
+
+        begin_body(member: Symbol) is
+            begin_body()
+        si
+
+        write(value: Value) is
+            _current!.add(value)
+        si
+
+        /// Keeps the body for lowering. A function that provides an intrinsic
+        /// has its body dropped, since a call to it lowers to the operation
+        /// itself.
+        finish_body(function: Function) is
+            if function.intrinsic_operation? then
+                return
+            fi
+
+            if !_bodies.contains_key(function) then
+                _order.add(function)
+            fi
+
+            _bodies[function] = _current!
+        si
+
+        finish_frame_member_body(frame: Classy, member: FrameMember) is
+            let location =
+                if let state_machine: Semantic.Symbols.STATE_MACHINE_FRAME_BASE = frame then
+                    state_machine.owning_function.location
+                else
+                    frame.location
+                fi
+
+            _report(location, "a generator or asynchronous function")
+        si
+
+        finish_unit_variant_initializer(variant: Classy) is
+            _report(variant.location, "a union")
+        si
+
+        end_body() is
+            assert _enclosing.count > 0 else "body ended without one begun"
+
+            _current = _enclosing.pop()
+        si
+
+        abandon_bodies() is
+            _enclosing.clear()
+            _current = null
+        si
+
+        /// Always false: this target generates no unions yet.
+        has_unit_variant_instance(variant: Classy) -> bool => false
+
+        mark_entry_point(function: Function) is
+            _entry_point = function
+        si
+
+        _report(location: Source.LOCATION, construct: string) is
+            IoC.CONTAINER.instance.logger.error(
+                location,
+                "code generation for {construct} is not supported on the llvm target")
+        si
+
+        // Adds every instance the program reaches to the worklist, declaring
+        // an LLVM function for each the first time it is named, then lowers
+        // each body into its function. A body adds what it calls as it is
+        // lowered, so the worklist is drained until nothing new is added.
+        _build_module() -> MODULE is
+            let module = MODULE()
+            let names = LLVM_FUNCTION_NAMES()
+            let worklist = FUNCTION_WORKLIST(f => _bodies.contains_key(f))
+            let functions = MAP[FUNCTION_INSTANCE, FUNCTION?]()
+
+            let declare = (instance: FUNCTION_INSTANCE) -> FUNCTION? is
+                let found: FUNCTION? mut
+
+                if functions.try_get_value(instance, found ref) then
+                    return found
+                fi
+
+                if !worklist.add(instance)? then
+                    functions[instance] = null
+                    return null
+                fi
+
+                let declared = _declare(instance, names.name_of(instance))
+
+                if let present = declared then
+                    module.add_function(present)
+                fi
+
+                functions[instance] = declared
+
+                return declared
+            si
+
+            // An executable compiles what its entry point reaches; a library
+            // compiles everything that is not generic, since anything can be
+            // called from outside.
+            if let entry = _entry_point then
+                declare(FUNCTION_INSTANCE.of(entry))
+            else
+                for function in _order do
+                    if !_is_generic(function) then
+                        declare(FUNCTION_INSTANCE.of(function))
+                    fi
+                od
+            fi
+
+            while let instance = worklist.next() do
+                if let function = functions[instance] then
+                    _lower(module, instance, function, declare)
+                fi
+            od
+
+            worklist.seal()
+
+            return module
+        si
+
+        // The LLVM function an instance is compiled into, with no body yet,
+        // or null, reported, where its signature has a type the target holds
+        // no values of.
+        _declare(instance: FUNCTION_INSTANCE, name: string) -> FUNCTION? is
+            let definition = instance.definition
+
+            if definition.is_emitted_with_receiver then
+                _report(definition.location, "an instance method")
+                return null
+            fi
+
+            let parameters = LIST[PARAMETER]()
+
+            for (i, argument) in definition.arguments |> Ghul.Pipes.index() do
+                if let type = LLVM_TYPES.value_type(instance.specialize(argument)) then
+                    parameters.add(PARAMETER(type, "a{i}"))
+                else
+                    _report(definition.location, "an argument of type {argument}")
+                    return null
+                fi
+            od
+
+            let result = LLVM_TYPES.result_type(instance.specialize(definition.return_type))
+
+            if !result? then
+                _report(definition.location, "a result of type {definition.return_type}")
+                return null
+            fi
+
+            return FUNCTION(name, result, parameters.to_array())
+        si
+
+        _lower(module: MODULE, instance: FUNCTION_INSTANCE, function: FUNCTION, callee: (FUNCTION_INSTANCE) -> FUNCTION?) is
+            let definition = instance.definition
+
+            let lowering = LLVM_LOWERING(module, function, instance, instance.specialize(definition.return_type), callee)
+
+            lowering.lower(_bodies[definition])
+
+            for construct in lowering.unsupported do
+                _report(definition.location, construct)
+            od
+        si
+
+        // Whether `function` takes type arguments of its own or its class's,
+        // so it is compiled only at the instantiations a program reaches.
+        _is_generic(function: Function) -> bool is
+            if function.generic_arguments.count > 0 then
+                return true
+            fi
+
+            let scope: Semantic.Scope? mut = function.owner
+
+            while scope? do
+                if let classy: Classy = scope /\ classy.is_generic then
+                    return true
+                elif let enclosing: Function = scope /\ enclosing.generic_arguments.count > 0 then
+                    return true
+                fi
+
+                if let symbol: Symbol = scope /\ symbol.owner != scope then
+                    scope = symbol.owner
+                else
+                    scope = null
+                fi
+            od
+
+            return false
+        si
+    si
+si
