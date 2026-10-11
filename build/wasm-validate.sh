@@ -39,19 +39,17 @@ trap 'rm -rf "$scratch"' EXIT
 checked=0
 failed=0
 
-# Every test under $root built for $target: one whose ghulflags name
-# `--target $target`, or whose `targets` file lists it, in which case the
-# flag is added as ghul-test adds it. Each is printed as its directory and
-# its flags, tab-separated. A `.targets` directory holds ghul-test's own
-# copies of a test, not tests.
+# Every test under $root whose ghulflags name `--target $target`, printed
+# as its directory and its flags, tab-separated. A test that runs under the
+# target through a `targets` file is left to ghul-test, which builds it with
+# the core library and runs it, so there is nothing an engine could add. A
+# `.targets` directory holds ghul-test's own copies of a test, not tests.
 tests_for_target() {
     find "$root" -name ghulflags -not -path "*/.targets/*" | sort | while IFS= read -r flags_file; do
         dir="$(dirname "$flags_file")"
         flags="$(tr "\n" " " < "$flags_file")"
 
-        if [ -f "$dir/targets" ] && grep -qw "$target" "$dir/targets"; then
-            printf "%s\t%s --target %s\n" "$dir" "$flags" "$target"
-        elif [[ " $flags " == *" --target $target "* ]]; then
+        if [[ " $flags " == *" --target $target "* ]]; then
             printf "%s\t%s\n" "$dir" "$flags"
         fi
     done
@@ -60,7 +58,7 @@ tests_for_target() {
 while IFS=$'\t' read -r dir flags_text; do
     dir="$(cd "$dir" && pwd)"
 
-    if [ -e "$dir/fail.expected" ] || [ -e "$dir/fail.$target.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
+    if [ -e "$dir/fail.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
         continue
     fi
 

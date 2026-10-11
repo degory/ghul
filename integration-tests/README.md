@@ -134,8 +134,10 @@ Don't copy a program that an execution test already holds into `wasm/` or
 
 `build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
 compiler writes for their target to an engine. They select tests by the target
-the `ghulflags` or `targets` file names, wherever the test lives, so a target
-test outside `wasm/` or `llvm/` is checked too.
+the `ghulflags` name, wherever the test lives, so a target test outside
+`wasm/` or `llvm/` is checked too. A test that runs under the target through a
+`targets` file is left to ghul-test, which builds it with the core library and
+runs it.
 
 ## Generated tests
 
