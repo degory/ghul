@@ -132,6 +132,21 @@ A test belongs in one of two places:
 Don't copy a program that an execution test already holds into `wasm/` or
 `llvm/`: give the execution test a `targets` file instead.
 
+A run under `wasm` needs the core library, which a wasm build compiles in
+from source rather than loading from an assembly. `build/wasm-libraries.sh`
+writes the response file naming ghul-core's and ghul-runtime's sources from
+their checkouts, and ghul-test is given it for every wasm run:
+
+```sh
+build/wasm-libraries.sh ../ghul-core ../ghul-runtime wasm-libraries.rsp
+dotnet ghul-test --target-flags wasm "@$PWD/wasm-libraries.rsp" integration-tests
+```
+
+CI does the same from fresh checkouts of both at their default branches.
+Without the flags a wasm run fails to compile, which is the right answer: the
+test asserts the program on that target, and silently skipping it would hide
+the gap the `targets` file exists to show.
+
 `build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
 compiler writes for their target to an engine. They select tests by the target
 the `ghulflags` name, wherever the test lives, so a target test outside
