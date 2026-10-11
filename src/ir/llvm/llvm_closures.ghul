@@ -1,0 +1,265 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Collections.LIST
+    use Collections.MAP
+
+    use LLVM.BLOCK
+    use LLVM.FUNCTION
+    use LLVM.GLOBAL_VARIABLE
+    use LLVM.Linkage
+    use LLVM.MODULE
+    use LLVM.PARAMETER
+    use LLVM.Types
+    use LLVM.Values
+
+    /// How a closure's thunk reaches the function it calls.
+    enum ThunkKind is
+        /// The function takes no receiver, so the closure's is dropped.
+        DROP_RECEIVER,
+
+        /// The function takes the closure's receiver as its first argument.
+        PASS_RECEIVER,
+
+        /// The receiver's vtable slot holds the function.
+        VIRTUAL,
+
+        /// The receiver's row in the trait table holds the function.
+        INTERFACE
+    si
+
+    /// Function values on the LLVM target. A closure is
+    /// `{ ptr descriptor, ptr function, ptr receiver }`: calling it calls
+    /// the function with the receiver, then the call's own arguments. The
+    /// receiver is null for a function that takes none.
+    ///
+    /// The function a closure holds has exactly the signature its type calls
+    /// through: a receiver, then the arguments, then the result. A function
+    /// that does not, because it takes no receiver, answers a result the
+    /// value's type discards, or is reached through a vtable or the trait
+    /// table, is reached through a thunk that does.
+    class LLVM_CLOSURES is
+        _module: MODULE
+        _objects: LLVM_OBJECTS
+        _thunks: MAP[THUNK_KEY, FUNCTION]
+        _is_used: bool
+
+        /// The size of a closure in bytes.
+        SIZE: int static => 24
+
+        /// The offset of the function a closure calls.
+        FUNCTION_OFFSET: int static => 8
+
+        /// The offset of the receiver a closure passes.
+        RECEIVER_OFFSET: int static => 16
+
+        /// The name of the descriptor every closure carries.
+        DESCRIPTOR_NAME: string static => "$ghul_closure_descriptor"
+
+        /// The class number a closure's descriptor holds, which falls in no
+        /// class's range.
+        CLASS_ID: int static => 0x7fffffff
+
+        /// - module: where thunks and the descriptor are added
+        /// - objects: the program's classes, whose vtables and trait table the thunks dispatch through
+        init(module: MODULE, objects: LLVM_OBJECTS) is
+            _module = module
+            _objects = objects
+            _thunks = MAP[THUNK_KEY, FUNCTION]()
+        si
+
+        /// The descriptor every closure carries.
+        descriptor: LLVM.Value is
+            _is_used = true
+
+            return Values.global(DESCRIPTOR_NAME)
+        si
+
+        /// The function a closure of the function type `signature` holds to
+        /// call `target`, the compiled function of `instance`, reached as
+        /// `kind` says.
+        ///
+        /// - signature: the function type a call through the closure has
+        /// - instance: the function the closure stands for
+        /// - target: its compiled function, which only `DROP_RECEIVER` and `PASS_RECEIVER` call
+        /// - kind: how the thunk reaches the function
+        /// - offset: the vtable slot or trait table row a dispatching thunk reads
+        thunk(signature: LLVM.Type.FUNCTION, instance: FUNCTION_INSTANCE, target: FUNCTION?, kind: ThunkKind, offset: int) -> FUNCTION? is
+            let discards = signature.result =~ LLVM.Type.VOID /\ !(target?.result =~ LLVM.Type.VOID ?? true)
+
+            if kind == ThunkKind.PASS_RECEIVER /\ !discards /\ target? then
+                if _same_signature(signature, target) then
+                    return target
+                fi
+            fi
+
+            let key = THUNK_KEY(instance, kind, signature)
+            let found: FUNCTION mut
+
+            if _thunks.try_get_value(key, found ref) then
+                return found
+            fi
+
+            let parameters = LIST[PARAMETER]()
+
+            for (i, type) in signature.parameters |> Ghul.Pipes.index() do
+                parameters.add(PARAMETER(type, "a{i}"))
+            od
+
+            let thunk = FUNCTION("$ghul_thunk_{_thunks.count}", signature.result, parameters.to_array())
+
+            thunk.linkage = Linkage.INTERNAL
+
+            let block = thunk.add_block("entry")
+            let receiver = thunk.parameter(0)
+            let arguments = LIST[LLVM.Value]()
+
+            if kind != ThunkKind.DROP_RECEIVER then
+                arguments.add(receiver)
+            fi
+
+            for i in 1..signature.parameters.count do
+                arguments.add(thunk.parameter(i))
+            od
+
+            let result =
+                case kind
+                when ThunkKind.DROP_RECEIVER, ThunkKind.PASS_RECEIVER then
+                    if let t = target then block.call(t, arguments.to_array()) else null fi
+                else
+                    _dispatch(block, signature, instance, receiver, kind, offset, arguments)
+                esac
+
+            if signature.result =~ LLVM.Type.VOID then
+                block.return_void()
+            elif let r = result then
+                block.return_value(r)
+            else
+                block.return_value(LLVM_TYPES.zero(signature.result))
+            fi
+
+            _module.add_function(thunk)
+
+            _thunks[key] = thunk
+
+            return thunk
+        si
+
+        // Calls through the receiver's vtable slot, or its row of the trait
+        // table, at `offset`.
+        _dispatch(
+            block: BLOCK,
+            signature: LLVM.Type.FUNCTION,
+            instance: FUNCTION_INSTANCE,
+            receiver: LLVM.Value,
+            kind: ThunkKind,
+            offset: int,
+            arguments: LIST[LLVM.Value]
+        ) -> LLVM.Value? is
+            let descriptor = block.load(Types.pointer, receiver, 8)
+
+            let entry =
+                if kind == ThunkKind.VIRTUAL then
+                    block.element_pointer(Types.i8, descriptor, [Values.i32(LLVM_OBJECTS.DESCRIPTOR_VTABLE + 8 * offset)], true)
+                else
+                    let class_id = block.load(Types.i32, descriptor, 8)
+                    let index = block.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, class_id, Values.i32(offset))
+
+                    block.element_pointer(Types.pointer, Values.global(LLVM_OBJECTS.TRAIT_TABLE_NAME), [index], true)
+                fi
+
+            let function = block.load(Types.pointer, entry, 8)
+
+            let called = _called_signature(instance)
+
+            if !called? then
+                return null
+            fi
+
+            let result = block.call(called, function, arguments.to_array())
+
+            return if signature.result =~ LLVM.Type.VOID then null else result fi
+        si
+
+        // The signature of the method a dispatching thunk calls: the receiver,
+        // its arguments and its result, at the instance's type arguments.
+        _called_signature(instance: FUNCTION_INSTANCE) -> LLVM.Type? is
+            let parameters = LIST[LLVM.Type]()
+
+            parameters.add(Types.pointer)
+
+            for argument in instance.definition.arguments do
+                if let held = LLVM_TYPES.value_type(instance.specialize(argument)) then
+                    parameters.add(held)
+                else
+                    return null
+                fi
+            od
+
+            if let result = LLVM_TYPES.result_type(instance.specialize(instance.definition.return_type)) then
+                return LLVM.Type.FUNCTION(result, parameters.to_array(), false)
+            fi
+
+            return null
+        si
+
+        _same_signature(signature: LLVM.Type.FUNCTION, target: FUNCTION) -> bool is
+            if signature.parameters.count != target.parameters.count \/ !(signature.result =~ target.result) then
+                return false
+            fi
+
+            for i in 0..signature.parameters.count do
+                if !(signature.parameters[i] =~ target.parameters[i].type) then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
+        /// Adds the closures' descriptor, where any closure was made.
+        finish(strings: LLVM_STRINGS) is
+            if !_is_used then
+                return
+            fi
+
+            let type =
+                Types.structure([
+                    Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, LLVM.Type.ARRAY(0, Types.pointer)
+                ])
+
+            let superclass =
+                if let root = _objects.root then Values.global(_objects.descriptor_name(root)) else Values.null_pointer fi
+
+            let initializer =
+                LLVM.Value.AGGREGATE(
+                    [
+                        Values.i32(CLASS_ID),
+                        Values.i32(CLASS_ID),
+                        superclass,
+                        strings.literal("System.Delegate"),
+                        Values.null_pointer,
+                        Values.null_pointer,
+                        Values.i64(cast long(SIZE)),
+                        LLVM.Value.AGGREGATE([], LLVM.Type.ARRAY(0, Types.pointer))
+                    ],
+                    type)
+
+            let global = GLOBAL_VARIABLE(DESCRIPTOR_NAME, type, initializer, true)
+
+            global.linkage = Linkage.INTERNAL
+            global.alignment = 8
+
+            _module.add_global(global)
+        si
+    si
+
+    /// A thunk, told apart by the function it stands for, how it reaches it,
+    /// and the signature it is called with.
+    class THUNK_KEY(instance: FUNCTION_INSTANCE, kind: ThunkKind, signature: LLVM.Type) is
+        =~(other: THUNK_KEY) -> bool pure =>
+            instance =~ other.instance /\ kind == other.kind /\ signature =~ other.signature
+
+        get_hash_code() -> int pure => instance.get_hash_code()
+    si
+si
