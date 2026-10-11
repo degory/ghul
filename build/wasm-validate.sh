@@ -3,7 +3,7 @@
 # wasm-validate.sh - hand every module the wasm integration tests build
 # to an engine.
 #
-# ghul-test compiles each test under integration-tests/wasm and compares
+# ghul-test compiles each test built for the wasm target and compares
 # what the compiler said and the text form it wrote, but it has no
 # engine, and it deletes a passing test's module. So a module the tests
 # accept may still be one an engine rejects. This script builds each
@@ -11,7 +11,7 @@
 # about it through WebAssembly.validate.
 #
 # Usage: build/wasm-validate.sh [test-root]
-#        (default: integration-tests/wasm; run from the repository root
+#        (default: integration-tests; run from the repository root
 #        after `dotnet publish --output publish/`)
 #
 # Fails when Node is missing, when a test that should build a module
@@ -19,7 +19,8 @@
 
 set -uo pipefail
 
-root="${1:-integration-tests/wasm}"
+root="${1:-integration-tests}"
+target=wasm
 compiler="$(pwd)/publish/ghul.dll"
 
 if ! command -v node >/dev/null 2>&1; then
@@ -38,8 +39,24 @@ trap 'rm -rf "$scratch"' EXIT
 checked=0
 failed=0
 
-while IFS= read -r flags_file; do
-    dir="$(cd "$(dirname "$flags_file")" && pwd)"
+# Every test under $root whose ghulflags name `--target $target`, printed
+# as its directory and its flags, tab-separated. A test that runs under the
+# target through a `targets` file is left to ghul-test, which builds it with
+# the core library and runs it, so there is nothing an engine could add. A
+# `.targets` directory holds ghul-test's own copies of a test, not tests.
+tests_for_target() {
+    find "$root" -name ghulflags -not -path "*/.targets/*" | sort | while IFS= read -r flags_file; do
+        dir="$(dirname "$flags_file")"
+        flags="$(tr "\n" " " < "$flags_file")"
+
+        if [[ " $flags " == *" --target $target "* ]]; then
+            printf "%s\t%s\n" "$dir" "$flags"
+        fi
+    done
+}
+
+while IFS=$'\t' read -r dir flags_text; do
+    dir="$(cd "$dir" && pwd)"
 
     if [ -e "$dir/fail.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
         continue
@@ -48,7 +65,7 @@ while IFS= read -r flags_file; do
     out="$scratch/$checked"
     mkdir -p "$out"
 
-    read -r -a flags < "$flags_file"
+    read -r -a flags <<< "$flags_text"
 
     # Compiled from the test's own directory, as ghul-test compiles it, so
     # a path its ghulflags name is read from there.
@@ -65,7 +82,7 @@ while IFS= read -r flags_file; do
     fi
 
     checked=$((checked + 1))
-done < <(find "$root" -name ghulflags | sort)
+done < <(tests_for_target)
 
 echo "wasm-validate: $checked modules checked, $failed failed"
 

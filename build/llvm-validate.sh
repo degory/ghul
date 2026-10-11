@@ -3,7 +3,7 @@
 # llvm-validate.sh - hand every module the llvm integration tests build
 # to LLVM, and run the ones that say what they exit with.
 #
-# ghul-test compiles each test under integration-tests/llvm and compares
+# ghul-test compiles each test built for the llvm target and compares
 # what the compiler said, but it does not assemble the module the compiler
 # wrote, and it does not run a native executable on CI, which has no
 # ghul-llvm. So a module the tests accept may still be one LLVM rejects.
@@ -16,7 +16,7 @@
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
 #
 # Usage: build/llvm-validate.sh [test-root]
-#        (default: integration-tests/llvm; run from the repository root
+#        (default: integration-tests; run from the repository root
 #        after `dotnet publish --output publish/`)
 #
 # Fails when ghul-llvm is missing, when a test that should build a module
@@ -25,7 +25,8 @@
 
 set -uo pipefail
 
-root="${1:-integration-tests/llvm}"
+root="${1:-integration-tests}"
+target=llvm
 compiler="$(pwd)/publish/ghul.dll"
 ghul_llvm="${GHUL_LLVM:-ghul-llvm}"
 
@@ -46,8 +47,24 @@ checked=0
 ran=0
 failed=0
 
-while IFS= read -r flags_file; do
-    dir="$(cd "$(dirname "$flags_file")" && pwd)"
+# Every test under $root whose ghulflags name `--target $target`, printed
+# as its directory and its flags, tab-separated. A test that runs under the
+# target through a `targets` file is left to ghul-test, which builds it with
+# the core library and runs it, so there is nothing an engine could add. A
+# `.targets` directory holds ghul-test's own copies of a test, not tests.
+tests_for_target() {
+    find "$root" -name ghulflags -not -path "*/.targets/*" | sort | while IFS= read -r flags_file; do
+        dir="$(dirname "$flags_file")"
+        flags="$(tr "\n" " " < "$flags_file")"
+
+        if [[ " $flags " == *" --target $target "* ]]; then
+            printf "%s\t%s\n" "$dir" "$flags"
+        fi
+    done
+}
+
+while IFS=$'\t' read -r dir flags_text; do
+    dir="$(cd "$dir" && pwd)"
 
     if [ -e "$dir/fail.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
         continue
@@ -56,7 +73,7 @@ while IFS= read -r flags_file; do
     out="$scratch/$checked"
     mkdir -p "$out"
 
-    read -r -a flags < "$flags_file"
+    read -r -a flags <<< "$flags_text"
 
     checked=$((checked + 1))
 
@@ -114,7 +131,7 @@ while IFS= read -r flags_file; do
         echo "llvm-validate: $dir wrote other output than output.expected" >&2
         failed=$((failed + 1))
     fi
-done < <(find "$root" -name ghulflags -exec grep -l -- '--target llvm' {} + | sort)
+done < <(tests_for_target)
 
 echo "llvm-validate: $checked modules checked, $ran run, $failed failed"
 
