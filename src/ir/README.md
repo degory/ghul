@@ -11,7 +11,7 @@ A composite value whose IL branches, such as `?.` or a fused pipe loop, expands 
 Useful files:
 
 - `backend.ghul` – the trait generate-il and the driver write a program through; the CIL backend's is `emitter/cil_backend.ghul`, and the WasmGC backend's is `wasmgc/wasmgc_backend.ghul`.
-- `program/` – what a whole-program backend plans independently of its target: class and function instances at their type arguments (`instances.ghul`, `type_maps.ghul`), the worklist of reachable functions (`function_worklist.ghul`), the limits on self-instantiating generics (`instantiation_limits.ghul`), class numbering (`class_id_numbering.ghul`, `class_id_ranges.ghul`) and the packing of the trait dispatch table (`row_displacement.ghul`). The WasmGC backend builds on it.
+- `program/` – what a whole-program backend plans independently of its target: class and function instances at their type arguments (`instances.ghul`, `type_maps.ghul`), the worklist of reachable functions (`function_worklist.ghul`), the classes, arrays and boxes a program uses and their numbering (`class_set.ghul`, given the built-in types it treats specially by `core_classes.ghul`), the limits on self-instantiating generics (`instantiation_limits.ghul`), class numbering (`class_id_numbering.ghul`, `class_id_ranges.ghul`) and the packing of the trait dispatch table (`row_displacement.ghul`). The WasmGC backend builds on it.
 - `frame_member.ghul` – the state-machine frame members no symbol declares.
 - `operations.ghul` – the scalar kinds, arithmetic operations and comparisons built-in operators are described by.
 - `local.ghul` – a local of the function being generated.

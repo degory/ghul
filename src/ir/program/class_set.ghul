@@ -1,0 +1,471 @@
+namespace IR.Program is
+    use Collections.LIST
+    use Collections.MAP
+
+    use Source.LOCATION
+
+    use Semantic.Scope
+    use Semantic.Types.Type
+    use Semantic.Symbols.Symbol
+    use Semantic.Symbols.Classy
+    use Semantic.Symbols.GENERIC
+
+    use IR.Emitter.SRM_MEMBER_ORDER
+    use IR.Emitter.SRM_EMITTED_TYPE
+
+    /// The classes a whole program uses, one for each instantiation, with
+    /// the array types and the boxes scalars are held in, and the numbers
+    /// that place each in the class tree.
+    ///
+    /// Classes are found in two steps. `collect` takes every class that is
+    /// not generic, and until `number` is called, every instantiation asked
+    /// about is added too. `number` then numbers them all, and nothing is
+    /// added afterwards.
+    class CLASS_SET is
+        _object: CLASS_INSTANCE?
+        _holds_element: (Type) -> bool
+        _core: CoreClasses
+
+        _classes: MAP[CLASS_INSTANCE, CLASS_INSTANCE]
+        _new_classes: LIST[CLASS_INSTANCE]
+
+        // Each array type the program uses, with its element type. An array
+        // type is numbered as a class under the root.
+        _arrays: MAP[CLASS_INSTANCE, Type]
+
+        // The scalar types a value is boxed from, keyed by the box.
+        _boxed: MAP[CLASS_INSTANCE, Type]
+
+        _fields_left: Collections.SET[CLASS_INSTANCE]
+
+        _numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE]
+        _is_numbered: bool
+
+        /// A set whose classes derive from `object`.
+        ///
+        /// - object: the root class, or null for a program with no classes
+        /// - holds_element: whether the target can hold an array of a type;
+        ///   an array of any other type is not added
+        /// - core: the built-in types the set treats specially
+        init(object: Classy?, holds_element: (Type) -> bool, core: CoreClasses) is
+            _holds_element = holds_element
+            _core = core
+
+            _classes = MAP[CLASS_INSTANCE, CLASS_INSTANCE]()
+            _new_classes = LIST[CLASS_INSTANCE]()
+            _arrays = MAP[CLASS_INSTANCE, Type]()
+            _boxed = MAP[CLASS_INSTANCE, Type]()
+            _fields_left = Collections.SET[CLASS_INSTANCE]()
+
+            _numbering = CLASS_ID_NUMBERING[CLASS_INSTANCE]()
+
+            if let definition = object then
+                _object = intern(CLASS_INSTANCE.of(definition))
+            fi
+        si
+
+        /// The root class, or null for a set that knows no classes.
+        root: CLASS_INSTANCE? => _object
+
+        /// The numbers given to the classes, once `number` has run.
+        numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _numbering
+
+        /// The built-in types the set treats specially.
+        core: CoreClasses => _core
+
+        /// Whether `number` has run, after which nothing is added.
+        is_numbered: bool => _is_numbered
+
+        /// Every class held, boxes included, in the order added.
+        classes: Collections.Iterable[CLASS_INSTANCE] => _classes.values
+
+        /// Every array type held, with its element type, in the order added.
+        arrays: Collections.Iterable[Collections.KEY_VALUE_PAIR[CLASS_INSTANCE, Type]] => _arrays
+
+        /// Every box held, with the scalar type it holds, in the order
+        /// added.
+        boxes: Collections.Iterable[Collections.KEY_VALUE_PAIR[CLASS_INSTANCE, Type]] => _boxed
+
+        /// Every class held, and every array type.
+        classes_and_arrays: Collections.List[CLASS_INSTANCE] is
+            let result = LIST[CLASS_INSTANCE](_classes.values)
+
+            for (array, _) in _arrays do
+                result.add(array)
+            od
+
+            return result
+        si
+
+        /// Takes every class declared under `root` that is not generic, a box
+        /// for each scalar, and a box for each enum.
+        ///
+        /// - root: the scope the program's types are declared under
+        /// - scalars: the scalar types, each of which gets a box
+        collect(root: Scope, scalars: Collections.Iterable[Type]) is
+            for type in SRM_MEMBER_ORDER.types(root) do
+                if let declared = type.declared /\ is_object_type(declared) /\ !declared.is_generic then
+                    class_of(declared, MAP[Symbol, Type]())
+                fi
+            od
+
+            for scalar in scalars do
+                if let box: Classy = scalar.symbol then
+                    let boxed = intern(CLASS_INSTANCE.of(box))
+
+                    _boxed[boxed] = scalar
+                fi
+            od
+
+            // An enum is boxed as a scalar is, in a box of its own, so a
+            // boxed value says which enum it holds.
+            for type in SRM_MEMBER_ORDER.types(root) do
+                if let declared = type.declared /\ declared.symbol_kind =~ Semantic.Symbols.SymbolKind.ENUM then
+                    _boxed[intern(CLASS_INSTANCE.of(declared))] = Semantic.Types.NAMED(declared)
+                fi
+            od
+        si
+
+        /// The classes added since this was last asked, each once.
+        take_new_classes() -> Collections.List[CLASS_INSTANCE] is
+            let result = LIST[CLASS_INSTANCE](_new_classes)
+
+            _new_classes.clear()
+
+            return result
+        si
+
+        /// The one instance of `type` the set holds, adding it, and its
+        /// superclass, where it is new.
+        intern(type: CLASS_INSTANCE) -> CLASS_INSTANCE is
+            let existing: CLASS_INSTANCE mut
+
+            if _classes.try_get_value(type, existing ref) then
+                return existing
+            fi
+
+            _classes[type] = type
+            _new_classes.add(type)
+
+            superclass_of(type)
+
+            return type
+        si
+
+        /// Records that the types `type`'s fields hold are not added, because
+        /// the class is already reported as instantiating itself without end.
+        ///
+        /// - type: the class whose field types are left out
+        leave_field_types(type: CLASS_INSTANCE) =>
+            _fields_left.add(type)
+
+        /// Whether the types `type`'s fields hold were left out.
+        field_types_left_out(type: CLASS_INSTANCE) -> bool => _fields_left.contains(type)
+
+        /// Adds the type each of `type`'s fields holds, instance and static,
+        /// since the fields are laid out wherever the class is, whether or
+        /// not anything creates a value of those types. A class this adds is
+        /// taken by the next `take_new_classes`.
+        ///
+        /// - type: the class whose fields to add the types of
+        add_field_types(type: CLASS_INSTANCE) is
+            for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type.definition)) do
+                _add_held(type.specialize(`field.type))
+            od
+        si
+
+        // An array's element type is added before the array, which needs it
+        // to choose how its elements are stored.
+        _add_held(held: Type?) is
+            if !held? then
+                return
+            fi
+
+            let type = if held.is_optional /\ !held.is_value_type then held.optional_inner_type ?? held else held fi
+
+            if let generic: GENERIC = type.symbol /\ cast Classy?(generic.unspecialized_symbol) == _core.array_definition /\ type.arguments.count == 1 then
+                _add_held(type.arguments[0])
+            fi
+
+            class_of(type)
+        si
+
+        /// The class `definition` at the type arguments `type_map` gives its
+        /// parameters, added until the set is numbered. Null where the set
+        /// does not hold it, or where `definition` is not a class the object
+        /// model represents.
+        class_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? is
+            let arguments = LIST[Type]()
+            let map = MAP[Symbol, Type]()
+
+            for (parameter, argument) in type_map do
+                if parameter.owner == definition then
+                    map[parameter] = argument
+                fi
+            od
+
+            for name in definition.argument_names do
+                for (parameter, argument) in map do
+                    if parameter.name =~ name then
+                        arguments.add(argument)
+                    fi
+                od
+            od
+
+            // A closure's frame declares no type parameters of its own: its
+            // parameters are the enclosing function's, so they are owned by
+            // the function rather than by the frame.
+            if isa Semantic.Symbols.FRAME(definition) /\ arguments.count != definition.argument_names.count then
+                arguments.clear()
+                map.clear()
+
+                for i in 0..definition.argument_names.count do
+                    if let parameter = definition.type_parameter_at(i) then
+                        if let argument = TYPE_MAPS.argument_of(parameter, type_map) then
+                            map[parameter] = argument
+                            arguments.add(argument)
+                        fi
+                    fi
+                od
+            fi
+
+            let key = CLASS_INSTANCE(definition, arguments, map)
+
+            let existing: CLASS_INSTANCE mut
+
+            if _classes.try_get_value(key, existing ref) then
+                return existing
+            fi
+
+            if _is_numbered \/ !is_object_type(definition) \/ arguments.count != definition.argument_names.count then
+                return null
+            fi
+
+            // An instantiation is compiled only once every argument is a
+            // type rather than a type parameter still to be bound.
+            for argument in arguments do
+                if argument.is_type_variable then
+                    return null
+                fi
+            od
+
+            return intern(key)
+        si
+
+        /// The class a value of `type` is an instance of, or null where it
+        /// is not one the set holds. `type` must have no type parameters
+        /// left in it.
+        class_of(type: Type?) -> CLASS_INSTANCE? is
+            if !type? then
+                return null
+            fi
+
+            if let array = array_of(type) then
+                return array
+            fi
+
+            let symbol = type.symbol
+
+            if let generic: GENERIC = symbol then
+                if let definition: Classy = generic.unspecialized_symbol then
+                    return class_of(definition, generic.type_map)
+                fi
+            elif let definition: Classy = symbol then
+                return class_of(definition, MAP[Symbol, Type]())
+            fi
+
+            return null
+        si
+
+        /// The array type `type` is, added until the set is numbered. Null
+        /// where `type` is not an array, or where the target cannot hold its
+        /// elements.
+        array_of(type: Type?) -> CLASS_INSTANCE? is
+            let generic = cast GENERIC?(type?.symbol)
+
+            if !generic? then
+                return null
+            fi
+
+            let definition = cast Classy?(generic.unspecialized_symbol)
+
+            let arguments = type!.arguments
+
+            if !definition? \/ definition != _core.array_definition \/ arguments.count != 1 then
+                return null
+            fi
+
+            let element = arguments[0]
+
+            if element.is_type_variable \/ !_holds_element(element) then
+                return null
+            fi
+
+            let map = MAP[Symbol, Type]()
+
+            for (parameter, argument) in generic.type_map do
+                if parameter.owner == definition then
+                    map[parameter] = argument
+                fi
+            od
+
+            let key = CLASS_INSTANCE(definition, LIST[Type]([element]), map)
+
+            if _arrays.contains_key(key) then
+                return key
+            fi
+
+            if _is_numbered then
+                return null
+            fi
+
+            _arrays[key] = element
+
+            return key
+        si
+
+        /// Whether `type` is an array type.
+        is_array(type: CLASS_INSTANCE) -> bool => _arrays.contains_key(type)
+
+        /// The element type of the array type `type`.
+        array_element(type: CLASS_INSTANCE) -> Type => _arrays[type]
+
+        /// Whether `type` is a scalar's box rather than a class.
+        is_box(type: CLASS_INSTANCE) -> bool => _boxed.contains_key(type)
+
+        /// The scalar type a box holds a value of, or null where `type` is
+        /// not a box.
+        boxed_type(type: CLASS_INSTANCE) -> Type? is
+            let boxed: Type mut
+
+            if _boxed.try_get_value(type, boxed ref) then
+                return boxed
+            fi
+
+            return null
+        si
+
+        /// The box a value of the scalar `type` is held in, or null where
+        /// `type` is not a scalar.
+        box_type(type: Type?) -> CLASS_INSTANCE? is
+            if let box: Classy = type?.symbol then
+                let key = CLASS_INSTANCE.of(box)
+
+                let existing: CLASS_INSTANCE mut
+
+                if _classes.try_get_value(key, existing ref) /\ _boxed.contains_key(existing) then
+                    return existing
+                fi
+            fi
+
+            return null
+        si
+
+        /// The class `type` extends, where the program declares it, or null
+        /// where it extends the root.
+        superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? is
+            for ancestor in type.definition.ancestors do
+                if ancestor.is_trait then
+                    continue
+                fi
+
+                let specialized = type.specialize(ancestor)!
+
+                if let superclass = class_of(specialized) /\ superclass != type then
+                    if superclass.definition.is_object then
+                        return null
+                    fi
+
+                    return superclass
+                fi
+            od
+
+            return null
+        si
+
+        /// Numbers every class, box and array type held, depth first down
+        /// the class tree, with boxes and arrays under the root. Nothing is
+        /// added afterwards.
+        number() is
+            _is_numbered = true
+
+            let object = _object!
+
+            _numbering.add_root(object)
+
+            let added = Collections.SET[CLASS_INSTANCE]()
+            added.add(object)
+
+            for type in _classes.values do
+                if !_boxed.contains_key(type) then
+                    _add_class(type, added)
+                fi
+            od
+
+            for (box, _) in _boxed do
+                _numbering.add(box, object)
+            od
+
+            for (array, _) in _arrays do
+                _numbering.add(array, object)
+            od
+
+            _numbering.number()
+        si
+
+        _add_class(type: CLASS_INSTANCE, added: Collections.SET[CLASS_INSTANCE]) is
+            if added.contains(type) then
+                return
+            fi
+
+            let parent = superclass_of(type) ?? _object!
+
+            if !added.contains(parent) then
+                _add_class(parent, added)
+            fi
+
+            _numbering.add(type, parent)
+            added.add(type)
+        si
+
+        /// Whether `type` is a class the object model represents: not the
+        /// root, nothing reflected from an assembly, and a built-in type the
+        /// compiler constructs only where the core library gives it a
+        /// representation of its own.
+        is_object_type(type: Classy) -> bool is
+            let is_frame = isa Semantic.Symbols.FRAME(type) \/ isa Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type)
+
+            if type.is_object \/ type.is_reflected then
+                return false
+            fi
+
+            // bigint is constructed with no fields, and held as a box around
+            // the host's integer once the core library gives it members.
+            if type == _core.bigint then
+                return SRM_MEMBER_ORDER.methods(SRM_EMITTED_TYPE(type)) |> Ghul.Pipes.any(m => true)
+            fi
+
+            // A tuple family is constructed too, but held as a struct once
+            // the core library gives it fields.
+            if !is_frame /\ type.location == LOCATION.internal then
+                return _is_constructed_struct_with_fields(type)
+            fi
+
+            return isa Semantic.Symbols.CLASS(type) \/ isa Semantic.Symbols.STRUCT(type) \/ is_frame \/ type.is_union \/ type.is_variant
+        si
+
+        _is_constructed_struct_with_fields(type: Classy) -> bool static is
+            if !isa Semantic.Symbols.STRUCT(type) then
+                return false
+            fi
+
+            for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type)) do
+                if `field.is_instance then
+                    return true
+                fi
+            od
+
+            return false
+        si
+    si
+si

@@ -138,13 +138,10 @@ namespace IR.WasmGC is
         /// to the module.
         discovering: bool public
 
-        _classes: MAP[CLASS_INSTANCE, CLASS_INSTANCE]
-        _new_classes: LIST[CLASS_INSTANCE]
         _dispatched: Collections.SET[Function]
         _lowered: Collections.SET[IR.Values.Call.INNATE]
-        _is_built: bool
 
-        _numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE]
+        _class_set: CLASS_SET
 
         _type_indices: MAP[CLASS_INSTANCE, int]
         _layouts: MAP[CLASS_INSTANCE, LIST[VALUE_TYPE]]
@@ -164,19 +161,12 @@ namespace IR.WasmGC is
         _statics: MAP[(member: Symbol, owner: CLASS_INSTANCE), (index: int, type: VALUE_TYPE)]
         _namespace_globals: MAP[Symbol, (index: int, type: VALUE_TYPE)]
 
-        // The scalar types a value is boxed from, keyed by the box's
-        // place in the class tree.
-        _boxed: MAP[CLASS_INSTANCE, Type]
-
         _static_constructors: MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, initialised: int)]
 
-        // Each array type the program uses, with its element type. An
-        // array type is numbered as a class under the root, but every array
-        // whose elements are held the same way shares one struct type, so
-        // an array of a class is usable where an array of its superclass
-        // is expected.
-        _arrays: MAP[CLASS_INSTANCE, Type]
-        _fields_left: Collections.SET[CLASS_INSTANCE]
+        // The ways the program's arrays hold their elements, and the struct
+        // type each takes. Every array whose elements are held the same way
+        // shares one struct type, so an array of a class is usable where an
+        // array of its superclass is expected.
         _array_storages: Collections.SET[int]
         _array_storage_types: MAP[int, int]
 
@@ -206,7 +196,7 @@ namespace IR.WasmGC is
         unsupported: Collections.List[(location: LOCATION, construct: string)] => _unsupported
 
         /// The numbers given to the classes.
-        numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _numbering
+        numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _class_set.numbering
 
         /// A nullable reference to the root, which holds any object.
         object_reference: VALUE_TYPE => VALUE_TYPE.of_type_index(OBJECT_TYPE_INDEX, true)
@@ -230,12 +220,10 @@ namespace IR.WasmGC is
             _module = module
             _object_definition = object
 
-            _classes = MAP[CLASS_INSTANCE, CLASS_INSTANCE]()
-            _new_classes = LIST[CLASS_INSTANCE]()
             _dispatched = Collections.SET[Function]()
             _lowered = Collections.SET[IR.Values.Call.INNATE]()
 
-            _numbering = CLASS_ID_NUMBERING[CLASS_INSTANCE]()
+            _class_set = CLASS_SET(object, element => _holds_array_of(element), INNATE_CORE_CLASSES())
 
             _type_indices = MAP[CLASS_INSTANCE, int]()
             _layouts = MAP[CLASS_INSTANCE, LIST[VALUE_TYPE]]()
@@ -249,14 +237,11 @@ namespace IR.WasmGC is
             _statics = MAP[(member: Symbol, owner: CLASS_INSTANCE), (index: int, type: VALUE_TYPE)]()
             _namespace_globals = MAP[Symbol, (index: int, type: VALUE_TYPE)]()
 
-            _boxed = MAP[CLASS_INSTANCE, Type]()
             _displayers = MAP[CLASS_INSTANCE, int]()
             _boxes_made = Collections.SET[CLASS_INSTANCE]()
             _cells = Collections.SET[IR.LOCAL]()
             _static_constructors = MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, initialised: int)]()
 
-            _arrays = MAP[CLASS_INSTANCE, Type]()
-            _fields_left = Collections.SET[CLASS_INSTANCE]()
             _array_storages = Collections.SET[int]()
             _array_storage_types = MAP[int, int]()
 
@@ -270,39 +255,16 @@ namespace IR.WasmGC is
             _ordered = LIST[CLASS_INSTANCE]()
             _initialisers = MAP[CLASS_INSTANCE, LIST[INSTRUCTION]]()
 
-            if let definition = object then
-                _object = _intern(CLASS_INSTANCE.of(definition))
-            fi
+            _object = _class_set.root
 
             if let definition = string_type then
-                _string = _intern(CLASS_INSTANCE.of(definition))
+                _string = _class_set.intern(CLASS_INSTANCE.of(definition))
             fi
         si
 
-        /// Takes every class declared under `root` that is not generic.
-        collect(root: Scope) is
-            for type in SRM_MEMBER_ORDER.types(root) do
-                if let declared = type.declared /\ _is_object_type(declared) /\ !declared.is_generic then
-                    class_of(declared, MAP[Symbol, Type]())
-                fi
-            od
-
-            for scalar in _scalar_types() do
-                if let box: Classy = scalar.symbol then
-                    let boxed = _intern(CLASS_INSTANCE.of(box))
-
-                    _boxed[boxed] = scalar
-                fi
-            od
-
-            // An enum is boxed as a scalar is, in a box of its own, so a
-            // boxed value says which enum it holds.
-            for type in SRM_MEMBER_ORDER.types(root) do
-                if let declared = type.declared /\ declared.symbol_kind =~ Semantic.Symbols.SymbolKind.ENUM then
-                    _boxed[_intern(CLASS_INSTANCE.of(declared))] = Semantic.Types.NAMED(declared)
-                fi
-            od
-        si
+        /// Takes every class declared under `root` that is not generic, a
+        /// box for each scalar, and a box for each enum.
+        collect(root: Scope) => _class_set.collect(root, _scalar_types())
 
         /// Gives `owner` a method that no symbol of it declares, which
         /// dispatch reaches as it reaches the methods `owner` declares.
@@ -332,13 +294,7 @@ namespace IR.WasmGC is
         si
 
         /// The classes added since this was last asked, each once.
-        take_new_classes() -> Collections.List[CLASS_INSTANCE] is
-            let result = LIST[CLASS_INSTANCE](_new_classes)
-
-            _new_classes.clear()
-
-            return result
-        si
+        take_new_classes() -> Collections.List[CLASS_INSTANCE] => _class_set.take_new_classes()
 
         /// Records, while discovering, that a call dispatches on `method`
         /// through a vtable or the trait table, so whatever overrides it
@@ -374,182 +330,42 @@ namespace IR.WasmGC is
         was_lowered(call: IR.Values.Call.INNATE) -> bool => _lowered.contains(call)
 
         /// Every class the registry holds, boxes included.
-        classes: Collections.Iterable[CLASS_INSTANCE] => _classes.values
-
-        // The one instance of each class, so the maps below can be keyed by
-        // it. A class's superclass is added with it.
-        _intern(type: CLASS_INSTANCE) -> CLASS_INSTANCE is
-            let existing: CLASS_INSTANCE mut
-
-            if _classes.try_get_value(type, existing ref) then
-                return existing
-            fi
-
-            _classes[type] = type
-            _new_classes.add(type)
-
-            _superclass_of(type)
-
-            return type
-        si
+        classes: Collections.Iterable[CLASS_INSTANCE] => _class_set.classes
 
         /// Records that the types `type`'s fields hold are not added, because
         /// the class is already reported as instantiating itself without end.
         /// A field whose type is then missing is laid out as an object
         /// reference rather than reported again.
-        ///
-        /// - type: the class whose field types are left out
-        leave_field_types(type: CLASS_INSTANCE) =>
-            _fields_left.add(type)
+        leave_field_types(type: CLASS_INSTANCE) => _class_set.leave_field_types(type)
 
-        /// Adds the type each of `type`'s fields holds, instance and static,
-        /// since the fields are laid out wherever the class is, whether or
-        /// not anything creates a value of those types. A class this adds is
-        /// taken by the next `take_new_classes`.
-        ///
-        /// - type: the class whose fields to add the types of
-        add_field_types(type: CLASS_INSTANCE) is
-            for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type.definition)) do
-                _add_held(type.specialize(`field.type))
-            od
-        si
-
-        // An array's element type is added before the array, which needs it
-        // to choose how its elements are stored.
-        _add_held(held: Type?) is
-            if !held? then
-                return
-            fi
-
-            let type = if held.is_optional /\ !held.is_value_type then held.optional_inner_type ?? held else held fi
-
-            if let generic: GENERIC = type.symbol /\ cast Classy?(generic.unspecialized_symbol) == _array_definition /\ type.arguments.count == 1 then
-                _add_held(type.arguments[0])
-            fi
-
-            class_of(type)
-        si
+        /// Adds the type each of `type`'s fields holds, instance and static.
+        /// A class this adds is taken by the next `take_new_classes`.
+        add_field_types(type: CLASS_INSTANCE) => _class_set.add_field_types(type)
 
         /// The class `definition` at the type arguments `type_map` gives its
         /// parameters, added while discovering. Null where the registry does
         /// not hold it, or where `definition` is not a class the object
         /// model represents.
-        class_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? is
-            let arguments = LIST[Type]()
-            let map = MAP[Symbol, Type]()
-
-            for (parameter, argument) in type_map do
-                if parameter.owner == definition then
-                    map[parameter] = argument
-                fi
-            od
-
-            for name in definition.argument_names do
-                for (parameter, argument) in map do
-                    if parameter.name =~ name then
-                        arguments.add(argument)
-                    fi
-                od
-            od
-
-            // A closure's frame declares no type parameters of its own: its
-            // parameters are the enclosing function's, so they are owned by
-            // the function rather than by the frame.
-            if isa Semantic.Symbols.FRAME(definition) /\ arguments.count != definition.argument_names.count then
-                arguments.clear()
-                map.clear()
-
-                for i in 0..definition.argument_names.count do
-                    if let parameter = definition.type_parameter_at(i) then
-                        if let argument = TYPE_MAPS.argument_of(parameter, type_map) then
-                            map[parameter] = argument
-                            arguments.add(argument)
-                        fi
-                    fi
-                od
-            fi
-
-            let key = CLASS_INSTANCE(definition, arguments, map)
-
-            let existing: CLASS_INSTANCE mut
-
-            if _classes.try_get_value(key, existing ref) then
-                return existing
-            fi
-
-            if _is_built \/ !_is_object_type(definition) \/ arguments.count != definition.argument_names.count then
-                return null
-            fi
-
-            // An instantiation is compiled only once every argument is a
-            // type rather than a type parameter still to be bound.
-            for argument in arguments do
-                if argument.is_type_variable then
-                    return null
-                fi
-            od
-
-            return _intern(key)
-        si
+        class_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? =>
+            _class_set.class_of(definition, type_map)
 
         /// The class a value of `type` is an instance of, or null where it
         /// is not one the registry holds. `type` must have no type
         /// parameters left in it.
-        class_of(type: Type?) -> CLASS_INSTANCE? is
-            if !type? then
-                return null
-            fi
-
-            if let array = array_of(type) then
-                return array
-            fi
-
-            let symbol = type.symbol
-
-            if let generic: GENERIC = symbol then
-                if let definition: Classy = generic.unspecialized_symbol then
-                    return class_of(definition, generic.type_map)
-                fi
-            elif let definition: Classy = symbol then
-                return class_of(definition, MAP[Symbol, Type]())
-            fi
-
-            return null
-        si
+        class_of(type: Type?) -> CLASS_INSTANCE? => _class_set.class_of(type)
 
         /// Numbers every class held and builds the recursion group and the
         /// globals. Must run before anything else adds a type to the module.
         build() is
             assert _module.type_count() == 0 else "the object model's types must come first"
 
-            _is_built = true
+            _class_set.number()
 
             let object = _object!
 
-            _numbering.add_root(object)
-
-            let added = Collections.SET[CLASS_INSTANCE]()
-            added.add(object)
-
-            for type in _classes.values do
-                if !_boxed.contains_key(type) then
-                    _add_class(type, added)
-                fi
-            od
-
-            for (box, _) in _boxed do
-                _numbering.add(box, object)
-            od
-
-            for (array, _) in _arrays do
-                _numbering.add(array, object)
-            od
-
-            _numbering.number()
-
             let ordered = LIST[CLASS_INSTANCE]()
 
-            for type in _numbering.in_order() do
+            for type in _class_set.numbering.in_order() do
                 if !is_array(type) then
                     ordered.add(type)
                 fi
@@ -608,7 +424,7 @@ namespace IR.WasmGC is
             // as a class does, so it is planned with the classes.
             let planned = LIST[CLASS_INSTANCE](ordered)
 
-            for (array, _) in _arrays do
+            for (array, _) in _class_set.arrays do
                 planned.add(array)
             od
 
@@ -624,7 +440,7 @@ namespace IR.WasmGC is
 
             // An array's descriptor refers to its element's, so the arrays'
             // are added after every class's.
-            for (array, _) in _arrays do
+            for (array, _) in _class_set.arrays do
                 _add_descriptor_global(array)
             od
 
@@ -634,7 +450,7 @@ namespace IR.WasmGC is
                     GLOBAL(VALUE_TYPE.of_type_index(DESCRIPTOR_TYPE_INDEX, false), false, _closure_descriptor))
 
             for type in ordered do
-                if !_boxed.contains_key(type) /\ type != object then
+                if !_class_set.is_box(type) /\ type != object then
                     _add_statics(type)
                 fi
             od
@@ -660,13 +476,13 @@ namespace IR.WasmGC is
                 _fill_descriptor(type)
             od
 
-            for (array, element) in _arrays do
+            for (array, element) in _class_set.arrays do
                 _fill_array_descriptor(array, element)
             od
 
             // A function value is numbered after every class and array type,
             // so no class or trait test matches one.
-            let closure_id = _numbering.last_descendant(_object!) + 1
+            let closure_id = _class_set.numbering.last_descendant(_object!) + 1
 
             _closure_descriptor.add(I32_CONSTANT(closure_id))
             _closure_descriptor.add(I32_CONSTANT(closure_id))
@@ -970,7 +786,7 @@ namespace IR.WasmGC is
                 if let frame = class_of(closure.frame, function.type_map) /\ is_object_type(frame) then
                     return VALUE_TYPE.of_type_index(type_index(frame)!, true)
                 fi
-            elif let owner = owning_class(definition) /\ owner == _array_definition then
+            elif let owner = owning_class(definition) /\ owner == _class_set.core.array_definition then
                 for (parameter, element) in function.type_map do
                     if parameter.owner == owner then
                         let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
@@ -1000,74 +816,10 @@ namespace IR.WasmGC is
         /// The array type `type` is, added while discovering. Null where
         /// `type` is not an array, or where its elements are of a type the
         /// target cannot hold yet.
-        array_of(type: Type?) -> CLASS_INSTANCE? is
-            let generic = cast GENERIC?(type?.symbol)
-
-            if !generic? then
-                return null
-            fi
-
-            let definition = cast Classy?(generic.unspecialized_symbol)
-
-            let arguments = type!.arguments
-
-            if !definition? \/ definition != _array_definition \/ arguments.count != 1 then
-                return null
-            fi
-
-            let element = arguments[0]
-
-            if element.is_type_variable then
-                return null
-            fi
-
-            let storage = _array_storage(element)
-
-            if !storage? then
-                return null
-            fi
-
-            let map = MAP[Symbol, Type]()
-
-            for (parameter, argument) in generic.type_map do
-                if parameter.owner == definition then
-                    map[parameter] = argument
-                fi
-            od
-
-            let key = CLASS_INSTANCE(definition, LIST[Type]([element]), map)
-
-            if _arrays.contains_key(key) then
-                return key
-            fi
-
-            if _is_built then
-                return null
-            fi
-
-            _arrays[key] = element
-            _array_storages.add(storage)
-
-            return key
-        si
-
-        // The generic definition every array type is an instance of.
-        _array_definition: Classy? =>
-            cast Classy?(
-                cast GENERIC?(
-                    IoC.CONTAINER.instance.innate_symbol_lookup.get_array_type(
-                        IoC.CONTAINER.instance.innate_symbol_lookup.get_int_type()).symbol)?.unspecialized_symbol)
+        array_of(type: Type?) -> CLASS_INSTANCE? => _class_set.array_of(type)
 
         /// Every class the registry holds, and every array type.
-        classes_and_arrays: Collections.List[CLASS_INSTANCE] is
-            let result = LIST[CLASS_INSTANCE](_classes.values)
-
-            for (array, _) in _arrays do
-                result.add(array)
-            od
-
-            return result
-        si
+        classes_and_arrays: Collections.List[CLASS_INSTANCE] => _class_set.classes_and_arrays
 
         /// The class numbers of every array type a value of the array type
         /// `type` can be: `type` itself and, where its element is a
@@ -1081,14 +833,14 @@ namespace IR.WasmGC is
                 return result
             fi
 
-            let target = _arrays[type]
+            let target = _class_set.array_element(type)
 
-            for (array, element) in _arrays do
+            for (array, element) in _class_set.arrays do
                 if
                     array =~ type \/
                     (!target.is_value_type /\ !element.is_value_type /\ target.is_assignable_from(element))
                 then
-                    result.add(_numbering.id(array))
+                    result.add(_class_set.numbering.id(array))
                 fi
             od
 
@@ -1096,16 +848,16 @@ namespace IR.WasmGC is
         si
 
         /// Whether `type` is an array type.
-        is_array(type: CLASS_INSTANCE) -> bool => _arrays.contains_key(type)
+        is_array(type: CLASS_INSTANCE) -> bool => _class_set.is_array(type)
 
         /// The element type of the array type `type`.
-        array_element(type: CLASS_INSTANCE) -> Type => _arrays[type]
+        array_element(type: CLASS_INSTANCE) -> Type => _class_set.array_element(type)
 
         /// The struct type an array of `type` is held in, the array type its
         /// elements are held in, and the type of an element as held: a
         /// scalar as itself, and any reference as a reference to the root.
         array_storage(type: CLASS_INSTANCE) -> (struct_index: int, data_index: int, element: VALUE_TYPE) is
-            let storage = _array_storage(_arrays[type])!
+            let storage = _array_storage(_class_set.array_element(type))!
             let element = _array_storage_value_type(storage)
 
             if discovering then
@@ -1121,17 +873,29 @@ namespace IR.WasmGC is
         /// that the array was made for it: an array of a class with no
         /// subclasses can only be an array of exactly that class.
         array_store_is_checked(type: CLASS_INSTANCE) -> bool is
-            let element = _arrays[type]
+            let element = _class_set.array_element(type)
 
             if WASMGC_TYPES.scalar(element)? then
                 return false
             fi
 
             if let held = class_of(element) /\ _type_indices.contains_key(held) then
-                return _numbering.has_children(held)
+                return _class_set.numbering.has_children(held)
             fi
 
             return true
+        si
+
+        // Whether the target can hold an array of `element`, recording the
+        // storage such an array takes when it can.
+        _holds_array_of(element: Type) -> bool is
+            if let storage = _array_storage(element) then
+                _array_storages.add(storage)
+
+                return true
+            fi
+
+            return false
         si
 
         // How the elements of an array of `element` are held: one of the
@@ -1181,7 +945,7 @@ namespace IR.WasmGC is
                 fi
             od
 
-            for (array, element) in _arrays do
+            for (array, element) in _class_set.arrays do
                 _type_indices[array] = _array_storage_types[_array_storage(element)!]
             od
         si
@@ -1230,8 +994,8 @@ namespace IR.WasmGC is
         _fill_array_descriptor(array: CLASS_INSTANCE, element: Type) is
             let initialiser = _initialisers[array]
 
-            initialiser.add(I32_CONSTANT(_numbering.id(array)))
-            initialiser.add(I32_CONSTANT(_numbering.last_descendant(array)))
+            initialiser.add(I32_CONSTANT(_class_set.numbering.id(array)))
+            initialiser.add(I32_CONSTANT(_class_set.numbering.last_descendant(array)))
             initialiser.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _descriptor_globals[_object!]))
             initialiser.add_range(chars_of("{_display_name(element)}[]"))
 
@@ -1253,7 +1017,7 @@ namespace IR.WasmGC is
                 return null
             fi
 
-            let element = _arrays[type]
+            let element = _class_set.array_element(type)
 
             if WASMGC_TYPES.scalar(element)? then
                 return null
@@ -1266,85 +1030,8 @@ namespace IR.WasmGC is
             return null
         si
 
-        // Whether `type` is represented as a struct by this model. Traits
-        // have no instances of their own, structs and enums are value types
-        // with a representation of their own, and the built-in types the
-        // compiler constructs are not declared by the program.
-        _is_object_type(type: Classy) -> bool is
-            let is_frame = isa Semantic.Symbols.FRAME(type) \/ isa Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type)
-
-            if type.is_object \/ type.is_reflected then
-                return false
-            fi
-
-            // bigint is constructed with no fields, and held as a box around
-            // the host's integer once the core library gives it members.
-            if type == IoC.CONTAINER.instance.innate_symbol_lookup.get_bigint_type().symbol then
-                return SRM_MEMBER_ORDER.methods(SRM_EMITTED_TYPE(type)) |> Ghul.Pipes.any(m => true)
-            fi
-
-            // A tuple family is constructed too, but held as a struct once
-            // the core library gives it fields.
-            if !is_frame /\ type.location == LOCATION.internal then
-                return _is_constructed_struct_with_fields(type)
-            fi
-
-            return isa Semantic.Symbols.CLASS(type) \/ isa Semantic.Symbols.STRUCT(type) \/ is_frame \/ type.is_union \/ type.is_variant
-        si
-
-        _is_constructed_struct_with_fields(type: Classy) -> bool is
-            if !isa Semantic.Symbols.STRUCT(type) then
-                return false
-            fi
-
-            for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type)) do
-                if `field.is_instance then
-                    return true
-                fi
-            od
-
-            return false
-        si
-
-        _add_class(type: CLASS_INSTANCE, added: Collections.SET[CLASS_INSTANCE]) is
-            if added.contains(type) then
-                return
-            fi
-
-            let parent = _superclass_of(type) ?? _object!
-
-            if !added.contains(parent) then
-                _add_class(parent, added)
-            fi
-
-            _numbering.add(type, parent)
-            added.add(type)
-        si
-
-        // The class `type` extends, where the program declares it, or null
-        // where it extends the root.
-        _superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? is
-            for ancestor in type.definition.ancestors do
-                if ancestor.is_trait then
-                    continue
-                fi
-
-                let specialized = type.specialize(ancestor)!
-
-                if let superclass = class_of(specialized) /\ superclass != type then
-                    if superclass.definition.is_object then
-                        return null
-                    fi
-
-                    return superclass
-                fi
-            od
-
-            return null
-        si
-
         /// The class `type` extends, or null where that is the root.
-        superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? => _superclass_of(type)
+        superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? => _class_set.superclass_of(type)
 
         // A descriptor's type object is made the first time one is asked
         // for, so every descriptor starts without one; its displayer is
@@ -1446,9 +1133,7 @@ namespace IR.WasmGC is
         _sub_type(type: CLASS_INSTANCE) -> SUB_TYPE is
             let layout = LIST[VALUE_TYPE]()
 
-            let boxed: Type mut
-
-            if _boxed.try_get_value(type, boxed ref) then
+            if let boxed = _class_set.boxed_type(type) then
                 layout.add(VALUE_TYPE.of_type_index(DESCRIPTOR_TYPE_INDEX, false))
                 layout.add(value_type(boxed)!)
 
@@ -1504,7 +1189,7 @@ namespace IR.WasmGC is
                 return SUB_TYPE(_struct(layout), true, [OBJECT_TYPE_INDEX])
             fi
 
-            let parent = _superclass_of(type) ?? _object!
+            let parent = _class_set.superclass_of(type) ?? _object!
             let layout_types = LIST[Type?]()
 
             for inherited in _layouts[parent] do
@@ -1529,7 +1214,7 @@ namespace IR.WasmGC is
 
             return SUB_TYPE(
                 _struct(layout),
-                !_numbering.has_children(type),
+                !_class_set.numbering.has_children(type),
                 [_type_indices[parent]])
         si
 
@@ -1559,7 +1244,7 @@ namespace IR.WasmGC is
                 return value_type
             fi
 
-            if !owner? \/ !_fields_left.contains(owner) then
+            if !owner? \/ !_class_set.field_types_left_out(owner) then
                 _unsupported.add((`field.location, "a field of type {type}"))
             fi
 
@@ -1582,13 +1267,13 @@ namespace IR.WasmGC is
         _fill_descriptor(type: CLASS_INSTANCE) is
             let initialiser = _initialisers[type]
 
-            initialiser.add(I32_CONSTANT(_numbering.id(type)))
-            initialiser.add(I32_CONSTANT(_numbering.last_descendant(type)))
+            initialiser.add(I32_CONSTANT(_class_set.numbering.id(type)))
+            initialiser.add(I32_CONSTANT(_class_set.numbering.last_descendant(type)))
 
             if type == _object then
                 initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_type_index(DESCRIPTOR_TYPE_INDEX)))
             else
-                initialiser.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _descriptor_globals[_superclass_of(type) ?? _object!]))
+                initialiser.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _descriptor_globals[_class_set.superclass_of(type) ?? _object!]))
             fi
 
             for instruction in chars_of(display_name(type)) do
@@ -1650,7 +1335,7 @@ namespace IR.WasmGC is
                         _namespace_globals[`field] =
                             (_module.add_global(GLOBAL(value_type, true, [default_value(value_type)])), value_type)
                     od
-                elif let declared = type.declared /\ !_is_object_type(declared) then
+                elif let declared = type.declared /\ !_class_set.is_object_type(declared) then
                     for method in SRM_MEMBER_ORDER.methods(type) do
                         if method.is_static_constructor then
                             _unsupported.add((method.location, "a static constructor"))
@@ -1746,7 +1431,7 @@ namespace IR.WasmGC is
         /// Whether `type` is a struct, which is held in a box of its own. A
         /// scalar's box is not one: its definition is the scalar's.
         is_struct(type: CLASS_INSTANCE) -> bool =>
-            isa Semantic.Symbols.STRUCT(type.definition) /\ !is_box(type) /\ _is_object_type(type.definition)
+            isa Semantic.Symbols.STRUCT(type.definition) /\ !is_box(type) /\ _class_set.is_object_type(type.definition)
 
         /// The struct a value of `type` is a box of, or null where `type` is
         /// not a struct the registry holds. An optional struct is not one:
@@ -1927,22 +1612,14 @@ namespace IR.WasmGC is
 
         /// Whether `type` is a class with a struct type of its own.
         is_object_type(type: CLASS_INSTANCE) -> bool =>
-            !is_box(type) /\ _is_object_type(type.definition)
+            !is_box(type) /\ _class_set.is_object_type(type.definition)
 
         /// Whether `type` is a scalar's box rather than a class.
-        is_box(type: CLASS_INSTANCE) -> bool => _boxed.contains_key(type)
+        is_box(type: CLASS_INSTANCE) -> bool => _class_set.is_box(type)
 
         /// The scalar type a box holds a value of, or null where `type` is
         /// not a box.
-        boxed_type(type: CLASS_INSTANCE) -> Type? is
-            let boxed: Type mut
-
-            if _boxed.try_get_value(type, boxed ref) then
-                return boxed
-            fi
-
-            return null
-        si
+        boxed_type(type: CLASS_INSTANCE) -> Type? => _class_set.boxed_type(type)
 
         /// Where the instance field `field` lives in `owner`, the class
         /// declaring it, or null where the registry does not hold it.
@@ -2085,7 +1762,7 @@ namespace IR.WasmGC is
         /// Whether a value of `type` can exist: a box only where something
         /// boxes a value in it.
         is_instantiated(type: CLASS_INSTANCE) -> bool =>
-            !_boxed.contains_key(type) \/ _boxes_made.contains(type)
+            !_class_set.is_box(type) \/ _boxes_made.contains(type)
 
         /// The struct type a reference to a value of reference type is held
         /// in: a cell with one field, `REFERENCE_CELL_VALUE`, holding any
@@ -2145,26 +1822,14 @@ namespace IR.WasmGC is
 
         /// The box a value of the scalar `type` is held in, or null where
         /// `type` is not a scalar.
-        box_type(type: Type?) -> CLASS_INSTANCE? is
-            if let box: Classy = type?.symbol then
-                let key = CLASS_INSTANCE.of(box)
-
-                let existing: CLASS_INSTANCE mut
-
-                if _classes.try_get_value(key, existing ref) /\ _boxed.contains_key(existing) then
-                    return existing
-                fi
-            fi
-
-            return null
-        si
+        box_type(type: Type?) -> CLASS_INSTANCE? => _class_set.box_type(type)
 
         /// Whether every instance of `derived` is an instance of `base`.
         is_subclass(derived: CLASS_INSTANCE, base: CLASS_INSTANCE) -> bool =>
             base == _object \/
             _type_indices.contains_key(derived) /\
             _type_indices.contains_key(base) /\
-            _numbering.is_within(derived, base)
+            _class_set.numbering.is_within(derived, base)
 
         /// Whether `type` is the root class.
         is_object(type: CLASS_INSTANCE) -> bool => type == _object
