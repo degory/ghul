@@ -39,6 +39,7 @@ namespace IR.LLVMTarget is
         _scalars: (Type?) -> Scalar?
         _is_string: (Type?) -> bool
         _strings: LLVM_STRINGS?
+        _arrays: LLVM_ARRAYS?
 
         _entry: BLOCK
         _block: BLOCK
@@ -69,15 +70,17 @@ namespace IR.LLVMTarget is
         /// - return_type: the type the function returns
         /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
         /// - strings: where string literals and the runtime's functions are declared, or null where strings are not lowered
+        /// - arrays: where array descriptors are declared, or null where arrays are not lowered
         init(
             module: MODULE,
             function: FUNCTION,
             instance: FUNCTION_INSTANCE?,
             return_type: Type?,
             callee: (FUNCTION_INSTANCE) -> FUNCTION?,
-            strings: LLVM_STRINGS?
+            strings: LLVM_STRINGS?,
+            arrays: LLVM_ARRAYS?
         ) is
-            self.init(module, function, instance, return_type, callee, strings, t => LLVM_TYPES.scalar(t), t => LLVM_TYPES.is_string(t))
+            self.init(module, function, instance, return_type, callee, strings, arrays, t => LLVM_TYPES.scalar(t), t => LLVM_TYPES.is_string(t))
         si
 
         /// - module: where intrinsics the body calls are declared
@@ -86,6 +89,7 @@ namespace IR.LLVMTarget is
         /// - return_type: the type the function returns
         /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
         /// - strings: where string literals and the runtime's functions are declared, or null where strings are not lowered
+        /// - arrays: where array descriptors are declared, or null where arrays are not lowered
         /// - scalars: the scalar kind a value of a type is, or null where it is not a scalar
         /// - is_string: whether a type is `string`
         init(
@@ -95,10 +99,12 @@ namespace IR.LLVMTarget is
             return_type: Type?,
             callee: (FUNCTION_INSTANCE) -> FUNCTION?,
             strings: LLVM_STRINGS?,
+            arrays: LLVM_ARRAYS?,
             scalars: (Type?) -> Scalar?,
             is_string: (Type?) -> bool
         ) is
             _strings = strings
+            _arrays = arrays
             _scalars = scalars
             _is_string = is_string
             _module = module
@@ -167,7 +173,7 @@ namespace IR.LLVMTarget is
         _held(type: Type?) -> LLVM.Type? =>
             if let scalar = _scalar(type) then
                 LLVM_TYPES.value_type(scalar)
-            elif _is_string(_specialize(type)) then
+            elif _is_string(_specialize(type)) \/ LLVM_TYPES.is_array(_specialize(type)) then
                 Types.pointer
             else
                 null
@@ -536,11 +542,98 @@ namespace IR.LLVMTarget is
         visit(leave: Values.LEAVE_FILE) is si
         visit(closure: Values.MAKE_CLOSURE) is _report("a function value") si
 
-        visit(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("an array") si
-        visit_address(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("an array") si
-        visit(array: Values.NEW_ARRAY) is _report("an array") si
-        visit(store: Values.STORE_ARRAY_ELEMENT) is _report("an array") si
-        visit(sequence: Values.SEQUENCE) is _report("a sequence") si
+        visit(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("the address of an array element") si
+        visit_address(address: Values.ARRAY_ELEMENT_ADDRESS) is _report("the address of an array element") si
+
+        visit(array: Values.NEW_ARRAY) is
+            _new_array(array.type, array.count)
+        si
+
+        visit(store: Values.STORE_ARRAY_ELEMENT) is
+            _store_array_element(store.array, store.index, store.element)
+        si
+
+        visit(sequence: Values.SEQUENCE) is
+            let type = _array_of(sequence.type)
+
+            if !type? then
+                return
+            fi
+
+            let arrays = _arrays!
+            let result = arrays.allocate(_current, type, _i32(sequence.values.count))
+
+            for (i, value) in sequence.values |> Ghul.Pipes.index() do
+                if let element = _value_of(value) then
+                    arrays.store(_current, type, result, _i32(i), _normalise_for(element, sequence.element_type))
+                else
+                    return
+                fi
+            od
+
+            _push(result)
+        si
+
+        // The array type a value of `type` is, or null, reported, where the
+        // target holds no arrays of its element type.
+        _array_of(type: Type?) -> CLASS_INSTANCE? is
+            if let arrays = _arrays, array = arrays.array_of(_specialize(type)) then
+                return array
+            fi
+
+            _report("an array of type {type}")
+
+            return null
+        si
+
+        _new_array(array_type: Type?, count: Value) is
+            if let type = _array_of(array_type), length = _value_of(count) then
+                _push(_arrays!.allocate(_current, type, length))
+            fi
+        si
+
+        _store_array_element(array_value: Value, index_value: Value, element_value: Value) is
+            if let type = _array_of(array_value.type),
+                array = _value_of(array_value),
+                index = _value_of(index_value),
+                element = _value_of(element_value)
+            then
+                let arrays = _arrays!
+
+                _check_index(array, index)
+
+                arrays.store(_current, type, array, index, _normalise_for(element, arrays.element_of(type)))
+            fi
+        si
+
+        // Throws where `index` is outside the array `array` points at, an
+        // unsigned comparison catching a negative index too. Until the target
+        // has exception objects, what is thrown carries no type or message.
+        _check_index(array: LLVM.Value, index: LLVM.Value) is
+            let in_range = _current.compare(IntegerPredicate.ULT, index, _arrays!.count(_current, array))
+
+            let outside = _new_block()
+            let inside = _new_block()
+
+            _current.branch(in_range, inside, outside)
+
+            _start(outside)
+
+            _current.call(_strings!.runtime("$ghul_throw", LLVM.Type.VOID, [Types.pointer]), [LLVM.Values.null_pointer])
+            _current.unreachable()
+
+            _start(inside)
+        si
+
+        // The built-in array operation a call to `function` performs, or
+        // null where it performs none.
+        _array_operation(function: Function) -> string? is
+            if let operation = cast Function?(function.root_specialized_from)?.intrinsic_operation /\ operation.starts_with("array.") then
+                return operation
+            fi
+
+            return null
+        si
 
         visit(compare: Values.COMPARE_ORDER_TO_ZERO) is
             if let value = _value_of(compare.value) then
@@ -1162,7 +1255,27 @@ namespace IR.LLVMTarget is
         si
 
         visit(call: Values.Call.STRUCT) is _report("a method of a struct") si
-        visit(call: Values.Call.INSTANCE) is _report("an instance method") si
+
+        /// An array's count and indexer lower to the operations they stand
+        /// for. No other instance method can be called yet.
+        visit(call: Values.Call.INSTANCE) is
+            let operation = _array_operation(call.function)
+
+            if operation =~ "array.count" then
+                if let _ = _array_of(call.from.type), array = _value_of(call.from) then
+                    _push(_arrays!.count(_current, array))
+                fi
+            elif operation =~ "array.get" then
+                if let type = _array_of(call.from.type), array = _value_of(call.from), index = _value_of(call.arguments[0]) then
+                    _check_index(array, index)
+
+                    _push(_arrays!.load(_current, type, array, index))
+                fi
+            else
+                _report("an instance method")
+            fi
+        si
+
         visit(call: Values.Call.CLOSURE) is _report("a function value") si
         /// A built-in operation lowers to the IR the operation stands for,
         /// made once and reused by every later lowering of the same body.
@@ -1187,6 +1300,10 @@ namespace IR.LLVMTarget is
             if let operation = function.intrinsic_operation then
                 if operation.starts_with("host.") then
                     _call_host(operation.substring(5), function, arguments)
+                elif operation =~ "array.new" then
+                    _new_array(_instance_of(function).specialize(cast Function?(function.root_specialized_from)!.return_type), arguments[0])
+                elif operation =~ "array.set" then
+                    _store_array_element(arguments[0], arguments[1], arguments[2])
                 else
                     _report("the intrinsic {operation}")
                 fi

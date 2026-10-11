@@ -1,0 +1,200 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Collections.MAP
+
+    use Semantic.Types.Type
+
+    use LLVM.BLOCK
+    use LLVM.Conversion
+    use LLVM.FUNCTION
+    use LLVM.GLOBAL_VARIABLE
+    use LLVM.IntegerFlags
+    use LLVM.Intrinsics
+    use LLVM.Linkage
+    use LLVM.MODULE
+    use LLVM.PARAMETER
+    use LLVM.Types
+    use LLVM.Values
+
+    /// An array on the LLVM target: one object holding its type's
+    /// descriptor, a word nothing reads, the number of elements and the
+    /// elements, laid out as `{ ptr, i32, i32, [N x E] }`, so the count sits
+    /// where a string's does.
+    ///
+    /// An element of a kind narrower than 32 bits is stored at its own
+    /// width, so a `ubyte[]` holds one byte for each element.
+    class LLVM_ARRAYS is
+        _module: MODULE
+        _strings: LLVM_STRINGS
+        _classes: CLASS_SET
+        _descriptors: MAP[CLASS_INSTANCE, LLVM.Value]
+
+        /// The offset of the count of elements within an array.
+        COUNT_OFFSET: int static => 12
+
+        /// The offset of the first element within an array.
+        ELEMENTS_OFFSET: int static => 16
+
+        /// - module: where descriptors and the runtime's functions are added
+        /// - strings: where the runtime's functions are declared
+        /// - classes: the program's classes, which the array types it uses
+        ///   are added to
+        init(module: MODULE, strings: LLVM_STRINGS, classes: CLASS_SET) is
+            _module = module
+            _strings = strings
+            _classes = classes
+            _descriptors = MAP[CLASS_INSTANCE, LLVM.Value]()
+        si
+
+        /// Whether the target can hold an array of `element`.
+        holds_element(element: Type) -> bool static => storage_type(element)?
+
+        /// The type an element of `element` is stored as, or null where the
+        /// target holds no values of it.
+        storage_type(element: Type) -> LLVM.Type? static =>
+            if let scalar = LLVM_TYPES.scalar(element) then
+                case scalar
+                when Scalar.BOOL, Scalar.INT8, Scalar.UINT8 then Types.i8
+                when Scalar.CHAR, Scalar.INT16, Scalar.UINT16 then Types.i16
+                else LLVM_TYPES.value_type(scalar)
+                esac
+            else
+                LLVM_TYPES.value_type(element)
+            fi
+
+        /// The array type `type` is, or null where it is not an array the
+        /// target holds.
+        array_of(type: Type?) -> CLASS_INSTANCE? => _classes.array_of(type)
+
+        /// The element type of `array`.
+        element_of(array: CLASS_INSTANCE) -> Type => _classes.array_element(array)
+
+        /// The descriptor of `array`, one for each array type.
+        descriptor(array: CLASS_INSTANCE) -> LLVM.Value is
+            let found: LLVM.Value mut
+
+            if _descriptors.try_get_value(array, found ref) then
+                return found
+            fi
+
+            let global = GLOBAL_VARIABLE("$ghul_array_descriptor_{_descriptors.count}", Types.i8, Values.zero(Types.i8), true)
+
+            global.linkage = Linkage.INTERNAL
+
+            _module.add_global(global)
+
+            _descriptors[array] = global.reference
+
+            return global.reference
+        si
+
+        /// A new array of `array` holding `count` elements, each zero. An
+        /// array of pointers is one the collector scans.
+        /// - block: where the allocation goes
+        /// - array: the array type
+        /// - count: the number of elements, an `i32`
+        allocate(block: BLOCK, array: CLASS_INSTANCE, count: LLVM.Value) -> LLVM.Value is
+            let storage = storage_type(element_of(array))!
+
+            let wide = block.convert(Conversion.SIGN_EXTEND, count, Types.i64)
+            let bytes = block.binary(LLVM.BinaryOperator.MUL, IntegerFlags.NONE, wide, Values.i64(cast long(_size(storage))))
+            let size = block.binary(LLVM.BinaryOperator.ADD, IntegerFlags.NONE, bytes, Values.i64(cast long(ELEMENTS_OFFSET)))
+
+            let allocator = if isa LLVM.Type.POINTER(storage) then "$ghul_alloc" else "$ghul_alloc_atomic" fi
+
+            let result = block.call(_strings.runtime(allocator, Types.pointer, [Types.pointer, Types.i64]), [descriptor(array), size])!
+
+            block.store(count, block.element_pointer(Types.i8, result, [Values.i32(COUNT_OFFSET)], true), 4)
+
+            return result
+        si
+
+        /// The number of elements in the array `value` points at.
+        count(block: BLOCK, value: LLVM.Value) -> LLVM.Value =>
+            block.load(Types.i32, block.element_pointer(Types.i8, value, [Values.i32(COUNT_OFFSET)], true), 4)
+
+        /// The element at `index` in the array `value` points at, widened
+        /// to the type it is held in.
+        load(block: BLOCK, array: CLASS_INSTANCE, value: LLVM.Value, index: LLVM.Value) -> LLVM.Value is
+            let element = element_of(array)
+            let storage = storage_type(element)!
+
+            let loaded = block.load(storage, _address(block, storage, value, index), 0)
+
+            if let scalar = LLVM_TYPES.scalar(element) /\ LLVM_TYPES.is_narrow(scalar) then
+                return block.convert(
+                    if LLVM_TYPES.is_unsigned(scalar) then Conversion.ZERO_EXTEND else Conversion.SIGN_EXTEND fi,
+                    loaded,
+                    Types.i32)
+            fi
+
+            return loaded
+        si
+
+        /// Stores `element` at `index` in the array `value` points at,
+        /// narrowed to the width it is stored at.
+        store(block: BLOCK, array: CLASS_INSTANCE, value: LLVM.Value, index: LLVM.Value, element: LLVM.Value) is
+            let storage = storage_type(element_of(array))!
+
+            let stored =
+                if LLVM_TYPES.width(storage) > 0 /\ LLVM_TYPES.width(storage) < LLVM_TYPES.width(element.type) then
+                    block.convert(Conversion.TRUNCATE, element, storage)
+                else
+                    element
+                fi
+
+            block.store(stored, _address(block, storage, value, index), 0)
+        si
+
+        /// Adds the function the native runtime calls to make a `ubyte[]`,
+        /// which every program defines.
+        add_exports() is
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            let function =
+                FUNCTION(
+                    LLVM_STRINGS.MAKE_BYTES_NAME,
+                    Types.pointer,
+                    [PARAMETER(Types.pointer, "bytes"), PARAMETER(Types.i32, "length")])
+
+            let block = function.add_block("entry")
+
+            if let array = array_of(lookup.get_array_type(lookup.get_ubyte_type())) then
+                let length = function.parameter(1)
+                let result = allocate(block, array, length)
+
+                block.call(
+                    _module.declare_intrinsic(Intrinsics.memcpy()),
+                    [
+                        block.element_pointer(Types.i8, result, [Values.i32(ELEMENTS_OFFSET)], true),
+                        function.parameter(0),
+                        block.convert(Conversion.SIGN_EXTEND, length, Types.i64),
+                        Values.boolean(false)
+                    ])
+
+                block.return_value(result)
+            else
+                block.return_value(Values.null_pointer)
+            fi
+
+            _module.add_function(function)
+        si
+
+        _address(block: BLOCK, storage: LLVM.Type, value: LLVM.Value, index: LLVM.Value) -> LLVM.Value =>
+            block.element_pointer(
+                storage,
+                block.element_pointer(Types.i8, value, [Values.i32(ELEMENTS_OFFSET)], true),
+                [index],
+                true)
+
+        _size(storage: LLVM.Type) -> int =>
+            case LLVM_TYPES.width(storage)
+            when 8 then 1
+            when 16 then 2
+            when 32 then 4
+            else
+                if storage =~ LLVM.Type.FLOAT then 4 else 8 fi
+            esac
+    si
+si
