@@ -146,8 +146,8 @@ A run under `llvm` links with ghul-llvm, which is not on every machine. So the
 its `run_targets`, and passes over every llvm run: a `targets` file's `llvm`
 variant and a test whose `ghulflags` name `--target llvm` alike, reporting how
 many it passed over. Those runs are made only by a configuration whose
-`run_targets` names `llvm`, on a machine with ghul-llvm on the PATH, as CI's
-llvm job is. A test author adding `llvm` to a `targets` file runs it that way;
+`run_targets` names `llvm`, on a machine with ghul-llvm on the PATH. A test
+author adding `llvm` to a `targets` file runs it that way;
 neither the shards nor `build/llvm-validate.sh` reach it.
 
 `build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
