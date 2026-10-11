@@ -141,12 +141,22 @@ Without the libraries a wasm run fails to compile, which is the right answer: th
 test asserts the program on that target, and silently skipping it would hide
 the gap the `targets` file exists to show.
 
+A run under `llvm` links with ghul-llvm, which is not on every machine. So the
+`local` configuration, and `ci` through it, lists only `dotnet` and `wasm` in
+its `run_targets`, and passes over every llvm run: a `targets` file's `llvm`
+variant and a test whose `ghulflags` name `--target llvm` alike, reporting how
+many it passed over. Those runs are made only by a configuration whose
+`run_targets` names `llvm`, on a machine with ghul-llvm on the PATH. A test
+author adding `llvm` to a `targets` file runs it that way;
+neither the shards nor `build/llvm-validate.sh` reach it.
+
 `build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
 compiler writes for their target to an engine. They select tests by the target
 the `ghulflags` name, wherever the test lives, so a target test outside
 `wasm/` or `llvm/` is checked too. A test that runs under the target through a
-`targets` file is left to ghul-test, which builds it with the core library and
-runs it.
+`targets` file is left to ghul-test: under `wasm`, the configuration that runs
+the suite builds it with the core library and runs it; under `llvm`, only a
+configuration whose `run_targets` names `llvm` does, as described above.
 
 ## Generated tests
 
