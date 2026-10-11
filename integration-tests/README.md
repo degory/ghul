@@ -154,8 +154,9 @@ neither the shards nor `build/llvm-validate.sh` reach it.
 compiler writes for their target to an engine. They select tests by the target
 the `ghulflags` name, wherever the test lives, so a target test outside
 `wasm/` or `llvm/` is checked too. A test that runs under the target through a
-`targets` file is left to ghul-test, which builds it with the core library and
-runs it.
+`targets` file is left to ghul-test: under `wasm`, the configuration that runs
+the suite builds it with the core library and runs it; under `llvm`, only a
+configuration whose `run_targets` names `llvm` does, as described above.
 
 ## Generated tests
 

@@ -50,9 +50,9 @@ failed=0
 
 # Every test under $root whose ghulflags name `--target $target`, printed
 # as its directory and its flags, tab-separated. A test that runs under the
-# target through a `targets` file is left to ghul-test, which builds it with
-# the core library and runs it, so there is nothing an engine could add. A
-# `.targets` directory holds ghul-test's own copies of a test, not tests.
+# target through a `targets` file is left to ghul-test, run by a configuration
+# whose run_targets names llvm. A `.targets` directory holds ghul-test's own
+# copies of a test, not tests.
 tests_for_target() {
     find "$root" -name ghulflags -not -path "*/.targets/*" | sort | while IFS= read -r flags_file; do
         dir="$(dirname "$flags_file")"
