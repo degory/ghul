@@ -37,6 +37,8 @@ namespace IR.LLVMTarget is
         _return_type: Type?
         _callee: (FUNCTION_INSTANCE) -> FUNCTION?
         _scalars: (Type?) -> Scalar?
+        _is_string: (Type?) -> bool
+        _strings: LLVM_STRINGS?
 
         _entry: BLOCK
         _block: BLOCK
@@ -66,14 +68,16 @@ namespace IR.LLVMTarget is
         /// - instance: the function instance the body belongs to, or null where it belongs to none
         /// - return_type: the type the function returns
         /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
+        /// - strings: where string literals and the runtime's functions are declared, or null where strings are not lowered
         init(
             module: MODULE,
             function: FUNCTION,
             instance: FUNCTION_INSTANCE?,
             return_type: Type?,
-            callee: (FUNCTION_INSTANCE) -> FUNCTION?
+            callee: (FUNCTION_INSTANCE) -> FUNCTION?,
+            strings: LLVM_STRINGS?
         ) is
-            self.init(module, function, instance, return_type, callee, t => LLVM_TYPES.scalar(t))
+            self.init(module, function, instance, return_type, callee, strings, t => LLVM_TYPES.scalar(t), t => LLVM_TYPES.is_string(t))
         si
 
         /// - module: where intrinsics the body calls are declared
@@ -81,16 +85,22 @@ namespace IR.LLVMTarget is
         /// - instance: the function instance the body belongs to, or null where it belongs to none
         /// - return_type: the type the function returns
         /// - callee: the LLVM function a call to an instance names, or null where it cannot be called
+        /// - strings: where string literals and the runtime's functions are declared, or null where strings are not lowered
         /// - scalars: the scalar kind a value of a type is, or null where it is not a scalar
+        /// - is_string: whether a type is `string`
         init(
             module: MODULE,
             function: FUNCTION,
             instance: FUNCTION_INSTANCE?,
             return_type: Type?,
             callee: (FUNCTION_INSTANCE) -> FUNCTION?,
-            scalars: (Type?) -> Scalar?
+            strings: LLVM_STRINGS?,
+            scalars: (Type?) -> Scalar?,
+            is_string: (Type?) -> bool
         ) is
+            _strings = strings
             _scalars = scalars
+            _is_string = is_string
             _module = module
             _function = function
             _instance = instance
@@ -155,7 +165,13 @@ namespace IR.LLVMTarget is
         _scalar(type: Type?) -> Scalar? => _scalar_of(_specialize(type))
 
         _held(type: Type?) -> LLVM.Type? =>
-            if let scalar = _scalar(type) then LLVM_TYPES.value_type(scalar) else null fi
+            if let scalar = _scalar(type) then
+                LLVM_TYPES.value_type(scalar)
+            elif _is_string(_specialize(type)) then
+                Types.pointer
+            else
+                null
+            fi
 
         // The block instructions go into, opened afresh where the last one
         // ended in a terminator: code after an unconditional exit is
@@ -373,7 +389,13 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        visit(string: Values.Literal.STRING) is _report("a string literal") si
+        visit(string: Values.Literal.STRING) is
+            if let strings = _strings then
+                _push(strings.literal(string.value))
+            else
+                _report("a string literal")
+            fi
+        si
         visit(decimal: Values.Literal.DECIMAL) is _report("a decimal literal") si
         visit(bigint: Values.Literal.BIGINT) is _report("a bigint literal") si
 
@@ -531,7 +553,17 @@ namespace IR.LLVMTarget is
         visit(compare: Values.DECIMAL_COMPARE) is _report("decimal arithmetic") si
         visit(convert: Values.DECIMAL_CONVERT) is _report("a decimal conversion") si
         visit(equality: Values.EQUALITY_COMPARISON) is _report("an equality comparison") si
-        visit(test: Values.HAS_VALUE) is _report("an optional value") si
+        /// A reference optional is present where it is not null. A value-type
+        /// optional is not lowered yet.
+        visit(test: Values.HAS_VALUE) is
+            if let value = _value_of(test.value) then
+                if value.type =~ Types.pointer then
+                    _push(_bool(_current.compare(IntegerPredicate.NE, value, LLVM.Values.null_pointer)))
+                else
+                    _report("an optional value of type {test.value.type}")
+                fi
+            fi
+        si
         visit(check: Values.REFERENCE_NULL_CHECK) is _report("a null check") si
 
         visit(conversion: Values.SCALAR_CONVERSION) is
@@ -605,7 +637,9 @@ namespace IR.LLVMTarget is
         visit(repack: Values.TUPLE_REPACK) is _report("a tuple") si
         visit(spilled: Values.SPILLED_SUBJECT) is _report("a spilled value") si
 
-        visit(null_value: Values.NULL) is _report("null") si
+        visit(null_value: Values.NULL) is
+            _push(LLVM.Values.null_pointer)
+        si
         visit(box: Values.BOX) is _report("a boxed value") si
         visit(unbox: Values.UNBOX) is _report("a boxed value") si
         visit(conversion: Values.CAST) is _report("a cast") si
@@ -1150,8 +1184,13 @@ namespace IR.LLVMTarget is
                 TYPE_MAPS.function_map(function, _type_map))
 
         _call(function: Function, arguments: Collections.List[Value]) is
-            if function.intrinsic_operation? then
-                _report("the intrinsic {function.intrinsic_operation}")
+            if let operation = function.intrinsic_operation then
+                if operation.starts_with("host.") then
+                    _call_host(operation.substring(5), function, arguments)
+                else
+                    _report("the intrinsic {operation}")
+                fi
+
                 return
             fi
 
@@ -1175,6 +1214,64 @@ namespace IR.LLVMTarget is
 
             if let result = _current.call(callee, values.to_array()) then
                 _push(result)
+            fi
+        si
+
+        // A host operation is a function the native runtime defines, named
+        // for the operation. A string crosses as the address of its code
+        // units and their count, and comes back as a string the runtime made
+        // through `ghul_make_string`.
+        _call_host(operation: string, function: Function, arguments: Collections.List[Value]) is
+            let strings = _strings
+
+            if !strings? then
+                _report("the host operation {operation}")
+                return
+            fi
+
+            let parameter_types = LIST[LLVM.Type]()
+            let values = LIST[LLVM.Value]()
+            let formals = function.arguments
+
+            for i in 0..arguments.count do
+                let formal = if i < formals.count then formals[i] else arguments[i].type fi
+
+                let value = _value_of(arguments[i])
+
+                if !value? then
+                    return
+                fi
+
+                if let scalar = _scalar(formal) then
+                    parameter_types.add(LLVM_TYPES.value_type(scalar))
+                    values.add(_normalise_for(value, formal))
+                elif _is_string(_specialize(formal)) then
+                    parameter_types.add(Types.pointer)
+                    parameter_types.add(Types.i32)
+                    values.add(strings.chars(_current, value))
+                    values.add(strings.length(_current, value))
+                else
+                    _report("a host operation taking {formal}")
+                    return
+                fi
+            od
+
+            let result_type =
+                if LLVM_TYPES.is_void(function.return_type) then
+                    LLVM.Type.VOID
+                else
+                    _held(function.return_type)
+                fi
+
+            if !result_type? then
+                _report("a host operation answering {function.return_type}")
+                return
+            fi
+
+            let host = strings.runtime(LLVM_STRINGS.host_name(operation), result_type, parameter_types.to_array())
+
+            if let answer = _current.call(host, values.to_array()) then
+                _push(answer)
             fi
         si
 

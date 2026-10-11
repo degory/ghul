@@ -1,0 +1,224 @@
+namespace IR.LLVMTarget is
+    use Collections.LIST
+    use Collections.MAP
+
+    use LLVM.BLOCK
+    use LLVM.FUNCTION
+    use LLVM.GLOBAL_VARIABLE
+    use LLVM.Intrinsics
+    use LLVM.Linkage
+    use LLVM.MODULE
+    use LLVM.PARAMETER
+    use LLVM.Types
+    use LLVM.Values
+
+    /// A string on the LLVM target: one object holding the string type's
+    /// descriptor, a cached hash, the number of UTF-16 code units and the
+    /// code units themselves, laid out as `{ ptr, i32, i32, [N x i16] }`.
+    ///
+    /// This builds what strings need beyond the lowering of each body: one
+    /// constant global per distinct literal, and the functions the native
+    /// runtime calls to make the program's strings.
+    class LLVM_STRINGS is
+        _module: MODULE
+        _literals: MAP[string, LLVM.Value]
+        _descriptor: GLOBAL_VARIABLE?
+
+        /// The offset of the count of code units within a string.
+        LENGTH_OFFSET: int static => 12
+
+        /// The offset of the first code unit within a string.
+        CHARS_OFFSET: int static => 16
+
+        /// The name of the global that stands for the string type's
+        /// descriptor.
+        DESCRIPTOR_NAME: string static => "ghul_string_descriptor"
+
+        /// The name of the function the runtime calls to make a string.
+        MAKE_STRING_NAME: string static => "ghul_make_string"
+
+        /// The name of the function the runtime calls to make a `ubyte[]`.
+        MAKE_BYTES_NAME: string static => "ghul_make_bytes"
+
+        /// The name of the function the runtime calls to describe an
+        /// exception nothing caught.
+        REPORT_UNHANDLED_NAME: string static => "ghul_report_unhandled"
+
+        /// The name of the runtime's host operation for `host.<operation>`.
+        host_name(operation: string) -> string static => "ghul_host_{operation}"
+
+        /// - module: where the literals and functions are added
+        init(module: MODULE) is
+            _module = module
+            _literals = MAP[string, LLVM.Value]()
+        si
+
+        /// The hash `string.get_hash_code` answers for `text`, so a literal's
+        /// cached hash agrees with one computed at run time.
+        hash(text: string) -> int static is
+            let hash mut = -2128831035
+
+            for unit in text do
+                hash = (hash ^ cast int(unit)) * 16777619
+            od
+
+            return hash
+        si
+
+        /// The string type's descriptor.
+        descriptor: LLVM.Value is
+            if let present = _descriptor then
+                return present.reference
+            fi
+
+            let global = GLOBAL_VARIABLE(DESCRIPTOR_NAME, Types.i8, Values.zero(Types.i8), true)
+
+            global.linkage = Linkage.INTERNAL
+
+            _module.add_global(global)
+
+            _descriptor = global
+
+            return global.reference
+        si
+
+        /// The constant global holding the literal `text`. Every literal
+        /// with the same text is the same object, as on .NET.
+        literal(text: string) -> LLVM.Value is
+            let found: LLVM.Value mut
+
+            if _literals.try_get_value(text, found ref) then
+                return found
+            fi
+
+            let units = LIST[LLVM.Value]()
+
+            for unit in text do
+                units.add(Values.integer(Types.i16, bigint(cast int(unit))))
+            od
+
+            let chars = LLVM.Type.ARRAY(text.length, Types.i16)
+            let type = Types.structure([Types.pointer, Types.i32, Types.i32, chars])
+
+            let initializer =
+                LLVM.Value.AGGREGATE(
+                    [
+                        descriptor,
+                        Values.i32(hash(text)),
+                        Values.i32(text.length),
+                        LLVM.Value.AGGREGATE(units.to_array(), chars)
+                    ],
+                    type)
+
+            let global = GLOBAL_VARIABLE("ghul_string_literal_{_literals.count}", type, initializer, true)
+
+            global.linkage = Linkage.PRIVATE
+            global.alignment = 8
+
+            _module.add_global(global)
+
+            let reference = global.reference
+
+            _literals[text] = reference
+
+            return reference
+        si
+
+        /// The address of the first code unit of the string `text` points at.
+        chars(block: BLOCK, text: LLVM.Value) -> LLVM.Value =>
+            block.element_pointer(Types.i8, text, [Values.i32(CHARS_OFFSET)], true)
+
+        /// The number of code units in the string `text` points at.
+        length(block: BLOCK, text: LLVM.Value) -> LLVM.Value =>
+            block.load(Types.i32, block.element_pointer(Types.i8, text, [Values.i32(LENGTH_OFFSET)], true), 4)
+
+        /// Adds the functions the native runtime calls, which every program
+        /// defines: making a string, making a `ubyte[]` and describing an
+        /// exception nothing caught.
+        add_exports() is
+            _add_make_string()
+            _add_make_bytes()
+            _add_report_unhandled()
+        si
+
+        // Copies `length` code units into a new string, through the runtime's
+        // allocator for objects that hold no references. The hash is left
+        // zero, as `string.get_hash_code` does not read it.
+        _add_make_string() is
+            let function =
+                FUNCTION(
+                    MAKE_STRING_NAME,
+                    Types.pointer,
+                    [PARAMETER(Types.pointer, "chars"), PARAMETER(Types.i32, "length")])
+
+            let block = function.add_block("entry")
+
+            let length = function.parameter(1)
+            let bytes = block.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, block.convert(LLVM.Conversion.SIGN_EXTEND, length, Types.i64), Values.i64(1L))
+            let size = block.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, bytes, Values.i64(cast long(CHARS_OFFSET)))
+
+            let result = block.call(runtime("ghul_alloc_atomic", Types.pointer, [Types.pointer, Types.i64]), [descriptor, size])!
+
+            block.store(length, block.element_pointer(Types.i8, result, [Values.i32(LENGTH_OFFSET)], true), 4)
+
+            block.call(
+                _module.declare_intrinsic(Intrinsics.memcpy()),
+                [chars(block, result), function.parameter(0), bytes, Values.boolean(false)])
+
+            block.return_value(result)
+
+            _module.add_function(function)
+        si
+
+        // A `ubyte[]` cannot be made until the target has arrays, so this
+        // answers null, which a host operation answering one reads as absent.
+        _add_make_bytes() is
+            let function =
+                FUNCTION(
+                    MAKE_BYTES_NAME,
+                    Types.pointer,
+                    [PARAMETER(Types.pointer, "bytes"), PARAMETER(Types.i32, "length")])
+
+            function.add_block("entry").return_value(Values.null_pointer)
+
+            _module.add_function(function)
+        si
+
+        // Writes the first line .NET prints for an exception nothing caught.
+        // Until the target has exceptions, it has no type name or message to
+        // add.
+        _add_report_unhandled() is
+            let function = FUNCTION(REPORT_UNHANDLED_NAME, LLVM.Type.VOID, [PARAMETER(Types.pointer, "exception")])
+
+            let block = function.add_block("entry")
+            let text = literal("Unhandled exception.\n")
+
+            block.call(
+                runtime(host_name("write"), LLVM.Type.VOID, [Types.pointer, Types.i32, Types.i32]),
+                [chars(block, text), length(block, text), Values.i32(2)])
+
+            block.return_void()
+
+            _module.add_function(function)
+        si
+
+        /// The module's declaration of `name`, a function the runtime
+        /// defines, adding it the first time it is asked for.
+        /// - name: the function's name
+        /// - result: the type it returns
+        /// - parameters: the types it takes
+        runtime(name: string, result: LLVM.Type, parameters: LLVM.Type[]) -> FUNCTION is
+            if let existing = _module.function_named(name) then
+                return existing
+            fi
+
+            let declared = LIST[PARAMETER]()
+
+            for (i, type) in parameters |> Ghul.Pipes.index() do
+                declared.add(PARAMETER(type, "a{i}"))
+            od
+
+            return _module.add_function(FUNCTION(name, result, declared.to_array()))
+        si
+    si
+si
