@@ -9,8 +9,9 @@
 # ghul-llvm. So a module the tests accept may still be one LLVM rejects.
 # This script builds each test's module again, with the compiler in
 # publish/, and has ghul-llvm verify and compile it to an object. A test
-# with an `exit.expected` is also built as an executable, run, and its exit
-# status compared.
+# with an `exit.expected` is also built as an executable and run, with its
+# `input` as standard input where it has one; its exit status is compared,
+# and its standard output too where it has an `output.expected`.
 #
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
 #
@@ -94,12 +95,23 @@ while IFS= read -r flags_file; do
 
     ran=$((ran + 1))
 
-    "$out/program" >/dev/null 2>&1
+    input="/dev/null"
+
+    if [ -f "$dir/input" ]; then
+        input="$dir/input"
+    fi
+
+    "$out/program" < "$input" > "$out/output" 2> "$out/errors"
     status=$?
     expected="$(tr -d '[:space:]' < "$dir/exit.expected")"
 
     if [ "$status" != "$expected" ]; then
         echo "llvm-validate: $dir exited with $status, expected $expected" >&2
+        failed=$((failed + 1))
+    fi
+
+    if [ -f "$dir/output.expected" ] && ! diff -u "$dir/output.expected" "$out/output" >&2; then
+        echo "llvm-validate: $dir wrote other output than output.expected" >&2
         failed=$((failed + 1))
     fi
 done < <(find "$root" -name ghulflags -exec grep -l -- '--target llvm' {} + | sort)
