@@ -3,7 +3,7 @@
 # llvm-validate.sh - hand every module the llvm integration tests build
 # to LLVM, and run the ones that say what they exit with.
 #
-# ghul-test compiles each test under integration-tests/llvm and compares
+# ghul-test compiles each test built for the llvm target and compares
 # what the compiler said, but it does not assemble the module the compiler
 # wrote, and it does not run a native executable on CI, which has no
 # ghul-llvm. So a module the tests accept may still be one LLVM rejects.
@@ -16,7 +16,7 @@
 # ghul-llvm is found on the PATH unless GHUL_LLVM names it.
 #
 # Usage: build/llvm-validate.sh [test-root]
-#        (default: integration-tests/llvm; run from the repository root
+#        (default: integration-tests; run from the repository root
 #        after `dotnet publish --output publish/`)
 #
 # Fails when ghul-llvm is missing, when a test that should build a module
@@ -25,7 +25,8 @@
 
 set -uo pipefail
 
-root="${1:-integration-tests/llvm}"
+root="${1:-integration-tests}"
+target=llvm
 compiler="$(pwd)/publish/ghul.dll"
 ghul_llvm="${GHUL_LLVM:-ghul-llvm}"
 
@@ -46,17 +47,35 @@ checked=0
 ran=0
 failed=0
 
-while IFS= read -r flags_file; do
-    dir="$(cd "$(dirname "$flags_file")" && pwd)"
+# Every test under $root built for $target: one whose ghulflags name
+# `--target $target`, or whose `targets` file lists it, in which case the
+# flag is added as ghul-test adds it. Each is printed as its directory and
+# its flags, tab-separated. A `.targets` directory holds ghul-test's own
+# copies of a test, not tests.
+tests_for_target() {
+    find "$root" -name ghulflags -not -path "*/.targets/*" | sort | while IFS= read -r flags_file; do
+        dir="$(dirname "$flags_file")"
+        flags="$(tr "\n" " " < "$flags_file")"
 
-    if [ -e "$dir/fail.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
+        if [ -f "$dir/targets" ] && grep -qw "$target" "$dir/targets"; then
+            printf "%s\t%s --target %s\n" "$dir" "$flags" "$target"
+        elif [[ " $flags " == *" --target $target "* ]]; then
+            printf "%s\t%s\n" "$dir" "$flags"
+        fi
+    done
+}
+
+while IFS=$'\t' read -r dir flags_text; do
+    dir="$(cd "$dir" && pwd)"
+
+    if [ -e "$dir/fail.expected" ] || [ -e "$dir/fail.$target.expected" ] || compgen -G "$dir/disabled*" >/dev/null; then
         continue
     fi
 
     out="$scratch/$checked"
     mkdir -p "$out"
 
-    read -r -a flags < "$flags_file"
+    read -r -a flags <<< "$flags_text"
 
     checked=$((checked + 1))
 

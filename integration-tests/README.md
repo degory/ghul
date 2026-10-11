@@ -67,6 +67,7 @@ A test directory must contain one or more `.ghul` source files and a `ghulflags`
 | `ghul.json` | Configuration file pointing at the compiler (created from the template). |
 | `disabled*` | Any file beginning with `disabled` causes the test to be skipped. |
 | `tags` | Zero or more whitespace-separated tag names, used to select a subset of tests with `--tag`. See 'Tags' below. |
+| `targets` | The targets the test runs under, from `dotnet`, `wasm` and `llvm`. The runner builds and runs the test once per target. See 'Targets' below. |
 
 ## Tags
 
@@ -103,6 +104,38 @@ mismatched one, or add a new tag to the list above (updating this section) when
 an existing test clearly needs a feature tag that doesn't exist yet. Don't go
 looking for mistagged tests outside of what you're already touching — this is
 opportunistic upkeep, not a project.
+
+## Targets
+
+The suite is organised by what a test asserts - `execution/`, `semantic/`,
+`parse/`, `il/` - and a target is a second axis across it, not a fifth kind.
+A test belongs in one of two places:
+
+- **A program that should mean the same thing on every target** lives under
+  its kind and carries a `targets` file naming the targets it runs under,
+  `dotnet wasm llvm` or any subset. The runner builds and runs it once per
+  target, adding `--target <name>` to its `ghulflags` - which must not name a
+  target itself - and reports each run as `<test>[<target>]`. Each run
+  happens in its own `.targets/<target>/` directory under the test, holding
+  copies of the sources, inputs and expectations, so the runs neither collide
+  nor leave artifacts in the test directory. One `run.expected` serves every
+  target; where a target's result legitimately differs, a
+  `run.wasm.expected`, `err.llvm.expected` or `fail.wasm.expected` stands in
+  for the plain file in that target's run alone. A test that does not yet
+  pass on a target records the difference that way rather than leaving the
+  target out, so the gap stays visible.
+- **A test about a target's own behaviour** - what it cannot compile yet,
+  the shape of the module or IR it writes, a host operation only it has -
+  lives under that target's directory, `wasm/` or `llvm/`, with `--target
+  <name>` in its `ghulflags`.
+
+Don't copy a program that an execution test already holds into `wasm/` or
+`llvm/`: give the execution test a `targets` file instead.
+
+`build/wasm-validate.sh` and `build/llvm-validate.sh` hand every module the
+compiler writes for their target to an engine. They select tests by the target
+the `ghulflags` or `targets` file names, wherever the test lives, so a target
+test outside `wasm/` or `llvm/` is checked too.
 
 ## Generated tests
 
