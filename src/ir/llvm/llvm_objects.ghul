@@ -1,0 +1,465 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Collections.LIST
+    use Collections.MAP
+
+    use Semantic.Scope
+    use Semantic.Types.Type
+    use Semantic.Symbols.Symbol
+    use Semantic.Symbols.Classy
+    use Semantic.Symbols.Function
+
+    use IR.Emitter.SRM_MEMBER_ORDER
+    use IR.Emitter.SRM_EMITTED_TYPE
+
+    use LLVM.GLOBAL_VARIABLE
+    use LLVM.Linkage
+    use LLVM.MODULE
+    use LLVM.Types
+    use LLVM.Values
+
+    /// The program's classes on the LLVM target: one object layout and one
+    /// constant descriptor for each class instantiation the program uses,
+    /// the vtables and the trait table calls dispatch through, and the
+    /// globals holding static fields and namespace-level variables.
+    ///
+    /// An object is `{ ptr descriptor, superclass fields..., own fields... }`,
+    /// each field held as the lowering holds a value of its type, so a field
+    /// is at the same offset in every instance that has it.
+    ///
+    /// A descriptor is `{ i32 class number, i32 last descendant's number,
+    /// ptr superclass descriptor, ptr name, ptr display function, ptr type
+    /// object, i64 instance size, [N x ptr] vtable }`. The name is a string
+    /// literal; the display function and the type object are null until the
+    /// target has them.
+    ///
+    /// The trait table is one constant `[N x ptr]`, indexed by a row's offset
+    /// plus the receiver's class number.
+    ///
+    /// Classes are found while the program's reach is discovered, then
+    /// numbered and laid out by `build`, and the descriptors and the trait
+    /// table are written by `finish` once every function is declared.
+    class LLVM_OBJECTS: DispatchTarget is
+        _module: MODULE
+        _classes: CLASS_SET
+        _dispatched: DISPATCHED_METHODS
+        _plan: DISPATCH_PLAN
+
+        _is_built: bool
+
+        _layouts: MAP[CLASS_INSTANCE, LIST[LLVM.Type]]
+        _sizes: MAP[CLASS_INSTANCE, int]
+        _field_positions: MAP[Symbol, int]
+
+        _statics: MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]
+        _globals: MAP[Symbol, (name: string, type: LLVM.Type)]
+        _next_global: int
+
+        _unsupported: LIST[(location: Source.LOCATION, construct: string)]
+        _boxes_made: Collections.SET[CLASS_INSTANCE]
+
+        /// The offset of the class number within a descriptor.
+        DESCRIPTOR_CLASS_ID: int static => 0
+
+        /// The offset of the number of the class's last descendant within a
+        /// descriptor.
+        DESCRIPTOR_LAST_DESCENDANT: int static => 4
+
+        /// The offset of the superclass's descriptor within a descriptor,
+        /// null for the root.
+        DESCRIPTOR_SUPERCLASS: int static => 8
+
+        /// The offset of the type's name, a string, within a descriptor.
+        DESCRIPTOR_NAME: int static => 16
+
+        /// The offset of the function that writes a value of the class for
+        /// display within a descriptor, null where it has none.
+        DESCRIPTOR_DISPLAY: int static => 24
+
+        /// The offset within a descriptor of the type object `get_type` answers,
+        /// null until the target makes one.
+        DESCRIPTOR_TYPE_OBJECT: int static => 32
+
+        /// The offset of an instance's size in bytes within a descriptor.
+        DESCRIPTOR_SIZE: int static => 40
+
+        /// The offset of the first vtable entry within a descriptor.
+        DESCRIPTOR_VTABLE: int static => 48
+
+        /// The name of the trait table.
+        TRAIT_TABLE_NAME: string static => "$ghul_trait_table"
+
+        /// - module: where the descriptors, the trait table and the globals are added
+        /// - classes: the program's classes, rooted at `object`
+        init(module: MODULE, classes: CLASS_SET) is
+            _module = module
+            _classes = classes
+            _dispatched = DISPATCHED_METHODS()
+            _plan = DISPATCH_PLAN(self)
+
+            _layouts = MAP[CLASS_INSTANCE, LIST[LLVM.Type]]()
+            _sizes = MAP[CLASS_INSTANCE, int]()
+            _field_positions = MAP[Symbol, int]()
+
+            _statics = MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]()
+            _globals = MAP[Symbol, (name: string, type: LLVM.Type)]()
+
+            _unsupported = LIST[(location: Source.LOCATION, construct: string)]()
+            _boxes_made = Collections.SET[CLASS_INSTANCE]()
+        si
+
+        /// The methods calls dispatch on, found while discovering.
+        dispatched: DISPATCHED_METHODS => _dispatched
+
+        /// The program's classes.
+        classes: CLASS_SET => _classes
+
+        /// Whether `build` has numbered and laid out the classes. Until it
+        /// has, positions, slots and offsets are placeholders, since what is
+        /// lowered then is thrown away.
+        is_built: bool => _is_built
+
+        /// What the classes use that the target cannot compile yet, each
+        /// with where it is declared.
+        unsupported: Collections.List[(location: Source.LOCATION, construct: string)] => _unsupported
+
+        /// Takes every class declared under `root` that is not generic, and a
+        /// box for each scalar and each enum.
+        collect(root: Scope) => _classes.collect(root, CLASS_SET.innate_scalar_types())
+
+        /// The box a value of the scalar `type` is held in, or null where
+        /// `type` is not a scalar.
+        box_type(type: Type?) -> CLASS_INSTANCE? => _classes.box_type(type)
+
+        /// Records that the program boxes a value in `box`, so a value of it
+        /// can exist.
+        note_boxed(box: CLASS_INSTANCE) is
+            _boxes_made.add(box)
+        si
+
+        /// The class a value of `type` is an instance of, or null where the
+        /// program has none.
+        class_of(type: Type?) -> CLASS_INSTANCE? => _classes.class_of(type)
+
+        /// The class `definition` at the arguments `type_map` gives its
+        /// parameters, or null where it is not a class the target represents.
+        class_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? =>
+            _classes.class_of(definition, type_map)
+
+        /// The one instance of the trait a value of `type` is.
+        trait_of(type: Type) -> CLASS_INSTANCE? => _plan.trait_of(type)
+
+        /// The one instance of the trait `definition` at the arguments
+        /// `type_map` gives its parameters.
+        trait_of(definition: Classy, type_map: Collections.Map[Symbol, Type]) -> CLASS_INSTANCE? =>
+            _plan.trait_of(definition, type_map)
+
+        /// Numbers the classes, lays each out and plans its vtable, and plans
+        /// the trait table. Nothing is added to the classes afterwards.
+        build() is
+            _classes.number()
+
+            let ordered = LIST[CLASS_INSTANCE]()
+
+            for type in _classes.numbering.in_order() do
+                if !_classes.is_array(type) then
+                    _lay_out(type)
+                fi
+
+                ordered.add(type)
+            od
+
+            _plan.plan_slots(ordered)
+            _plan.plan_traits()
+
+            _is_built = true
+        si
+
+        // An object's fields follow its superclass's, after the descriptor.
+        _lay_out(type: CLASS_INSTANCE) is
+            let layout = LIST[LLVM.Type]()
+
+            if let parent = _classes.superclass_of(type) ?? (if type != _classes.root then _classes.root else null fi) then
+                layout.add_range(_layouts[parent])
+            else
+                layout.add(Types.pointer)
+            fi
+
+            if let boxed = _classes.boxed_type(type) then
+                layout.add(LLVM_TYPES.value_type(boxed) ?? Types.i32)
+            elif is_object_type(type) then
+                for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type.definition)) do
+                    if `field.is_instance then
+                        _field_positions[`field] = layout.count
+
+                        if let held = LLVM_TYPES.value_type(type.specialize(`field.type)) then
+                            layout.add(held)
+                        else
+                            _unsupported.add((`field.location, "a field of type {type.specialize(`field.type)}"))
+                            layout.add(Types.pointer)
+                        fi
+                    fi
+                od
+            fi
+
+            _layouts[type] = layout
+            _sizes[type] = _size_of(layout)
+        si
+
+        // The size of a struct of `layout`, each field at its natural
+        // alignment, rounded up to a multiple of eight.
+        _size_of(layout: LIST[LLVM.Type]) -> int is
+            let offset mut = 0
+
+            for type in layout do
+                let size = _field_size(type)
+
+                offset = (offset + size - 1) / size * size + size
+            od
+
+            return (offset + 7) / 8 * 8
+        si
+
+        _field_size(type: LLVM.Type) -> int =>
+            case LLVM_TYPES.width(type)
+            when 8 then 1
+            when 16 then 2
+            when 32 then 4
+            else
+                if type =~ LLVM.Type.FLOAT then 4 else 8 fi
+            esac
+
+        /// The LLVM struct type an instance of `type` is.
+        struct_type(type: CLASS_INSTANCE) -> LLVM.Type =>
+            if _is_built then Types.structure(_layouts[type].to_array()) else Types.structure([Types.pointer]) fi
+
+        /// The size in bytes of an instance of `type`.
+        size_of(type: CLASS_INSTANCE) -> int => if _is_built then _sizes[type] else 8 fi
+
+        /// The position in its owner's struct type of the instance field
+        /// `field`, or null where the target does not hold it.
+        field_position(`field: Symbol) -> int? is
+            if !_is_built then
+                return 0
+            fi
+
+            let position mut = 0
+
+            if _field_positions.try_get_value(`field.root_specialized_from, position ref) then
+                return position
+            fi
+
+            return null
+        si
+
+        /// The name of the global holding `type`'s descriptor.
+        descriptor_name(type: CLASS_INSTANCE) -> string =>
+            if _is_built then "$ghul_descriptor_{_classes.numbering.id(type)}" else "$ghul_descriptor" fi
+
+        /// The number of `type` and of its last descendant, so a value is
+        /// an instance of `type` exactly when its class number is between
+        /// the two.
+        class_range(type: CLASS_INSTANCE) -> (first: int, last: int) =>
+            if _is_built then
+                (_classes.numbering.id(type), _classes.numbering.last_descendant(type))
+            else
+                (0, 0)
+            fi
+
+        /// The global holding the static field `field` of `owner`, or the
+        /// namespace-level variable `field` where `owner` is null, or null
+        /// where its type is one the target holds no values of.
+        global_of(`field: Symbol, owner: CLASS_INSTANCE?, type: Type?) -> (name: string, type: LLVM.Type)? is
+            let held = LLVM_TYPES.value_type(type)
+
+            if !held? then
+                return null
+            fi
+
+            let globals =
+                if let o = owner then
+                    if !_statics.contains_key(o) then
+                        _statics[o] = MAP[Symbol, (name: string, type: LLVM.Type)]()
+                    fi
+
+                    _statics[o]
+                else
+                    _globals
+                fi
+
+            let root = `field.root_specialized_from
+            let found: (name: string, type: LLVM.Type) mut
+
+            if globals.try_get_value(root, found ref) then
+                return found
+            fi
+
+            let result = ("$ghul_global_{_next_global}", held)
+
+            _next_global = _next_global + 1
+
+            globals[root] = result
+
+            return result
+        si
+
+        /// Records, while discovering, that a call dispatches on `method`.
+        note_dispatched(method: Function) => _dispatched.note(method)
+
+        /// The vtable slot a virtual call to `method` goes through, or null
+        /// where it has none.
+        slot_of(method: FUNCTION_INSTANCE) -> DISPATCH_SLOT? => _plan.slot_of(method)
+
+        /// The trait table row a call to the trait method `method` on an
+        /// instance of `trait_type` goes through, or null where it has none.
+        selector_of(method: Function, trait_type: CLASS_INSTANCE) -> TRAIT_SELECTOR? =>
+            _plan.selector_of(method, trait_type)
+
+        /// The one implementation `selector`'s row holds, or null where it
+        /// holds more than one.
+        only_implementation(selector: TRAIT_SELECTOR) -> FUNCTION_INSTANCE? => _plan.only_implementation(selector)
+
+        /// The classes implementing `trait_type`, or null where the program
+        /// has none.
+        implementors(trait_type: CLASS_INSTANCE) -> Collections.List[CLASS_INSTANCE]? => _plan.implementors(trait_type)
+
+        /// Adds every descriptor, the trait table and the globals to the
+        /// module, each function referred to by the LLVM function `callee`
+        /// answers for it, null where the program never compiles it.
+        finish(strings: LLVM_STRINGS, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
+            for type in _classes.numbering.in_order() do
+                if !_classes.is_array(type) then
+                    _add_descriptor(type, strings, callee)
+                fi
+            od
+
+            _add_trait_table(callee)
+
+            for (_, globals) in _statics do
+                for (_, (name, type)) in globals do
+                    _add_global(name, type)
+                od
+            od
+
+            for (_, (name, type)) in _globals do
+                _add_global(name, type)
+            od
+        si
+
+        _add_global(name: string, type: LLVM.Type) is
+            let global = GLOBAL_VARIABLE(name, type, LLVM_TYPES.zero(type), false)
+
+            global.linkage = Linkage.INTERNAL
+
+            _module.add_global(global)
+        si
+
+        _add_descriptor(type: CLASS_INSTANCE, strings: LLVM_STRINGS, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
+            let entries = LIST[LLVM.Value]()
+
+            if _plan.has_slots(type) then
+                for entry in _plan.slot_entries(type) do
+                    // An entry a call can reach must be compiled, or the call
+                    // would go through a null pointer.
+                    if let e = entry /\ is_instantiated(type) /\ _dispatched.is_dispatched_to(e.definition) /\ !callee(e)? then
+                        _unsupported.add((e.definition.location, "a method of {type} called through a vtable"))
+                    fi
+
+                    entries.add(_reference(entry, callee))
+                od
+            fi
+
+            let vtable_type = LLVM.Type.ARRAY(entries.count, Types.pointer)
+
+            let superclass =
+                if let parent = _plan.parent(type) then
+                    Values.global(descriptor_name(parent))
+                else
+                    Values.null_pointer
+                fi
+
+            let descriptor_type =
+                Types.structure([
+                    Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, vtable_type
+                ])
+
+            let initializer =
+                LLVM.Value.AGGREGATE(
+                    [
+                        Values.i32(_classes.numbering.id(type)),
+                        Values.i32(_classes.numbering.last_descendant(type)),
+                        superclass,
+                        strings.literal(TYPE_NAMES.name_of(type, _classes, null, t => LLVM_TYPES.scalar(t), t => LLVM_TYPES.is_string(t))),
+                        Values.null_pointer,
+                        Values.null_pointer,
+                        Values.i64(cast long(size_of(type))),
+                        LLVM.Value.AGGREGATE(entries.to_array(), vtable_type)
+                    ],
+                    descriptor_type)
+
+            let global = GLOBAL_VARIABLE(descriptor_name(type), descriptor_type, initializer, true)
+
+            global.linkage = Linkage.INTERNAL
+            global.alignment = 8
+
+            _module.add_global(global)
+        si
+
+        _add_trait_table(callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
+            let size = _plan.table_size
+
+            if size == 0 then
+                return
+            fi
+
+            let entries = LIST[LLVM.Value]()
+
+            for i in 0..size do
+                entries.add(Values.null_pointer)
+            od
+
+            for (method, row) in _plan.rows do
+                let offset = _plan.selector(method).offset
+
+                for (class_id, implementation) in row do
+                    entries[offset + class_id] = _reference(implementation, callee)
+                od
+            od
+
+            let type = LLVM.Type.ARRAY(size, Types.pointer)
+
+            let global = GLOBAL_VARIABLE(TRAIT_TABLE_NAME, type, LLVM.Value.AGGREGATE(entries.to_array(), type), true)
+
+            global.linkage = Linkage.INTERNAL
+
+            _module.add_global(global)
+        si
+
+        _reference(instance: FUNCTION_INSTANCE?, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) -> LLVM.Value =>
+            if let i = instance, function = callee(i) then function.reference else Values.null_pointer fi
+
+        root: CLASS_INSTANCE? => _classes.root
+        numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _classes.numbering
+        superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? => _classes.superclass_of(type)
+        methods_of(definition: Classy) -> Collections.List[Function] => SRM_MEMBER_ORDER.methods(SRM_EMITTED_TYPE(definition))
+        is_object(type: CLASS_INSTANCE) -> bool => type == _classes.root
+        is_object_type(type: CLASS_INSTANCE) -> bool => !_classes.is_box(type) /\ _classes.is_object_type(type.definition)
+        is_box(type: CLASS_INSTANCE) -> bool => _classes.is_box(type)
+        is_array(type: CLASS_INSTANCE) -> bool => _classes.is_array(type)
+
+        /// Always false: the string type is not one of the classes yet.
+        is_string(type: CLASS_INSTANCE) -> bool => false
+
+        is_bigint(type: CLASS_INSTANCE) -> bool => type.definition == _classes.core.bigint
+
+        /// Whether a value of `type` can exist: a box only where something
+        /// boxes a value in it.
+        is_instantiated(type: CLASS_INSTANCE) -> bool => !_classes.is_box(type) \/ _boxes_made.contains(type)
+
+        // Every receiver is a `ptr`, so a slot or a row needs no signature
+        // of its own: the call site gives the function type.
+        slot_signature(owner: CLASS_INSTANCE, method: FUNCTION_INSTANCE) -> int? => 0
+        selector_signature(method: FUNCTION_INSTANCE) -> int? => 0
+    si
+si
