@@ -259,13 +259,29 @@ namespace IR.WasmGC is
                 fi
             else
                 for (function, _) in _bodies do
-                    if !_is_generic(function) then
+                    if !FUNCTION_BODIES.is_generic(function) then
                         numbering.index_of(function)
                     fi
                 od
             fi
 
-            _discover(registry, discovery_imports, numbering)
+            let bodies_compiled = LIST[Function]()
+
+            for (function, _) in _bodies do
+                bodies_compiled.add(function)
+            od
+
+            let plan = PROGRAM_PLAN(registry.class_set, numbering.worklist, registry.dispatched, registry.display_plan, bodies_compiled)
+
+            registry.discovering = true
+
+            plan.discover(
+                WASMGC_DISCOVERY(
+                    registry,
+                    (instance: FUNCTION_INSTANCE) -> void => _lower(registry, discovery_imports, null, null, numbering, instance, LIST[VALUE_TYPE]()),
+                    (location, construct) => _report(location, construct)))
+
+            registry.discovering = false
 
             registry.build()
 
@@ -382,148 +398,8 @@ namespace IR.WasmGC is
             return imports
         si
 
-        // Finds every class instantiation the program uses, before the
-        // recursion group is built, by compiling what the walk reaches and
-        // throwing the code away; the function numbers it gives out stay.
-        // Every method of an array type found is numbered, since the trait
-        // table reaches them at the element type, and so is every known
-        // class's implementation of a method called through a vtable or the
-        // trait table, since dispatch can reach it.
-        _discover(
-            registry: WASMGC_TYPE_REGISTRY,
-            imports: WASMGC_IMPORTS,
-            numbering: WASMGC_FUNCTION_NUMBERING
-        ) is
-            let methods = MAP[Classy, LIST[Function]]()
 
-            for (function, _) in _bodies do
-                if let owner = _class_of_body(function) then
-                    if !methods.contains_key(owner) then
-                        methods[owner] = LIST[Function]()
-                    fi
 
-                    methods[owner].add(function)
-                fi
-            od
-
-            let too_deep = Collections.SET[Classy]()
-            let instantiations = Collections.MAP[Classy, int]()
-            let reference_parameters_found = Collections.SET[CLASS_INSTANCE]()
-
-            registry.discovering = true
-
-            let display = WASMGC_DISPLAY(registry)
-
-            let is_done mut = false
-
-            while !is_done do
-                is_done = true
-
-                while let function = numbering.next() do
-                    is_done = false
-
-                    _lower(registry, imports, null, null, numbering, function, LIST[VALUE_TYPE]())
-                od
-
-                for type in registry.take_new_classes() do
-                    is_done = false
-
-                    let found mut = 0
-
-                    instantiations.try_get_value(type.definition, found ref)
-                    instantiations[type.definition] = found + 1
-
-                    if type.definition.is_generic /\ (found >= INSTANTIATION_LIMITS.MAXIMUM_INSTANTIATIONS \/ TYPE_MAPS.depth(type.arguments) > INSTANTIATION_LIMITS.MAXIMUM_TYPE_ARGUMENT_DEPTH) then
-                        // A class whose methods or fields instantiate it at
-                        // deeper and deeper type arguments would be compiled
-                        // without end, so its fields add nothing further.
-                        if too_deep.add(type.definition) then
-                            _report(type.definition.location, "a generic class that instantiates itself at ever deeper type arguments")
-                        fi
-
-                        registry.leave_field_types(type)
-                    else
-                        registry.add_field_types(type)
-                    fi
-                od
-
-                let count = numbering.count
-                let reference_parameters_count = reference_parameters_found.count
-
-                for type in registry.classes_and_arrays do
-                    if !registry.is_instantiated(type) then
-                        continue
-                    fi
-
-                    if reference_parameters_found.add(type) then
-                        registry.dispatch.discover_reference_parameters(type)
-                    fi
-
-                    let class_methods: LIST[Function] mut
-
-                    if methods.try_get_value(type.definition, class_methods ref) then
-                        for method in class_methods do
-                            if (method.generic_arguments.count == 0 /\ registry.is_dispatched_to(method)) \/ registry.is_array(type) then
-                                numbering.index_of(FUNCTION_INSTANCE(method, type.type_map))
-                            fi
-                        od
-                    fi
-                od
-
-                for (definition, class_methods) in methods do
-                    if definition.is_trait /\ !definition.is_generic then
-                        for method in class_methods do
-                            if registry.is_dispatched_to(method) then
-                                numbering.index_of(FUNCTION_INSTANCE.of(method))
-                            fi
-                        od
-                    fi
-                od
-
-                display.number(numbering)
-
-                if numbering.count != count \/ reference_parameters_found.count != reference_parameters_count then
-                    is_done = false
-                fi
-            od
-
-            registry.discovering = false
-        si
-
-        // The class whose members `function` is one of, where its body can
-        // name that class's type parameters.
-        _class_of_body(function: Function) -> Classy? =>
-            if let closure: Semantic.Symbols.Closure = function /\ closure.frame? then
-                closure.frame
-            else
-                WASMGC_TYPE_REGISTRY.owning_class(function)
-            fi
-
-        // Whether `function`'s body names type parameters, so that it is
-        // compiled only for the instantiations the program uses.
-        _is_generic(function: Function) -> bool is
-            if function.generic_arguments.count > 0 then
-                return true
-            fi
-
-            let scope: Semantic.Scope? mut = WASMGC_TYPE_REGISTRY.owning_class(function) ?? function.owner
-
-            while scope? do
-                if let classy: Classy = scope /\ classy.is_generic then
-                    return true
-                elif let enclosing: Function = scope /\ enclosing.generic_arguments.count > 0 then
-                    return true
-                fi
-
-                if let symbol: Semantic.Symbols.Symbol = scope /\ symbol.owner != scope then
-                    scope = symbol.owner
-                else
-                    scope = null
-                fi
-            od
-
-            return false
-        si
 
         // The registry the classes are collected into. Their struct types
         // take the first type indices, so they are built before any
@@ -802,5 +678,25 @@ namespace IR.WasmGC is
 
             return LIST[Value]()
         si
+    si
+
+    // Finds a program's reach by lowering each body it reaches through the
+    // backend's own lowering, with the registry discovering, and keeping
+    // nothing but what the lowering recorded.
+    class WASMGC_DISCOVERY(
+        registry: WASMGC_TYPE_REGISTRY private,
+        lower: (FUNCTION_INSTANCE) -> void private,
+        report: (Source.LOCATION, string) -> void private
+    ): DiscoveryTarget is
+        reach(instance: FUNCTION_INSTANCE) => _lower(instance)
+
+        is_instantiated(type: CLASS_INSTANCE) -> bool => _registry.is_instantiated(type)
+
+        // The cells and boxes the by-reference parameters of the slots and
+        // selectors `type` takes a place in are held in have to exist
+        // before any body reaching them is compiled.
+        note_instantiated(type: CLASS_INSTANCE) => _registry.dispatch.discover_reference_parameters(type)
+
+        report(location: Source.LOCATION, construct: string) => _report(location, construct)
     si
 si
