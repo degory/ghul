@@ -50,7 +50,7 @@ namespace IR.LLVMTarget is
 
         _stack: LIST[LLVM.Value]
         _locals: MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]
-        _arguments: LIST[(pointer: LLVM.Value, type: LLVM.Type)]
+        _arguments: LIST[(pointer: LLVM.Value, type: LLVM.Type, value_type: Type?)]
 
         // The structured nodes open at the point being lowered, innermost
         // last: each node's continuation, and a loop's header after it, which
@@ -154,7 +154,7 @@ namespace IR.LLVMTarget is
 
             _stack = LIST[LLVM.Value]()
             _locals = MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]()
-            _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type)]()
+            _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type, value_type: Type?)]()
             _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
             _caught = LIST[LLVM.Value]()
             _finally_exits = MAP[int, (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING)]()
@@ -175,11 +175,15 @@ namespace IR.LLVMTarget is
                 _entry.debug_location = _debug_location
             fi
 
-            for parameter in _function.parameters do
-                let pointer = _entry.alloca(parameter.type, 0)
+            // Each argument is spilled to a slot of the width its type is stored
+            // at, so its address means the same as any other location's.
+            for (i, parameter) in _function.parameters |> Ghul.Pipes.index() do
+                let value_type = _argument_type(i)
+                let stored = if let scalar = _scalar(value_type) then LLVM_TYPES.stored_type(scalar) else parameter.type fi
+                let pointer = _entry.alloca(stored, 0)
 
-                _entry.store(parameter.value, pointer, 0)
-                _arguments.add((pointer, parameter.type))
+                _entry.store(_narrow_in(_entry, parameter.value, value_type), pointer, 0)
+                _arguments.add((pointer, stored, value_type))
             od
 
             _declare_arguments()
@@ -294,6 +298,54 @@ namespace IR.LLVMTarget is
                 _objects?.held_type(_specialize(type))
             fi
 
+        // The type a value of `type` is stored as in memory: a scalar at the
+        // width of its kind, anything else as it is held.
+        _stored(type: Type?) -> LLVM.Type? =>
+            if let scalar = _scalar(type) then LLVM_TYPES.stored_type(scalar) else _held(type) fi
+
+        // `value` of `type` as loaded from memory, widened to the width it is
+        // computed with.
+        _widen(value: LLVM.Value, type: Type?) -> LLVM.Value =>
+            if let scalar = _scalar(type) then LLVM_TYPES.widen(_current, value, scalar) else value fi
+
+        // `value` of `type` narrowed to the width it is stored at.
+        _narrow(value: LLVM.Value, type: Type?) -> LLVM.Value => _narrow_in(_current, value, type)
+
+        _narrow_in(block: BLOCK, value: LLVM.Value, type: Type?) -> LLVM.Value =>
+            if let scalar = _scalar(type) then LLVM_TYPES.narrow(block, value, scalar) else value fi
+
+        // A value of `type` loaded from `pointer`, which holds it as stored.
+        _load_stored(type: Type?, pointer: LLVM.Value) -> LLVM.Value? =>
+            if let stored = _stored(type) then _widen(_current.load(stored, pointer, 0), type) else null fi
+
+        // Stores `value` of `type` at `pointer`, at the width it is stored at.
+        _store_stored(value: LLVM.Value, type: Type?, pointer: LLVM.Value) is
+            _current.store(_narrow(value, type), pointer, 0)
+        si
+
+        // The member at `index` of an aggregate held in place, a struct, a
+        // tuple or an optional value type, whose type is `member`.
+        _extract_member(aggregate: LLVM.Value, index: int, member: Type?) -> LLVM.Value =>
+            _widen(_current.extract_value(_stored(member)!, aggregate, [index]), member)
+
+        // `aggregate` with its member at `index`, of type `member`, replaced.
+        _insert_member(aggregate: LLVM.Value, value: LLVM.Value, index: int, member: Type?) -> LLVM.Value =>
+            _current.insert_value(aggregate, _narrow(value, member), [index])
+
+        // The type of the argument at `index` among the function's
+        // parameters, or null for the receiver or where there is no instance.
+        _argument_type(index: int) -> Type? is
+            if let instance = _instance then
+                let at = index - _receiver_offset
+
+                if at >= 0 /\ at < instance.definition.arguments.count then
+                    return instance.specialize(instance.definition.arguments[at])
+                fi
+            fi
+
+            return null
+        si
+
         // The block instructions go into, opened afresh where the last one
         // ended in a terminator: code after an unconditional exit is
         // unreachable, but every block needs exactly one terminator.
@@ -386,7 +438,7 @@ namespace IR.LLVMTarget is
                 return found
             fi
 
-            if let type = _held(local.type) then
+            if let type = _stored(local.type) then
                 let slot = (pointer = _slot(type), type = type)
 
                 _locals[local] = slot
@@ -433,9 +485,9 @@ namespace IR.LLVMTarget is
                 return null
             fi
 
-            let held = _held(value.type)
+            let stored = _stored(value.type)
 
-            if !held? then
+            if !stored? then
                 _report("the address of a value of type {value.type}")
                 return null
             fi
@@ -446,22 +498,22 @@ namespace IR.LLVMTarget is
                 return null
             fi
 
-            let slot = _slot(held)
+            let slot = _slot(stored)
 
-            _current.store(result, slot, 0)
+            _store_stored(result, value.type, slot)
 
             return slot
         si
 
         _load_local(local: LOCAL) is
             if let (pointer, type) = _local(local) then
-                _push(_current.load(type, pointer, 0))
+                _push(_widen(_current.load(type, pointer, 0), local.type))
             fi
         si
 
         _store_local(local: LOCAL, value: LLVM.Value?) is
-            if let (pointer, type) = _local(local) /\ value? then
-                _current.store(_normalise_for(value, local.type), pointer, 0)
+            if let (pointer, _) = _local(local) /\ value? then
+                _current.store(_narrow(value, local.type), pointer, 0)
             fi
         si
 
@@ -483,9 +535,9 @@ namespace IR.LLVMTarget is
 
         _load_argument(index: int) is
             if index < _arguments.count then
-                let (pointer, type) = _arguments[index]
+                let (pointer, type, value_type) = _arguments[index]
 
-                _push(_current.load(type, pointer, 0))
+                _push(_widen(_current.load(type, pointer, 0), value_type))
             else
                 _report("an argument the function does not take")
             fi
@@ -493,9 +545,9 @@ namespace IR.LLVMTarget is
 
         _store_argument(index: int, value: LLVM.Value?, type: Type?) is
             if index < _arguments.count /\ value? then
-                let (pointer, _) = _arguments[index]
+                let (pointer, _, _) = _arguments[index]
 
-                _current.store(_normalise_for(value, type), pointer, 0)
+                _current.store(_narrow(value, type), pointer, 0)
             else
                 _report("an argument the function does not take")
             fi
@@ -525,7 +577,7 @@ namespace IR.LLVMTarget is
             case scalar
             when Scalar.INT8 then _sign_extend_from(value, 8)
             when Scalar.INT16 then _sign_extend_from(value, 16)
-            when Scalar.UINT8, Scalar.BOOL then _current.binary(BinaryOperator.AND, IntegerFlags.NONE, value, _i32(0xFF))
+            when Scalar.UINT8 then _current.binary(BinaryOperator.AND, IntegerFlags.NONE, value, _i32(0xFF))
             when Scalar.UINT16, Scalar.CHAR then _current.binary(BinaryOperator.AND, IntegerFlags.NONE, value, _i32(0xFFFF))
             else value
             esac
@@ -544,10 +596,6 @@ namespace IR.LLVMTarget is
             fi
 
         _i32(value: int) -> LLVM.Value => LLVM.Values.integer(Types.i32, bigint(value))
-
-        // A comparison's `i1` widened to the `i32` a bool is held in.
-        _bool(value: LLVM.Value) -> LLVM.Value =>
-            _current.convert(Conversion.ZERO_EXTEND, value, Types.i32)
 
         visit_value(value: Value) is
             if let lowered: LLVM_VALUE = value then
@@ -572,6 +620,8 @@ namespace IR.LLVMTarget is
 
             if let to = number.narrowing then
                 _push(_convert(value, from, to))
+            elif _scalar(number.type) =~ Scalar.BOOL then
+                _push(_convert(value, from, Scalar.BOOL))
             else
                 _push(value)
             fi
@@ -755,15 +805,13 @@ namespace IR.LLVMTarget is
         visit_address(self_load: Values.Load.OUTER_SELF) is visit(self_load) si
         // A struct method's receiver is the address of its struct.
         visit(self_load: Values.Load.VALUE_SELF) is
-            let held = _held(self_load.type)
-
-            if !held? then
+            if !_stored(self_load.type)? then
                 _report("self of type {self_load.type}")
                 return
             fi
 
             if let pointer = _receiver_address() then
-                _push(_current.load(held, pointer, 0))
+                _push(_load_stored(self_load.type, pointer)!)
             fi
         si
 
@@ -817,7 +865,7 @@ namespace IR.LLVMTarget is
         // is held.
         visit(store: Values.Store.INDIRECT) is
             if let pointer = _value_of(store.address), value = _value_of(store.value) then
-                _current.store(_normalise_for(value, store.type), pointer, 0)
+                _store_stored(value, store.type, pointer)
             fi
         si
         visit(wrapper: Values.TYPE_WRAPPER) is gen(wrapper.value) si
@@ -852,14 +900,20 @@ namespace IR.LLVMTarget is
             return null
         si
 
-        // An optional value type is held in place as whether it is present
-        // and its value: `{ i1, T }`, zeroed where absent.
+        // An optional value type is held in place as whether it is present,
+        // a byte holding 0 or 1, and its value as stored: `{ i8, T }`, zeroed
+        // where absent.
         _optional_type(inner: Type) -> LLVM.Type? =>
-            if let held = _held(inner) then Types.structure([Types.i1, held]) else null fi
+            if let stored = _stored(inner) then Types.structure([Types.i8, stored]) else null fi
 
-        // The present optional of type `optional` holding `value`.
-        _wrap(value: LLVM.Value, optional: LLVM.Type) -> LLVM.Value =>
-            _current.insert_value(_current.insert_value(LLVM_TYPES.zero(optional), LLVM.Values.boolean(true), [0]), value, [1])
+        // The present optional of type `optional` holding `value` of type
+        // `inner`.
+        _wrap(value: LLVM.Value, optional: LLVM.Type, inner: Type?) -> LLVM.Value =>
+            _insert_member(_current.insert_value(LLVM_TYPES.zero(optional), LLVM.Values.integer(Types.i8, 1n), [0]), value, 1, inner)
+
+        // Whether the optional value type `optional` holds a value.
+        _is_present(optional: LLVM.Value) -> LLVM.Value =>
+            _current.convert(Conversion.TRUNCATE, _current.extract_value(Types.i8, optional, [0]), Types.i1)
 
         visit(wrap: Values.WRAP_OPTIONAL) is
             // A MAYBE, the optional of an unconstrained type parameter, is the
@@ -877,7 +931,7 @@ namespace IR.LLVMTarget is
             fi
 
             if let value = _value_of(wrap.value) then
-                _push(_wrap(_normalise_for(value, _value_optional_inner(wrap.type)), optional))
+                _push(_wrap(value, optional, _value_optional_inner(wrap.type)))
             fi
         si
 
@@ -900,10 +954,10 @@ namespace IR.LLVMTarget is
             fi
 
             let held = _current.load(optional, pointer, 0)
-            let present = _current.extract_value(Types.i1, held, [0])
+            let present = _is_present(held)
 
             if operation =~ "nullable.has_value" then
-                _push(_bool(present))
+                _push(present)
             elif operation =~ "nullable.value" then
                 let absent = _new_block()
                 let carry_on = _new_block()
@@ -924,7 +978,7 @@ namespace IR.LLVMTarget is
 
                 _start(carry_on)
 
-                _push(_current.extract_value(_held(inner)!, held, [1]))
+                _push(_extract_member(held, 1, inner))
             else
                 _report("the operation {operation}")
             fi
@@ -942,15 +996,15 @@ namespace IR.LLVMTarget is
         // held otherwise, such as an optional value type viewed as the value
         // it holds, is copied into a place of its own.
         visit_address(view: Values.NARROW_VIEW) is
-            let viewed = _held(view.type)
-            let underlying = _held(view.underlying.type)
+            let viewed = _stored(view.type)
+            let underlying = _stored(view.underlying.type)
 
             if viewed? /\ underlying? /\ viewed =~ underlying then
                 _push_address_of(view.underlying)
-            elif let held = viewed, value = _value_of(view) then
-                let slot = _slot(held)
+            elif let stored = viewed, value = _value_of(view) then
+                let slot = _slot(stored)
 
-                _current.store(value, slot, 0)
+                _store_stored(value, view.type, slot)
                 _push(slot)
             else
                 _report("the address of a value of type {view.type}")
@@ -969,22 +1023,12 @@ namespace IR.LLVMTarget is
         visit_address(address: Values.ARRAY_ELEMENT_ADDRESS) is _element_address(address) si
 
         // The address of an array element, checked against the array's count.
-        // An element stored narrower than it is held, a bool, a byte, a char
-        // or a short, would be read through the address at the wrong width,
-        // so is reported.
         _element_address(address: Values.ARRAY_ELEMENT_ADDRESS) is
             let arrays = _arrays
             let type = _array_of(address.array.type)
 
             if !arrays? \/ !type? then
                 _report("the address of an array element")
-                return
-            fi
-
-            let element = arrays.element_of(type)
-
-            if let scalar = LLVM_TYPES.scalar(element) /\ LLVM_TYPES.is_narrow(scalar) then
-                _report("the address of an element of an array of {element}")
                 return
             fi
 
@@ -1075,7 +1119,7 @@ namespace IR.LLVMTarget is
 
         visit(compare: Values.COMPARE_ORDER_TO_ZERO) is
             if let value = _value_of(compare.value) then
-                _push(_bool(_compare(compare.comparison, value, _i32(0), false)))
+                _push(_compare(compare.comparison, value, _i32(0), false))
             fi
         si
 
@@ -1088,9 +1132,9 @@ namespace IR.LLVMTarget is
         visit(test: Values.HAS_VALUE) is
             if let value = _value_of(test.value) then
                 if value.type =~ Types.pointer then
-                    _push(_bool(_current.compare(IntegerPredicate.NE, value, LLVM.Values.null_pointer)))
+                    _push(_current.compare(IntegerPredicate.NE, value, LLVM.Values.null_pointer))
                 elif _value_optional_inner(test.value.type)? then
-                    _push(_bool(_current.extract_value(Types.i1, value, [0])))
+                    _push(_is_present(value))
                 else
                     _report("an optional value of type {test.value.type}")
                 fi
@@ -1157,15 +1201,13 @@ namespace IR.LLVMTarget is
         visit_address(default_value: Values.DEFAULT) is _report("the address of a value") si
         // A reference is a pointer to where its value is held.
         visit(deref: Values.DEREF) is
-            let held = _held(deref.type)
-
-            if !held? then
+            if !_stored(deref.type)? then
                 _report("a reference to {deref.type}")
                 return
             fi
 
             if let pointer = _value_of(deref.value) then
-                _push(_current.load(held, pointer, 0))
+                _push(_load_stored(deref.type, pointer)!)
             fi
         si
 
@@ -1216,7 +1258,7 @@ namespace IR.LLVMTarget is
                 fi
             elif let objects = _objects, box_type = objects.box_type(_specialize(value.type)) then
                 if let held = _value_of(value) then
-                    _push(_box_value(objects, box_type, _normalise_for(held, value.type)))
+                    _push(_box_value(objects, box_type, held, value.type))
                 fi
             elif let held = _held(value.type) /\ isa LLVM.Type.POINTER(held) then
                 gen(value)
@@ -1226,9 +1268,9 @@ namespace IR.LLVMTarget is
         si
 
 
-        // A new box of `box_type` holding `held`.
+        // A new box of `box_type` holding `held`, a value of `type`.
         // A box holding something the collector must follow is one it scans.
-        _box_value(objects: LLVM_OBJECTS, box_type: CLASS_INSTANCE, held: LLVM.Value) -> LLVM.Value is
+        _box_value(objects: LLVM_OBJECTS, box_type: CLASS_INSTANCE, held: LLVM.Value, type: Type?) -> LLVM.Value is
             objects.note_boxed(box_type)
 
             let allocator = if LLVM_TYPES.holds_pointer(held.type) then "$ghul_alloc" else "$ghul_alloc_atomic" fi
@@ -1238,7 +1280,7 @@ namespace IR.LLVMTarget is
                     _strings!.runtime(allocator, Types.pointer, [Types.pointer, Types.i64]),
                     [LLVM.Values.global(objects.descriptor_name(box_type)), LLVM.Values.i64(cast long(objects.size_of(box_type)))])!
 
-            _current.store(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
+            _store_stored(held, type, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true))
 
             return object
         si
@@ -1269,12 +1311,12 @@ namespace IR.LLVMTarget is
             let present = _new_block()
             let join = _new_block()
 
-            _current.branch(_current.extract_value(Types.i1, held, [0]), present, join)
+            _current.branch(_is_present(held), present, join)
 
             _start(present)
 
-            let inner_value = _current.extract_value(_held(inner)!, held, [1])
-            let object = _box_value(objects, box_type, inner_value)
+            let inner_value = _extract_member(held, 1, inner)
+            let object = _box_value(objects, box_type, inner_value, inner)
 
             _current.store(object, slot, 0)
             _current.branch(join)
@@ -1314,7 +1356,7 @@ namespace IR.LLVMTarget is
             _start(present)
 
             if let unboxed = _unbox_value(object, inner) then
-                let wrapped = _wrap(unboxed, optional)
+                let wrapped = _wrap(unboxed, optional, inner)
 
                 _current.store(wrapped, slot, 0)
             fi
@@ -1406,9 +1448,8 @@ namespace IR.LLVMTarget is
                 return _current.load(held, _current.element_pointer(Types.structure([Types.pointer, held]), object, [_i32(0), _i32(1)], true), 0)
             fi
             let box_type = if let o = objects then o.box_type(_specialize(type)) else null fi
-            let held = _held(type)
 
-            if !objects? \/ !box_type? \/ !held? then
+            if !objects? \/ !box_type? \/ !_stored(type)? then
                 _report("unboxing a {type}")
                 return null
             fi
@@ -1421,7 +1462,7 @@ namespace IR.LLVMTarget is
 
             _throw_if(_current.compare(IntegerPredicate.EQ, _in_ranges(id, range), LLVM.Values.boolean(false)), "Ghul.InvalidCastException")
 
-            return _current.load(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
+            return _load_stored(type, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true))
         si
 
         /// The type object of a type named in the program: the one its
@@ -1448,10 +1489,11 @@ namespace IR.LLVMTarget is
             fi
 
             let result mut = LLVM_TYPES.zero(held!)
+            let element_types = cast Semantic.Types.TUPLE?(_specialize(tuple.type))?.arguments
 
             for (i, element) in tuple.values |> Ghul.Pipes.index() do
                 if let value = _value_of(element) then
-                    result = _current.insert_value(result, value, [i])
+                    result = _insert_member(result, value, i, if let types = element_types then types[i] else element.type fi)
                 else
                     return
                 fi
@@ -1462,7 +1504,7 @@ namespace IR.LLVMTarget is
 
         visit(negation: Values.NOT) is
             if let value = _value_of(negation.value) then
-                _push(_bool(_current.compare(IntegerPredicate.EQ, value, LLVM_TYPES.zero(value.type))))
+                _push(_current.binary(BinaryOperator.XOR, IntegerFlags.NONE, value, LLVM.Values.boolean(true)))
             fi
         si
 
@@ -1690,7 +1732,7 @@ namespace IR.LLVMTarget is
             let right = _value_of(compare.right)
 
             if left? /\ right? then
-                _push(_bool(_compare(compare.comparison, left, right, compare.is_unsigned)))
+                _push(_compare(compare.comparison, left, right, compare.is_unsigned))
             fi
         si
 
@@ -1750,6 +1792,15 @@ namespace IR.LLVMTarget is
         // The conversion of a value of kind `from` to kind `to`, saturating
         // from floating to integer as .NET does.
         _convert(value: LLVM.Value, from: Scalar, to: Scalar) -> LLVM.Value is
+            // A value is true where it is not zero.
+            if to == Scalar.BOOL /\ from != Scalar.BOOL then
+                if LLVM_TYPES.is_floating(value.type) then
+                    return _current.compare(FloatPredicate.UNE, value, LLVM_TYPES.zero(value.type))
+                fi
+
+                return _current.compare(IntegerPredicate.NE, value, LLVM_TYPES.zero(value.type))
+            fi
+
             let source = LLVM_TYPES.value_type(from)
             let target = LLVM_TYPES.value_type(to)
             let source_unsigned = LLVM_TYPES.is_unsigned(from)
@@ -2017,6 +2068,16 @@ namespace IR.LLVMTarget is
                 if LLVM_TYPES.is_floating(first.type) then
                     _report("a condition on {operands[0].type}")
                     return null
+                fi
+
+                // A bool is its own condition.
+                if first.type =~ Types.i1 then
+                    return
+                        if condition == IR.BRANCH.Z then
+                            _current.binary(BinaryOperator.XOR, IntegerFlags.NONE, first, LLVM.Values.boolean(true))
+                        else
+                            first
+                        fi
                 fi
 
                 return _current.compare(
@@ -2400,7 +2461,7 @@ namespace IR.LLVMTarget is
             od
 
             if let result = _current.call(helper, values.to_array()) then
-                _push(if helper.result =~ Types.i1 then _bool(result) else result fi)
+                _push(result)
             fi
         si
 
@@ -2468,7 +2529,7 @@ namespace IR.LLVMTarget is
                 else
                     let big = _current.load(Types.pointer, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_BIG)], true), 0)
 
-                    _push(_bool(_current.compare(IntegerPredicate.EQ, big, LLVM.Values.null_pointer)))
+                    _push(_current.compare(IntegerPredicate.EQ, big, LLVM.Values.null_pointer))
                 fi
             fi
         si
@@ -2559,6 +2620,7 @@ namespace IR.LLVMTarget is
             fi
 
             let parameter_types = LIST[LLVM.Type]()
+            let parameter_attributes = LIST[LLVM.Attribute?]()
             let values = LIST[LLVM.Value]()
             let formals = function.arguments
 
@@ -2572,15 +2634,19 @@ namespace IR.LLVMTarget is
                 fi
 
                 if let scalar = _scalar(formal) then
-                    parameter_types.add(LLVM_TYPES.value_type(scalar))
-                    values.add(_normalise_for(value, formal))
+                    parameter_types.add(_c_type(scalar))
+                    parameter_attributes.add(_c_extension(scalar))
+                    values.add(_to_c(value, scalar))
                 elif _is_string(_specialize(formal)) then
                     parameter_types.add(Types.pointer)
                     parameter_types.add(Types.i32)
+                    parameter_attributes.add(null)
+                    parameter_attributes.add(null)
                     values.add(strings.chars(_current, value))
                     values.add(strings.length(_current, value))
                 elif _objects?.bigint_of(_specialize(formal))? then
                     parameter_types.add(Types.pointer)
+                    parameter_attributes.add(null)
                     values.add(_bigint_to_host(value))
                 else
                     _report("a host operation taking {formal}")
@@ -2588,9 +2654,13 @@ namespace IR.LLVMTarget is
                 fi
             od
 
+            let result_scalar = if LLVM_TYPES.is_void(result) then null else _scalar(result) fi
+
             let result_type =
                 if LLVM_TYPES.is_void(result) then
                     LLVM.Type.VOID
+                elif let scalar = result_scalar then
+                    _c_type(scalar)
                 else
                     _held(result)
                 fi
@@ -2602,14 +2672,56 @@ namespace IR.LLVMTarget is
 
             let host = strings.runtime(LLVM_STRINGS.host_name(operation), result_type, parameter_types.to_array())
 
+            // A small scalar crosses as the C prototype declares it, and is
+            // extended to a register by the side that passes it, as clang
+            // declares one.
+            if host.result_attributes.count == 0 then
+                if let scalar = result_scalar, extension = _c_extension(scalar) then
+                    host.result_attributes.add(extension)
+                fi
+
+                for (i, attribute) in parameter_attributes |> Ghul.Pipes.index() do
+                    if let a = attribute /\ host.parameters[i].attributes.count == 0 then
+                        host.parameters[i].attributes.add(a)
+                    fi
+                od
+            fi
+
             if let answer = _current.call(host, values.to_array()) then
                 if let b = _objects?.bigint_of(_specialize(result)) then
                     _bigint_from_host(b, _specialize(result)!, answer)
+                elif let scalar = result_scalar then
+                    _push(_from_c(answer, scalar))
                 else
                     _push(answer)
                 fi
             fi
         si
+
+        // The type a value of the kind has in a C prototype: a bool as an
+        // `i1`, a small integer at its width, anything else as it is held.
+        _c_type(scalar: Scalar) -> LLVM.Type =>
+            if scalar == Scalar.BOOL then Types.i1 else LLVM_TYPES.stored_type(scalar) fi
+
+        // How C extends a value of the kind to a register: `zeroext` for a
+        // bool or an unsigned small kind, `signext` for a signed one.
+        _c_extension(scalar: Scalar) -> LLVM.Attribute? =>
+            if scalar != Scalar.BOOL /\ !LLVM_TYPES.is_narrow(scalar) then
+                null
+            elif LLVM_TYPES.is_unsigned(scalar) then
+                LLVM.Attribute.FLAG("zeroext")
+            else
+                LLVM.Attribute.FLAG("signext")
+            fi
+
+        // `value`, as the kind is computed with, as C passes it: a bool is
+        // the `i1` it already is.
+        _to_c(value: LLVM.Value, scalar: Scalar) -> LLVM.Value =>
+            if scalar == Scalar.BOOL then value else LLVM_TYPES.narrow(_current, value, scalar) fi
+
+        // `value`, as C passes it, as the kind is computed with.
+        _from_c(value: LLVM.Value, scalar: Scalar) -> LLVM.Value =>
+            if scalar == Scalar.BOOL then value else LLVM_TYPES.widen(_current, value, scalar) fi
 
         visit(store: Values.Store.SYMBOL) is _report("a store to {store.symbol.name}") si
 
@@ -2818,9 +2930,9 @@ namespace IR.LLVMTarget is
             if let v = _value_of(value), s = _value_of(state) then
                 let descriptor = _current.load(Types.pointer, v, 8)
                 let displayer = _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_DISPLAY)], true), 8)
-                let result = _slot(Types.i32)
+                let result = _slot(Types.i1)
 
-                _current.store(_i32(0), result, 4)
+                _current.store(LLVM.Values.boolean(false), result, 1)
 
                 let call = _new_block()
                 let carry_on = _new_block()
@@ -2830,12 +2942,12 @@ namespace IR.LLVMTarget is
                 _start(call)
 
                 _current.call(LLVM.Type.FUNCTION(LLVM.Type.VOID, [Types.pointer, Types.pointer], false), displayer, [v, s])
-                _current.store(_i32(1), result, 4)
+                _current.store(LLVM.Values.boolean(true), result, 1)
                 _current.branch(carry_on)
 
                 _start(carry_on)
 
-                _push(_current.load(Types.i32, result, 4))
+                _push(_current.load(Types.i1, result, 1))
             fi
         si
 
@@ -2974,21 +3086,19 @@ namespace IR.LLVMTarget is
         si
 
         visit(load: Values.Load.INSTANCE_FIELD) is
-            let held = _held(load.type)
-
-            if !held? then
+            if !_stored(load.type)? then
                 _report("a field of type {load.type}")
                 return
             fi
 
             if let address = _field_address(load.from, load.symbol) then
-                _push(_current.load(held, address, 0))
+                _push(_load_stored(load.type, address)!)
             fi
         si
 
         visit(store: Values.Store.INSTANCE_FIELD) is
             if let address = _field_address(store.from, store.symbol), value = _value_of(store.value) then
-                _current.store(_normalise_for(value, store.type), address, 0)
+                _store_stored(value, store.type, address)
             fi
         si
 
@@ -3028,13 +3138,13 @@ namespace IR.LLVMTarget is
 
         _load_global(symbol: Semantic.Symbols.Symbol, is_static: bool) is
             if let (name, type) = _global(symbol, is_static) then
-                _push(_current.load(type, LLVM.Values.global(name), 0))
+                _push(_widen(_current.load(type, LLVM.Values.global(name), 0), _specialize(cast Semantic.Types.Typed?(symbol)?.type)))
             fi
         si
 
         _store_global(symbol: Semantic.Symbols.Symbol, is_static: bool, value: Value) is
             if let (name, _) = _global(symbol, is_static), stored = _value_of(value) then
-                _current.store(_normalise_for(stored, cast Semantic.Types.Typed?(symbol)?.type), LLVM.Values.global(name), 0)
+                _store_stored(stored, _specialize(cast Semantic.Types.Typed?(symbol)?.type), LLVM.Values.global(name))
             fi
         si
 
@@ -3458,7 +3568,7 @@ namespace IR.LLVMTarget is
                     return
                 fi
 
-                _push(_bool(_in_ranges(_class_id(value), ranges)))
+                _push(_in_ranges(_class_id(value), ranges))
             fi
         si
 
@@ -3527,7 +3637,7 @@ namespace IR.LLVMTarget is
 
         visit(equality: Values.REFERENCE_EQUALITY) is
             if let left = _value_of(equality.left), right = _value_of(equality.right) then
-                _push(_bool(_current.compare(IntegerPredicate.EQ, left, right)))
+                _push(_current.compare(IntegerPredicate.EQ, left, right))
             fi
         si
 
@@ -3974,7 +4084,7 @@ namespace IR.LLVMTarget is
 
             if left? /\ right? then
                 if let equal = _equal_held(left, right, type) then
-                    _push(_bool(equal))
+                    _push(equal)
                 fi
             fi
         si
@@ -4009,14 +4119,12 @@ namespace IR.LLVMTarget is
                 let result mut = LLVM.Values.boolean(true)
 
                 for (i, element) in tuple.arguments |> Ghul.Pipes.index() do
-                    let held = _held(element)
-
-                    if !held? then
+                    if !_stored(element)? then
                         _report("an equality comparison of {type}")
                         return null
                     fi
 
-                    let equal = _equal_held(_current.extract_value(held!, left, [i]), _current.extract_value(held!, right, [i]), element)
+                    let equal = _equal_held(_extract_member(left, i, element), _extract_member(right, i, element), element)
 
                     if !equal? then
                         return null
@@ -4068,7 +4176,7 @@ namespace IR.LLVMTarget is
         // instance method is, so an override is the one reached, and only
         // where both are present.
         _equal_references_through(operator: Function, left: LLVM.Value, right: LLVM.Value, type: Type) -> LLVM.Value is
-            let result = _slot(Types.i32)
+            let result = _slot(Types.i1)
             let left_absent = _new_block()
             let left_present = _new_block()
             let both_present = _new_block()
@@ -4077,11 +4185,11 @@ namespace IR.LLVMTarget is
             _current.branch(_current.compare(IntegerPredicate.EQ, left, LLVM.Values.null_pointer), left_absent, left_present)
 
             _start(left_absent)
-            _current.store(_bool(_current.compare(IntegerPredicate.EQ, right, LLVM.Values.null_pointer)), result, 4)
+            _current.store(_current.compare(IntegerPredicate.EQ, right, LLVM.Values.null_pointer), result, 1)
             _branch(done)
 
             _start(left_present)
-            _current.store(_i32(0), result, 4)
+            _current.store(LLVM.Values.boolean(false), result, 1)
             _current.branch(_current.compare(IntegerPredicate.EQ, right, LLVM.Values.null_pointer), done, both_present)
 
             _start(both_present)
@@ -4089,14 +4197,14 @@ namespace IR.LLVMTarget is
             let bool_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_bool_type()
 
             if let compared = _value_of(Values.Call.INSTANCE(LLVM_VALUE(left, type), operator, LIST[Value]([LLVM_VALUE(right, type)]), bool_type)) then
-                _current.store(compared, result, 4)
+                _current.store(compared, result, 1)
             fi
 
             _branch(done)
 
             _start(done)
 
-            return _current.compare(IntegerPredicate.NE, _current.load(Types.i32, result, 4), _i32(0))
+            return _current.load(Types.i1, result, 1)
         si
 
         // A constrained call on a reference is an ordinary call on it, once
