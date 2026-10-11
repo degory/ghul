@@ -59,6 +59,19 @@ namespace IR.LLVMTarget is
         // stack was when the node began.
         _labels: LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]
 
+        // The try being lowered's landing pad, which calls unwind to, or null
+        // outside every try.
+        _unwind: BLOCK?
+
+        // Where each catch being lowered keeps the exception it caught,
+        // innermost last.
+        _caught: LIST[LLVM.Value]
+
+        // The position on the label stack of each try with a finally whose
+        // protected body is being lowered, with the slot an exit leaving it
+        // records its number in and the numbers given out.
+        _finally_exits: MAP[int, (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING)]
+
         _unsupported: LIST[string]
 
         /// The kinds of construct the lowered values used that this target
@@ -126,6 +139,8 @@ namespace IR.LLVMTarget is
             _locals = MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]()
             _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type)]()
             _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
+            _caught = LIST[LLVM.Value]()
+            _finally_exits = MAP[int, (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING)]()
             _unsupported = LIST[string]()
 
             _entry = function.add_block("entry")
@@ -457,7 +472,6 @@ namespace IR.LLVMTarget is
             _load_argument(load.index + _receiver_offset)
         si
 
-
         /// A composite value's structured expansion is lowered as any other
         /// structured IR is.
         visit(composite: Values.Composite) is
@@ -526,6 +540,10 @@ namespace IR.LLVMTarget is
                 return
             elif runtime.operation == IR.RuntimeOperation.CURRENT_THREAD_ID then
                 _push(_i32(0))
+            elif let name = _runtime_exception(runtime.operation) then
+                if let exception = _new_exception(name, runtime.operands) then
+                    _push(exception)
+                fi
             else
                 _report("the runtime operation {runtime.operation}")
             fi
@@ -616,22 +634,11 @@ namespace IR.LLVMTarget is
         si
 
         // Throws where `index` is outside the array `array` points at, an
-        // unsigned comparison catching a negative index too. Until the target
-        // has exception objects, what is thrown carries no type or message.
+        // unsigned comparison catching a negative index too.
         _check_index(array: LLVM.Value, index: LLVM.Value) is
             let in_range = _current.compare(IntegerPredicate.ULT, index, _arrays!.count(_current, array))
 
-            let outside = _new_block()
-            let inside = _new_block()
-
-            _current.branch(in_range, inside, outside)
-
-            _start(outside)
-
-            _current.call(_strings!.runtime("$ghul_throw", LLVM.Type.VOID, [Types.pointer]), [LLVM.Values.null_pointer])
-            _current.unreachable()
-
-            _start(inside)
+            _throw_if(_current.compare(IntegerPredicate.EQ, in_range, LLVM.Values.boolean(false)), "Ghul.IndexOutOfRangeException")
         si
 
         // The built-in array operation a call to `function` performs, or
@@ -702,8 +709,6 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        visit(thrown: Values.THROW) is _report("a throw") si
-
         visit(ret: Values.RET) is
             _return()
         si
@@ -771,27 +776,35 @@ namespace IR.LLVMTarget is
         visit(unbox: Values.UNBOX) is _unbox(unbox.value, unbox.type) si
 
         _unbox(value: Value, type: Type?) is
+            if let object = _value_of(value), unboxed = _unbox_value(object, type) then
+                _push(unboxed)
+            fi
+        si
+
+        // The value of `type` held in the box `object` points at, or null,
+        // reported, where the target has no box for `type`. A null, or a box
+        // of another type, throws.
+        _unbox_value(object: LLVM.Value, type: Type?) -> LLVM.Value? is
             let objects = _objects
             let box_type = if let o = objects then o.box_type(_specialize(type)) else null fi
             let held = _held(type)
 
             if !objects? \/ !box_type? \/ !held? then
                 _report("unboxing a {type}")
-                return
+                return null
             fi
 
-            if let object = _value_of(value) then
-                let range = LIST[(first: int, last: int)]()
+            let range = LIST[(first: int, last: int)]()
 
-                range.add(objects.class_range(box_type))
+            range.add(objects.class_range(box_type))
 
-                let id = _class_id(object)
+            let id = _class_id(object)
 
-                _throw_if(_current.compare(IntegerPredicate.EQ, _in_ranges(id, range), LLVM.Values.boolean(false)))
+            _throw_if(_current.compare(IntegerPredicate.EQ, _in_ranges(id, range), LLVM.Values.boolean(false)), "Ghul.InvalidCastException")
 
-                _push(_current.load(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0))
-            fi
+            return _current.load(held, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true), 0)
         si
+
         visit(type_of: Values.TYPEOF) is _report("typeof") si
         visit(tuple: Values.TUPLE) is _report("a tuple") si
 
@@ -1028,6 +1041,16 @@ namespace IR.LLVMTarget is
             fi
 
             if let value = _value_of(convert.value) then
+                // A source narrowed from a reference is still the box its
+                // value is held in.
+                if isa LLVM.Type.POINTER(value.type) then
+                    if let unboxed = _unbox_value(value, convert.type) then
+                        _push(unboxed)
+                    fi
+
+                    return
+                fi
+
                 _push(_convert(value, convert.from ?? Scalar.INT32, convert.to))
             fi
         si
@@ -1094,8 +1117,18 @@ namespace IR.LLVMTarget is
                 _lower_region(region, null)
             elif let loop: Values.LOOP = node then
                 _lower_loop(loop)
-            elif isa Values.TRY(node) then
-                _report("a try")
+            elif let `try: Values.TRY = node then
+                if let `finally = `try.finally_region then
+                    if `try.catches.count > 0 then
+                        _report("a try with both catches and a finally")
+                    else
+                        _lower_try_finally(`try, `finally)
+                    fi
+                elif `try.catches.count > 0 then
+                    _lower_try_catch(`try)
+                else
+                    _report("a try with no handler")
+                fi
             else
                 _report("a generator or asynchronous function")
             fi
@@ -1200,7 +1233,14 @@ namespace IR.LLVMTarget is
             _check_depth(depth, "loop")
         si
 
-        visit(exit: Values.Exit) is
+        visit(exit: Values.Exit) is _route(exit, false) si
+
+        // An exit goes to its target's block, unless it leaves the protected
+        // body of a try with a finally on the way. Where `is_taken`, the
+        // exit's condition has already held and any value it carries is
+        // already where its target reads it: the exit is being taken again
+        // after a finally.
+        _route(exit: Values.Exit, is_taken: bool) is
             let is_continue = isa Values.CONTINUE(exit)
 
             let i mut = _labels.count - 1
@@ -1208,8 +1248,20 @@ namespace IR.LLVMTarget is
             while i >= 0 do
                 let label = _labels[i]
 
+                let finally_exits: (selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING) mut
+
+                if _finally_exits.try_get_value(i, finally_exits ref) then
+                    _leave_through_finally(exit, is_taken, finally_exits.selector, finally_exits.exits, label.target)
+                    return
+                fi
+
                 if label.node == exit.target /\ label.is_loop_head == is_continue then
-                    _exit(exit, label.target, label.result, label.depth)
+                    if is_taken then
+                        _branch(label.target)
+                    else
+                        _exit(exit, label.target, label.result, label.depth)
+                    fi
+
                     return
                 fi
 
@@ -1217,6 +1269,25 @@ namespace IR.LLVMTarget is
             od
 
             _report("an exit from a construct the lowering does not handle")
+        si
+
+        // The label an exit goes to, outside any try it leaves.
+        _target_label(exit: Values.Exit) -> (node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)? is
+            let is_continue = isa Values.CONTINUE(exit)
+
+            let i mut = _labels.count - 1
+
+            while i >= 0 do
+                let label = _labels[i]
+
+                if label.node == exit.target /\ label.is_loop_head == is_continue /\ !_finally_exits.contains_key(i) then
+                    return label
+                fi
+
+                i = i - 1
+            od
+
+            return null
         si
 
         _exit(exit: Values.Exit, target: BLOCK, result: LLVM.Value?, depth: int) is
@@ -1383,7 +1454,7 @@ namespace IR.LLVMTarget is
                 fi
             od
 
-            if let result = _current.call(callee, values.to_array()) then
+            if let result = _emit_call(callee, values.to_array()) then
                 _push(result)
             fi
         si
@@ -1472,7 +1543,6 @@ namespace IR.LLVMTarget is
             fi
         si
 
-
         _load_receiver() is
             if _receiver_offset == 0 then
                 _report("self outside an instance method")
@@ -1531,16 +1601,18 @@ namespace IR.LLVMTarget is
                 _start(run)
 
                 _current.store(_i32(1), LLVM.Values.global(flag), 4)
-                _current.call(callee, [])
+                _emit_call(callee, [])
                 _current.branch(carry_on)
 
                 _start(carry_on)
             fi
         si
 
-        // Throws where `condition`, an `i1`, holds. Until the target has
-        // exception objects, what is thrown carries no type or message.
-        _throw_if(condition: LLVM.Value) is
+        // Throws a new instance of the core library's exception class
+        // `exception`, such as `Ghul.InvalidCastException`, where `condition`,
+        // an `i1`, holds. Where the program has no such class, what is thrown
+        // carries no type or message.
+        _throw_if(condition: LLVM.Value, exception: string) is
             let thrown = _new_block()
             let carry_on = _new_block()
 
@@ -1548,16 +1620,85 @@ namespace IR.LLVMTarget is
 
             _start(thrown)
 
-            _current.call(_strings!.runtime("$ghul_throw", LLVM.Type.VOID, [Types.pointer]), [LLVM.Values.null_pointer])
-            _current.unreachable()
+            _throw_new(exception)
 
             _start(carry_on)
         si
 
-        // Throws where `object` is null, as .NET throws on a member reached
-        // through a null reference rather than reading through it.
+        // The core library class of the exception a runtime operation makes,
+        // or null where it makes none.
+        _runtime_exception(operation: IR.RuntimeOperation) -> string? =>
+            case operation
+            when IR.RuntimeOperation.NEW_NOT_IMPLEMENTED then "Ghul.NotImplementedException"
+            when IR.RuntimeOperation.NEW_NOT_SUPPORTED then "Ghul.NotSupportedException"
+            when IR.RuntimeOperation.NEW_ASSERT_FAILED then "Ghul.AssertFailedException"
+            else null
+            esac
+
+        // A new instance of the core library's exception class `name`, made
+        // by its constructor taking `arguments`, or null, reported, where the
+        // program declares no such constructor.
+        _new_exception(name: string, arguments: Collections.List[Value]) -> LLVM.Value? is
+            if let declared = IR.Program.CORE_LIBRARY.find_class(name), group = cast Semantic.Symbols.FUNCTION_GROUP?(declared.find_direct("init")) then
+                for constructor in group.functions do
+                    if constructor.arguments.count == arguments.count then
+                        return _construct(constructor, arguments, name)
+                    fi
+                od
+            fi
+
+            _report("a {name} constructor taking {arguments.count} arguments")
+
+            return null
+        si
+
+        // Throws a new instance of the core library's exception class `name`,
+        // made by its constructor taking nothing.
+        _throw_new(name: string) is
+            if let declared = IR.Program.CORE_LIBRARY.find_class(name), group = cast Semantic.Symbols.FUNCTION_GROUP?(declared.find_direct("init")) then
+                for constructor in group.functions do
+                    if constructor.arguments.count == 0 then
+                        if let exception = _construct(constructor, LIST[Value](), name) then
+                            _throw(exception)
+                            return
+                        fi
+                    fi
+                od
+            fi
+
+            _throw(LLVM.Values.null_pointer)
+        si
+
+        // Throws `exception` through the runtime, which unwinds to this
+        // function's landing pad where the throw is inside a try.
+        _throw(exception: LLVM.Value) is
+            _emit_call(_strings!.runtime("$ghul_throw", LLVM.Type.VOID, [Types.pointer]), [exception])
+            _current.unreachable()
+            _is_terminated = true
+        si
+
+        // Calls `function`: through `invoke` inside a try, so a throw reaches
+        // the try's landing pad, and as a plain call outside every try.
+        _emit_call(function: FUNCTION, arguments: LLVM.Value[]) -> LLVM.Value? =>
+            _emit_call(function.type, function.reference, arguments)
+
+        _emit_call(function_type: LLVM.Type, callee: LLVM.Value, arguments: LLVM.Value[]) -> LLVM.Value? is
+            if let unwind = _unwind then
+                let normal = _new_block()
+                let result = _current.invoke(function_type, callee, arguments, normal, unwind)
+
+                _start(normal)
+
+                return result
+            fi
+
+            return _current.call(function_type, callee, arguments)
+        si
+
+        // Throws where `object` is null, for a `!` the program writes. A
+        // dereference of a value whose type says it is present is not checked.
         _check_not_null(object: LLVM.Value) is
-            _throw_if(_current.compare(IntegerPredicate.EQ, object, LLVM.Values.null_pointer))
+            _throw_if(_current.compare(IntegerPredicate.EQ, object, LLVM.Values.null_pointer), "Ghul.NullReferenceException")
         si
 
         // The address of the instance field `symbol` of the object `from`
@@ -1588,8 +1729,6 @@ namespace IR.LLVMTarget is
             if !object? then
                 return null
             fi
-
-            _check_not_null(object)
 
             return _current.element_pointer(objects.struct_type(owner), object, [_i32(0), _i32(position)], true)
         si
@@ -1670,25 +1809,46 @@ namespace IR.LLVMTarget is
         /// An object is allocated through the runtime, zeroed, with its
         /// descriptor in place, and its constructor is called on it.
         visit(construction: Values.NEW) is
-            let constructor = construction.constructor
+            if let object = _construct(construction.constructor, construction.arguments, "{construction.type}") then
+                _push(object)
+            fi
+        si
+
+        // A new instance of `constructor`'s class, built from `arguments`, or
+        // null, reported, where the target cannot build one. The arguments
+        // are evaluated before the object is allocated, as on .NET.
+        _construct(constructor: Function, arguments: Collections.List[Value], description: string) -> LLVM.Value? is
             let objects = _objects
             let type = _owner_class(constructor.owner)
 
             if constructor.intrinsic_operation? \/ !objects? \/ !type? \/ !(objects.is_object_type(type) \/ objects.is_object(type)) then
-                _report("constructing a {construction.type}")
-                return
+                _report("constructing a {description}")
+                return null
             fi
 
             if type.definition.is_union \/ type.definition.is_variant then
                 _report("a union")
-                return
+                return null
             fi
 
             // A generator's or asynchronous function's frame is the one place
             // such a function shows itself to its caller.
             if isa Semantic.Symbols.STATE_MACHINE_FRAME_BASE(type.definition) then
                 _report("a generator or asynchronous function")
-                return
+                return null
+            fi
+
+            let callee = if objects.is_object(type) then null else _callee(_instance_of(constructor)) fi
+
+            if !objects.is_object(type) /\ !callee? then
+                _report("a call to {constructor.name}")
+                return null
+            fi
+
+            let values = _arguments_for(constructor, arguments)
+
+            if !values? then
+                return null
             fi
 
             _ensure_initialised(constructor.owner)
@@ -1698,25 +1858,13 @@ namespace IR.LLVMTarget is
                     _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
                     [LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type)))])!
 
-            if objects.is_object(type) then
-                _push(object)
-                return
-            fi
-
-            let callee = _callee(_instance_of(constructor))
-
-            if !callee? then
-                _report("a call to {constructor.name}")
-                return
-            fi
-
-            if let values = _arguments_for(constructor, construction.arguments) then
+            if let c = callee then
                 values.insert(0, object)
 
-                _current.call(callee, values.to_array())
-
-                _push(object)
+                _emit_call(c, values.to_array())
             fi
+
+            return object
         si
 
         // The arguments of a call to `function`, each brought into the
@@ -1777,11 +1925,10 @@ namespace IR.LLVMTarget is
             fi
 
             if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
-                _check_not_null(receiver)
 
                 values.insert(0, receiver)
 
-                if let result = _current.call(callee, values.to_array()) then
+                if let result = _emit_call(callee, values.to_array()) then
                     _push(result)
                 fi
             fi
@@ -1838,7 +1985,7 @@ namespace IR.LLVMTarget is
 
             let target = _current.load(Types.pointer, entry, 8)
 
-            if let result = _current.call(function_type, target, values.to_array()) then
+            if let result = _emit_call(function_type, target, values.to_array()) then
                 _push(result)
             fi
         si
@@ -1862,7 +2009,6 @@ namespace IR.LLVMTarget is
             fi
 
             if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
-                _check_not_null(receiver)
 
                 let descriptor = _current.load(Types.pointer, receiver, 8)
                 let entry = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_VTABLE + 8 * slot.index)], true)
@@ -1903,7 +2049,6 @@ namespace IR.LLVMTarget is
             fi
 
             if let receiver = _value_of(call.from), values = _arguments_for(function, call.arguments) then
-                _check_not_null(receiver)
 
                 let descriptor = _current.load(Types.pointer, receiver, 8)
                 let class_id = _current.load(Types.i32, descriptor, 8)
@@ -2020,9 +2165,14 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            // A cast to a scalar tests for its box and keeps the reference,
-            // which is unboxed afterwards.
+            // A checked cast to a scalar tests for its box and keeps the
+            // reference, which is unboxed afterwards. An unchecked one unboxes.
             let is_box = _objects?.box_type(target)?
+
+            if is_box /\ !conversion.is_checked then
+                _unbox(conversion.value, target)
+                return
+            fi
 
             if !target? \/ !(LLVM_TYPES.is_object_reference(target) \/ is_box) then
                 _report("a cast to {conversion.type}")
@@ -2051,7 +2201,7 @@ namespace IR.LLVMTarget is
             let fits = _current.binary(BinaryOperator.OR, IntegerFlags.NONE, _in_ranges(id, ranges), _current.compare(IntegerPredicate.EQ, id, _i32(-1)))
 
             if conversion.faults_on_failure \/ (conversion.is_checked /\ is_box) then
-                _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)))
+                _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)), "Ghul.InvalidCastException")
                 _push(value)
             else
                 _push(_current.select(fits, value, LLVM.Values.null_pointer))
@@ -2271,17 +2421,230 @@ namespace IR.LLVMTarget is
                 fi
             od
 
-            _check_not_null(closure)
-
             let function = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.FUNCTION_OFFSET)], true), 8)
             let receiver = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.RECEIVER_OFFSET)], true), 8)
 
             values.insert(0, receiver)
 
-            if let result = _current.call(signature, function, values.to_array()) then
+            if let result = _emit_call(signature, function, values.to_array()) then
                 if !(signature.result =~ LLVM.Type.VOID) then
                     _push(result)
                 fi
+            fi
+        si
+
+        // The landing pad of the innermost try being lowered: the block
+        // starts the handler, and makes this function name the runtime's
+        // personality routine.
+        _landing_pad(block: BLOCK) -> LLVM.Value is
+            _function.personality = _strings!.runtime("$ghul_personality", Types.i32, []).reference
+
+            _start(block)
+
+            let landed = _current.landing_pad(Types.structure([Types.pointer, Types.i32]), false, [LLVM.Values.null_pointer])
+            let header = _current.extract_value(Types.pointer, landed, [0])
+
+            return _current.call(_strings!.runtime("$ghul_caught", Types.pointer, [Types.pointer]), [header])!
+        si
+
+        // The protected body's calls unwind to a landing pad that tests the
+        // exception against each catch's type in turn. A catch that matches
+        // has the exception on the stack where its body starts. One no catch
+        // matches is thrown on.
+        _lower_try_catch(node: Values.TRY) is
+            let end = _new_block()
+            let handler = _new_block()
+            let enclosing = _unwind
+
+            _labels.add((node, false, end, null, _stack.count))
+
+            _unwind = handler
+
+            for value in node.body.values do
+                gen(value)
+            od
+
+            _unwind = enclosing
+
+            if !_is_terminated then
+                _branch(end)
+            fi
+
+            let exception = _landing_pad(handler)
+            let caught = _slot(Types.pointer)
+
+            _current.store(exception, caught, 8)
+
+            for `catch in node.catches do
+                let ranges = _class_ranges(_specialize(`catch.type))
+
+                if !ranges? then
+                    _report("a catch of {`catch.type}")
+                    continue
+                fi
+
+                let id = _class_id(_current.load(Types.pointer, caught, 8))
+                let matched = _new_block()
+                let next = _new_block()
+
+                _current.branch(_in_ranges(id, ranges), matched, next)
+
+                _start(matched)
+
+                _caught.add(caught)
+                _push(_current.load(Types.pointer, caught, 8))
+
+                for value in `catch.body.values do
+                    gen(value)
+                od
+
+                _caught.remove_at(_caught.count - 1)
+
+                if !_is_terminated then
+                    _branch(end)
+                fi
+
+                _start(next)
+            od
+
+            _throw(_current.load(Types.pointer, caught, 8))
+
+            _labels.remove_at(_labels.count - 1)
+
+            _start(end)
+        si
+
+        // An exit that leaves the protected body records which exit it is
+        // and goes to the finally, after which the exit is taken again from
+        // outside. An exception runs the finally and is thrown on. The
+        // finally is lowered once for each path.
+        _lower_try_finally(node: Values.TRY, `finally: Values.REGION) is
+            let end = _new_block()
+            let handler = _new_block()
+            let normal = _new_block()
+            let selector = _slot(Types.i32)
+            let exits = IR.Program.EXIT_NUMBERING()
+            let enclosing = _unwind
+
+            _current.store(_i32(0), selector, 4)
+
+            _labels.add((node, false, end, null, _stack.count))
+
+            let marker = _labels.count
+
+            _labels.add((node, true, normal, null, _stack.count))
+            _finally_exits[marker] = (selector, exits)
+
+            _unwind = handler
+
+            for value in node.body.values do
+                gen(value)
+            od
+
+            _unwind = enclosing
+
+            if !_is_terminated then
+                _branch(normal)
+            fi
+
+            _finally_exits.remove(marker)
+            _labels.remove_at(marker)
+
+            let exception = _landing_pad(handler)
+            let caught = _slot(Types.pointer)
+
+            _current.store(exception, caught, 8)
+
+            _lower_region(`finally, null)
+
+            if !_is_terminated then
+                _throw(_current.load(Types.pointer, caught, 8))
+            fi
+
+            _start(normal)
+
+            _lower_region(`finally, null)
+
+            if !_is_terminated then
+                let taken = _current.load(Types.i32, selector, 4)
+
+                for i in 0..exits.exits.count do
+                    let take = _new_block()
+                    let next = _new_block()
+
+                    _current.branch(_current.compare(IntegerPredicate.EQ, taken, _i32(i + 1)), take, next)
+
+                    _start(take)
+
+                    _route(exits.exits[i], true)
+
+                    if !_is_terminated then
+                        _branch(end)
+                    fi
+
+                    _start(next)
+                od
+
+                _branch(end)
+            fi
+
+            _labels.remove_at(_labels.count - 1)
+
+            _start(end)
+        si
+
+        // Records which exit is being taken and goes to the finally, after
+        // which the exit is taken again.
+        _leave_through_finally(exit: Values.Exit, is_taken: bool, selector: LLVM.Value, exits: IR.Program.EXIT_NUMBERING, finally_block: BLOCK) is
+            let number = exits.number(exit)
+            let target = _target_label(exit)
+
+            if is_taken \/ exit.condition == IR.BRANCH.ALWAYS then
+                // A value the exit carries goes where its target reads it now,
+                // since the finally runs between here and there.
+                if !is_taken then
+                    if let t = target then
+                        _leave_with_result(t.result, t.depth)
+                    fi
+                fi
+
+                _current.store(_i32(number), selector, 4)
+                _branch(finally_block)
+                return
+            fi
+
+            if target?.result? ?? false then
+                _report("a conditional exit carrying a value out of a try with a finally")
+                return
+            fi
+
+            if let condition = _test(exit.condition, exit.operands) then
+                let leave = _new_block()
+                let next = _new_block()
+
+                _current.branch(condition, leave, next)
+
+                _start(leave)
+
+                _current.store(_i32(number), selector, 4)
+                _branch(finally_block)
+
+                _start(next)
+            fi
+        si
+
+        /// A throw hands the exception to the runtime, which unwinds to
+        /// the innermost try's landing pad. A throw with no exception, in a
+        /// catch, throws on the exception the catch caught.
+        visit(thrown: Values.THROW) is
+            if let exception = thrown.exception then
+                if let value = _value_of(exception) then
+                    _throw(value)
+                fi
+            elif _caught.count > 0 then
+                _throw(_current.load(Types.pointer, _caught[_caught.count - 1], 8))
+            else
+                _report("a rethrow outside a catch")
             fi
         si
     si
