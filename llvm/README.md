@@ -30,7 +30,7 @@ The text is written for the LLVM the `ghul-llvm` tool is built from, LLVM
   enumerations its operands use.
 - `intrinsics.ghul` - declarations of the intrinsics the backend calls.
 - `metadata.ghul` - `Metadata`, `MetadataNode` and the debug information
-  nodes source lines need.
+  nodes source lines and variables need.
 - `module.ghul` - `MODULE`, which holds everything above in the order it
   was added.
 - `names.ghul` - how names and quoted strings are spelled.
@@ -135,4 +135,4 @@ What the matrix covers:
 - `intrinsics` - every intrinsic `Intrinsics` declares, called.
 - `metadata`, `debug-info` - plain and named metadata, attachments, module
   flags, and enough debug information that the object `llc` writes carries
-  source lines.
+  source lines and variables.

@@ -27,16 +27,20 @@ namespace IR.LLVMTarget is
     class LLVM_BACKEND: Backend is
         _bodies: MAP[Function, LIST[Value]]
         _order: LIST[Function]
+        _frame_members: LIST[(frame: Classy, method: Function)]
         _enclosing: STACK[LIST[Value]?]
         _current: LIST[Value]?
 
         _entry_point: Function?
         _module: MODULE?
         _want_library: bool
+        _debug_info: LLVM_DEBUG_INFO?
+        _objects: LLVM_OBJECTS?
 
         init() is
             _bodies = MAP[Function, LIST[Value]]()
             _order = LIST[Function]()
+            _frame_members = LIST[(frame: Classy, method: Function)]()
             _enclosing = STACK[LIST[Value]?]()
         si
 
@@ -50,6 +54,7 @@ namespace IR.LLVMTarget is
         reset() is
             _bodies.clear()
             _order.clear()
+            _frame_members.clear()
             _enclosing.clear()
             _current = null
             _entry_point = null
@@ -97,7 +102,7 @@ namespace IR.LLVMTarget is
             File.write_all_text(ll_path, text)
 
             try
-                LLVM_LINKER.link(ll_path, path)
+                LLVM_LINKER.link(ll_path, path, IoC.CONTAINER.instance.build_flags.want_debug)
             finally
                 if !is_kept then
                     File.delete(ll_path)
@@ -134,10 +139,19 @@ namespace IR.LLVMTarget is
             _bodies[function] = _current!
         si
 
-        /// Drops the body: this target compiles no generator or asynchronous
-        /// function yet, and one the program reaches is reported where a body
-        /// that uses it is lowered.
-        finish_frame_member_body(frame: Classy, member: FrameMember) is si
+        /// Keeps a generator frame's member as a method of the frame, which
+        /// dispatch reaches as it reaches any other implementation. An
+        /// asynchronous function's is dropped: that function is reported where
+        /// its frame is constructed.
+        finish_frame_member_body(frame: Classy, member: FrameMember) is
+            if let generator: Semantic.Symbols.STATE_MACHINE_FRAME = frame then
+                if let method = FRAME_MEMBER_METHODS.method_for(generator, member) then
+                    _frame_members.add((frame, method))
+                    _order.add(method)
+                    _bodies[method] = _current!
+                fi
+            fi
+        si
 
         /// Drops the initializer: a unit variant's one instance is a global
         /// whose fields are all zero, built where the module is finished.
@@ -174,6 +188,8 @@ namespace IR.LLVMTarget is
         _build_module() -> MODULE is
             let module = MODULE()
             let names = LLVM_FUNCTION_NAMES()
+
+            _debug_info = if IoC.CONTAINER.instance.build_flags.want_debug then LLVM_DEBUG_INFO(module) else null fi
 
             let worklist = FUNCTION_WORKLIST(f => _bodies.contains_key(f))
             let declared = MAP[FUNCTION_INSTANCE, FUNCTION?]()
@@ -219,9 +235,15 @@ namespace IR.LLVMTarget is
             let container = IoC.CONTAINER.instance
             let object = cast Classy?(container.innate_symbol_lookup.get_object_type().symbol)
             let classes = CLASS_SET(object, element => LLVM_ARRAYS.holds_element(element), INNATE_CORE_CLASSES())
-            let objects = LLVM_OBJECTS(module, classes)
+            let objects = LLVM_OBJECTS(module, classes, cast Classy?(container.innate_symbol_lookup.get_string_type().symbol))
+
+            _objects = objects
 
             objects.collect(container.symbol_table.global_scope)
+
+            for (frame, method) in _frame_members do
+                objects.add_method(frame, method)
+            od
 
             let plan =
                 PROGRAM_PLAN(
@@ -230,6 +252,8 @@ namespace IR.LLVMTarget is
                     objects.dispatched,
                     null,
                     _order)
+
+            objects.reach = instance => declare(instance)
 
             let discovery_module = MODULE()
             let discovery_strings = LLVM_STRINGS(discovery_module)
@@ -274,7 +298,12 @@ namespace IR.LLVMTarget is
             od
 
             objects.finish(strings, callee)
-            closures.finish(strings)
+
+            if !objects.has_string_type then
+                strings.add_placeholder_descriptor()
+            fi
+
+            closures.finish(strings, callee)
 
             for (location, construct) in objects.unsupported do
                 _report(location, construct)
@@ -290,6 +319,8 @@ namespace IR.LLVMTarget is
 
                 LLVM_EXCEPTIONS.add_report_unhandled(module, strings, if let g = getter then callee(FUNCTION_INSTANCE.of(g)) else null fi)
             fi
+
+            _debug_info?.finish()
 
             return module
         si
@@ -408,6 +439,11 @@ namespace IR.LLVMTarget is
             return result
         si
 
+        // The LLVM type a value of `type` is held in, a struct and an
+        // optional value type included once the classes are known.
+        _held(type: Semantic.Types.Type?) -> LLVM.Type? =>
+            if let objects = _objects then objects.held_type(type) else LLVM_TYPES.value_type(type) fi
+
         // The LLVM function an instance is compiled into, with no body yet,
         // or null, reported, where its signature has a type the target holds
         // no values of.
@@ -416,17 +452,14 @@ namespace IR.LLVMTarget is
 
             let parameters = LIST[PARAMETER]()
 
+            // A struct method's receiver is the address of the struct, so
+            // the method changes it in place, as on .NET.
             if definition.is_emitted_with_receiver then
-                if isa Semantic.Symbols.STRUCT(definition.owner) then
-                    _report(definition.location, "a method of a struct")
-                    return null
-                fi
-
                 parameters.add(PARAMETER(LLVM.Types.pointer, "self"))
             fi
 
             for (i, argument) in definition.arguments |> Ghul.Pipes.index() do
-                if let type = LLVM_TYPES.value_type(instance.specialize(argument)) then
+                if let type = _held(instance.specialize(argument)) then
                     parameters.add(PARAMETER(type, "a{i}"))
                 else
                     _report(definition.location, "an argument of type {argument}")
@@ -434,7 +467,8 @@ namespace IR.LLVMTarget is
                 fi
             od
 
-            let result = LLVM_TYPES.result_type(instance.specialize(definition.return_type))
+            let return_type = instance.specialize(definition.return_type)
+            let result = if LLVM_TYPES.is_void(return_type) then LLVM.Type.VOID else _held(return_type) fi
 
             if !result? then
                 _report(definition.location, "a result of type {definition.return_type}")
@@ -448,6 +482,11 @@ namespace IR.LLVMTarget is
             let definition = instance.definition
 
             let lowering = LLVM_LOWERING(module, function, instance, instance.specialize(definition.return_type), callee, strings, arrays, objects)
+
+            if let debug = _debug_info then
+                lowering.debug_info = debug
+                lowering.debug_scope = debug.subprogram(function, instance.to_string(), definition.location)
+            fi
 
             lowering.lower(_bodies[definition])
 
@@ -469,7 +508,7 @@ namespace IR.LLVMTarget is
 
         is_instantiated(type: CLASS_INSTANCE) -> bool => _objects.is_instantiated(type)
 
-        note_instantiated(type: CLASS_INSTANCE) is si
+        note_instantiated(type: CLASS_INSTANCE) => _objects.note_instantiated(type)
 
         report(location: Source.LOCATION, construct: string) => _report(location, construct)
     si
