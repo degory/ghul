@@ -141,7 +141,7 @@ run_out_of_process_suite() {
     esac
     [[ -e "$target" ]] || die "no such test path: $target"
 
-    local args="ghul-test $target"
+    local args="ghul-test --no-ci $target"
     [[ "$suite" == "cross-assembly" ]] && args="ghul-test --use-dotnet-build $target"
 
     echo "coverage: running $suite ($target)"
@@ -149,15 +149,12 @@ run_out_of_process_suite() {
     # A failing test still leaves usable coverage, so record the outcome and
     # carry on rather than losing the run to `set -e`.
     local status=0
-    # GitHub Actions sets CI=true for every job. ghul-test reads that and
-    # defaults to COMPILER_RUN_MODE.CI, which runs the pinned `dotnet
-    # ghul-compiler` tool instead of discovering publish/ghul.dll — the exact
-    # file just instrumented above — so the suite runs at its normal,
-    # uninstrumented speed and coverage comes back empty. --use-dotnet-build
-    # already sidesteps this for cross-assembly by forcing DOTNET mode
-    # outright; clearing CI here gets the plain integration run the same
-    # publish/ discovery by falling back to LOCAL mode.
-    CI= "$tools/coverlet" publish/ghul.dll \
+    # --no-ci makes the integration run use publish/ghul.dll, the file just
+    # instrumented above, although GitHub Actions sets CI=true for every
+    # job; the pinned ghul-compiler tool would run uninstrumented and leave
+    # coverage empty. --use-dotnet-build takes its compiler from the build,
+    # so the cross-assembly run needs neither.
+    "$tools/coverlet" publish/ghul.dll \
         --target dotnet \
         --targetargs "$args" \
         --format cobertura \
