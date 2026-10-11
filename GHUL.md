@@ -955,7 +955,22 @@ si
 
 Nothing changes inside the declaring assembly, where a closed trait is implemented and derived from exactly as an open one is. A trait imported from an assembly built before the closure existed is treated as open.
 
-An override or trait implementation can narrow its return type to a subtype of the overridden member's, as `make() -> CIRCLE` narrows `make() -> SHAPE`: it is still the override, so a caller holding the base class or the trait reaches it and a caller holding the narrower type gets the narrower return. Only a reference type narrows this way - a value type in place of a reference is a different representation rather than a narrower one - and any other difference in return type is an error at the member.
+An override or trait implementation can narrow its return type to a subtype of the overridden member's, as `make() -> CIRCLE` narrows `make() -> SHAPE`: it is still the override, so a caller holding the base class or the trait reaches it and a caller holding the narrower type gets the narrower return. Only a reference type narrows this way - a value type in place of a reference is a different representation rather than a narrower one - and a trait member's implementation with any other return type is an error at the member.
+
+A class member with the same name and arguments as one it inherits from another class, but a return type that is neither the same nor narrower, does not override it: it hides it. It takes a slot of its own, a caller holding the subclass reaches the subclass's member, and a caller holding the base reaches the base's, even for an instance of the subclass. That reads like an override and is not one, so it draws a `hides-inherited` warning, suppressible on the member. A task with a result is the case it is for, as .NET's `Task<TResult>` hides `Task`'s awaiter:
+
+```ghul
+class TASK is
+    get_awaiter() -> TASK_AWAITER => TASK_AWAITER(self)
+si
+
+class TASK[T]: TASK is
+    @suppress("hides-inherited")
+    get_awaiter() -> TASK_AWAITER[T] => TASK_AWAITER[T](self)
+si
+```
+
+Awaiting a `TASK[int]` gives its `int`. Awaiting the same task through a `TASK` reaches the base's awaiter, which waits for it and drops the result, as it does on .NET. `super.get_awaiter()` reaches the hidden member.
 
 An override or trait implementation must keep the overridden member's optionality contract. It may strengthen it - a non-optional return or property where the base declares optional, an optional parameter where the base declares non-optional - but weakening it in either position is a compile error: returning `T?` where the base promises `T` would hand null to callers that use the base type, and requiring a non-optional parameter where the base accepts `T?` would receive null from them. A property with an assign accessor faces both directions at once, so its type must match the base's optionality exactly. The equality and order operators `=~` and `<>` are the one exception on the parameter side: presence is settled where the operator is used and the body is only handed present values, so an implementation may declare its parameter non-optional even where the overridden member spells it optional.
 
