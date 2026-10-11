@@ -133,17 +133,11 @@ Don't copy a program that an execution test already holds into `wasm/` or
 `llvm/`: give the execution test a `targets` file instead.
 
 A run under `wasm` needs the core library, which a wasm build compiles in
-from source rather than loading from an assembly. `build/wasm-libraries.sh`
-writes the response file naming ghul-core's and ghul-runtime's sources from
-their checkouts, and ghul-test is given it for every wasm run:
-
-```sh
-build/wasm-libraries.sh ../ghul-core ../ghul-runtime wasm-libraries.rsp
-dotnet ghul-test --target-flags wasm "@$PWD/wasm-libraries.rsp" integration-tests
-```
-
-CI does the same from fresh checkouts of both at their default branches.
-Without the flags a wasm run fails to compile, which is the right answer: the
+from source rather than loading from an assembly. The `local` configuration in
+`ghul-test.json` names ghul-core's and ghul-runtime's sources, from checkouts
+under `libraries/` or beside the repository, and ghul-test gives them to every
+wasm run. CI checks both out under `libraries/` at their default branches.
+Without the libraries a wasm run fails to compile, which is the right answer: the
 test asserts the program on that target, and silently skipping it would hide
 the gap the `targets` file exists to show.
 
@@ -222,16 +216,19 @@ ghul apply to them cleanly.
 ## Command line usage
 
 ```
-ghul-test [--use-dotnet-build] [--tag <name>]... <test-folder> [...]
+ghul-test [--config <name>] [--tag <name>]... [--shard <index>/<count>] <test-folder> [...]
 ```
+
+The configurations are in `ghul-test.json` at the root of the repository:
+`local` (the default, the compiler in `publish/`), `published` (the same
+without the wasm libraries), `cross-assembly` (MSBuild projects built with the
+compiler in `publish/`), and `ci` and `ci-cross-assembly`, which CI runs.
 
 `--tag <name>` (repeatable) restricts discovery to tests carrying at least one
 of the requested tags — see 'Tags' above.
 
 Environment variables:
 
-- `HOST` and `TARGET` &ndash; commands used to run the compiler and compiled program (default `dotnet`).
-- `CI` &ndash; set to `1` or `true` for CI mode.
 - `TEST_PROCESSES` &ndash; number of worker processes to use.
 
 ## Dependencies

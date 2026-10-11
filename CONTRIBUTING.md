@@ -129,7 +129,7 @@ need to run the whole suite yourself, because the queue will.
 |---|---|---|---|
 | Unit | `dotnet test unit-tests` | seconds | Deliberately selective - see [Changing the type system](#changing-the-type-system) for the exception |
 | Integration | `dotnet publish --output publish/ && dotnet ghul-test integration-tests` | ~3 min | Snapshot-based; see [integration-tests/README.md](integration-tests/README.md) |
-| Cross-assembly | `dotnet publish --output publish/ && dotnet ghul-test --use-dotnet-build cross-assembly-tests` | ~1 min | Real MSBuild projects; see [cross-assembly-tests/README.md](cross-assembly-tests/README.md) |
+| Cross-assembly | `dotnet publish --output publish/ && dotnet ghul-test --config cross-assembly cross-assembly-tests` | ~1 min | Real MSBuild projects; see [cross-assembly-tests/README.md](cross-assembly-tests/README.md) |
 | Analysis | `dotnet test analysis-tests` | seconds | Drives the language-service mode the editor extension uses |
 | Bootstrap | `./build/bootstrap.sh` | ~1-2 min | Self-hosting; produces little output until each pass finishes |
 
