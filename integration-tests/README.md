@@ -158,8 +158,9 @@ the `ghulflags` name, wherever the test lives, so a target test outside
 the suite builds it with the core library and runs it; under `llvm`, only a
 configuration whose `run_targets` names `llvm` does, as described above.
 
-A run under `llvm` links a native executable with `ghul-llvm`, which nothing
-but the `llvm` configurations expect to find. `build/ghul-llvm.sh` fetches the
+A run under `llvm` links a native executable with `ghul-llvm`, so the `local`
+and `ci` configurations pass every llvm run over and the `llvm` configuration
+runs those alone. `build/ghul-llvm.sh` fetches the
 release the tests are run with, the one `build/ghul-llvm.version` names, as a
 user's build fetches it, and prints where its executable is:
 
