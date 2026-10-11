@@ -13,5 +13,9 @@ concepts include:
   `target_capabilities.ghul` answers for the .NET and WebAssembly targets, and
   `capability_checker.ghul` checks a use against them and reports the ones the
   target does not carry.
+- **target profiles** – `target_profile.ghul` answers what else the front end
+  and driver ask of a target: whether its core library is compiled from
+  source, whether its entry point takes arguments, and which `@IF` names it
+  turns on. Code asks the profile rather than testing for a target by name.
 
 Most passes under `syntax/process` rely on these APIs.
