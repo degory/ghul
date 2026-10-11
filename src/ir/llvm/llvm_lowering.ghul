@@ -395,7 +395,11 @@ namespace IR.LLVMTarget is
             _current.convert(Conversion.ZERO_EXTEND, value, Types.i32)
 
         visit_value(value: Value) is
-            _report("{value.get_type().name}")
+            if let lowered: LLVM_VALUE = value then
+                _push(lowered.value)
+            else
+                _report("{value.get_type().name}")
+            fi
         si
 
         visit_address_of_value(value: Value) is
@@ -661,7 +665,6 @@ namespace IR.LLVMTarget is
         visit(arithmetic: Values.DECIMAL_ARITHMETIC) is _report("decimal arithmetic") si
         visit(compare: Values.DECIMAL_COMPARE) is _report("decimal arithmetic") si
         visit(convert: Values.DECIMAL_CONVERT) is _report("a decimal conversion") si
-        visit(equality: Values.EQUALITY_COMPARISON) is _report("an equality comparison") si
         /// A reference optional is present where it is not null. A value-type
         /// optional is not lowered yet.
         visit(test: Values.HAS_VALUE) is
@@ -1405,7 +1408,9 @@ namespace IR.LLVMTarget is
         /// A built-in operation lowers to the IR the operation stands for,
         /// made once and reused by every later lowering of the same body.
         visit(call: Values.Call.INNATE) is
-            if call.innate_name.starts_with("host.") \/ call.innate_name.starts_with("nullable.") then
+            // An object's type name and a string's own operations need the
+            // type objects and strings the target does not build yet.
+            if call.innate_name.starts_with("host.") \/ call.innate_name.starts_with("nullable.") \/ call.innate_name.starts_with("object.") \/ call.innate_name.starts_with("string.") then
                 _report("the operation {call.innate_name}")
             elif call.is_lowered then
                 gen(call.lowering)
@@ -1897,6 +1902,11 @@ namespace IR.LLVMTarget is
             let function = call.function
             let dispatch = call.dispatch
 
+            if let constrained: Values.CONSTRAINED = call.from then
+                _call_constrained(call, constrained)
+                return
+            fi
+
             if _is_object_constructor(function) then
                 return
             fi
@@ -2142,7 +2152,7 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let value = _value_of(Values.TYPE_TEST_OPERAND.operand(test.value)) then
+            if let value = _value_of(_type_test_operand(test.value)) then
                 if !(isa LLVM.Type.POINTER(value.type)) then
                     _report("a type test of {test.value.type}")
                     return
@@ -2158,10 +2168,11 @@ namespace IR.LLVMTarget is
         // type answers null. A cast to `object` cannot fail.
         visit(conversion: Values.CAST) is
             let target = _specialize(conversion.type)
+            let operand = _type_test_operand(conversion.value)
 
             let held = _held(conversion.value.type)
 
-            if !held? \/ !isa LLVM.Type.POINTER(held) then
+            if !isa Values.BOX(operand) /\ (!held? \/ !isa LLVM.Type.POINTER(held)) then
                 _report("a cast")
                 return
             fi
@@ -2180,7 +2191,7 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            let value = _value_of(conversion.value)
+            let value = _value_of(operand)
 
             if !value? then
                 return
@@ -2648,5 +2659,118 @@ namespace IR.LLVMTarget is
                 _report("a rethrow outside a catch")
             fi
         si
+
+        // `left =~ right` over values of the concrete type the comparer's
+        // type parameter is: by value for a scalar, a NaN equal to another as
+        // .NET's comparer has it, through the type's own `=~` where it
+        // declares one, and by reference otherwise. An absent value is equal
+        // only to another.
+        visit(equality: Values.EQUALITY_COMPARISON) is
+            let type = _specialize(equality.left.type)
+
+            if let scalar = _scalar_of(type) then
+                if let left = _value_of(equality.left), right = _value_of(equality.right) then
+                    if LLVM_TYPES.is_floating(left.type) then
+                        let equal = _current.compare(FloatPredicate.OEQ, left, right)
+                        let left_nan = _current.compare(FloatPredicate.UNO, left, left)
+                        let right_nan = _current.compare(FloatPredicate.UNO, right, right)
+                        let both_nan = _current.binary(BinaryOperator.AND, IntegerFlags.NONE, left_nan, right_nan)
+
+                        _push(_bool(_current.binary(BinaryOperator.OR, IntegerFlags.NONE, equal, both_nan)))
+                    else
+                        _push(_bool(_current.compare(IntegerPredicate.EQ, left, right)))
+                    fi
+                fi
+
+                return
+            fi
+
+            if !type? \/ _is_string(type) \/ !LLVM_TYPES.is_object_reference(type) then
+                _report("an equality comparison of {type}")
+                return
+            fi
+
+            let left = _value_of(equality.left)
+            let right = _value_of(equality.right)
+
+            if !left? \/ !right? then
+                return
+            fi
+
+            let operator = _declared_equals(type)
+
+            if !operator? then
+                _push(_bool(_current.compare(IntegerPredicate.EQ, left, right)))
+                return
+            fi
+
+            let result = _slot(Types.i32)
+            let left_absent = _new_block()
+            let left_present = _new_block()
+            let both_present = _new_block()
+            let done = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.EQ, left, LLVM.Values.null_pointer), left_absent, left_present)
+
+            _start(left_absent)
+            _current.store(_bool(_current.compare(IntegerPredicate.EQ, right, LLVM.Values.null_pointer)), result, 4)
+            _branch(done)
+
+            _start(left_present)
+            _current.store(_i32(0), result, 4)
+            _current.branch(_current.compare(IntegerPredicate.EQ, right, LLVM.Values.null_pointer), done, both_present)
+
+            _start(both_present)
+
+            let bool_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_bool_type()
+
+            if let compared = _value_of(Values.Call.INSTANCE(LLVM_VALUE(left, type), operator, LIST[Value]([LLVM_VALUE(right, type)]), bool_type)) then
+                _current.store(compared, result, 4)
+            fi
+
+            _branch(done)
+
+            _start(done)
+
+            _push(_current.load(Types.i32, result, 4))
+        si
+
+        // The `=~` a type declares taking a value of itself, or null where it
+        // declares none.
+        _declared_equals(type: Type) -> Function? is
+            if let group: Semantic.Symbols.FUNCTION_GROUP = type.find_member("=~") then
+                for function in group.functions do
+                    if function.arguments.count == 1 /\ function.arguments[0].is_assignable_from(type) then
+                        return function
+                    fi
+                od
+            fi
+
+            return null
+        si
+
+        // A constrained call on a reference is an ordinary call on it, once
+        // the type parameter is the reference type it stands for.
+        _call_constrained(call: Values.Call.INSTANCE, constrained: Values.CONSTRAINED) is
+            let receiver = if let address: Values.ADDRESS = constrained.value then address.value else constrained.value fi
+
+            // A string's descriptor carries no vtable yet, so a call on one is
+            // reported rather than made through it.
+            if !LLVM_TYPES.is_object_reference(_specialize(constrained.type)) \/ _is_string(_specialize(constrained.type)) then
+                _report("a constrained call on {_specialize(constrained.type)}")
+                return
+            fi
+
+            _call_instance(Values.Call.INSTANCE(receiver, call.function, call.arguments, call.type))
+        si
+
+        // The operand of a type test, as the reference the test examines: a
+        // value whose type parameter stands for a scalar is boxed.
+        _type_test_operand(value: Value) -> Value =>
+            if value.type?.type_variable_side? /\ _objects?.box_type(_specialize(value.type))? then
+                Values.BOX(value)
+            else
+                Values.TYPE_TEST_OPERAND.operand(value)
+            fi
     si
 si
