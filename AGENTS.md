@@ -49,11 +49,11 @@ a pull request the maintainer reviews on its diff - see
 ## A failing test is your change
 
 Assume every test failure you see was caused by what you just did. "That test
-was already broken" is almost never true here: a pull request enters the merge
-queue only when its own run is green, the queue runs the whole suite on the
-pull request merged with `main` before it lands, and the squash-merged commit is
-the tree the queue tested. A published release is the package the queue built
-and tested from that tree.
+was already broken" is almost never true here: a pull request merges only when
+its own run of the whole suite is green and it has an approving review, and the
+release build on `main` runs the suite again on the commit that landed and
+publishes nothing when it fails. A published release passed the whole suite on
+the tree it was built from.
 
 Before concluding otherwise, reproduce the failure against the latest published
 compiler on an unmodified checkout, and find the CI run where it failed. If you
