@@ -94,9 +94,6 @@ count=$(ls "$out"/*.ll 2>/dev/null | wc -l)
 if [ "$count" -eq 0 ]; then
     echo "llvm-check: no modules were written; the test run failed:" >&2
     echo "$test_log" | grep -E "error|Failed" >&2
-| wc -l)
-if [ "$count" -eq 0 ]; then
-    echo "llvm-check: no modules were written; the test run failed" >&2
     exit 1
 fi
 
