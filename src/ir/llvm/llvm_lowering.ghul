@@ -575,7 +575,24 @@ namespace IR.LLVMTarget is
             fi
         si
         visit(decimal: Values.Literal.DECIMAL) is _report("a decimal literal") si
-        visit(bigint: Values.Literal.BIGINT) is _report("a bigint literal") si
+        // A bigint literal that fits in a long is built into the box's i64
+        // field. A wider one is built at run time from its decimal digits,
+        // through the static `parse` the core library gives `bigint`.
+        visit(bigint: Values.Literal.BIGINT) is
+            let small: long mut
+
+            if long.try_parse(bigint.value, small ref) then
+                let long_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_long_type()
+
+                _bigint_of_small(bigint.type, Values.Literal.NUMBER(Values.Literal.CONSTANT.I8(small), long_type))
+            elif let parse = _static_method(bigint.type, "parse", 1) then
+                let string_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type()
+
+                gen(Values.Call.STATIC(parse, LIST[Value]([Values.Literal.STRING(bigint.value, string_type)]), bigint.type, null))
+            else
+                _report("a bigint literal, whose type has no parse")
+            fi
+        si
 
         visit(load: Values.Load.SYMBOL) is _report("a load of {load.symbol.name}") si
         visit_address(load: Values.Load.SYMBOL) is _report("the address of {load.symbol.name}") si
@@ -590,8 +607,14 @@ namespace IR.LLVMTarget is
         si
 
         visit_address(load: Values.Load.TEMP) is _local_address(load.local) si
-        visit_address(load: Values.Load.STATIC_FIELD) is _report("the address of a static field") si
-        visit_address(load: Values.Load.GLOBAL_FIELD) is _report("the address of a global variable") si
+        visit_address(load: Values.Load.STATIC_FIELD) is _global_address(load.symbol, true) si
+        visit_address(load: Values.Load.GLOBAL_FIELD) is _global_address(load.symbol, false) si
+
+        _global_address(symbol: Semantic.Symbols.Symbol, is_static: bool) is
+            if let (name, _) = _global(symbol, is_static) then
+                _push(LLVM.Values.global(name))
+            fi
+        si
 
         visit(load: Values.Load.LOCAL_ARGUMENT) is
             let symbol = load.symbol
@@ -2105,6 +2128,8 @@ namespace IR.LLVMTarget is
                 _lower_nullable(call.innate_name, call.from)
             elif call.innate_name.starts_with("string.") then
                 _call_string(call.innate_name, call.arguments)
+            elif call.innate_name =~ "bigint.is_small" \/ call.innate_name =~ "bigint.small" then
+                _lower_bigint_field(call.innate_name, call.arguments[0])
             elif call.is_lowered then
                 gen(call.lowering)
             else
@@ -2129,6 +2154,13 @@ namespace IR.LLVMTarget is
                     _store_array_element(arguments[0], arguments[1], arguments[2])
                 elif operation.starts_with("string.") then
                     _call_string(operation, arguments)
+                elif operation =~ "bigint.is_small" \/ operation =~ "bigint.small" then
+                    _lower_bigint_field(operation, arguments[0])
+                elif operation =~ "double.bits" \/ operation =~ "single.bits" then
+                    // The bits of a floating value, as the integer of its width.
+                    if let value = _value_of(arguments[0]) then
+                        _push(_current.convert(Conversion.BIT_CAST, value, if operation =~ "double.bits" then Types.i64 else Types.i32 fi))
+                    fi
                 else
                     _report("the intrinsic {operation}")
                 fi
@@ -2267,11 +2299,143 @@ namespace IR.LLVMTarget is
             fi
         si
 
+
+        // A new bigint box holding `small` in its i64 field and `big`, the
+        // runtime's integer or null, in the other. It holds a pointer, so it
+        // is one the collector scans.
+        _new_bigint(objects: LLVM_OBJECTS, type: CLASS_INSTANCE, small: LLVM.Value, big: LLVM.Value) -> LLVM.Value is
+            let box =
+                _current.call(
+                    _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
+                    [LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type)))])!
+
+            let layout = objects.struct_type(type)
+
+            _current.store(small, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_SMALL)], true), 0)
+            _current.store(big, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_BIG)], true), 0)
+
+            return box
+        si
+
+        // A bigint whose value its i64 field holds: `value`, a long or an int.
+        _bigint_of_small(type: Type?, value: Value) is
+            let objects = _objects
+            let b = if let o = objects then o.bigint_of(_specialize(type)) else null fi
+
+            if !objects? \/ !b? then
+                _report("a bigint made from a {value.type}")
+                return
+            fi
+
+            if let held = _value_of(value) then
+                let small = if LLVM_TYPES.width(held.type) < 64 then _current.convert(Conversion.SIGN_EXTEND, held, Types.i64) else held fi
+
+                _push(_new_bigint(objects, b, small, LLVM.Values.null_pointer))
+            fi
+        si
+
+        // The bigint `box` points at's i64 field, or whether that holds its
+        // value: where it does, the runtime's integer is null.
+        _lower_bigint_field(operation: string, value: Value) is
+            let objects = _objects
+            let b = if let o = objects then o.bigint_of(_specialize(value.type)) else null fi
+
+            if !objects? \/ !b? then
+                _report("{operation} on a {value.type}")
+                return
+            fi
+
+            if let box = _value_of(value) then
+                let layout = objects.struct_type(b)
+
+                if operation =~ "bigint.small" then
+                    _push(_current.load(Types.i64, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_SMALL)], true), 0))
+                else
+                    let big = _current.load(Types.pointer, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_BIG)], true), 0)
+
+                    _push(_bool(_current.compare(IntegerPredicate.EQ, big, LLVM.Values.null_pointer)))
+                fi
+            fi
+        si
+
+        // The runtime's integer for the bigint `box` points at: the one it
+        // holds, or, for a value its i64 field holds, one made from that.
+        _bigint_to_host(box: LLVM.Value) -> LLVM.Value is
+            let layout = LLVM.Types.structure([Types.pointer, Types.i64, Types.pointer])
+
+            let slot = _slot(Types.pointer)
+            let big = _current.load(Types.pointer, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_BIG)], true), 0)
+
+            _current.store(big, slot, 0)
+
+            let from_small = _new_block()
+            let join = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.EQ, big, LLVM.Values.null_pointer), from_small, join)
+
+            _start(from_small)
+
+            let small = _current.load(Types.i64, _current.element_pointer(layout, box, [_i32(0), _i32(LLVM_OBJECTS.BIGINT_SMALL)], true), 0)
+            let made = _current.call(_strings!.runtime(LLVM_STRINGS.host_name("bigint_from_long"), Types.pointer, [Types.i64]), [small])!
+
+            _current.store(made, slot, 0)
+            _current.branch(join)
+
+            _start(join)
+
+            return _current.load(Types.pointer, slot, 0)
+        si
+
+        // Wraps the runtime's integer `big` in a new bigint box, which the
+        // core library's `_canonical` moves into the i64 field where it fits,
+        // as every other bigint operation looks there first.
+        _bigint_from_host(b: CLASS_INSTANCE, type: Type, big: LLVM.Value) is
+            let canonical = _static_method(type, "_canonical", 1)
+
+            if !canonical? then
+                _report("a bigint the runtime answers with, with no bigint._canonical")
+                return
+            fi
+
+            let box = _new_bigint(_objects!, b, LLVM.Values.i64(0L), big)
+
+            if let callee = _callee(_instance_of(canonical)) then
+                if let result = _emit_call(callee, [box]) then
+                    _push(result)
+                fi
+            else
+                _report("a call to {canonical.name}")
+            fi
+        si
+
+        // The static method of `type` named `name` that takes `arity`
+        // arguments.
+        _static_method(type: Type?, name: string, arity: int) -> Function? is
+            let found = type?.find_member(name)
+
+            if let group: Semantic.Symbols.FUNCTION_GROUP = found then
+                for function in group.functions do
+                    if !function.is_instance /\ function.arguments.count == arity then
+                        return function
+                    fi
+                od
+            elif let function: Function = found /\ !function.is_instance /\ function.arguments.count == arity then
+                return function
+            fi
+
+            return null
+        si
         // A host operation is a function the native runtime defines, named
         // for the operation. A string crosses as the address of its code
         // units and their count, and comes back as a string the runtime made
         // through `ghul_make_string`.
         _call_host(operation: string, function: Function, arguments: Collections.List[Value]) is
+            _call_host(operation, function, arguments, function.return_type)
+        si
+
+        // A bigint crosses as the runtime's integer, made from its i64 field
+        // where that holds the value, and comes back wrapped in a new box.
+        _call_host(operation: string, function: Function, arguments: Collections.List[Value], result: Type?) is
             let strings = _strings
 
             if !strings? then
@@ -2300,6 +2464,9 @@ namespace IR.LLVMTarget is
                     parameter_types.add(Types.i32)
                     values.add(strings.chars(_current, value))
                     values.add(strings.length(_current, value))
+                elif _objects?.bigint_of(_specialize(formal))? then
+                    parameter_types.add(Types.pointer)
+                    values.add(_bigint_to_host(value))
                 else
                     _report("a host operation taking {formal}")
                     return
@@ -2307,21 +2474,25 @@ namespace IR.LLVMTarget is
             od
 
             let result_type =
-                if LLVM_TYPES.is_void(function.return_type) then
+                if LLVM_TYPES.is_void(result) then
                     LLVM.Type.VOID
                 else
-                    _held(function.return_type)
+                    _held(result)
                 fi
 
             if !result_type? then
-                _report("a host operation answering {function.return_type}")
+                _report("a host operation answering {result}")
                 return
             fi
 
             let host = strings.runtime(LLVM_STRINGS.host_name(operation), result_type, parameter_types.to_array())
 
             if let answer = _current.call(host, values.to_array()) then
-                _push(answer)
+                if let b = _objects?.bigint_of(_specialize(result)) then
+                    _bigint_from_host(b, _specialize(result)!, answer)
+                else
+                    _push(answer)
+                fi
             fi
         si
 
@@ -2626,6 +2797,18 @@ namespace IR.LLVMTarget is
         /// An object is allocated through the runtime, zeroed, with its
         /// descriptor in place, and its constructor is called on it.
         visit(construction: Values.NEW) is
+            let operation = construction.constructor.intrinsic_operation
+
+            // A bigint is built in its box's i64 field from a long or an int,
+            // and by the runtime from anything else.
+            if operation =~ "bigint.of_small" then
+                _bigint_of_small(construction.type, construction.arguments[0])
+                return
+            elif let o = operation /\ o.starts_with("host.") then
+                _call_host(o.substring(5), construction.constructor, construction.arguments, construction.type)
+                return
+            fi
+
             if let object = _construct(construction.constructor, construction.arguments, "{construction.type}") then
                 _push(object)
             fi
@@ -2753,9 +2936,9 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            // A value's own method, of a struct or a scalar held in place,
-            // is called as a struct's is.
-            if isa Semantic.Symbols.STRUCT(function.root_specialized_from.owner) /\ _held(call.from.type)? /\ !isa LLVM.Type.POINTER(_held(call.from.type)!) then
+            // A value type's own method, of a struct, a scalar or a bigint, is
+            // called with the address of the value, as a struct's is.
+            if isa Semantic.Symbols.STRUCT(function.root_specialized_from.owner) /\ (_specialize(call.from.type)?.is_value_type ?? false) then
                 _call_struct(call.from, function, call.arguments)
                 return
             fi
