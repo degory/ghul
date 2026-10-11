@@ -76,7 +76,7 @@ A top-level `let` whose initializer names the variable it declares, as `let tota
 
 Every file whose top-level statements are left unselected is told so, as a `top-level-statements-not-run` warning at its first statement — the statements do not run, so a `let` among them never initializes. Suppress it project-wide with `--suppress top-level-statements-not-run`, or take it as a hint with `--warn-as-hint`, in a project where several script files under one build is the intended shape. Where several files carry top-level statements and nothing names an entry point, none is chosen, every one of them warns, and an executable build reports that it has no entry point.
 
-An ordinary pragma wraps the one definition or statement written after it, which gives it nowhere to reach a warning reported at a top-level statement — there is no wrapping definition to attach to. `@@pragma(...)`, doubled at, is a **file-level** pragma: written before everything else in the file, one or more of them cover the whole file rather than one definition. `@@suppress("slug")` reaches every diagnostic in the file, top-level statements included; `@@precedence(...)` sets an operator's precedence for the rest of the file's parse, with no restore at the end the way the per-definition `@precedence` has; `@@IF.<name>()` leaves the whole file out of the build when `<name>` is off, definitions and top-level statements alike, which is how a source shared between targets keeps a file to one of them (`@@IF.dotnet()`, `@@IF.wasm()`, `@@IF.not.dotnet()`). A `@@` pragma anywhere but the very start of the file — after a `use`, a definition, or a top-level statement — is an error:
+An ordinary pragma wraps the one definition or statement written after it, which gives it nowhere to reach a warning reported at a top-level statement — there is no wrapping definition to attach to. `@@pragma(...)`, doubled at, is a **file-level** pragma: written before everything else in the file, one or more of them cover the whole file rather than one definition. `@@suppress("slug")` reaches every diagnostic in the file, top-level statements included; `@@precedence(...)` sets an operator's precedence for the rest of the file's parse, with no restore at the end the way the per-definition `@precedence` has; `@@IF.<name>()` leaves the whole file out of the build when `<name>` is off, definitions and top-level statements alike, which is how a source shared between targets keeps a file to one of them (`@@IF.dotnet()`, `@@IF.wasm()`, `@@IF.source_core()`). A `@@` pragma anywhere but the very start of the file — after a `use`, a definition, or a top-level statement — is an error:
 
 ```ghul
 @@suppress("top-level-statements-not-run")
@@ -2605,7 +2605,9 @@ si
 
 See <https://ghul.dev/webassembly.html>.
 
-The compiler builds for one of two targets, chosen with `--target`: `dotnet`, the default, writes a .NET assembly, and `wasm` writes a WebAssembly module using the GC proposal, with a JavaScript loader beside it that runs the module under Node.js 22 or newer. The same source builds for either target, and it means the same thing on both: where the `wasm` target cannot compile something yet, it reports an error rather than compiling it differently.
+The compiler builds for a target chosen with `--target`: `dotnet`, the default, writes a .NET assembly, and `wasm` writes a WebAssembly module using the GC proposal, with a JavaScript loader beside it that runs the module under Node.js 22 or newer. The same source builds for either target, and it means the same thing on both: where the `wasm` target cannot compile something yet, it reports an error rather than compiling it differently.
+
+A third target, `llvm`, is for a native executable. It has no code generation yet: a build for it type-checks the program against ghul-core and ghul-runtime as a `wasm` build does, reports what the target cannot carry, and then reports `code generation for the llvm target is not supported`. `--type-check` stops before that point, so it succeeds on a program the front end accepts.
 
 A `wasm` build loads no .NET assemblies. What they supply on .NET comes from two libraries compiled into the module from source: ghul-core, which gives the built-in types their members and declares the collections, and ghul-runtime, which supplies the pipes and the rest of `Ghul`. The `ghul` command-line tool builds a project for either target and fetches those libraries for a `wasm` build; a project lists the targets it builds for in its `ghul-project.json` manifest:
 
@@ -2617,7 +2619,7 @@ ghul run --target wasm
 
 ### conditional compilation
 
-`@IF.<name>()` written before a definition or a statement keeps it only when `<name>` is on, and `@IF.not.<name>()` keeps it only when it is off. The target's own name is on for its build and the other target's is off, so `@IF.dotnet()` and `@IF.wasm()` give each target a declaration of its own:
+`@IF.<name>()` written before a definition or a statement keeps it only when `<name>` is on, and `@IF.not.<name>()` keeps it only when it is off. The target's own name is on for its build and the other targets' names are off, so `@IF.dotnet()`, `@IF.wasm()` and `@IF.llvm()` give each target a declaration of its own. `@IF.source_core()` is on for every target whose core library is compiled from source, `wasm` and `llvm`, and off for `dotnet`, so a declaration that only needs there to be no .NET base class library is written once:
 
 ```ghul
 use IO.Std.write_line
@@ -2636,7 +2638,7 @@ target_name() -> string => "dotnet"
 target_name() -> string => "wasm"
 ```
 
-`--define <name>` turns any other name on, and a name nothing turns on is off. A `--define` of either target's name has no effect: the target being built decides those two. What is left out is never compiled, so it can name things the build does not have, a .NET API in a `@IF.dotnet()` declaration for instance. To leave a whole file out of one target, write the `@IF` on its namespace.
+`--define <name>` turns any other name on, and a name nothing turns on is off. A `--define` of a target's name, or of `source_core`, has no effect: the target being built decides those. What is left out is never compiled, so it can name things the build does not have, a .NET API in a `@IF.dotnet()` declaration for instance. To leave a whole file out of one target, write the `@IF` on its namespace.
 
 ### what differs on the wasm target
 
