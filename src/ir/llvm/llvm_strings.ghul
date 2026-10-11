@@ -22,7 +22,7 @@ namespace IR.LLVMTarget is
     class LLVM_STRINGS is
         _module: MODULE
         _literals: MAP[string, LLVM.Value]
-        _descriptor: GLOBAL_VARIABLE?
+        _is_descriptor_used: bool
 
         /// The offset of the count of code units within a string.
         LENGTH_OFFSET: int static => 12
@@ -65,10 +65,20 @@ namespace IR.LLVMTarget is
             return hash
         si
 
-        /// The string type's descriptor.
+        /// The string type's descriptor, which the string class adds with
+        /// the other descriptors.
         descriptor: LLVM.Value is
-            if let present = _descriptor then
-                return present.reference
+            _is_descriptor_used = true
+
+            return Values.global(DESCRIPTOR_NAME)
+        si
+
+        /// Adds a placeholder for the string type's descriptor where strings
+        /// were made, for a program whose core library declares no string
+        /// type and so has no string class to describe them.
+        add_placeholder_descriptor() is
+            if !_is_descriptor_used then
+                return
             fi
 
             let global = GLOBAL_VARIABLE(DESCRIPTOR_NAME, Types.i8, Values.zero(Types.i8), true)
@@ -76,10 +86,6 @@ namespace IR.LLVMTarget is
             global.linkage = Linkage.INTERNAL
 
             _module.add_global(global)
-
-            _descriptor = global
-
-            return global.reference
         si
 
         /// The constant global holding the literal `text`. Every literal
@@ -132,6 +138,151 @@ namespace IR.LLVMTarget is
         length(block: BLOCK, text: LLVM.Value) -> LLVM.Value =>
             block.load(Types.i32, block.element_pointer(Types.i8, text, [Values.i32(LENGTH_OFFSET)], true), 4)
 
+        /// The code unit at `index` in the string `text` points at, as the
+        /// `i32` a `char` is held in. The index is not checked.
+        char_at(block: BLOCK, text: LLVM.Value, index: LLVM.Value) -> LLVM.Value is
+            let offset = block.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, index, Values.i32(1))
+            let unit = block.load(Types.i16, block.element_pointer(Types.i8, chars(block, text), [offset], true), 2)
+
+            return block.convert(LLVM.Conversion.ZERO_EXTEND, unit, Types.i32)
+        si
+
+        /// A new string of `length` code units, as yet unwritten, from the
+        /// allocator for objects that hold no references.
+        allocate(block: BLOCK, length: LLVM.Value) -> LLVM.Value is
+            let bytes = block.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, block.convert(LLVM.Conversion.SIGN_EXTEND, length, Types.i64), Values.i64(1L))
+            let size = block.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, bytes, Values.i64(cast long(CHARS_OFFSET)))
+
+            let result = block.call(runtime("$ghul_alloc_atomic", Types.pointer, [Types.pointer, Types.i64]), [descriptor, size])!
+
+            block.store(length, block.element_pointer(Types.i8, result, [Values.i32(LENGTH_OFFSET)], true), 4)
+
+            return result
+        si
+
+        // Copies `count` code units from `from` to `to`.
+        _copy(block: BLOCK, to: LLVM.Value, from: LLVM.Value, count: LLVM.Value) is
+            let bytes = block.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, block.convert(LLVM.Conversion.SIGN_EXTEND, count, Types.i64), Values.i64(1L))
+
+            block.call(_module.declare_intrinsic(Intrinsics.memcpy()), [to, from, bytes, Values.boolean(false)])
+        si
+
+        // The address `count` code units on from `units`.
+        _advance(block: BLOCK, units: LLVM.Value, count: LLVM.Value) -> LLVM.Value =>
+            block.element_pointer(Types.i16, units, [count], true)
+
+        /// The function that joins two strings, either of which may be
+        /// null and is then taken as empty, into a new one.
+        concat_function: FUNCTION =>
+            _helper("$ghul_string_concat", Types.pointer, [Types.pointer, Types.pointer], function is
+                let block = function.add_block("entry")
+                let empty = literal("")
+
+                let left = block.select(block.compare(LLVM.IntegerPredicate.EQ, function.parameter(0), Values.null_pointer), empty, function.parameter(0))
+                let right = block.select(block.compare(LLVM.IntegerPredicate.EQ, function.parameter(1), Values.null_pointer), empty, function.parameter(1))
+
+                let left_length = length(block, left)
+                let right_length = length(block, right)
+
+                let result = allocate(block, block.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, left_length, right_length))
+                let to = chars(block, result)
+
+                _copy(block, to, chars(block, left), left_length)
+                _copy(block, _advance(block, to, left_length), chars(block, right), right_length)
+
+                block.return_value(result)
+            si)
+
+        /// The function that answers whether two strings, either of which
+        /// may be null, hold the same code units: two nulls are equal, and
+        /// a null is equal to no string.
+        equals_function: FUNCTION =>
+            _helper("$ghul_string_equals", Types.i1, [Types.pointer, Types.pointer], function is
+                let left = function.parameter(0)
+                let right = function.parameter(1)
+
+                let entry = function.add_block("entry")
+                let same = function.add_block("same")
+                let present = function.add_block("present")
+                let lengths = function.add_block("lengths")
+                let compare = function.add_block("compare")
+                let different = function.add_block("different")
+
+                entry.branch(entry.compare(LLVM.IntegerPredicate.EQ, left, right), same, present)
+
+                same.return_value(Values.boolean(true))
+
+                let either_null =
+                    present.binary(
+                        LLVM.BinaryOperator.OR,
+                        LLVM.IntegerFlags.NONE,
+                        present.compare(LLVM.IntegerPredicate.EQ, left, Values.null_pointer),
+                        present.compare(LLVM.IntegerPredicate.EQ, right, Values.null_pointer))
+
+                present.branch(either_null, different, lengths)
+
+                let left_length = lengths.load(Types.i32, lengths.element_pointer(Types.i8, left, [Values.i32(LENGTH_OFFSET)], true), 4)
+                let right_length = lengths.load(Types.i32, lengths.element_pointer(Types.i8, right, [Values.i32(LENGTH_OFFSET)], true), 4)
+
+                lengths.branch(lengths.compare(LLVM.IntegerPredicate.NE, left_length, right_length), different, compare)
+
+                different.return_value(Values.boolean(false))
+
+                let bytes = compare.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, compare.convert(LLVM.Conversion.SIGN_EXTEND, left_length, Types.i64), Values.i64(1L))
+                let order = compare.call(runtime("memcmp", Types.i32, [Types.pointer, Types.pointer, Types.i64]), [chars(compare, left), chars(compare, right), bytes])!
+
+                compare.return_value(compare.compare(LLVM.IntegerPredicate.EQ, order, Values.i32(0)))
+            si)
+
+        /// The function that copies `count` code units of a string from
+        /// `start` into a new string. The range is not checked.
+        substring_function: FUNCTION =>
+            _helper("$ghul_string_substring", Types.pointer, [Types.pointer, Types.i32, Types.i32], function is
+                let block = function.add_block("entry")
+                let count = function.parameter(2)
+
+                let result = allocate(block, count)
+
+                _copy(block, chars(block, result), _advance(block, chars(block, function.parameter(0)), function.parameter(1)), count)
+
+                block.return_value(result)
+            si)
+
+        /// The function that makes a string of the one code unit it is
+        /// passed, held as an `i32`.
+        from_char_function: FUNCTION =>
+            _helper("$ghul_string_from_char", Types.pointer, [Types.i32], function is
+                let block = function.add_block("entry")
+
+                let result = allocate(block, Values.i32(1))
+
+                block.store(block.convert(LLVM.Conversion.TRUNCATE, function.parameter(0), Types.i16), chars(block, result), 2)
+
+                block.return_value(result)
+            si)
+
+        // The function `name`, private to the module, built by `build` the
+        // first time it is asked for.
+        _helper(name: string, result: LLVM.Type, parameters: LLVM.Type[], build: FUNCTION -> void) -> FUNCTION is
+            if let existing = _module.function_named(name) then
+                return existing
+            fi
+
+            let declared = LIST[PARAMETER]()
+
+            for (i, type) in parameters |> Ghul.Pipes.index() do
+                declared.add(PARAMETER(type, "a{i}"))
+            od
+
+            let function = FUNCTION(name, result, declared.to_array())
+
+            function.linkage = Linkage.INTERNAL
+
+            build(function)
+
+            return _module.add_function(function)
+        si
+
         /// Adds the function the native runtime calls to make a string, which
         /// every program defines.
         add_exports() is
@@ -151,16 +302,9 @@ namespace IR.LLVMTarget is
             let block = function.add_block("entry")
 
             let length = function.parameter(1)
-            let bytes = block.binary(LLVM.BinaryOperator.SHL, LLVM.IntegerFlags.NONE, block.convert(LLVM.Conversion.SIGN_EXTEND, length, Types.i64), Values.i64(1L))
-            let size = block.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, bytes, Values.i64(cast long(CHARS_OFFSET)))
+            let result = allocate(block, length)
 
-            let result = block.call(runtime("$ghul_alloc_atomic", Types.pointer, [Types.pointer, Types.i64]), [descriptor, size])!
-
-            block.store(length, block.element_pointer(Types.i8, result, [Values.i32(LENGTH_OFFSET)], true), 4)
-
-            block.call(
-                _module.declare_intrinsic(Intrinsics.memcpy()),
-                [chars(block, result), function.parameter(0), bytes, Values.boolean(false)])
+            _copy(block, chars(block, result), function.parameter(0), length)
 
             block.return_value(result)
 

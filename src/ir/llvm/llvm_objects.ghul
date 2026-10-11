@@ -61,6 +61,7 @@ namespace IR.LLVMTarget is
         _next_global: int
 
         _unsupported: LIST[(location: Source.LOCATION, construct: string)]
+        _string: CLASS_INSTANCE?
         _boxes_made: Collections.SET[CLASS_INSTANCE]
 
         /// The offset of the class number within a descriptor.
@@ -96,9 +97,14 @@ namespace IR.LLVMTarget is
 
         /// - module: where the descriptors, the trait table and the globals are added
         /// - classes: the program's classes, rooted at `object`
-        init(module: MODULE, classes: CLASS_SET) is
+        /// - string_type: the string type, or null where the program has none
+        init(module: MODULE, classes: CLASS_SET, string_type: Classy?) is
             _module = module
             _classes = classes
+
+            if let definition = string_type then
+                _string = classes.intern(CLASS_INSTANCE.of(definition))
+            fi
             _dispatched = DISPATCHED_METHODS()
             _plan = DISPATCH_PLAN(self)
 
@@ -152,7 +158,7 @@ namespace IR.LLVMTarget is
 
         /// The class a value of `type` is an instance of, or null where the
         /// program has none.
-        class_of(type: Type?) -> CLASS_INSTANCE? => _classes.class_of(type)
+        class_of(type: Type?) -> CLASS_INSTANCE? => if LLVM_TYPES.is_string(type) then _string else _classes.class_of(type) fi
 
         /// The class `definition` at the arguments `type_map` gives its
         /// parameters, or null where it is not a class the target represents.
@@ -192,20 +198,33 @@ namespace IR.LLVMTarget is
         _lay_out(type: CLASS_INSTANCE) is
             let layout = LIST[LLVM.Type]()
 
-            if let parent = _classes.superclass_of(type) ?? (if type != _classes.root then _classes.root else null fi) then
+            if _layouts.contains_key(type) then
+                return
+            fi
+
+            // A struct is held in place, its fields and nothing more.
+            if is_struct(type) then
+                // Marked laid out first, so a struct that holds itself is caught
+                // by the type checker rather than recursing here.
+                _layouts[type] = layout
+            elif let parent = _classes.superclass_of(type) ?? (if type != _classes.root then _classes.root else null fi) then
+                _lay_out(parent)
                 layout.add_range(_layouts[parent])
             else
                 layout.add(Types.pointer)
             fi
 
-            if let boxed = _classes.boxed_type(type) then
+            if is_string(type) then
+                layout.add(Types.i32)
+                layout.add(Types.i32)
+            elif let boxed = _classes.boxed_type(type) then
                 layout.add(LLVM_TYPES.value_type(boxed) ?? Types.i32)
             elif is_object_type(type) then
                 for `field in SRM_MEMBER_ORDER.fields(SRM_EMITTED_TYPE(type.definition)) do
                     if `field.is_instance then
                         _field_positions[`field] = layout.count
 
-                        if let held = LLVM_TYPES.value_type(type.specialize(`field.type)) then
+                        if let held = held_type(type.specialize(`field.type)) then
                             layout.add(held)
                         else
                             _unsupported.add((`field.location, "a field of type {type.specialize(`field.type)}"))
@@ -216,31 +235,49 @@ namespace IR.LLVMTarget is
             fi
 
             _layouts[type] = layout
-            _sizes[type] = _size_of(layout)
+            _sizes[type] = LLVM_TYPES.size_of(Types.structure(layout.to_array()))
         si
 
-        // The size of a struct of `layout`, each field at its natural
-        // alignment, rounded up to a multiple of eight.
-        _size_of(layout: LIST[LLVM.Type]) -> int is
-            let offset mut = 0
+        /// The LLVM type a value of `type` is held in: a scalar's or a
+        /// reference's as LLVM_TYPES gives it, a struct as its fields, in
+        /// place, and an optional value type as whether it is present and
+        /// its value, `{ i1, T }`. Null where the target holds no values of the type.
+        held_type(type: Type?) -> LLVM.Type? is
+            if let t = type /\ t.is_optional /\ t.is_value_type then
+                if let inner = held_type(t.optional_inner_type) then
+                    return Types.structure([Types.i1, inner])
+                fi
 
-            for type in layout do
-                let size = _field_size(type)
+                return null
+            elif let held = LLVM_TYPES.value_type(type) then
+                return held
+            elif let s = struct_of(type) then
+                _lay_out(s)
 
-                offset = (offset + size - 1) / size * size + size
-            od
+                return Types.structure(_layouts[s].to_array())
+            fi
 
-            return (offset + 7) / 8 * 8
+            return null
         si
 
-        _field_size(type: LLVM.Type) -> int =>
-            case LLVM_TYPES.width(type)
-            when 8 then 1
-            when 16 then 2
-            when 32 then 4
-            else
-                if type =~ LLVM.Type.FLOAT then 4 else 8 fi
-            esac
+        /// The struct a value of `type` is, held in place, or null where it
+        /// is not one: a scalar, an enum or an optional struct is not.
+        struct_of(type: Type?) -> CLASS_INSTANCE? is
+            if !type? \/ type.is_optional \/ LLVM_TYPES.value_type(type)? then
+                return null
+            fi
+
+            if let s = _classes.class_of(type) /\ is_struct(s) then
+                return s
+            fi
+
+            return null
+        si
+
+        /// Whether `type` is a struct, which is held in place rather than
+        /// through a reference.
+        is_struct(type: CLASS_INSTANCE) -> bool =>
+            isa Semantic.Symbols.STRUCT(type.definition) /\ !_classes.is_box(type) /\ _classes.is_object_type(type.definition)
 
         /// The LLVM struct type an instance of `type` is.
         struct_type(type: CLASS_INSTANCE) -> LLVM.Type =>
@@ -274,7 +311,9 @@ namespace IR.LLVMTarget is
 
         /// The name of the global holding `type`'s descriptor.
         descriptor_name(type: CLASS_INSTANCE) -> string =>
-            if _is_built then "$ghul_descriptor_{_classes.numbering.id(type)}" else "$ghul_descriptor" fi
+            if is_string(type) then
+                LLVM_STRINGS.DESCRIPTOR_NAME
+            elif _is_built then "$ghul_descriptor_{_classes.numbering.id(type)}" else "$ghul_descriptor" fi
 
         /// The name of the global holding the one instance of the unit variant
         /// `type`.
@@ -636,8 +675,11 @@ namespace IR.LLVMTarget is
         is_box(type: CLASS_INSTANCE) -> bool => _classes.is_box(type)
         is_array(type: CLASS_INSTANCE) -> bool => _classes.is_array(type)
 
-        /// Always false: the string type is not one of the classes yet.
-        is_string(type: CLASS_INSTANCE) -> bool => false
+        /// Whether `type` is the string type.
+        is_string(type: CLASS_INSTANCE) -> bool => _string? /\ type == _string
+
+        /// Whether the program has a string type, whose descriptor this adds.
+        has_string_type: bool => _string?
 
         is_bigint(type: CLASS_INSTANCE) -> bool => type.definition == _classes.core.bigint
 
