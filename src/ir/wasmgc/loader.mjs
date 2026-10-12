@@ -61,11 +61,28 @@ export async function run(options = {}) {
     let instance = null;
     const callbacks = (id) => instance.exports._run_callback(id);
 
+    // A WasmGC reference has no address to hash, so each object is given a
+    // number the first time its identity is hashed, held for as long as the
+    // object lives.
+    const identities = new WeakMap();
+    let next_identity = 0;
+
     const host = {
         write(text, stream) {
             (sinks[stream] ?? stdout)(String(text));
         },
         flush(_stream) {},
+
+        identity_hash(value) {
+            let hash = identities.get(value);
+
+            if (hash === undefined) {
+                hash = Math.imul(++next_identity, 0x9E3779B1);
+                identities.set(value, hash);
+            }
+
+            return hash;
+        },
 
         file_written(path, content) {
             onfile(String(path), base64_bytes(String(content)));
