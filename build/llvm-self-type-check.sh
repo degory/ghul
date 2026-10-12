@@ -14,30 +14,13 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 compiler=${1:-$root/publish/ghul.dll}
-core=$(cd "${2:-$root/libraries/ghul-core}" && pwd)
-runtime=$(cd "${3:-$root/libraries/ghul-runtime}" && pwd)
+core=${2:-$root/libraries/ghul-core}
+runtime=${3:-$root/libraries/ghul-runtime}
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-{
-    echo --library-source
-    echo "ghul-core@$(tr -d '[:space:]' < "$core/VERSION")=$core"
-    find "$core/src" -name '*.ghul' | sort
-
-    echo --library-source
-    echo "ghul-runtime@$(tr -d '[:space:]' < "$runtime/VERSION")=$runtime"
-
-    while read -r file; do
-        if [ -n "$file" ]; then
-            echo "$runtime/$file"
-        fi
-    done < "$runtime/wasm-sources.rsp"
-} > "$work/libraries.rsp"
-
-for directory in src wasm/src llvm/src analysis-protocol/src; do
-    find "$root/$directory" -name '*.ghul' -not -path '*/bin/*' -not -path '*/obj/*'
-done | sort > "$work/sources.rsp"
+"$root/build/llvm-self-sources.sh" "$work" "$core" "$runtime"
 
 echo "type-checking $(wc -l < "$work/sources.rsp") files for llvm with $compiler"
 
