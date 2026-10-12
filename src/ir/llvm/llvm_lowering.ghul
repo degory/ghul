@@ -51,6 +51,9 @@ namespace IR.LLVMTarget is
 
         _stack: LIST[LLVM.Value]
 
+        // Where each value with a known exact-class source came from.
+        _sources: MAP[LLVM.Value, EXACT_SOURCE]
+
         // The shallowest the stack has been since the innermost _value_of
         // began, so a value that reads an operand already on the stack, as
         // a member load reads its receiver, still counts as producing one.
@@ -160,6 +163,7 @@ namespace IR.LLVMTarget is
             _callee = callee
 
             _stack = LIST[LLVM.Value]()
+            _sources = MAP[LLVM.Value, EXACT_SOURCE](Collections.ReferenceEqualityComparer.instance)
             _locals = MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]()
             _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type, value_type: Type?)]()
             _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
@@ -474,6 +478,8 @@ namespace IR.LLVMTarget is
         si
 
         _local_address(local: LOCAL) is
+            _note_store(local, null)
+
             if let (pointer, _) = _local(local) then
                 _push(pointer)
             fi
@@ -543,11 +549,21 @@ namespace IR.LLVMTarget is
 
         _load_local(local: LOCAL) is
             if let (pointer, type) = _local(local) then
-                _push(_widen(_current.load(type, pointer, 0), local.type))
+                let value = _widen(_current.load(type, pointer, 0), local.type)
+
+                if let instance = _instance then
+                    _sources[value] = EXACT_SOURCE(null, instance, local)
+                fi
+
+                _push(value)
             fi
         si
 
         _store_local(local: LOCAL, value: LLVM.Value?) is
+            if !_is_null(value) then
+                _note_store(local, _source_of(value))
+            fi
+
             if let (pointer, _) = _local(local) /\ value? then
                 _current.store(_narrow(value, local.type), pointer, 0)
             fi
@@ -589,6 +605,32 @@ namespace IR.LLVMTarget is
             fi
         si
 
+        // Where a value came from, as far as its exact class goes, or null
+        // where nothing is known of it.
+        _source_of(value: LLVM.Value?) -> EXACT_SOURCE? is
+            let source: EXACT_SOURCE mut
+
+            if let v = value /\ _sources.try_get_value(v, source ref) then
+                return source
+            fi
+
+            return null
+        si
+
+        // Records, while discovering, what is stored in `local`: a value
+        // from `source`, or anything at all where it is null.
+        _note_store(local: LOCAL, source: EXACT_SOURCE?) is
+            if let objects = _objects, instance = _instance /\ !objects.is_built then
+                objects.exact.note_store(instance, local, source)
+            fi
+        si
+
+        _is_null(value: LLVM.Value?) -> bool => isa LLVM.Value.NULL(value) \/ isa LLVM.Value.ZERO(value)
+
+        // The exact class of `value`, where it is known to be one class.
+        _exact_class(value: LLVM.Value) -> CLASS_INSTANCE? =>
+            if let objects = _objects then objects.exact.exact(_source_of(value)) else null fi
+
         // Returns the value on the stack, or the default value of the result
         // where the stack is empty.
         _return() is
@@ -596,6 +638,12 @@ namespace IR.LLVMTarget is
                 _current.return_void()
             elif let type = _held(_return_type) then
                 let value = if _stack.count > 0 then _pop()! else LLVM_TYPES.zero(type) fi
+
+                // A null reaches a call as a null receiver whatever class the
+                // call is bound to, so it says nothing against exactness.
+                if let objects = _objects, instance = _instance /\ !objects.is_built /\ !_is_null(value) then
+                    objects.exact.note_return(instance, _source_of(value))
+                fi
 
                 _current.return_value(_normalise_for(value, _return_type))
             else
@@ -2807,6 +2855,7 @@ namespace IR.LLVMTarget is
             od
 
             if let result = _emit_call(callee, values.to_array()) then
+                _sources[result] = EXACT_SOURCE(null, _instance_of(function), null)
                 _push(result)
             fi
         si
@@ -3752,6 +3801,8 @@ namespace IR.LLVMTarget is
             let object =
                 _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type))), true)
 
+            _sources[object] = EXACT_SOURCE(type, null, null)
+
             if let c = callee then
                 values.insert(0, object)
 
@@ -3844,13 +3895,29 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
+            if let receiver = _value_of(call.from) then
+                _call_direct_on(call, instance, receiver)
+            fi
+        si
+
+        // Calls `instance` directly on `receiver`, the call's receiver
+        // already lowered.
+        _call_direct_on(call: Values.Call.INSTANCE, instance: FUNCTION_INSTANCE, receiver: LLVM.Value) is
+            let callee = _callee(instance)
+
+            if !callee? then
+                _report("a call to {instance.definition.name}")
+                return
+            fi
+
+            if let values = _arguments_for(call.function, call.arguments) then
 
                 _check_receiver(call.from, if call.from.is_value_type then null else receiver fi)
 
                 values.insert(0, _receiver_for(instance, call.from, receiver))
 
                 if let result = _emit_call(callee, values.to_array()) then
+                    _sources[result] = EXACT_SOURCE(null, instance, null)
                     _push(result)
                 fi
             fi
@@ -3961,7 +4028,20 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
+            let receiver = _value_of(call.from)
+
+            if !receiver? then
+                return
+            fi
+
+            // A receiver whose exact class is known runs that class's own
+            // entry for the slot.
+            if let type = _exact_class(receiver), exact = objects.exact_slot_implementation(slot, type) /\ _callee(exact)? then
+                _call_direct_on(call, exact, receiver)
+                return
+            fi
+
+            if let values = _arguments_for(call.function, call.arguments) then
 
                 _check_receiver(call.from, receiver)
 
@@ -4039,7 +4119,18 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(function, call.arguments) then
+            let receiver = _value_of(call.from)
+
+            if !receiver? then
+                return
+            fi
+
+            if let type = _exact_class(receiver), exact = objects.exact_implementation(selector, type) /\ _callee(exact)? then
+                _call_direct_on(call, exact, receiver)
+                return
+            fi
+
+            if let values = _arguments_for(function, call.arguments) then
 
                 _check_receiver(call.from, receiver)
 
