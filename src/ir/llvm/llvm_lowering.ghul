@@ -1035,11 +1035,19 @@ namespace IR.LLVMTarget is
             throw System.InvalidOperationException("dummy block generated, created at: {block.location} because: {block.why}")
         si
 
-        // Only a struct method reaches its receiver by address, and its
-        // receiver is already the address of the struct.
+        // A struct method's receiver is already the address of the struct.
+        // A class's receiver is a reference, so its address is the slot the
+        // reference is held in, as an asynchronous function's frame passes
+        // itself by reference to the builder that resumes it.
         visit_address(self_load: Values.Load.REFERENCE_SELF) is
-            if let pointer = _receiver_address() then
-                _push(pointer)
+            if isa Semantic.Symbols.STRUCT(self_load.`self) then
+                if let pointer = _receiver_address() then
+                    _push(pointer)
+                fi
+            elif _receiver_offset == 0 \/ _arguments.count == 0 then
+                _report("self outside an instance method")
+            else
+                _push(_arguments[0].pointer)
             fi
         si
         /// Inside a generator's frame, the receiver of the method that made
@@ -1299,8 +1307,12 @@ namespace IR.LLVMTarget is
             let arrays = _arrays!
             let result = arrays.allocate(_current, type, _i32(sequence.values.count))
 
+            // An element whose type is not the array's, an int in an
+            // object[], is boxed as it is stored.
+            let boxer = IoC.CONTAINER.instance.value_boxer
+
             for (i, value) in sequence.values |> Ghul.Pipes.index() do
-                if let element = _value_of(value) then
+                if let element = _value_of(boxer.box_if_needed(value, sequence.element_type)) then
                     arrays.store(_current, type, result, _i32(i), _normalise_for(element, sequence.element_type))
                 else
                     return
@@ -1471,33 +1483,42 @@ namespace IR.LLVMTarget is
                 gen(step)
             od
         si
-        visit(decrement: Values.DECREMENT) is
-            _load_local(decrement.counter)
 
-            if let value = _pop() then
-                _store_local(decrement.counter, _current.binary(BinaryOperator.SUB, IntegerFlags.NONE, value, _i32(1)))
+        // Decrements the counter in place, leaving nothing.
+        visit(decrement: Values.DECREMENT) is
+            if let before = _counter(decrement.counter) then
+                _store_local(decrement.counter, _step(before, BinaryOperator.SUB))
             fi
         si
-        // Leaves the counter's value before the increment.
-        visit(increment: Values.POST_INCREMENT) is
-            _load_local(increment.counter)
 
-            if let value = _peek() then
-                _store_local(increment.counter, _current.binary(BinaryOperator.ADD, IntegerFlags.NONE, value, _i32(1)))
+        // Leaves the counter's value before the increment, and stores the
+        // incremented value back.
+        visit(increment: Values.POST_INCREMENT) is
+            if let before = _counter(increment.counter) then
+                _store_local(increment.counter, _step(before, BinaryOperator.ADD))
+                _push(before)
             fi
         si
 
         // Leaves the counter's value after the decrement.
         visit(decrement: Values.PRE_DECREMENT) is
-            _load_local(decrement.counter)
+            if let before = _counter(decrement.counter) then
+                let after = _step(before, BinaryOperator.SUB)
 
-            if let value = _pop() then
-                let decremented = _current.binary(BinaryOperator.SUB, IntegerFlags.NONE, value, _i32(1))
-
-                _store_local(decrement.counter, decremented)
-                _push(decremented)
+                _store_local(decrement.counter, after)
+                _push(after)
             fi
         si
+
+        _counter(counter: LOCAL) -> LLVM.Value? is
+            _load_local(counter)
+
+            return _pop()
+        si
+
+        _step(value: LLVM.Value, operator: BinaryOperator) -> LLVM.Value =>
+            _current.binary(operator, IntegerFlags.NONE, value, _i32(1))
+
         // The source is held in a local, which the rebuilt tuple reads.
         visit(repack: Values.TUPLE_REPACK) is
             _store_local(repack.temp, _value_of(repack.source))
@@ -1560,9 +1581,10 @@ namespace IR.LLVMTarget is
             let inner = _value_optional_inner(value.type)!
             let objects = _objects
             let box_type = if let o = objects then o.box_type(_specialize(inner)) else null fi
+            let struct_type = if let o = objects then o.struct_of(_specialize(inner)) else null fi
             let optional = _held(value.type)
 
-            if !objects? \/ !box_type? \/ !optional? then
+            if !objects? \/ (!box_type? /\ !struct_type?) \/ !optional? then
                 _report("boxing a {value.type}")
                 return
             fi
@@ -1585,7 +1607,12 @@ namespace IR.LLVMTarget is
             _start(present)
 
             let inner_value = _extract_member(held, 1, inner)
-            let object = _box_value(objects, box_type, inner_value, inner)
+            let object =
+                if let b = box_type then
+                    _box_value(objects, b, inner_value, inner)
+                else
+                    _box_struct(objects, struct_type!, inner_value)
+                fi
 
             _current.store(object, slot, 0)
             _current.branch(join)
@@ -2583,7 +2610,8 @@ namespace IR.LLVMTarget is
                 TYPE_MAPS.function_map(function, _type_map))
 
         _call(function: Function, arguments: Collections.List[Value]) is
-            if let operation = function.intrinsic_operation then
+            // A constructor intrinsic is an ordinary method, called as one.
+            if let operation = function.intrinsic_operation /\ !operation.starts_with("constructor.") then
                 if operation.starts_with("host.") then
                     _call_host(operation.substring(5), function, arguments)
                 elif operation =~ "array.new" then
@@ -2950,6 +2978,15 @@ namespace IR.LLVMTarget is
                     parameter_types.add(Types.pointer)
                     parameter_attributes.add(null)
                     values.add(_bigint_to_host(value))
+                elif let arrays = _arrays, array = arrays.array_of(_specialize(formal)) /\ LLVM_TYPES.scalar(arrays.element_of(array)) =~ Scalar.UINT8 then
+                    // A ubyte[] crosses as C takes bytes: the address of its
+                    // first element and how many there are.
+                    parameter_types.add(Types.pointer)
+                    parameter_types.add(Types.i32)
+                    parameter_attributes.add(null)
+                    parameter_attributes.add(null)
+                    values.add(arrays.element_address(_current, array, value, _i32(0)))
+                    values.add(arrays.count(_current, value))
                 else
                     _report("a host operation taking {formal}")
                     return
@@ -3702,12 +3739,24 @@ namespace IR.LLVMTarget is
 
                 _check_receiver(call.from, if call.from.is_value_type then null else receiver fi)
 
-                values.insert(0, receiver)
+                values.insert(0, _receiver_for(instance, call.from, receiver))
 
                 if let result = _emit_call(callee, values.to_array()) then
                     _push(result)
                 fi
             fi
+        si
+
+        // A struct's method takes the address of the value it is called on.
+        // Reached through a reference, as a trait call with one
+        // implementation is, the receiver is the box holding the value, and
+        // the address passed is that of the value within it.
+        _receiver_for(instance: FUNCTION_INSTANCE, from: Value, receiver: LLVM.Value) -> LLVM.Value is
+            if isa Semantic.Symbols.STRUCT(instance.definition.owner) /\ !(_specialize(from.type)?.is_value_type ?? false) then
+                return _current.element_pointer(Types.i8, receiver, [_i32(LLVM_OBJECTS.BOX_VALUE_OFFSET)], true)
+            fi
+
+            return receiver
         si
 
         // The function type a call to `instance` through a pointer has: the
@@ -3975,6 +4024,12 @@ namespace IR.LLVMTarget is
 
             if let t = target /\ _value_optional_inner(t)? then
                 _cast_to_optional(conversion, t)
+                return
+            fi
+
+            // `null` cast to a reference type is that type's null.
+            if (conversion.value.type?.is_null ?? false) /\ isa LLVM.Type.POINTER(_held(target)) then
+                gen(conversion.value)
                 return
             fi
 
