@@ -39,3 +39,34 @@ mkdir -p "$output"
 for directory in src wasm/src llvm/src analysis-protocol/src; do
     find "$root/$directory" -name '*.ghul' -not -path '*/bin/*' -not -path '*/obj/*'
 done | sort > "$output/sources.rsp"
+
+# A native build of the compiler reports the version GHUL_NATIVE_VERSION
+# names, and the requirements beside this script, through a copy of
+# src/driver/native_build.ghul compiled in place of the committed one.
+if [ -n "${GHUL_NATIVE_VERSION:-}" ]; then
+    case "$GHUL_NATIVE_VERSION" in
+        *[!A-Za-z0-9.+-]*)
+            echo "GHUL_NATIVE_VERSION is not a version: $GHUL_NATIVE_VERSION" >&2
+            exit 2
+            ;;
+    esac
+
+    requirements=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/{/{{/g' -e 's/}/}}/g' "$root/build/requirements.json" | awk '{ printf "%s\\n", $0 }')
+
+    cat > "$output/native_build.ghul" <<EOF
+namespace Driver is
+    @IF.not.dotnet()
+    class NATIVE_BUILD is
+        version: string static => "$GHUL_NATIVE_VERSION"
+
+        requirements: string static => "$requirements"
+    si
+si
+EOF
+
+    committed="$root/src/driver/native_build.ghul"
+
+    grep -vxF "$committed" "$output/sources.rsp" > "$output/sources.rsp.tmp"
+    echo "$output/native_build.ghul" >> "$output/sources.rsp.tmp"
+    mv "$output/sources.rsp.tmp" "$output/sources.rsp"
+fi
