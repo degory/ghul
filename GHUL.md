@@ -568,7 +568,7 @@ A slot returning `void` settles the literal's return type as much as any other d
 names |> each(name => seen.add(name));    // `add` returns a bool, discarded here
 ```
 
-Where several overloads take a function at the same arity, a body that produces a value goes to the formal that asks for one, and a `void` formal is reached only when no candidate does. So a literal returning a `bool` still picks a `(T) -> bool` formal over a `(T) -> void` one, and writing the return type out (`name -> void => seen.add(name)`) picks the void formal outright.
+Where several overloads take a function at the same arity, a body that produces a value goes to the formal that asks for one, and a `void` formal is reached only when no candidate does. So a literal returning a `bool` still picks a `(T) -> bool` formal over a `(T) -> void` one, and writing the return type out (`name -> void => seen.add(name)`) picks the void formal outright. Among formals that each ask for a value, the type the body produces picks the one it fits: a literal returning an `int` goes to a `(T) -> int` formal over `(T) -> double` and `(T) -> long` ones, however many there are.
 
 A function literal's parameter can be a destructure pattern too, written in its own parentheses inside the parameter list — the outer parentheses are the parameter list, the inner ones the pattern. It is one parameter, unpacked into the names the body uses, exactly as for a named function:
 
