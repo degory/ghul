@@ -845,6 +845,10 @@ namespace IR.WasmGC is
                 _struct_receiver(load.from!)
                 _coerce_top(VALUE_TYPE.of_type_index(`field.type_index, true))
 
+                if _is_null_checked(load.from) then
+                    _check_not_null(VALUE_TYPE.of_type_index(`field.type_index, true))
+                fi
+
                 _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, `field.type_index, `field.field_index))
             fi
         si
@@ -1603,6 +1607,11 @@ namespace IR.WasmGC is
             if name =~ "object.get_type" then
                 gen(arguments[0])
                 _coerce_top(_registry.object_reference)
+
+                if _is_null_checked(arguments[0]) then
+                    _check_not_null(_registry.object_reference)
+                fi
+
                 _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, WASMGC_TYPE_REGISTRY.OBJECT_TYPE_INDEX, 0))
                 _type_object()
 
@@ -1648,11 +1657,21 @@ namespace IR.WasmGC is
             if name =~ "string.length" then
                 gen(arguments[0])
                 _coerce_top(strings.string_reference)
+
+                if _is_null_checked(arguments[0]) then
+                    _check_not_null(strings.string_reference)
+                fi
+
                 _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, string_type, WASMGC_TYPE_REGISTRY.STRING_CHARS))
                 _emit(Opcode.ARRAY_LEN)
             elif name =~ "string.char_at" then
                 gen(arguments[0])
                 _coerce_top(strings.string_reference)
+
+                if _is_null_checked(arguments[0]) then
+                    _check_not_null(strings.string_reference)
+                fi
+
                 _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, string_type, WASMGC_TYPE_REGISTRY.STRING_CHARS))
                 gen(arguments[1])
                 _emit(TYPE_INSTRUCTION(Opcode.ARRAY_GET_U, chars))
@@ -1994,6 +2013,7 @@ namespace IR.WasmGC is
             gen(array_value)
             _coerce_top(VALUE_TYPE.of_type_index(storage.struct_index, true))
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, array))
+            _throw_if_null(array)
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, storage.struct_index, 1))
 
             gen(index)
@@ -2160,6 +2180,7 @@ namespace IR.WasmGC is
 
             gen(call.from)
             _coerce_top(VALUE_TYPE.of_type_index(storage.struct_index, true))
+            _check_not_null(VALUE_TYPE.of_type_index(storage.struct_index, true))
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, storage.struct_index, 1))
 
             if operation =~ "array.count" then
@@ -2452,12 +2473,20 @@ namespace IR.WasmGC is
                 return
             fi
 
+            // The throw leaves the stack as it found it, so what is on top
+            // afterwards is what was there before the exception was built.
+            let top_value = _top_value
+            let top_cast = _top_cast
+
             _begin()
             _construct_runtime_exception(kind, operands)
             _coerce_top(exception_type)
             _emit(Opcode.REF_AS_NON_NULL)
             _emit(THROW_INSTRUCTION(tag))
             let raised = _end()
+
+            _top_value = top_value
+            _top_cast = top_cast
 
             _emit(IF_INSTRUCTION(BLOCK_TYPE(), raised, LIST[INSTRUCTION]()))
         si
@@ -2732,16 +2761,7 @@ namespace IR.WasmGC is
             // castclass does, where the core library declares it, and
             // traps otherwise. A null passes.
             if conversion.faults_on_failure then
-                if _can_throw(Semantic.Lookups.RuntimeException.INVALID_CAST) then
-                    let checked = _temp(source_type)
-
-                    _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, checked))
-                    _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_TEST_NULL, target_heap))
-                    _emit(Opcode.I32_EQZ)
-                    _throw_if(Semantic.Lookups.RuntimeException.INVALID_CAST, LIST[Value]())
-                    _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, checked))
-                fi
-
+                _check_cast(source_type, target_heap)
                 _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, target_heap))
                 return
             fi
@@ -2770,6 +2790,7 @@ namespace IR.WasmGC is
             gen(value)
 
             if faults then
+                _check_cast(_top!, target_heap)
                 _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, target_heap))
             else
                 let source_type = _top!
@@ -2790,8 +2811,69 @@ namespace IR.WasmGC is
             _copy_if_mutable_or_null(held)
         si
 
+        // Whether a read through `from` is tested for null first: not where it
+        // is the receiver, which its caller tested, nor where it is a value.
+        _is_null_checked(from: Value?) -> bool =>
+            from? /\ !from.is_value_type /\ !isa Values.Load.REFERENCE_SELF(from) /\ !isa Values.Load.RECEIVER(from)
+
+        // Throws the core library's NullReferenceException where the reference
+        // in the local `held` is null, leaving the stack as it was. Where the
+        // library declares none, the read after it traps instead.
+        _throw_if_null(held: int) is
+            if !_can_throw(Semantic.Lookups.RuntimeException.NULL_REFERENCE) then
+                return
+            fi
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+            _emit(Opcode.REF_IS_NULL)
+            _throw_if(Semantic.Lookups.RuntimeException.NULL_REFERENCE, LIST[Value]())
+        si
+
+        // Throws the core library's NullReferenceException where the reference
+        // on the stack, of type `type`, is null, leaving it where it was.
+        _check_not_null(type: VALUE_TYPE) is
+            if !_can_throw(Semantic.Lookups.RuntimeException.NULL_REFERENCE) then
+                return
+            fi
+
+            let held = _temp(type)
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, held))
+            _throw_if_null(held)
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+        si
+
+        // Throws the core library's InvalidCastException where the reference
+        // on the stack, of type `source`, is neither null nor an instance of
+        // `target`, leaving the reference where it was. Where the library
+        // declares no such exception, the cast after it traps instead.
+        _check_cast(source: VALUE_TYPE, target: HEAP_TYPE) is
+            if !_can_throw(Semantic.Lookups.RuntimeException.INVALID_CAST) then
+                return
+            fi
+
+            let held = _temp(source)
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, held))
+            _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_TEST_NULL, target))
+            _emit(Opcode.I32_EQZ)
+            _throw_if(Semantic.Lookups.RuntimeException.INVALID_CAST, LIST[Value]())
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+        si
+
+        // Takes the i32 condition on the stack, true where a cast has failed,
+        // and throws the core library's InvalidCastException, or traps where
+        // the library declares none.
+        _fail_cast() is
+            if _can_throw(Semantic.Lookups.RuntimeException.INVALID_CAST) then
+                _throw_if(Semantic.Lookups.RuntimeException.INVALID_CAST, LIST[Value]())
+            else
+                _emit(IF_INSTRUCTION(BLOCK_TYPE(), [SIMPLE_INSTRUCTION(Opcode.UNREACHABLE)]: INSTRUCTION, LIST[INSTRUCTION]()))
+            fi
+        si
+
         // A cast to a trait answers the value where its class implements
-        // the trait. Otherwise it traps where the cast faults on failure,
+        // the trait. Otherwise it throws where the cast faults on failure,
         // and answers null where it declines.
         _cast_to_trait(value: Value, ids: Collections.List[int], faults: bool) is
             let held = _temp(_registry.object_reference)
@@ -2803,11 +2885,13 @@ namespace IR.WasmGC is
             let failed = LIST[INSTRUCTION]()
 
             if faults then
-                failed.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
-                failed.add(SIMPLE_INSTRUCTION(Opcode.REF_IS_NULL))
-                failed.add(SIMPLE_INSTRUCTION(Opcode.I32_EQZ))
-                failed.add(IF_INSTRUCTION(BLOCK_TYPE(), [SIMPLE_INSTRUCTION(Opcode.UNREACHABLE)]: INSTRUCTION, LIST[INSTRUCTION]()))
-                failed.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+                _begin()
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+                _emit(Opcode.REF_IS_NULL)
+                _emit(Opcode.I32_EQZ)
+                _fail_cast()
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, held))
+                failed.add_range(_end())
             else
                 failed.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, _registry.object_reference.heap_type()!))
             fi
@@ -4384,7 +4468,17 @@ namespace IR.WasmGC is
                 _coerce_top(receiver)
             fi
 
+            let tested = if let r = receiver /\ r.heap_type()? /\ _is_null_checked(call.from) /\ _can_throw(Semantic.Lookups.RuntimeException.NULL_REFERENCE) then _temp(r) else null fi
+
+            if let t = tested then
+                _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, t))
+            fi
+
             _lower_arguments(call.function, call.arguments)
+
+            if let t = tested then
+                _throw_if_null(t)
+            fi
 
             _emit(INDEX_INSTRUCTION(Opcode.CALL, index))
         si
@@ -4422,6 +4516,10 @@ namespace IR.WasmGC is
             _lower_arguments(function, call.arguments)
 
             let vtable_type = dispatch.vtable_type(slot.owner)!
+
+            if _is_null_checked(call.from) then
+                _throw_if_null(receiver)
+            fi
 
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, receiver))
             _load_descriptor()
@@ -4567,6 +4665,10 @@ namespace IR.WasmGC is
 
             _lower_arguments(function, call.arguments)
 
+            if _is_null_checked(call.from) then
+                _throw_if_null(receiver)
+            fi
+
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, receiver))
             _load_descriptor()
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, WASMGC_TYPE_REGISTRY.DESCRIPTOR_TYPE_INDEX, WASMGC_TYPE_REGISTRY.DESCRIPTOR_CLASS_ID))
@@ -4602,6 +4704,7 @@ namespace IR.WasmGC is
 
             gen(call.from)
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, closure))
+            _throw_if_null(closure)
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, _registry.closure_type_index, WASMGC_TYPE_REGISTRY.CLOSURE_RECEIVER))
 
             let parameters = func_type!.arguments
@@ -4938,9 +5041,20 @@ namespace IR.WasmGC is
                 _struct_receiver(store.from!)
                 _coerce_top(VALUE_TYPE.of_type_index(`field.type_index, true))
 
+                let checked = _is_null_checked(store.from) /\ _can_throw(Semantic.Lookups.RuntimeException.NULL_REFERENCE)
+                let receiver = if checked then _temp(VALUE_TYPE.of_type_index(`field.type_index, true)) else 0 fi
+
+                if checked then
+                    _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, receiver))
+                fi
+
                 gen(store.value)
 
                 _normalise_for(store.type)
+
+                if checked then
+                    _throw_if_null(receiver)
+                fi
                 _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_SET, `field.type_index, `field.field_index))
             fi
         si
