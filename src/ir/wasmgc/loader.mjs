@@ -68,8 +68,9 @@ export async function run(options = {}) {
     let next_identity = 0;
 
     const host = {
+        // A null string writes nothing, as it does on .NET.
         write(text, stream) {
-            (sinks[stream] ?? stdout)(String(text));
+            (sinks[stream] ?? stdout)(text === null ? "" : String(text));
         },
         flush(_stream) {},
 
