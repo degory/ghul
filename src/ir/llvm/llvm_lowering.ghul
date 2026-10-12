@@ -1466,6 +1466,15 @@ namespace IR.LLVMTarget is
             _default(default_return.type)
         si
 
+        visit(size_of: Values.SIZE_OF) is
+            _push(LLVM.Values.i32(_size_of(size_of.measured)))
+        si
+
+        // The bytes a value of `type` takes where it is stored, as an array's
+        // element holds it.
+        _size_of(type: Type) -> int =>
+            if let stored = _objects?.stored_type(_specialize(type)) then LLVM_TYPES.size_of(stored) else 8 fi
+
         visit(default_value: Values.DEFAULT) is
             _default(default_value.type)
         si
@@ -1588,12 +1597,10 @@ namespace IR.LLVMTarget is
         _box_value(objects: LLVM_OBJECTS, box_type: CLASS_INSTANCE, held: LLVM.Value, type: Type?) -> LLVM.Value is
             objects.note_boxed(box_type)
 
-            let allocator = if LLVM_TYPES.holds_pointer(held.type) then "$ghul_alloc" else "$ghul_alloc_atomic" fi
+            let scanned = LLVM_TYPES.holds_pointer(held.type)
 
             let object =
-                _current.call(
-                    _strings!.runtime(allocator, Types.pointer, [Types.pointer, Types.i64]),
-                    [LLVM.Values.global(objects.descriptor_name(box_type)), LLVM.Values.i64(cast long(objects.size_of(box_type)))])!
+                _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(box_type)), LLVM.Values.i64(cast long(objects.size_of(box_type))), scanned)
 
             _store_stored(held, type, _current.element_pointer(objects.struct_type(box_type), object, [_i32(0), _i32(1)], true))
 
@@ -1779,12 +1786,10 @@ namespace IR.LLVMTarget is
         // a reference is boxed where the collector scans it.
         _box_struct(objects: LLVM_OBJECTS, s: CLASS_INSTANCE, held: LLVM.Value) -> LLVM.Value is
             let boxed = Types.structure([Types.pointer, held.type])
-            let allocator = if LLVM_TYPES.holds_pointer(held.type) then "$ghul_alloc" else "$ghul_alloc_atomic" fi
+            let scanned = LLVM_TYPES.holds_pointer(held.type)
 
             let object =
-                _current.call(
-                    _strings!.runtime(allocator, Types.pointer, [Types.pointer, Types.i64]),
-                    [LLVM.Values.global(objects.descriptor_name(s)), LLVM.Values.i64(cast long(LLVM_TYPES.size_of(boxed)))])!
+                _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(s)), LLVM.Values.i64(cast long(LLVM_TYPES.size_of(boxed))), scanned)
 
             _current.store(held, _current.element_pointer(boxed, object, [_i32(0), _i32(1)], true), 0)
 
@@ -1810,6 +1815,20 @@ namespace IR.LLVMTarget is
                 _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)), Semantic.Lookups.RuntimeException.INVALID_CAST)
 
                 return _current.load(held, _current.element_pointer(Types.structure([Types.pointer, held]), object, [_i32(0), _i32(1)], true), 0)
+            fi
+
+            // A bigint is held as a reference to its box, so the box is the
+            // value once it is known to be one.
+            if let o = objects, b = o.bigint_of(type) then
+                let range = LIST[(first: int, last: int)]()
+
+                range.add(o.class_range(b))
+
+                let fits = _in_ranges(_class_id(object), range)
+
+                _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)), Semantic.Lookups.RuntimeException.INVALID_CAST)
+
+                return object
             fi
 
             // Unboxing to a reference type, as a type parameter bound to one
@@ -2714,6 +2733,8 @@ namespace IR.LLVMTarget is
                     _store_array_element(arguments[0], arguments[1], arguments[2])
                 elif operation.starts_with("string.") then
                     _call_string(operation, arguments)
+                elif operation =~ "type.size_of" then
+                    _push(LLVM.Values.i32(_size_of(function.generic_arguments[0])))
                 elif operation =~ "bigint.is_small" \/ operation =~ "bigint.small" then
                     _lower_bigint_field(operation, arguments[0])
                 elif operation =~ "object.type_name" then
@@ -2857,6 +2878,11 @@ namespace IR.LLVMTarget is
                 _call_string_helper(strings.equals_function, arguments)
             elif operation =~ "string.substring" then
                 _call_string_helper(strings.substring_function, arguments)
+            elif operation =~ "string.from_chars" then
+                // An array of `char` has a string's layout, its count where a
+                // string's length is and its code units where a string's are,
+                // so the substring helper copies a range of one as it is.
+                _call_string_helper(strings.substring_function, arguments)
             elif operation =~ "string.from_char" then
                 _call_string_helper(strings.from_char_function, arguments)
             else
@@ -2893,9 +2919,7 @@ namespace IR.LLVMTarget is
         // is one the collector scans.
         _new_bigint(objects: LLVM_OBJECTS, type: CLASS_INSTANCE, small: LLVM.Value, big: LLVM.Value) -> LLVM.Value is
             let box =
-                _current.call(
-                    _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
-                    [LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type)))])!
+                _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type))), true)
 
             let layout = objects.struct_type(type)
 
@@ -2912,7 +2936,7 @@ namespace IR.LLVMTarget is
             if let object = _value_of(value) then
                 _check_dereference(object)
 
-                let descriptor = _current.load(Types.pointer, object, 8)
+                let descriptor = _strings!.load_descriptor(_current, object)
 
                 _push(_current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_NAME)], true), 8))
             fi
@@ -3251,55 +3275,18 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        // The type object `descriptor` stands for: the one it caches, or, the
-        // first time, a new core library type object made from the
-        // descriptor's name and cached there, so a type has one type object
-        // however it is asked for. Null, reported, where the core library
-        // declares no type object.
+        // The type object `descriptor` stands for, a constant beside it, so
+        // a type has one type object however it is asked for. Null, reported,
+        // where the core library declares no type object.
         _type_object(descriptor: LLVM.Value) -> LLVM.Value? is
-            let found = _type_object_constructor()
-
-            if !found? then
+            if !_type_object_constructor()? then
                 _report("a type object")
                 return null
             fi
 
-            let (type, constructor) = found
-            let objects = _objects!
-            let callee = _callee(_instance_of(constructor))
-
-            if !callee? then
-                _report("a call to {constructor.name}")
-                return null
-            fi
-
-            let cache = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_TYPE_OBJECT)], true)
-            let result = _slot(Types.pointer)
-            let cached = _current.load(Types.pointer, cache, 8)
-
-            _current.store(cached, result, 8)
-
-            let make = _new_block()
-            let carry_on = _new_block()
-
-            _current.branch(_current.compare(IntegerPredicate.EQ, cached, LLVM.Values.null_pointer), make, carry_on)
-
-            _start(make)
-
-            let name = _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_NAME)], true), 8)
-            let made = _allocate(objects, type, constructor, callee, LIST[LLVM.Value]([name]))
-
-            _current.store(made, cache, 8)
-            _current.store(made, result, 8)
-            _current.branch(carry_on)
-
-            _start(carry_on)
-
-            return _current.load(Types.pointer, result, 8)
+            return _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_TYPE_OBJECT)], true), 8)
         si
 
-        // The core library's type object class and its constructor taking
-        // the type's name, or null where the library declares none.
         _type_object_constructor() -> (CLASS_INSTANCE, Function)? is
             if let constructor = IR.Program.CORE_LIBRARY.constructor(IR.Program.CORE_LIBRARY.type_class(), 1) then
                 if let type = _owner_class(constructor.owner), objects = _objects /\ objects.is_object_type(type) then
@@ -3365,7 +3352,7 @@ namespace IR.LLVMTarget is
             fi
 
             if let v = _value_of(value), s = _value_of(state) then
-                let descriptor = _current.load(Types.pointer, v, 8)
+                let descriptor = _strings!.load_descriptor(_current, v)
                 let displayer = _current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_DISPLAY)], true), 8)
                 let result = _slot(Types.i1)
 
@@ -3746,9 +3733,7 @@ namespace IR.LLVMTarget is
             _ensure_initialised(constructor.owner)
 
             let object =
-                _current.call(
-                    _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
-                    [LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type)))])!
+                _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type))), true)
 
             if let c = callee then
                 values.insert(0, object)
@@ -3955,7 +3940,7 @@ namespace IR.LLVMTarget is
 
                 _check_receiver(call.from, receiver)
 
-                let descriptor = _current.load(Types.pointer, receiver, 8)
+                let descriptor = _strings!.load_descriptor(_current, receiver)
                 let entry = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_VTABLE + 8 * slot.index)], true)
 
                 _call_through(call, receiver, values, entry)
@@ -3985,11 +3970,17 @@ namespace IR.LLVMTarget is
             let trait_type = _trait_instance(function.owner)
             let root = cast Function?(function.root_specialized_from)!
 
-            if !objects.is_built then
-                objects.note_dispatched(function)
+            let generic_arguments = DISPATCH_PLAN.own_type_arguments(_instance_of(function))
 
-                if let t = trait_type then
-                    objects.selector_of(root, t)
+            if !objects.is_built then
+                if let arguments = generic_arguments, t = trait_type then
+                    objects.note_generic_call(root, t, arguments)
+                else
+                    objects.note_dispatched(function)
+
+                    if let t = trait_type then
+                        objects.selector_of(root, t)
+                    fi
                 fi
 
                 // A trait nothing implements is called by throwing, below.
@@ -3999,15 +3990,14 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            let selector = if let t = trait_type then objects.selector_of(root, t) else null fi
-
-            // A method generic in its own right has no row in the trait
-            // table, which holds one entry per method rather than one per
-            // instantiation.
-            if !selector? /\ function.generic_arguments.count > 0 then
-                _report("a generic method called through a trait")
-                return
-            fi
+            // A method generic in its own right has a row for each
+            // instantiation a call was recorded at.
+            let selector =
+                if let t = trait_type then
+                    if let arguments = generic_arguments then objects.generic_selector_of(root, t, arguments) else objects.selector_of(root, t) fi
+                else
+                    null
+                fi
 
             if !selector? then
                 _call_on_null(call)
@@ -4028,7 +4018,7 @@ namespace IR.LLVMTarget is
 
                 _check_receiver(call.from, receiver)
 
-                let descriptor = _current.load(Types.pointer, receiver, 8)
+                let descriptor = _strings!.load_descriptor(_current, receiver)
                 let class_id = _current.load(Types.i32, descriptor, 8)
                 let index = _current.binary(BinaryOperator.ADD, IntegerFlags.NONE, class_id, _i32(selector.offset))
                 let entry = _current.element_pointer(Types.pointer, LLVM.Values.global(LLVM_OBJECTS.TRAIT_TABLE_NAME), [index], true)
@@ -4086,7 +4076,7 @@ namespace IR.LLVMTarget is
 
             _start(present)
 
-            let descriptor = _current.load(Types.pointer, value, 8)
+            let descriptor = _strings!.load_descriptor(_current, value)
 
             _current.store(_current.load(Types.i32, descriptor, 8), slot, 4)
             _current.branch(join)
@@ -4152,6 +4142,13 @@ namespace IR.LLVMTarget is
 
             if !isa Values.BOX(operand) /\ (!held? \/ !isa LLVM.Type.POINTER(held)) then
                 _report("a cast")
+                return
+            fi
+
+            // A bigint is a reference to its box, so a cast to one checks
+            // the object is a bigint and keeps the reference.
+            if _objects?.bigint_of(_specialize(target))? then
+                _unbox(conversion.value, target)
                 return
             fi
 
@@ -4380,9 +4377,7 @@ namespace IR.LLVMTarget is
             fi
 
             let value =
-                _current.call(
-                    _strings!.runtime("$ghul_alloc", Types.pointer, [Types.pointer, Types.i64]),
-                    [objects.closures!.descriptor, LLVM.Values.i64(cast long(LLVM_CLOSURES.SIZE))])!
+                _strings!.allocate_object(_current, objects.closures!.descriptor, LLVM.Values.i64(cast long(LLVM_CLOSURES.SIZE)), true)
 
             _current.store(thunk.reference, _current.element_pointer(Types.i8, value, [_i32(LLVM_CLOSURES.FUNCTION_OFFSET)], true), 8)
             _current.store(receiver, _current.element_pointer(Types.i8, value, [_i32(LLVM_CLOSURES.RECEIVER_OFFSET)], true), 8)
