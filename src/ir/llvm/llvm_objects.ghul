@@ -56,6 +56,7 @@ namespace IR.LLVMTarget is
         _statics: MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]
         _globals: MAP[Symbol, (name: string, type: LLVM.Type)]
         _box_hashes: MAP[CLASS_INSTANCE, LLVM.FUNCTION]
+        _box_equalities: MAP[CLASS_INSTANCE, LLVM.FUNCTION]
         _static_constructors: MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, flag: string)?]
         _unit_variants: Collections.SET[CLASS_INSTANCE]
         _trait_instances: LIST[CLASS_INSTANCE]
@@ -125,6 +126,7 @@ namespace IR.LLVMTarget is
             _statics = MAP[CLASS_INSTANCE, MAP[Symbol, (name: string, type: LLVM.Type)]]()
             _globals = MAP[Symbol, (name: string, type: LLVM.Type)]()
             _box_hashes = MAP[CLASS_INSTANCE, LLVM.FUNCTION]()
+            _box_equalities = MAP[CLASS_INSTANCE, LLVM.FUNCTION]()
             _static_constructors = MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, flag: string)?]()
             _unit_variants = Collections.SET[CLASS_INSTANCE]()
             _trait_instances = LIST[CLASS_INSTANCE]()
@@ -756,6 +758,10 @@ namespace IR.LLVMTarget is
                     return hash.reference
                 fi
 
+                if let o = owner /\ is_box(o) /\ _is_root_equals(i), equals = _box_equals(o, function) then
+                    return equals.reference
+                fi
+
                 if let o = owner /\ (is_box(o) \/ is_struct(o)) /\ isa Semantic.Symbols.STRUCT(i.definition.owner), c = closures then
                     return c.unboxing_thunk(function).reference
                 fi
@@ -803,6 +809,85 @@ namespace IR.LLVMTarget is
 
             return function
         si
+
+        // Whether `instance` is the root's `equals`, which a box of a scalar
+        // answers by comparing the scalar it holds instead.
+        _is_root_equals(instance: FUNCTION_INSTANCE) -> bool =>
+            instance.definition.name =~ "equals" /\
+            instance.definition.arguments.count == 1 /\
+            (cast Classy?(instance.definition.owner)?.is_object ?? false)
+
+        // The function the box `type` answers `equals` with, of the same type
+        // as `root_equals`, the root's: true where the other object is a box
+        // with the same descriptor holding a value equal to this one's, a NaN
+        // equal to another as .NET has it. Null where it holds no scalar.
+        _box_equals(type: CLASS_INSTANCE, root_equals: LLVM.FUNCTION) -> LLVM.FUNCTION? is
+            let found: LLVM.FUNCTION mut
+
+            if _box_equalities.try_get_value(type, found ref) then
+                return found
+            fi
+
+            let boxed = _classes.boxed_type(type)
+
+            if !LLVM_TYPES.value_type(boxed)? then
+                return null
+            fi
+
+            let function =
+                LLVM.FUNCTION(
+                    "\$ghul_box_equals_{_box_equalities.count}",
+                    root_equals.result,
+                    [LLVM.PARAMETER(Types.pointer, "box"), LLVM.PARAMETER(Types.pointer, "other")])
+
+            function.linkage = Linkage.INTERNAL
+
+            let entry = function.add_block("entry")
+            let same_type = function.add_block("same_type")
+            let compare = function.add_block("compare")
+            let different = function.add_block("different")
+
+            let box = function.parameter(0)
+            let other = function.parameter(1)
+
+            entry.branch(entry.compare(LLVM.IntegerPredicate.EQ, other, Values.null_pointer), different, same_type)
+
+            let descriptor = same_type.load(Types.pointer, box, 8)
+            let other_descriptor = same_type.load(Types.pointer, other, 8)
+
+            same_type.branch(same_type.compare(LLVM.IntegerPredicate.EQ, descriptor, other_descriptor), compare, different)
+
+            let left = load_stored(compare, boxed, compare.element_pointer(Types.i8, box, [Values.i32(BOX_VALUE_OFFSET)], true))!
+            let right = load_stored(compare, boxed, compare.element_pointer(Types.i8, other, [Values.i32(BOX_VALUE_OFFSET)], true))!
+
+            let equal =
+                if LLVM_TYPES.is_floating(left.type) then
+                    compare.binary(
+                        LLVM.BinaryOperator.OR,
+                        LLVM.IntegerFlags.NONE,
+                        compare.compare(LLVM.FloatPredicate.OEQ, left, right),
+                        compare.binary(
+                            LLVM.BinaryOperator.AND,
+                            LLVM.IntegerFlags.NONE,
+                            compare.compare(LLVM.FloatPredicate.UNO, left, left),
+                            compare.compare(LLVM.FloatPredicate.UNO, right, right)))
+                else
+                    compare.compare(LLVM.IntegerPredicate.EQ, left, right)
+                fi
+
+            compare.return_value(_as_result(compare, equal, root_equals.result))
+            different.return_value(_as_result(different, Values.boolean(false), root_equals.result))
+
+            _module.add_function(function)
+
+            _box_equalities[type] = function
+
+            return function
+        si
+
+        // `value`, an `i1`, as a function returning `result` returns a bool.
+        _as_result(block: LLVM.BLOCK, value: LLVM.Value, result: LLVM.Type) -> LLVM.Value =>
+            if result =~ Types.i1 then value else block.convert(LLVM.Conversion.ZERO_EXTEND, value, result) fi
 
         root: CLASS_INSTANCE? => _classes.root
         numbering: CLASS_ID_NUMBERING[CLASS_INSTANCE] => _classes.numbering
