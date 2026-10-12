@@ -1693,8 +1693,50 @@ namespace IR.LLVMTarget is
 
             _push(_current.select(fits, object, LLVM.Values.null_pointer))
         si
-        /// A null, or a box of another type, throws, as .NET does.
-        visit(unbox: Values.UNBOX) is _unbox(unbox.value, unbox.type) si
+        /// A null, or a box of another type, throws, as .NET does. Unboxing
+        /// through a type parameter follows the cast that tested the box,
+        /// so there a null is the declined cast and gives the default.
+        visit(unbox: Values.UNBOX) is
+            if (unbox.type?.is_type_variable ?? false) /\ !LLVM_TYPES.is_object_reference(_specialize(unbox.type)) then
+                _unbox_or_default(unbox.value, unbox.type)
+            else
+                _unbox(unbox.value, unbox.type)
+            fi
+        si
+
+        _unbox_or_default(value: Value, type: Type?) is
+            let held = _held(type)
+            let object = _value_of(value)
+
+            if !held? \/ !object? then
+                if !held? then
+                    _report("unboxing a {_specialize(type)}")
+                fi
+
+                return
+            fi
+
+            let slot = _slot(held)
+
+            _current.store(LLVM_TYPES.zero(held), slot, 0)
+
+            let present = _new_block()
+            let join = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.NE, object, LLVM.Values.null_pointer), present, join)
+
+            _start(present)
+
+            if let unboxed = _unbox_value(object, type) then
+                _current.store(unboxed, slot, 0)
+            fi
+
+            _current.branch(join)
+
+            _start(join)
+
+            _push(_current.load(held, slot, 0))
+        si
 
         _unbox(value: Value, type: Type?) is
             if _value_optional_inner(type)? then
@@ -1727,10 +1769,11 @@ namespace IR.LLVMTarget is
         // The value of `type` held in the box `object` points at, or null,
         // reported, where the target has no box for `type`. A null, or a box
         // of another type, throws.
-        _unbox_value(object: LLVM.Value, type: Type?) -> LLVM.Value? is
+        _unbox_value(object: LLVM.Value, unboxed: Type?) -> LLVM.Value? is
             let objects = _objects
+            let type = _specialize(unboxed)
 
-            if let o = objects, s = o.struct_of(_specialize(type)) then
+            if let o = objects, s = o.struct_of(type) then
                 let held = o.struct_type(s)
                 let range = LIST[(first: int, last: int)]()
 
@@ -1743,7 +1786,30 @@ namespace IR.LLVMTarget is
 
                 return _current.load(held, _current.element_pointer(Types.structure([Types.pointer, held]), object, [_i32(0), _i32(1)], true), 0)
             fi
-            let box_type = if let o = objects then o.box_type(_specialize(type)) else null fi
+
+            // Unboxing to a reference type, as a type parameter bound to one
+            // does, is a checked cast that lets null through.
+            if type? /\ LLVM_TYPES.is_object_reference(type) then
+                if type.is_object then
+                    return object
+                fi
+
+                let ranges = _class_ranges(type)
+
+                if !ranges? then
+                    _report("unboxing a {type}")
+                    return null
+                fi
+
+                let id = _class_id(object)
+                let fits = _current.binary(BinaryOperator.OR, IntegerFlags.NONE, _in_ranges(id, ranges), _current.compare(IntegerPredicate.EQ, id, _i32(-1)))
+
+                _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)), Semantic.Lookups.RuntimeException.INVALID_CAST)
+
+                return object
+            fi
+
+            let box_type = if let o = objects then o.box_type(type) else null fi
 
             if !objects? \/ !box_type? \/ !_stored(type)? then
                 _report("unboxing a {type}")
@@ -3948,7 +4014,7 @@ namespace IR.LLVMTarget is
 
             if let array = objects.classes.array_of(type) then
                 return objects.array_ranges(array)
-            elif let target = objects.class_of(type) ?? objects.box_type(type) then
+            elif let target = objects.class_of(type) ?? objects.box_type(type) ?? objects.struct_of(type) then
                 result.add(objects.class_range(target))
 
                 return result
@@ -4045,18 +4111,20 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            let held = _held(conversion.value.type)
+            let held = _held(operand.type)
 
             if !isa Values.BOX(operand) /\ (!held? \/ !isa LLVM.Type.POINTER(held)) then
                 _report("a cast")
                 return
             fi
 
-            // A checked cast to a scalar tests for its box and keeps the
-            // reference, which is unboxed afterwards. An unchecked one unboxes.
-            let is_box = _objects?.box_type(target)?
+            // A checked cast to a scalar or a struct tests for its box and
+            // keeps the reference, which is unboxed afterwards, and so does a
+            // cast to a type parameter, which declines rather than throwing.
+            // Any other unchecked one unboxes.
+            let is_box = _objects?.box_type(target)? \/ _objects?.struct_of(target)?
 
-            if is_box /\ !conversion.is_checked then
+            if is_box /\ !conversion.is_checked /\ !conversion.type.is_type_variable then
                 _unbox(conversion.value, target)
                 return
             fi
@@ -4087,7 +4155,12 @@ namespace IR.LLVMTarget is
             let id = _class_id(value)
             let fits = _current.binary(BinaryOperator.OR, IntegerFlags.NONE, _in_ranges(id, ranges), _current.compare(IntegerPredicate.EQ, id, _i32(-1)))
 
-            if conversion.faults_on_failure \/ (conversion.is_checked /\ is_box) then
+            // A checked cast to a box throws where the box is of another
+            // type, unless it is a cast to or from a type parameter, which
+            // declines.
+            let declines = conversion.type.is_type_variable \/ (conversion.value.type?.is_type_variable ?? false)
+
+            if conversion.faults_on_failure \/ (conversion.is_checked /\ is_box /\ !declines) then
                 _throw_if(_current.compare(IntegerPredicate.EQ, fits, LLVM.Values.boolean(false)), Semantic.Lookups.RuntimeException.INVALID_CAST)
                 _push(value)
             else
