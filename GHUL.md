@@ -1256,6 +1256,8 @@ Every other operand is a compile error pointing at `=~`. On a struct — a tuple
 
 **`==` on a `string` is reference identity, and stays that way.** Two strings with the same characters are `==` only when they are the same object, which for two literals they generally are and for anything computed they generally are not. That surprises people, and it is still the right definition, because it is the only one that keeps the four properties above. Compare characters with `=~`.
 
+Strings order by UTF-16 code unit, on every target: `<>` and the relational operators compare two strings a code unit at a time, so upper case sorts before lower case and punctuation by its code, and a program sorts the same way wherever it runs. Linguistic order is asked for explicitly, with `string.compare(a, b, StringComparison.CURRENT_CULTURE)` or one of the other culture values; on the wasm and llvm targets those compare as `ORDINAL` does, and the `IGNORE_CASE` ones as `ORDINAL_IGNORE_CASE`.
+
 `=~` and `!~` ask whether two values *mean the same*, and that is a question each type answers for itself:
 
 ```ghul
