@@ -5,7 +5,7 @@
 #
 # ghul-llvm is the assembler, optimiser and linker an llvm build hands its
 # module to, with the C runtime and libghul it links against. The release
-# named in build/ghul-llvm.version is downloaded from GitHub, checked
+# build/requirements.json names is downloaded from GitHub, checked
 # against the sha256 published beside it, and unpacked into <dir>; nothing
 # else is needed on the machine to build or run a program.
 #
@@ -21,7 +21,11 @@ if [ $# -ne 1 ]; then
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
-tag="$(tr -d '[:space:]' < "$here/ghul-llvm.version")"
+# The tests link with exactly the release requirements.json names, the
+# floor, rather than the newest above it as the libraries are chosen: a
+# ghul-llvm release changes what every llvm test links, so moving to a newer
+# one is a change of its own.
+tag="v$(sed -n 's/.*"ghul-llvm": *"\([^"]*\)".*/\1/p' "$here/requirements.json")"
 triple=x86_64-unknown-linux-musl
 archive="ghul-llvm-$triple.tar.gz"
 url="https://github.com/ghul-lang/ghul-llvm/releases/download/$tag/$archive"

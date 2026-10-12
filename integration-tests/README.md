@@ -155,7 +155,7 @@ PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
 ```
 
 `build/ghul-llvm.sh` fetches the release the tests are run with, the one
-`build/ghul-llvm.version` names, as a user's build fetches it, and prints where
+`build/requirements.json` names, as a user's build fetches it, and prints where
 its executable is. The CI job runs the tests in an image with no C compiler,
 linker or C library, and then runs each program again in an empty image with
 `build/llvm-programs.sh`, which fails any program that is not fully static.
