@@ -1324,9 +1324,11 @@ namespace IR.LLVMTarget is
             fi
         si
 
-        // Throws where `index` is outside the array `array` points at, an
-        // unsigned comparison catching a negative index too.
+        // Throws where `array` is null, or where `index` is outside the array
+        // it points at, an unsigned comparison catching a negative index too.
         _check_index(array: LLVM.Value, index: LLVM.Value) is
+            _check_dereference(array)
+
             let in_range = _current.compare(IntegerPredicate.ULT, index, _arrays!.count(_current, array))
 
             _throw_if(_current.compare(IntegerPredicate.EQ, in_range, LLVM.Values.boolean(false)), Semantic.Lookups.RuntimeException.INDEX_OUT_OF_RANGE)
@@ -2517,6 +2519,7 @@ namespace IR.LLVMTarget is
 
             if operation =~ "array.count" then
                 if let _ = _array_of(call.from.type), array = _value_of(call.from) then
+                    _check_dereference(array)
                     _push(_arrays!.count(_current, array))
                 fi
             elif operation =~ "array.get" then
@@ -2697,6 +2700,7 @@ namespace IR.LLVMTarget is
 
             if operation =~ "string.length" then
                 if let text = _value_of(arguments[0]) then
+                    _check_dereference(text)
                     _push(strings.length(_current, text))
                 fi
             elif operation =~ "string.char_at" then
@@ -2766,6 +2770,8 @@ namespace IR.LLVMTarget is
         // descriptor holds as a string.
         _type_name(value: Value) is
             if let object = _value_of(value) then
+                _check_dereference(object)
+
                 let descriptor = _current.load(Types.pointer, object, 8)
 
                 _push(_current.load(Types.pointer, _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_NAME)], true), 8))
@@ -3151,9 +3157,13 @@ namespace IR.LLVMTarget is
             return null
         si
 
-        // The type object of the object `value` points to.
-        _type_object_of(value: LLVM.Value) -> LLVM.Value? =>
-            _type_object(_current.load(Types.pointer, value, 8))
+        // The type object of the object `value` points to, which throws where
+        // `value` is null.
+        _type_object_of(value: LLVM.Value) -> LLVM.Value? is
+            _check_dereference(value)
+
+            return _type_object(_current.load(Types.pointer, value, 8))
+        si
 
         // Whether a call to `function` asks for its receiver's type object,
         // which no type can override: a member declaring the same name
@@ -3316,15 +3326,58 @@ namespace IR.LLVMTarget is
             return _current.call(function_type, callee, arguments)
         si
 
-        // Throws where `object` is null, for a `!` the program writes. A
-        // dereference of a value whose type says it is present is not checked.
-        _check_not_null(object: LLVM.Value) is
-            _throw_if(_current.compare(IntegerPredicate.EQ, object, LLVM.Values.null_pointer), Semantic.Lookups.RuntimeException.NULL_REFERENCE)
+        // Throws the null-reference exception where `object`, a reference
+        // about to be read through, is null. The test is marked
+        // !make.implicit, so where the read follows it LLVM folds the two:
+        // the read is left to fault, and the runtime resumes at the throw.
+        _check_dereference(object: LLVM.Value) is
+            let thrown = _new_block()
+            let carry_on = _new_block()
+
+            _current
+                .branch(_current.compare(IntegerPredicate.EQ, object, LLVM.Values.null_pointer), thrown, carry_on)
+                .attach("make.implicit", _module.empty_metadata())
+
+            _start(thrown)
+
+            _throw_null_reference()
+
+            _start(carry_on)
+        si
+
+        // Throws the null-reference exception through the runtime, which makes
+        // it with the program's $ghul_make_null_reference: one call, so a test
+        // for null adds little to the function it is in. Where the program
+        // has no such exception, what is thrown carries no type or message.
+        _throw_null_reference() is
+            if !LLVM_EXCEPTIONS.null_reference_constructor? then
+                _throw_new(Semantic.Lookups.RuntimeException.NULL_REFERENCE)
+                return
+            fi
+
+            _reach_exception(Semantic.Lookups.RuntimeException.NULL_REFERENCE)
+
+            _emit_call(_strings!.throw_null_reference, [])
+            _current.unreachable()
+            _is_terminated = true
         si
 
         // The address of the instance field `symbol` of the object `from`
-        // answers, or null, reported, where the target does not hold it.
+        // answers, tested for null first, or null, reported, where the target
+        // does not hold it.
         _field_address(from: Value?, symbol: Semantic.Symbols.Symbol) -> LLVM.Value? is
+            if let (object, address) = _field_access(from, symbol) then
+                _check_receiver(from, object)
+                return address
+            fi
+
+            return null
+        si
+
+        // The address of the instance field `symbol` and the object it is in,
+        // which is null for a field of a struct, untested. The caller tests
+        // the object before it reads or writes the field.
+        _field_access(from: Value?, symbol: Semantic.Symbols.Symbol) -> (object: LLVM.Value?, address: LLVM.Value)? is
             let objects = _objects
 
             if !objects? \/ !from? then
@@ -3348,19 +3401,29 @@ namespace IR.LLVMTarget is
                 fi
 
                 if let address = _address_of(from) then
-                    return _current.element_pointer(objects.struct_type(owner), address, [_i32(0), _i32(position)], true)
+                    let within: LLVM.Value? = null
+
+                    return (object = within, address = _current.element_pointer(objects.struct_type(owner), address, [_i32(0), _i32(position)], true))
                 fi
 
                 return null
             fi
 
-            let object = _value_of(from)
-
-            if !object? then
-                return null
+            if let object = _value_of(from) then
+                return (object = object, address = _current.element_pointer(objects.struct_type(owner), object, [_i32(0), _i32(position)], true))
             fi
 
-            return _current.element_pointer(objects.struct_type(owner), object, [_i32(0), _i32(position)], true)
+            return null
+        si
+
+        // Tests `object`, which `from` lowered to, for null before it is read
+        // through, unless `from` is the receiver, which its caller tested, or
+        // `object` is null because `from` is a struct, which is not a
+        // reference.
+        _check_receiver(from: Value?, object: LLVM.Value?) is
+            if let o = object /\ !isa Values.Load.REFERENCE_SELF(from) then
+                _check_dereference(o)
+            fi
         si
 
         visit(load: Values.Load.INSTANCE_FIELD) is
@@ -3375,7 +3438,8 @@ namespace IR.LLVMTarget is
         si
 
         visit(store: Values.Store.INSTANCE_FIELD) is
-            if let address = _field_address(store.from, store.symbol), value = _value_of(store.value) then
+            if let (object, address) = _field_access(store.from, store.symbol), value = _value_of(store.value) then
+                _check_receiver(store.from, object)
                 _store_stored(value, store.type, address)
             fi
         si
@@ -3618,6 +3682,8 @@ namespace IR.LLVMTarget is
 
             if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
 
+                _check_receiver(call.from, if call.from.is_value_type then null else receiver fi)
+
                 values.insert(0, receiver)
 
                 if let result = _emit_call(callee, values.to_array()) then
@@ -3713,6 +3779,8 @@ namespace IR.LLVMTarget is
 
             if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
 
+                _check_receiver(call.from, receiver)
+
                 let descriptor = _current.load(Types.pointer, receiver, 8)
                 let entry = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_VTABLE + 8 * slot.index)], true)
 
@@ -3775,6 +3843,8 @@ namespace IR.LLVMTarget is
             fi
 
             if let receiver = _value_of(call.from), values = _arguments_for(function, call.arguments) then
+
+                _check_receiver(call.from, receiver)
 
                 let descriptor = _current.load(Types.pointer, receiver, 8)
                 let class_id = _current.load(Types.i32, descriptor, 8)
@@ -3948,7 +4018,7 @@ namespace IR.LLVMTarget is
 
         visit(check: Values.REFERENCE_NULL_CHECK) is
             if let value = _value_of(check.inner) then
-                _check_not_null(value)
+                _check_dereference(value)
                 _push(value)
             fi
         si
@@ -4152,6 +4222,8 @@ namespace IR.LLVMTarget is
                     return
                 fi
             od
+
+            _check_dereference(closure)
 
             let function = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.FUNCTION_OFFSET)], true), 8)
             let receiver = _current.load(Types.pointer, _current.element_pointer(Types.i8, closure, [_i32(LLVM_CLOSURES.RECEIVER_OFFSET)], true), 8)
