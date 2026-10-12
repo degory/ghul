@@ -400,11 +400,13 @@ let combined = "{prefix}{suffix}";                  // concatenation
 
 An interpolated expression can carry an alignment and a format specifier, as in .NET: `{expr, alignment : format}`.
 
+A format reaches a number, and a value whose type implements `System.IFormattable`, which is written through its `to_string(format, format_provider)` with no provider. A format given to any other value is ignored, as on .NET. A type of your own takes a format by implementing `System.IFormattable`.
+
 ```ghul
 let padded = "[{value,12:F3}]";     // [    1500.000]
 ```
 
-How a value reads depends on its static type. A string, a number, an enum, and any type that declares its own `to_string` read as they always have, through that `to_string`, and so does any value given an alignment or a format. A `bool` reads `true` or `false`, as ghūl spells it. An optional reads as the value it holds, by these same rules, or as `null` when it holds nothing. Anything else - an array, a list, a tuple, a struct or class that declares no `to_string`, a value held as `object`, a trait or a type parameter - would otherwise read as its .NET type name, so the runtime's `$` writes it instead: a sequence as its elements in brackets, a tuple as its parts, and a record as its type and members.
+How a value reads depends on its static type. A string, a number, an enum, and any type that declares its own `to_string` read as they always have, through that `to_string`, and so does any value given an alignment. A `bool` reads `true` or `false`, as ghūl spells it. An optional reads as the value it holds, by these same rules, or as `null` when it holds nothing. Anything else - an array, a list, a tuple, a struct or class that declares no `to_string`, a value held as `object`, a trait or a type parameter - would otherwise read as its .NET type name, so the runtime's `$` writes it instead: a sequence as its elements in brackets, a tuple as its parts, and a record as its type and members.
 
 ```ghul
 struct POINT(x: int public, y: int public);
