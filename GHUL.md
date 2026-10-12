@@ -2389,6 +2389,8 @@ class COROUTINE[T] is ... si
 
 Everywhere else a type is required, a generic named with none of its type arguments is an error saying how many it takes: what the name stands for is the open generic, and an assembly naming one is refused by the runtime at load rather than at compile time. That covers a declared type, a parameter, a cast target, an `isa` test and a type argument alike. Two positions are not affected, because each takes its arguments from somewhere else: a union's variant, whose arguments come from the union and so from the value the variant is tested against or assigned to (`isa Option.NONE(o)` over an `Option[int]`), and a call whose type arguments are inferred (`LIST()`).
 
+`size_of[T]()` answers how many bytes a value of `T` takes where it is stored, as one element of a `T[]` holds it: a scalar's width, a reference's size for a class or trait, and a struct's laid-out size. It is a constant for each type argument, so it costs nothing at run time, and inside a generic it answers for the type the parameter stands for. The answer is the target's: a reference is 8 bytes on .NET and llvm and 4 on wasm, where a `bool` is also stored in 4.
+
 ## type inference
 
 See <https://ghul.dev/type-inference.html>.
