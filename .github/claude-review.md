@@ -65,6 +65,10 @@ What this does *not* cover: a source-level identifier used as a name is the datu
 
 Existing text-keyed mechanisms (the `MAP[string, Type]` type-argument maps in the specializers and the placeholder registry, the state-machine frame's function-name-keyed class map, the name-keyed symbol and definition maps) are not to be ripped out on sight, and a PR that merely touches one in passing is fine. But a PR that **significantly changes or extends** one - a new consumer, a new key format, a new entity kind flowing through it, a rework of how the keys are built - must say in its description why it is not being migrated to a non-text identity as part of the work. Any concrete reason is acceptable; silence is not. If the statement is missing, request changes and ask for it.
 
+### Reading the environment
+
+**Reject any new `System.Environment` use in `src/`, and any read of `Ghul.ENVIRONMENT` outside `src/driver/compiler_environment.ghul`.** The compiler runs on .NET, wasm and llvm, and `System.Environment` exists only on .NET. Every environment variable the compiler reads, an experiment's flag included, is declared as an accessor on `Driver.COMPILER_ENVIRONMENT` and read through it.
+
 ### Diagnostic message wording
 
 Every new or edited `error`/`warn`/`info`/`hint` call (and `set_constraint` message) in `src/` against this rubric:
