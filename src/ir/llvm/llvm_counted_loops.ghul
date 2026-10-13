@@ -1,0 +1,304 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Collections.MAP
+
+    use Semantic.Types.Type
+
+    use LLVM.BinaryOperator
+    use LLVM.IntegerFlags
+    use LLVM.IntegerPredicate
+    use LLVM.Types
+
+    use Values.Value
+
+    // How a counted `for` loop knows what it walks: an array, a list of a
+    // known class, or a list a run-time test of the receiver's class
+    // confirms, falling back to the iterator otherwise.
+    enum CountedRoute is
+        ARRAY,
+        EXACT,
+        GUARDED
+    si
+
+    // A `for` loop lowered over the storage it iterates: the array the
+    // elements are in, how many there are, and where the loop is. Where
+    // the receiver's class is only tested at run time, `flag` is the slot
+    // saying whether the test passed, and the iterator is used otherwise.
+    class COUNTED_LOOP is
+        iteration: FOR_ITERATION
+        is_active: bool public
+        flag: LLVM.Value? public
+        storage: LLVM.Value? public
+        count: LLVM.Value? public
+        index: LLVM.Value? public
+        array: CLASS_INSTANCE? public
+
+        init(iteration: FOR_ITERATION) is
+            self.iteration = iteration
+        si
+    si
+
+    /// Counts how each `for` loop the llvm target lowers was lowered.
+    class COUNTED_LOOP_STATISTICS is
+        /// Loops over an array.
+        arrays: int static public
+
+        /// Loops over a list whose exact class is known.
+        exact: int static public
+
+        /// Loops over a list-typed value tested at run time.
+        guarded: int static public
+
+        /// Loops left to the iterator because something else could
+        /// implement the receiver's type.
+        declined: int static public
+    si
+
+    partial LLVM_LOWERING is
+        // Records, when the local declared holds a `for` loop's iterator,
+        // the calls the loop makes on it, so they can be lowered over the
+        // iterated value's storage.
+        _note_iteration(local: LOCAL) is
+            if let iteration = local.iteration, objects = _objects, move_next = iteration.move_next, current = iteration.current /\ objects.is_built then
+                let loop = COUNTED_LOOP(iteration)
+
+                _counted_loops[iteration.get_iterator] = loop
+                _counted_loops[move_next] = loop
+                _counted_loops[current] = loop
+            fi
+        si
+
+        // Lowers `value` where it is one of a counted loop's calls,
+        // answering whether it did.
+        _lower_counted(value: Value) -> bool is
+            let loop: COUNTED_LOOP mut
+
+            if !_counted_loops.try_get_value(value, loop ref) then
+                return false
+            elif value == loop.iteration.get_iterator then
+                return _start_counted(loop, value)
+            elif !loop.is_active then
+                return false
+            elif value == loop.iteration.move_next then
+                _counted_step(loop, value, true)
+            else
+                _counted_step(loop, value, false)
+            fi
+
+            return true
+        si
+
+        _start_counted(loop: COUNTED_LOOP, value: Value) -> bool is
+            let objects = _objects!
+            let arrays = _arrays!
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            let call = cast Values.Call.INSTANCE?(value)
+
+            if !call? \/ call.from != loop.iteration.receiver \/ call.from.is_value_type then
+                return false
+            fi
+
+            let element = _specialize(loop.iteration.current!.type)
+            let receiver_type = _specialize(loop.iteration.receiver.type)
+
+            let moved = _held(loop.iteration.move_next!.type)
+
+            if !element? \/ !receiver_type? \/ !moved? \/ !(moved! =~ Types.i1) then
+                return false
+            fi
+
+            let route: CountedRoute mut
+            let list: CLASS_INSTANCE? mut = null
+
+            if let array = arrays.array_of(receiver_type) then
+                route = CountedRoute.ARRAY
+                loop.array = array
+            else
+                list = if let t = lookup.get_list_type(element) then objects.class_of(t) else null fi
+                loop.array = arrays.array_of(lookup.get_array_type(element))
+
+                if !list? \/ !loop.array? \/ !objects.is_allocated(list!) then
+                    return false
+                fi
+
+                if !(objects.class_of(receiver_type)? /\ objects.class_of(receiver_type)! =~ list!) /\ !objects.trait_of(receiver_type)? then
+                    return false
+                fi
+
+                route = CountedRoute.GUARDED
+            fi
+
+            let receiver = _value_of(call.from)
+
+            if !receiver? then
+                return true
+            fi
+
+            if route == CountedRoute.GUARDED then
+                if let exact = _exact_class(receiver!) /\ exact =~ list! then
+                    route = CountedRoute.EXACT
+                elif let static_class = objects.class_of(receiver_type) /\ static_class =~ list! /\ objects.has_no_subclasses(list!) then
+                    route = CountedRoute.EXACT
+                elif !_only_list_implements(receiver_type, list!) then
+                    COUNTED_LOOP_STATISTICS.declined = COUNTED_LOOP_STATISTICS.declined + 1
+
+                    _preevaluated[call.from] = receiver!
+                    value.accept(self)
+
+                    return true
+                fi
+            fi
+
+            let storage = _slot(Types.pointer)
+            let count = _slot(Types.i32)
+            let index = _slot(Types.i32)
+
+            loop.storage = storage
+            loop.count = count
+            loop.index = index
+            loop.is_active = true
+
+            _current.store(_i32(-1), index, 0)
+
+            if route == CountedRoute.ARRAY then
+                COUNTED_LOOP_STATISTICS.arrays = COUNTED_LOOP_STATISTICS.arrays + 1
+
+                _check_dereference(receiver!)
+                _current.store(receiver!, storage, 0)
+                _current.store(arrays.count(_current, receiver!), count, 0)
+                _push(LLVM.Values.null_pointer)
+            elif route == CountedRoute.EXACT then
+                COUNTED_LOOP_STATISTICS.exact = COUNTED_LOOP_STATISTICS.exact + 1
+
+                _check_dereference(receiver!)
+                _load_list_storage(list!, receiver!, storage, count)
+                _push(LLVM.Values.null_pointer)
+            else
+                COUNTED_LOOP_STATISTICS.guarded = COUNTED_LOOP_STATISTICS.guarded + 1
+
+                let flag = _slot(Types.i1)
+                let iterator = _slot(Types.pointer)
+
+                loop.flag = flag
+
+                let check = _new_block()
+                let is_list = _new_block()
+                let other = _new_block()
+                let join = _new_block()
+
+                _current.branch(_current.compare(IntegerPredicate.NE, receiver!, LLVM.Values.null_pointer), check, other)
+
+                _start(check)
+                let descriptor = _strings!.load_descriptor(_current, receiver!)
+                _current.branch(_current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(list!))), is_list, other)
+
+                _start(is_list)
+                _current.store(LLVM.Values.boolean(true), flag, 0)
+                _load_list_storage(list!, receiver!, storage, count)
+                _current.branch(join)
+
+                _start(other)
+                _preevaluated[call.from] = receiver!
+                value.accept(self)
+
+                if let made = _pop() then
+                    _current.store(made, iterator, 0)
+                fi
+
+                _current.branch(join)
+
+                _start(join)
+                _push(_current.load(Types.pointer, iterator, 0))
+            fi
+
+            return true
+        si
+
+        // Whether `list` is the only class the program allocates that is a
+        // `receiver_type`, arrays aside.
+        _only_list_implements(receiver_type: Type, list: CLASS_INSTANCE) -> bool is
+            let objects = _objects!
+
+            if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
+                for implementor in implementors do
+                    if objects.is_allocated(implementor) /\ !(implementor =~ list) /\ !objects.is_array(implementor) then
+                        return false
+                    fi
+                od
+
+                return true
+            fi
+
+            return false
+        si
+
+        // Stores the backing array and the count of `receiver`, a `list`,
+        // in `storage` and `count`, as the list's iterator takes them.
+        _load_list_storage(list: CLASS_INSTANCE, receiver: LLVM.Value, storage: LLVM.Value, count: LLVM.Value) is
+            let objects = _objects!
+            let layout = objects.struct_type(list)
+
+            if let items = objects.field_position_of(list, "_items"), counted = objects.field_position_of(list, "_count") then
+                _current.store(_current.load(Types.pointer, _current.element_pointer(layout, receiver, [_i32(0), _i32(items)], true), 0), storage, 0)
+                _current.store(_current.load(Types.i32, _current.element_pointer(layout, receiver, [_i32(0), _i32(counted)], true), 0), count, 0)
+            else
+                _report("a list's storage")
+            fi
+        si
+
+        // A counted loop's move to the next element, or its read of the
+        // element it is at; through the iterator where the run-time test
+        // did not pass.
+        _counted_step(loop: COUNTED_LOOP, value: Value, is_move: bool) is
+            if let flag = loop.flag then
+                let held = _held(value.type)
+
+                if !held? then
+                    _report("a counted loop's element")
+                    return
+                fi
+
+                let result = _slot(held!)
+                let counted = _new_block()
+                let other = _new_block()
+                let join = _new_block()
+
+                _current.branch(_current.load(Types.i1, flag, 0), counted, other)
+
+                _start(counted)
+                _current.store(_counted_value(loop, is_move), result, 0)
+                _current.branch(join)
+
+                _start(other)
+                value.accept(self)
+
+                if let made = _pop() then
+                    _current.store(made, result, 0)
+                fi
+
+                _current.branch(join)
+
+                _start(join)
+                _push(_current.load(held!, result, 0))
+            else
+                _push(_counted_value(loop, is_move))
+            fi
+        si
+
+        _counted_value(loop: COUNTED_LOOP, is_move: bool) -> LLVM.Value is
+            let index = loop.index!
+
+            if is_move then
+                let next = _current.binary(BinaryOperator.ADD, IntegerFlags.NONE, _current.load(Types.i32, index, 0), _i32(1))
+
+                _current.store(next, index, 0)
+
+                return _current.compare(IntegerPredicate.SLT, next, _current.load(Types.i32, loop.count!, 0))
+            fi
+
+            return _arrays!.load(_current, loop.array!, _current.load(Types.pointer, loop.storage!, 0), _current.load(Types.i32, index, 0))
+        si
+    si
+si
