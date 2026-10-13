@@ -34,6 +34,11 @@ namespace IR.LLVMTarget is
         index: LLVM.Value? public
         array: CLASS_INSTANCE? public
 
+        /// Whether the copy of the loop being lowered is the one entered
+        /// only when the run-time test passed, which needs no test of its
+        /// own on each step.
+        is_counted_copy: bool public
+
         init(iteration: FOR_ITERATION) is
             self.iteration = iteration
         si
@@ -53,6 +58,8 @@ namespace IR.LLVMTarget is
         /// Loops left to the iterator because something else could
         /// implement the receiver's type.
         declined: int static public
+
+        blockers: MAP[string, int]? static public
     si
 
     partial LLVM_LOWERING is
@@ -216,6 +223,94 @@ namespace IR.LLVMTarget is
             return true
         si
 
+        // A loop whose body is lowered at most this many instructions large
+        // is lowered twice where its receiver is tested at run time: once
+        // walking the storage with no test per step, and once testing the
+        // flag on each step, which the iterator path needs.
+        COUNTED_COPY_LIMIT: int static => 80
+
+        // The guarded counted loop `loop` is the loop of, where it is one:
+        // its exit tests that loop's move to the next element.
+        _guarded_loop_of(loop: Values.LOOP) -> COUNTED_LOOP? is
+            if _counted_loops.count == 0 then
+                return null
+            fi
+
+            for value in loop.body.values do
+                if let exit: Values.BREAK = value then
+                    for operand in exit.operands do
+                        let counted: COUNTED_LOOP mut
+
+                        if _counted_loops.try_get_value(operand, counted ref) /\ counted.is_active /\ counted.flag? /\ operand == counted.iteration.move_next then
+                            return counted
+                        fi
+                    od
+
+                    return null
+                fi
+            od
+
+            return null
+        si
+
+        // Lowers `loop` once testing the flag on each step, and again with
+        // no test where that copy is small, entering the second where the
+        // run-time test passed.
+        _lower_loop_twice(loop: Values.LOOP, counted: COUNTED_LOOP) is
+            let end = _new_block()
+            let depth = _stack.count
+            let dispatch = _new_block()
+
+            _branch(dispatch)
+
+            let first_block = _function.blocks.count
+            let dynamic_header = _lower_loop_copy(loop, end, depth)
+
+            let size mut = 0
+
+            for i in first_block.._function.blocks.count do
+                size = size + _function.blocks[i].instructions.count
+            od
+
+            if size <= COUNTED_COPY_LIMIT then
+                counted.is_counted_copy = true
+
+                let counted_header = _lower_loop_copy(loop, end, depth)
+
+                counted.is_counted_copy = false
+
+                dispatch.branch(dispatch.load(Types.i1, counted.flag!, 0), counted_header, dynamic_header)
+            else
+                dispatch.branch(dynamic_header)
+            fi
+
+            _start(end)
+
+            _check_depth(depth, "loop")
+        si
+
+        _lower_loop_copy(loop: Values.LOOP, end: LLVM.BLOCK, depth: int) -> LLVM.BLOCK is
+            let header = _new_block()
+
+            _labels.add((loop, false, end, null, depth))
+            _labels.add((loop, true, header, null, depth))
+
+            _start(header)
+
+            for value in loop.body.values do
+                gen(value)
+            od
+
+            if !_is_terminated then
+                _branch(header)
+            fi
+
+            _labels.remove_at(_labels.count - 1)
+            _labels.remove_at(_labels.count - 1)
+
+            return header
+        si
+
         // Whether `list` is the only class the program allocates that is a
         // `receiver_type`, arrays aside.
         _only_list_implements(receiver_type: Type, list: CLASS_INSTANCE) -> bool is
@@ -224,6 +319,15 @@ namespace IR.LLVMTarget is
             if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
                 for implementor in implementors do
                     if objects.is_allocated(implementor) /\ !(implementor =~ list) /\ !objects.is_array(implementor) then
+                        if System.Environment.get_environment_variable("GHUL_LLVM_LOOP_STATS")? then
+                            let blockers = COUNTED_LOOP_STATISTICS.blockers ?? MAP[string, int]()
+                            COUNTED_LOOP_STATISTICS.blockers = blockers
+                            let key = "{receiver_type} <- {implementor.definition}"
+                            let seen: int mut
+                            blockers.try_get_value(key, seen ref)
+                            blockers[key] = seen + 1
+                        fi
+
                         return false
                     fi
                 od
@@ -252,7 +356,7 @@ namespace IR.LLVMTarget is
         // element it is at; through the iterator where the run-time test
         // did not pass.
         _counted_step(loop: COUNTED_LOOP, value: Value, is_move: bool) is
-            if let flag = loop.flag then
+            if let flag = loop.flag /\ !loop.is_counted_copy then
                 let held = _held(value.type)
 
                 if !held? then
