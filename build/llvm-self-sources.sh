@@ -40,6 +40,24 @@ for directory in src wasm/src llvm/src analysis-protocol/src; do
     find "$root/$directory" -name '*.ghul' -not -path '*/bin/*' -not -path '*/obj/*'
 done | sort > "$output/sources.rsp"
 
+# A compiler built for a target other than .NET has no assembly resource to
+# carry the wasm loader, so its text is compiled in as a string, in place of
+# the committed file that has none.
+{
+    echo 'namespace IR.WasmGC is'
+    echo '    @IF.not.dotnet()'
+    echo '    class WASMGC_LOADER_TEXT is'
+    printf '        text: string? static => "'
+    awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\{/, "{{"); gsub(/\}/, "}}"); gsub(/\t/, "\\t"); printf "%s\\n", $0 }' "$root/src/ir/wasmgc/loader.mjs"
+    echo '"'
+    echo '    si'
+    echo 'si'
+} > "$output/wasmgc_loader_text.ghul"
+
+grep -vxF "$root/src/ir/wasmgc/wasmgc_loader_text.ghul" "$output/sources.rsp" > "$output/sources.rsp.tmp"
+echo "$output/wasmgc_loader_text.ghul" >> "$output/sources.rsp.tmp"
+mv "$output/sources.rsp.tmp" "$output/sources.rsp"
+
 # A native build of the compiler reports the version GHUL_NATIVE_VERSION
 # names, and the requirements beside this script, through a copy of
 # src/driver/native_build.ghul compiled in place of the committed one.
