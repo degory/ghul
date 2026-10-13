@@ -43,6 +43,10 @@ class Exit extends Error {
 //   Uint8Array, each time the program writes a file; without it a program
 //   run by Node has the file written relative to the working directory,
 //   and one run anywhere else has its files discarded
+// - options.file_system: whether the program reads and writes the real
+//   file system rather than files in memory; by default it does when run
+//   by Node with neither options.files nor options.onfile given, and never
+//   anywhere else, which has no file system to reach
 //
 // Answers the program's exit status.
 export async function run(options = {}) {
@@ -55,6 +59,7 @@ export async function run(options = {}) {
     const onfile = options.onfile ?? (is_node ? node_file_writer(stderr) : () => {});
     const input = input_reader(options.stdin);
     const input_files = Object.entries(options.files ?? {}).map(([path, content]) => [path, file_bytes(content)]);
+    const files = (options.file_system ?? (options.files === undefined && options.onfile === undefined)) && is_node ? node_files() : no_files;
 
     const started = performance.now();
 
@@ -101,6 +106,8 @@ export async function run(options = {}) {
         file_written(path, content) {
             onfile(String(path), base64_bytes(String(content)));
         },
+
+        ...files,
 
         input_file_count: () => input_files.length,
         input_file_path: (index) => input_files[index][0],
@@ -460,6 +467,123 @@ function node_file_writer(stderr) {
         node_fs.writeFileSync(path, bytes);
     };
 }
+
+// The host's file operations over Node's file system, each answering 0
+// or one of core's failure codes as libghul's do: 1 for a missing file, 2
+// for a missing directory, 3 for access denied and 4 for any other
+// failure. A file's bytes cross as a string holding one code unit for
+// each byte.
+function node_files() {
+    let last_error = 0;
+    let entries = [];
+
+    const code_for = (error, path) => {
+        switch (error?.code) {
+        case "ENOENT":
+            return node_fs.existsSync(node_path.dirname(path)) ? 1 : 2;
+        case "ENOTDIR":
+            return 2;
+        case "EACCES":
+        case "EPERM":
+        case "EISDIR":
+        case "EROFS":
+            return 3;
+        default:
+            return 4;
+        }
+    };
+
+    const attempt = (path, action) => {
+        try {
+            action();
+            return 0;
+        } catch (error) {
+            return code_for(error, path);
+        }
+    };
+
+    const is_directory = (path) => node_fs.statSync(path, { throwIfNoEntry: false })?.isDirectory() ?? false;
+
+    return {
+        file_system: () => 1,
+        file_current_directory: () => process.cwd(),
+
+        file_kind(path) {
+            const status = node_fs.statSync(String(path), { throwIfNoEntry: false });
+
+            return status === undefined ? 0 : status.isDirectory() ? 2 : 1;
+        },
+
+        file_read_text(path) {
+            try {
+                return node_fs.readFileSync(String(path)).toString("latin1");
+            } catch (error) {
+                last_error = code_for(error, String(path));
+                return null;
+            }
+        },
+
+        file_last_error: () => last_error,
+
+        file_write_text(path, content, append) {
+            const bytes = Buffer.from(String(content), "latin1");
+
+            return attempt(String(path), () =>
+                append ? node_fs.appendFileSync(String(path), bytes) : node_fs.writeFileSync(String(path), bytes));
+        },
+
+        // A file that is not there is no failure, as .NET's File.Delete
+        // does nothing for one, unless its directory is not there either.
+        file_delete(path) {
+            const code = attempt(String(path), () => node_fs.unlinkSync(String(path)));
+
+            return code === 1 ? 0 : code;
+        },
+
+        file_rename: (from, to) => attempt(String(from), () => node_fs.renameSync(String(from), String(to))),
+        directory_set_current: (path) => attempt(String(path), () => process.chdir(String(path))),
+        directory_create: (path) => attempt(String(path), () => node_fs.mkdirSync(String(path), { recursive: true })),
+
+        directory_delete: (path, recursive) =>
+            attempt(String(path), () => recursive ? node_fs.rmSync(String(path), { recursive: true }) : node_fs.rmdirSync(String(path))),
+
+        // The files, or the directories, directly in `path`, held for
+        // directory_entry to answer one at a time; a link counts as what
+        // it leads to.
+        directory_entries(path, directories) {
+            try {
+                entries = node_fs.readdirSync(String(path), { withFileTypes: true })
+                    .filter((entry) => (entry.isDirectory() || (entry.isSymbolicLink() && is_directory(node_path.join(String(path), entry.name)))) === Boolean(directories))
+                    .map((entry) => entry.name);
+
+                return entries.length;
+            } catch (error) {
+                return -code_for(error, String(path));
+            }
+        },
+
+        directory_entry: (index) => entries[index],
+    };
+}
+
+// What a program that reads no real file system is told: that there is
+// none to read. Core asks before using any other operation, but the module
+// imports each one it can reach, so each is here, failing.
+const no_files = {
+    file_system: () => 0,
+    file_current_directory: () => "/",
+    file_kind: () => 0,
+    file_read_text: () => null,
+    file_last_error: () => 4,
+    file_write_text: () => 4,
+    file_delete: () => 4,
+    file_rename: () => 4,
+    directory_set_current: () => 4,
+    directory_create: () => 4,
+    directory_delete: () => 4,
+    directory_entries: () => -4,
+    directory_entry: () => "",
+};
 
 // Node's standard input as pieces of text, read synchronously so the
 // program can block on it. Input arriving on a non-blocking descriptor is

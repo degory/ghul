@@ -95,6 +95,10 @@ namespace IR.WasmGC is
         // it, which is where a CONTINUE goes.
         _labels: LIST[(node: Values.Breakable?, is_loop_head: bool, finally_exits: WASMGC_FINALLY_EXITS?)]
 
+        // The type each value-producing region being lowered results in,
+        // which a value leaving it is cast to where it is held wider.
+        _region_results: MAP[Values.Breakable, VALUE_TYPE]
+
         // Inside a resumable body: the dispatch that opens it, the state
         // each resume point is reached by, and the states whose resume
         // point lies inside each block, region and loop.
@@ -213,6 +217,7 @@ namespace IR.WasmGC is
             _local_names = LIST[(index: int, name: string)]()
             _bodies = LIST[LIST[INSTRUCTION]]()
             _labels = LIST[(node: Values.Breakable?, is_loop_head: bool, finally_exits: WASMGC_FINALLY_EXITS?)]()
+            _region_results = MAP[Values.Breakable, VALUE_TYPE]()
             _resume_point_states = MAP[LABEL, int]()
             _resume_states = MAP[Value, LIST[int]]()
             _await_structures = MAP[Values.AWAIT_SUSPEND, Values.REGION]()
@@ -410,6 +415,9 @@ namespace IR.WasmGC is
         _held_type(value: Value) -> VALUE_TYPE? is
             if let wrapper: Values.TYPE_WRAPPER = value then
                 return _held_type(wrapper.value)
+            elif let block: Values.BLOCK = value /\ block.values.count > 0 /\ !isa Values.REGION(block.values[block.values.count - 1]) then
+                // A block leaves its last value.
+                return _held_type(block.values[block.values.count - 1])
             elif let wrapper: Values.WRAPPER = value /\ wrapper.value? then
                 return _held_type(wrapper.value)
             elif let view: Values.NARROW_VIEW = value then
@@ -434,6 +442,13 @@ namespace IR.WasmGC is
                 return _held_type(_frame_field_load(Values.state_machine_field_for(load.symbol)!))
             elif let load: Values.Load.LOCAL_VARIABLE = value then
                 if let variable = cast Semantic.Symbols.Variable?(load.symbol) then
+                    // A local held in a cell is read out of it, as its value.
+                    if _cell_index(variable.ir_local)? then
+                        return _value_type(variable.ir_local.type)
+                    elif let held = _reference_cell_of(variable.ir_local) then
+                        return held
+                    fi
+
                     return _local_type(_local(variable.ir_local))
                 fi
             elif let load: Values.Load.LOCAL_ARGUMENT = value then
@@ -452,10 +467,22 @@ namespace IR.WasmGC is
                 return _global_of(load.symbol)?.type
             elif let load: Values.Load.GLOBAL_FIELD = value then
                 return _global_of(load.symbol)?.type
+            elif let call: Values.Call.INSTANCE = value then
+                return _call_result(call.function, value)
+            elif let call: Values.Call.STATIC = value then
+                return _call_result(call.function, value)
+            elif let call: Values.Call.GLOBAL = value then
+                return _call_result(call.function, value)
             fi
 
             return _value_type(value.type)
         si
+
+        // What a call to `function` leaves: the type the function is
+        // declared to return, which the call's own type may have been
+        // narrowed past where flow analysis proved more about the result.
+        _call_result(function: Semantic.Symbols.Function, call: Value) -> VALUE_TYPE? =>
+            _value_type(function.return_type) ?? _value_type(call.type)
 
         // The declared type of parameter or local `index`.
         _local_type(index: int) -> VALUE_TYPE? =>
@@ -1032,8 +1059,19 @@ namespace IR.WasmGC is
         // The address of a scalar or reference-typed local is the cell it
         // lives in, which the local holds in place of the value.
         visit_address(load: Values.Load.LOCAL_VARIABLE) is
-            if _struct_of(load.type)? then
+            if let held = _struct_of(load.type) then
                 _variable_get(load)
+
+                // A read-only struct's box is shared rather than copied, so
+                // the local may hold a box something else holds too. A write
+                // through the reference must change only the local, so it is
+                // given a box of its own first.
+                if _registry.is_read_only(held) /\ !_registry.discovering then
+                    if let variable = cast Semantic.Symbols.Variable?(load.symbol) /\ !_registry.is_cell(variable.ir_local) /\ !Values.state_machine_field_for(load.symbol)? then
+                        _copy_struct(held)
+                        _emit(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, _local(variable.ir_local)))
+                    fi
+                fi
             elif Values.state_machine_field_for(load.symbol)? then
                 _report("a generator or asynchronous function's local")
             elif let variable = cast Semantic.Symbols.Variable?(load.symbol) /\ _has_cell(load.type) then
@@ -2671,8 +2709,12 @@ namespace IR.WasmGC is
         // The address of a struct is the box it lives in, or for a value
         // with no location of its own, the box the value already is.
         visit(address: Values.ADDRESS) is
-            if _struct_of(address.type)? then
+            if _struct_of(address.value.type)? then
                 _struct_receiver(address.value)
+            elif isa Semantic.Types.REFERENCE(_specialize(address.type)) /\ isa Values.Load.LOCAL_VARIABLE(address.value) /\ _has_cell(address.value.type) then
+                // A `ref` to a local is the cell the local lives in, which
+                // the callee writes through, whatever the local holds.
+                gen_address(address.value)
             elif _optional_inner(address.value.type)? then
                 gen(address.value)
             elif _has_cell(address.value.type) then
@@ -3143,6 +3185,10 @@ namespace IR.WasmGC is
             if mode == Values.TypeTestOperandMode.AS_IS /\ _value_type(value.type)?.heap_type()? then
                 return value
             elif mode == Values.TypeTestOperandMode.BOX /\ _registry.box_index(_specialize(value.type))? then
+                return Values.TYPE_TEST_OPERAND.operand(value)
+            elif mode == Values.TypeTestOperandMode.BOX /\ _value_type(value.type)?.heap_type()? then
+                // A struct, or a bigint, is held as a reference already,
+                // which is what boxing it gives.
                 return Values.TYPE_TEST_OPERAND.operand(value)
             elif mode == Values.TypeTestOperandMode.UNWRAP_MAYBE then
                 return Values.TYPE_TEST_OPERAND.operand(value)
@@ -3934,6 +3980,11 @@ namespace IR.WasmGC is
 
         _lower_region(region: Values.REGION, result: VALUE_TYPE?) is
             _push_label(region, false)
+
+            if let type = result then
+                _region_results[region] = type
+            fi
+
             _begin()
 
             let values = region.body.values
@@ -3969,6 +4020,7 @@ namespace IR.WasmGC is
 
             let body = _end()
             _pop_label()
+            _region_results.remove(region)
 
             _emit(BLOCK_INSTRUCTION(Opcode.BLOCK, _block_type(result), body))
         si
@@ -4037,6 +4089,12 @@ namespace IR.WasmGC is
                 let label = _labels[i]
 
                 if label.node == exit.target /\ label.is_loop_head == is_continue then
+                    if !is_continue then
+                        if let node = label.node /\ _region_results.contains_key(node) then
+                            _coerce_top(_region_results[node])
+                        fi
+                    fi
+
                     _branch(exit, _depth(i))
                     return
                 elif let finally_exits = label.finally_exits then
