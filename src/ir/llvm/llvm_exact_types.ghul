@@ -3,11 +3,10 @@ namespace IR.LLVMTarget is
 
     use Collections.LIST
     use Collections.MAP
-    use Collections.SET
 
     /// Where a lowered value came from, as far as its exact class goes: an
-    /// allocation of a class, the result of a call to a function, or a load
-    /// of a local of a function.
+    /// allocation of a class, the result of a call to a function, a load of
+    /// a local of a function, or the result of a dispatched call.
     class EXACT_SOURCE is
         /// The class allocated, for an allocation.
         type: CLASS_INSTANCE?
@@ -19,9 +18,9 @@ namespace IR.LLVMTarget is
         /// The local loaded, for a load.
         local: LOCAL?
 
-        /// The methods a dispatched call can run, for a dispatched call's
-        /// result; asked only once the dispatch plan is built.
-        targets: (() -> Collections.Iterable[FUNCTION_INSTANCE]?)?
+        _targets: (() -> Collections.Iterable[FUNCTION_INSTANCE]?)?
+        _resolved: LIST[FUNCTION_INSTANCE]?
+        _is_resolved: bool
 
         init(type: CLASS_INSTANCE?, function: FUNCTION_INSTANCE?, local: LOCAL?) is
             self.type = type
@@ -29,165 +28,256 @@ namespace IR.LLVMTarget is
             self.local = local
         si
 
+        /// A dispatched call's result, from whichever of the methods
+        /// `targets` gives, once the dispatch plan is built, it ran.
         init(targets: () -> Collections.Iterable[FUNCTION_INSTANCE]?) is
-            self.targets = targets
+            _targets = targets
+        si
+
+        /// Whether this is a dispatched call's result.
+        is_dispatched: bool => _targets?
+
+        /// The methods a dispatched call can run, or null where they are
+        /// not known; worked out once, when first asked.
+        targets: LIST[FUNCTION_INSTANCE]? is
+            if !_is_resolved then
+                _is_resolved = true
+
+                if let t = _targets, functions = t() then
+                    _resolved = LIST[FUNCTION_INSTANCE](functions)
+                fi
+            fi
+
+            return _resolved
+        si
+    si
+
+    // What reaches one function's returns or one local's stores.
+    class EXACT_SET is
+        sources: LIST[EXACT_SOURCE] public
+        is_poisoned: bool public
+        solved: CLASS_INSTANCE? public
+
+        init() is
+            sources = LIST[EXACT_SOURCE]()
+        si
+
+        add(source: EXACT_SOURCE?) is
+            if is_poisoned then
+                return
+            elif let s = source then
+                sources.add(s)
+            else
+                is_poisoned = true
+                sources.clear()
+            fi
         si
     si
 
     /// The exact runtime class of what functions return and locals hold,
     /// where every value reaching them is one class. Discovery records what
     /// reaches each function's returns and each local's stores; `solve`
-    /// settles them once discovery is over. A value of a known exact class
-    /// calls the one implementation its class has, whatever its static type.
+    /// settles them once the dispatch plan is built. A value of a known
+    /// exact class calls the one implementation its class has, whatever its
+    /// static type.
     class LLVM_EXACT_TYPES is
-        _returns: MAP[FUNCTION_INSTANCE, LIST[EXACT_SOURCE?]]
-        _locals: MAP[FUNCTION_INSTANCE, MAP[LOCAL, LIST[EXACT_SOURCE?]]]
-
-        _solved_returns: MAP[FUNCTION_INSTANCE, CLASS_INSTANCE]
-        _solved_locals: MAP[FUNCTION_INSTANCE, MAP[LOCAL, CLASS_INSTANCE]]
+        _returns: MAP[FUNCTION_INSTANCE, EXACT_SET]
+        _locals: MAP[FUNCTION_INSTANCE, MAP[LOCAL, EXACT_SET]]
 
         init() is
-            _returns = MAP[FUNCTION_INSTANCE, LIST[EXACT_SOURCE?]]()
-            _locals = MAP[FUNCTION_INSTANCE, MAP[LOCAL, LIST[EXACT_SOURCE?]]]()
-            _solved_returns = MAP[FUNCTION_INSTANCE, CLASS_INSTANCE]()
-            _solved_locals = MAP[FUNCTION_INSTANCE, MAP[LOCAL, CLASS_INSTANCE]]()
+            _returns = MAP[FUNCTION_INSTANCE, EXACT_SET]()
+            _locals = MAP[FUNCTION_INSTANCE, MAP[LOCAL, EXACT_SET]]()
         si
 
         /// Records, while discovering, that `function` returns a value from
         /// `source`, or one of no known source where it is null.
         note_return(function: FUNCTION_INSTANCE, source: EXACT_SOURCE?) is
-            let sources: LIST[EXACT_SOURCE?] mut
+            let set: EXACT_SET mut
 
-            if !_returns.try_get_value(function, sources ref) then
-                sources = LIST[EXACT_SOURCE?]()
-                _returns[function] = sources
+            if !_returns.try_get_value(function, set ref) then
+                set = EXACT_SET()
+                _returns[function] = set
             fi
 
-            sources.add(source)
+            set.add(source)
         si
 
         /// Records, while discovering, that `function` stores a value from
         /// `source` in `local`, or one of no known source, or writes it
         /// through its address, where `source` is null.
         note_store(function: FUNCTION_INSTANCE, local: LOCAL, source: EXACT_SOURCE?) is
-            let locals: MAP[LOCAL, LIST[EXACT_SOURCE?]] mut
+            let locals: MAP[LOCAL, EXACT_SET] mut
 
             if !_locals.try_get_value(function, locals ref) then
-                locals = MAP[LOCAL, LIST[EXACT_SOURCE?]](Collections.ReferenceEqualityComparer.instance)
+                locals = MAP[LOCAL, EXACT_SET](Collections.ReferenceEqualityComparer.instance)
                 _locals[function] = locals
             fi
 
-            let sources: LIST[EXACT_SOURCE?] mut
+            let set: EXACT_SET mut
 
-            if !locals.try_get_value(local, sources ref) then
-                sources = LIST[EXACT_SOURCE?]()
-                locals[local] = sources
+            if !locals.try_get_value(local, set ref) then
+                set = EXACT_SET()
+                locals[local] = set
             fi
 
-            sources.add(source)
+            set.add(source)
         si
 
         /// Settles every return and local whose sources all come to one
         /// class. A cycle with no class to start from settles nothing.
         solve() is
+            let pending mut = LIST[EXACT_SET]()
+
+            for (_, set) in _returns do
+                if !set.is_poisoned then
+                    pending.add(set)
+                fi
+            od
+
+            for (_, locals) in _locals do
+                for (_, set) in locals do
+                    if !set.is_poisoned then
+                        pending.add(set)
+                    fi
+                od
+            od
+
             let changed mut = true
 
             while changed do
                 changed = false
 
-                for (function, sources) in _returns do
-                    if !_solved_returns.contains_key(function) then
-                        if let type = _settle(sources) then
-                            _solved_returns[function] = type
-                            changed = true
-                        fi
+                let next = LIST[EXACT_SET]()
+
+                for set in pending do
+                    let settled = _settle(set)
+
+                    if settled == Settled.SETTLED then
+                        changed = true
+                    elif settled == Settled.FAILED then
+                        set.is_poisoned = true
+                        changed = true
+                    else
+                        next.add(set)
                     fi
                 od
 
-                for (function, locals) in _locals do
-                    let solved: MAP[LOCAL, CLASS_INSTANCE] mut
-
-                    if !_solved_locals.try_get_value(function, solved ref) then
-                        solved = MAP[LOCAL, CLASS_INSTANCE](Collections.ReferenceEqualityComparer.instance)
-                        _solved_locals[function] = solved
-                    fi
-
-                    for (local, sources) in locals do
-                        if !solved.contains_key(local) then
-                            if let type = _settle(sources) then
-                                solved[local] = type
-                                changed = true
-                            fi
-                        fi
-                    od
-                od
+                pending = next
             od
-
         si
 
         /// The exact class of a value from `source`, or null where it is not
         /// known to be one class.
         exact(source: EXACT_SOURCE?) -> CLASS_INSTANCE? is
-            if !source? then
-                return null
-            elif let type = source.type then
+            if let s = source then
+                let (type, _) = _state(s)
+
                 return type
-            elif let targets = source.targets then
-                // A dispatched call is exact where every method it can run
-                // returns the one class.
-                let found: CLASS_INSTANCE? mut = null
-
-                if let functions = targets() then
-                    for function in functions do
-                        let type: CLASS_INSTANCE mut
-
-                        if !_solved_returns.try_get_value(function, type ref) \/ (found? /\ !(found! =~ type)) then
-                            return null
-                        fi
-
-                        found = type
-                    od
-                fi
-
-                return found
-            elif let function = source.function then
-                if let local = source.local then
-                    let solved: MAP[LOCAL, CLASS_INSTANCE] mut
-                    let type: CLASS_INSTANCE mut
-
-                    if _solved_locals.try_get_value(function, solved ref) /\ solved.try_get_value(local, type ref) then
-                        return type
-                    fi
-
-                    return null
-                fi
-
-                let type: CLASS_INSTANCE mut
-
-                if _solved_returns.try_get_value(function, type ref) then
-                    return type
-                fi
             fi
 
             return null
         si
 
-        _settle(sources: LIST[EXACT_SOURCE?]) -> CLASS_INSTANCE? is
-            let found: CLASS_INSTANCE? mut = null
+        // A source's class where it is settled, and whether it never will be.
+        _state(source: EXACT_SOURCE) -> (type: CLASS_INSTANCE?, failed: bool) is
+            if let type = source.type then
+                return (type, false)
+            elif source.is_dispatched then
+                // A dispatched call is exact where every method it can run
+                // returns the one class.
+                let functions = source.targets
 
-            for source in sources do
-                if let type = exact(source) then
-                    if let f = found /\ !(f =~ type) then
-                        return null
+                if !functions? \/ functions!.count == 0 then
+                    return (null, true)
+                fi
+
+                let found: CLASS_INSTANCE? mut = null
+
+                for function in functions! do
+                    let (type, failed) = _set_state(_return_set(function))
+
+                    if failed \/ (type? /\ found? /\ !(found! =~ type!)) then
+                        return (null, true)
+                    elif !type? then
+                        return (null, false)
                     fi
 
                     found = type
-                else
-                    return null
+                od
+
+                return (found, false)
+            elif let function = source.function then
+                if let local = source.local then
+                    return _set_state(_local_set(function, local))
                 fi
+
+                return _set_state(_return_set(function))
+            fi
+
+            return (null, true)
+        si
+
+        _set_state(set: EXACT_SET?) -> (type: CLASS_INSTANCE?, failed: bool) =>
+            if let s = set then
+                if s.is_poisoned then (null, true) else (s.solved, false) fi
+            else
+                (null, true)
+            fi
+
+        _return_set(function: FUNCTION_INSTANCE) -> EXACT_SET? is
+            let set: EXACT_SET mut
+
+            if _returns.try_get_value(function, set ref) then
+                return set
+            fi
+
+            return null
+        si
+
+        _local_set(function: FUNCTION_INSTANCE, local: LOCAL) -> EXACT_SET? is
+            let locals: MAP[LOCAL, EXACT_SET] mut
+            let set: EXACT_SET mut
+
+            if _locals.try_get_value(function, locals ref) /\ locals.try_get_value(local, set ref) then
+                return set
+            fi
+
+            return null
+        si
+
+        _settle(set: EXACT_SET) -> Settled is
+            if set.solved? then
+                return Settled.SETTLED
+            fi
+
+            let found: CLASS_INSTANCE? mut = null
+
+            for source in set.sources do
+                let (type, failed) = _state(source)
+
+                if failed \/ (type? /\ found? /\ !(found! =~ type!)) then
+                    return Settled.FAILED
+                elif !type? then
+                    return Settled.PENDING
+                fi
+
+                found = type
             od
 
-            return found
+            if let f = found then
+                set.solved = f
+                return Settled.SETTLED
+            fi
+
+            return Settled.FAILED
         si
+    si
+
+    // How far a set has got: settled to one class, still waiting on
+    // another, or never to settle.
+    enum Settled is
+        SETTLED,
+        PENDING,
+        FAILED
     si
 si
