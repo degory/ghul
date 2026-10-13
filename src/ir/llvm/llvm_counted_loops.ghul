@@ -12,13 +12,30 @@ namespace IR.LLVMTarget is
 
     use Values.Value
 
-    // How a counted `for` loop knows what it walks: an array, a list of a
-    // known class, or a list a run-time test of the receiver's class
-    // confirms, falling back to the iterator otherwise.
+    // How a counted `for` loop knows what it walks: an array, a collection
+    // of a known class, or a collection a run-time test of the receiver's
+    // class confirms, falling back to the iterator otherwise.
     enum CountedRoute is
         ARRAY,
         EXACT,
         GUARDED
+    si
+
+    // The collection a counted loop walks the storage of.
+    enum StorageKind is
+        ARRAY,
+        LIST,
+        MAP,
+        SET
+    si
+
+    // How a counted loop steps: through every element of an array up to a
+    // count, or through the entries of a hash table, skipping removed ones,
+    // reading each entry's key and value or its key alone.
+    enum CountedShape is
+        PLAIN,
+        PAIRS,
+        KEYS
     si
 
     // A `for` loop lowered over the storage it iterates: the array the
@@ -33,6 +50,10 @@ namespace IR.LLVMTarget is
         count: LLVM.Value? public
         index: LLVM.Value? public
         array: CLASS_INSTANCE? public
+        shape: CountedShape public
+        hashes: LLVM.Value? public
+        values: LLVM.Value? public
+        value_array: CLASS_INSTANCE? public
 
         /// Whether the copy of the loop being lowered is the one entered
         /// only when the run-time test passed, which needs no test of its
@@ -98,28 +119,33 @@ namespace IR.LLVMTarget is
                 return false
             fi
 
-            let route: CountedRoute mut
-            let family = Collections.LIST[CLASS_INSTANCE]()
+            let candidates = Collections.LIST[(type: CLASS_INSTANCE, kind: StorageKind)]()
+            let has_other mut = false
 
             if let array = arrays.array_of(receiver_type) then
-                route = CountedRoute.ARRAY
-                loop.array = array
+                candidates.add((array, StorageKind.ARRAY))
+            elif let static_class = objects.class_of(receiver_type) then
+                if let kind = _storage_kind(static_class) /\ objects.has_no_subclasses(static_class) then
+                    candidates.add((static_class, kind))
+                else
+                    return false
+                fi
+            elif let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
+                for implementor in implementors do
+                    if objects.is_allocated(implementor) then
+                        if let kind = _storage_kind(implementor) then
+                            candidates.add((implementor, kind))
+                        else
+                            has_other = true
+                        fi
+                    fi
+                od
             else
-                let list = if let t = lookup.get_list_type(element) then objects.class_of(t) else null fi
+                return false
+            fi
 
-                if !list? then
-                    return false
-                fi
-
-                _list_family(receiver_type, element, list!, family)
-
-                loop.array = arrays.array_of(lookup.get_array_type(element)) ?? arrays.array_of(lookup.get_array_type(lookup.get_object_type()))
-
-                if family.count == 0 \/ family.count > COUNTED_FAMILY_LIMIT \/ !loop.array? then
-                    return false
-                fi
-
-                route = CountedRoute.GUARDED
+            if candidates.count == 0 then
+                return false
             fi
 
             let receiver = _value_of(call.from)
@@ -128,22 +154,27 @@ namespace IR.LLVMTarget is
                 return true
             fi
 
-            let layout_class: CLASS_INSTANCE? mut = if family.count > 0 then family[0] else null fi
+            let family = Collections.LIST[(type: CLASS_INSTANCE, kind: StorageKind)]()
+            let route: CountedRoute mut
 
-            if route == CountedRoute.GUARDED then
-                if let exact = _exact_class(receiver!) /\ _contains(family, exact) then
-                    route = CountedRoute.EXACT
-                    layout_class = exact
-                elif let static_class = objects.class_of(receiver_type) /\ _contains(family, static_class) /\ objects.has_no_subclasses(static_class) then
-                    route = CountedRoute.EXACT
-                    layout_class = static_class
-                elif !_only_list_implements(receiver_type, family) then
+            if let exact = _exact_class(receiver!), kind = _storage_kind(exact) /\ _contains(candidates, exact) then
+                family.add((exact, kind))
+                route = CountedRoute.EXACT
+            elif !has_other /\ candidates.count <= COUNTED_FAMILY_LIMIT /\ _one_shape(candidates) then
+                family.add_range(candidates)
+                route = if candidates.count == 1 /\ !objects.trait_of(receiver_type)? then CountedRoute.EXACT else CountedRoute.GUARDED fi
+            else
+                _preevaluated[call.from] = receiver!
+                value.accept(self)
 
-                    _preevaluated[call.from] = receiver!
-                    value.accept(self)
+                return true
+            fi
 
-                    return true
-                fi
+            if !_prepare_shape(loop, family[0], element) then
+                _preevaluated[call.from] = receiver!
+                value.accept(self)
+
+                return true
             fi
 
             let storage = _slot(Types.pointer)
@@ -153,18 +184,15 @@ namespace IR.LLVMTarget is
             loop.storage = storage
             loop.count = count
             loop.index = index
+            loop.hashes = _slot(Types.pointer)
+            loop.values = _slot(Types.pointer)
             loop.is_active = true
 
             _current.store(_i32(-1), index, 0)
 
-            if route == CountedRoute.ARRAY then
+            if route == CountedRoute.EXACT then
                 _check_dereference(receiver!)
-                _current.store(receiver!, storage, 0)
-                _current.store(arrays.count(_current, receiver!), count, 0)
-                _push(LLVM.Values.null_pointer)
-            elif route == CountedRoute.EXACT then
-                _check_dereference(receiver!)
-                _load_list_storage(layout_class!, receiver!, storage, count)
+                _load_storage(loop, family[0], receiver!)
                 _push(LLVM.Values.null_pointer)
             else
                 let flag = _slot(Types.i1)
@@ -173,7 +201,6 @@ namespace IR.LLVMTarget is
                 loop.flag = flag
 
                 let check = _new_block()
-                let is_list = _new_block()
                 let other = _new_block()
                 let join = _new_block()
 
@@ -181,18 +208,22 @@ namespace IR.LLVMTarget is
 
                 _start(check)
                 let descriptor = _strings!.load_descriptor(_current, receiver!)
-                let matches mut = _current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(family[0])))
 
-                for i in 1..family.count do
-                    matches = _current.binary(BinaryOperator.OR, IntegerFlags.NONE, matches, _current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(family[i]))))
+                for member in family do
+                    let matched = _new_block()
+                    let next = _new_block()
+
+                    _current.branch(_current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(member.type))), matched, next)
+
+                    _start(matched)
+                    _current.store(LLVM.Values.boolean(true), flag, 0)
+                    _load_storage(loop, member, receiver!)
+                    _current.branch(join)
+
+                    _start(next)
                 od
 
-                _current.branch(matches, is_list, other)
-
-                _start(is_list)
-                _current.store(LLVM.Values.boolean(true), flag, 0)
-                _load_list_storage(layout_class!, receiver!, storage, count)
-                _current.branch(join)
+                _current.branch(other)
 
                 _start(other)
                 _preevaluated[call.from] = receiver!
@@ -209,6 +240,139 @@ namespace IR.LLVMTarget is
             fi
 
             return true
+        si
+
+        // The collection `type` is, where a counted loop can walk its
+        // storage.
+        _storage_kind(type: CLASS_INSTANCE) -> StorageKind? is
+            let objects = _objects!
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            if objects.is_array(type) then
+                return StorageKind.ARRAY
+            elif let list = lookup.get_list_class() /\ type.definition == list then
+                return StorageKind.LIST
+            elif let map = lookup.get_map_class() /\ type.definition == map then
+                return StorageKind.MAP
+            elif let set = lookup.get_set_class() /\ type.definition == set then
+                return StorageKind.SET
+            fi
+
+            return null
+        si
+
+        _shape_of(kind: StorageKind) -> CountedShape =>
+            if kind == StorageKind.MAP then CountedShape.PAIRS elif kind == StorageKind.SET then CountedShape.KEYS else CountedShape.PLAIN fi
+
+        _one_shape(family: Collections.List[(type: CLASS_INSTANCE, kind: StorageKind)]) -> bool is
+            for member in family do
+                if _shape_of(member.kind) != _shape_of(family[0].kind) then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
+        _contains(family: Collections.List[(type: CLASS_INSTANCE, kind: StorageKind)], type: CLASS_INSTANCE) -> bool is
+            for member in family do
+                if member.type =~ type then
+                    return true
+                fi
+            od
+
+            return false
+        si
+
+        // Settles how `loop` steps and reads its elements, from `member`, the
+        // first class it walks, and `element`, the type of what it reads.
+        // False where the arrays it reads cannot be found.
+        _prepare_shape(loop: COUNTED_LOOP, member: (type: CLASS_INSTANCE, kind: StorageKind), element: Type) -> bool is
+            let arrays = _arrays!
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+
+            loop.shape = _shape_of(member.kind)
+
+            if loop.shape == CountedShape.PLAIN then
+                loop.array = arrays.array_of(lookup.get_array_type(element)) ?? arrays.array_of(lookup.get_array_type(lookup.get_object_type()))
+                return loop.array?
+            fi
+
+            let map = if member.kind == StorageKind.SET then _field_class(member.type, "_map") else member.type fi
+
+            if !map? then
+                return false
+            fi
+
+            loop.array = _field_array(map!, "_keys")
+            loop.value_array = _field_array(map!, "_values")
+
+            return loop.array? /\ (loop.shape == CountedShape.KEYS \/ loop.value_array?)
+        si
+
+        _field(type: CLASS_INSTANCE, name: string) -> (position: int, type: Type)? is
+            for (`field, field_type, position) in _objects!.fields_of(type) do
+                if `field.name =~ name \/ `field.name =~ "${name}" then
+                    return (position, field_type)
+                fi
+            od
+
+            return null
+        si
+
+        _field_class(type: CLASS_INSTANCE, name: string) -> CLASS_INSTANCE? =>
+            if let f = _field(type, name) then _objects!.class_of(f.type) else null fi
+
+        _field_array(type: CLASS_INSTANCE, name: string) -> CLASS_INSTANCE? =>
+            if let f = _field(type, name) then _arrays!.array_of(f.type) else null fi
+
+        _load_field(type: CLASS_INSTANCE, object: LLVM.Value, name: string, as: LLVM.Type) -> LLVM.Value? =>
+            if let f = _field(type, name) then
+                _current.load(as, _current.element_pointer(_objects!.struct_type(type), object, [_i32(0), _i32(f.position)], true), 0)
+            else
+                null
+            fi
+
+        // Stores the storage of `receiver`, a `member`, where `loop` reads
+        // it, as the collection's own iterator takes it when it is made.
+        _load_storage(loop: COUNTED_LOOP, member: (type: CLASS_INSTANCE, kind: StorageKind), receiver: LLVM.Value) is
+            let map_type: CLASS_INSTANCE mut
+            let map: LLVM.Value mut
+
+            if member.kind == StorageKind.ARRAY then
+                _current.store(receiver, loop.storage!, 0)
+                _current.store(_arrays!.count(_current, receiver), loop.count!, 0)
+                return
+            elif member.kind == StorageKind.LIST then
+                if let items = _load_field(member.type, receiver, "_items", Types.pointer), counted = _load_field(member.type, receiver, "_count", Types.i32) then
+                    _current.store(items, loop.storage!, 0)
+                    _current.store(counted, loop.count!, 0)
+                else
+                    _report("a list's storage")
+                fi
+
+                return
+            elif member.kind == StorageKind.SET then
+                if let inner = _field_class(member.type, "_map"), loaded = _load_field(member.type, receiver, "_map", Types.pointer) then
+                    map_type = inner
+                    map = loaded
+                else
+                    _report("a set's storage")
+                    return
+                fi
+            else
+                map_type = member.type
+                map = receiver
+            fi
+
+            if let hashes = _load_field(map_type, map, "_hashes", Types.pointer), keys = _load_field(map_type, map, "_keys", Types.pointer), values = _load_field(map_type, map, "_values", Types.pointer), used = _load_field(map_type, map, "_used", Types.i32) then
+                _current.store(hashes, loop.hashes!, 0)
+                _current.store(keys, loop.storage!, 0)
+                _current.store(values, loop.values!, 0)
+                _current.store(used, loop.count!, 0)
+            else
+                _report("a map's storage")
+            fi
         si
 
         // A loop whose body is lowered at most this many instructions large
@@ -299,88 +463,9 @@ namespace IR.LLVMTarget is
             return header
         si
 
-        // A guarded loop tests the receiver against at most this many list
-        // classes.
+        // A guarded loop tests the receiver against at most this many
+        // collection classes.
         COUNTED_FAMILY_LIMIT: int static => 8
-
-        // The list classes a loop over `receiver_type`, whose elements are
-        // `element`, can walk the storage of: `list` itself, and where the
-        // elements are references every list of references the program
-        // allocates that is a `receiver_type`, since all of those hold their
-        // elements the same way.
-        _list_family(receiver_type: Type, element: Type, list: CLASS_INSTANCE, family: Collections.LIST[CLASS_INSTANCE]) is
-            let objects = _objects!
-
-            if let static_class = objects.class_of(receiver_type) then
-                if static_class =~ list then
-                    family.add(list)
-                fi
-
-                return
-            fi
-
-            if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
-                for implementor in implementors do
-                    if objects.is_allocated(implementor) /\ implementor.definition == list.definition then
-                        if implementor =~ list \/ (!element.is_value_type /\ _holds_references(implementor)) then
-                            family.add(implementor)
-                        fi
-                    fi
-                od
-            fi
-        si
-
-        _holds_references(list: CLASS_INSTANCE) -> bool is
-            for (_, argument) in list.type_map do
-                if argument.is_value_type then
-                    return false
-                fi
-            od
-
-            return true
-        si
-
-        _contains(family: Collections.LIST[CLASS_INSTANCE], type: CLASS_INSTANCE) -> bool is
-            for member in family do
-                if member =~ type then
-                    return true
-                fi
-            od
-
-            return false
-        si
-
-        // Whether every class the program allocates that is a
-        // `receiver_type` is one of `family`, arrays aside.
-        _only_list_implements(receiver_type: Type, family: Collections.LIST[CLASS_INSTANCE]) -> bool is
-            let objects = _objects!
-
-            if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
-                for implementor in implementors do
-                    if objects.is_allocated(implementor) /\ !_contains(family, implementor) /\ !objects.is_array(implementor) then
-                        return false
-                    fi
-                od
-
-                return true
-            fi
-
-            return false
-        si
-
-        // Stores the backing array and the count of `receiver`, a `list`,
-        // in `storage` and `count`, as the list's iterator takes them.
-        _load_list_storage(list: CLASS_INSTANCE, receiver: LLVM.Value, storage: LLVM.Value, count: LLVM.Value) is
-            let objects = _objects!
-            let layout = objects.struct_type(list)
-
-            if let items = objects.field_position_of(list, "_items"), counted = objects.field_position_of(list, "_count") then
-                _current.store(_current.load(Types.pointer, _current.element_pointer(layout, receiver, [_i32(0), _i32(items)], true), 0), storage, 0)
-                _current.store(_current.load(Types.i32, _current.element_pointer(layout, receiver, [_i32(0), _i32(counted)], true), 0), count, 0)
-            else
-                _report("a list's storage")
-            fi
-        si
 
         // A counted loop's move to the next element, or its read of the
         // element it is at; through the iterator where the run-time test
@@ -402,7 +487,8 @@ namespace IR.LLVMTarget is
                 _current.branch(_current.load(Types.i1, flag, 0), counted, other)
 
                 _start(counted)
-                _current.store(_counted_value(loop, is_move), result, 0)
+                let stepped = _counted_value(loop, value, is_move)
+                _current.store(stepped, result, 0)
                 _current.branch(join)
 
                 _start(other)
@@ -417,22 +503,91 @@ namespace IR.LLVMTarget is
                 _start(join)
                 _push(_current.load(held!, result, 0))
             else
-                _push(_counted_value(loop, is_move))
+                _push(_counted_value(loop, value, is_move))
             fi
         si
 
-        _counted_value(loop: COUNTED_LOOP, is_move: bool) -> LLVM.Value is
+        _counted_value(loop: COUNTED_LOOP, value: Value, is_move: bool) -> LLVM.Value is
             let index = loop.index!
+            let arrays = _arrays!
 
             if is_move then
                 let next = _current.binary(BinaryOperator.ADD, IntegerFlags.NONE, _current.load(Types.i32, index, 0), _i32(1))
 
                 _current.store(next, index, 0)
 
-                return _current.compare(IntegerPredicate.SLT, next, _current.load(Types.i32, loop.count!, 0))
+                if loop.shape != CountedShape.PLAIN then
+                    _skip_removed(loop)
+                fi
+
+                let at = _current.load(Types.i32, index, 0)
+
+                return _current.compare(IntegerPredicate.SLT, at, _current.load(Types.i32, loop.count!, 0))
             fi
 
-            return _arrays!.load(_current, loop.array!, _current.load(Types.pointer, loop.storage!, 0), _current.load(Types.i32, index, 0))
+            let at = _current.load(Types.i32, index, 0)
+            let key = arrays.load(_current, loop.array!, _current.load(Types.pointer, loop.storage!, 0), at)
+
+            if loop.shape != CountedShape.PAIRS then
+                return key
+            fi
+
+            let element = arrays.load(_current, loop.value_array!, _current.load(Types.pointer, loop.values!, 0), at)
+
+            return _pair(value.type, key, element)
+        si
+
+        // Moves `loop`'s index on past the removed entries of a hash table,
+        // whose hashes are negative, as the table's own iterator does.
+        _skip_removed(loop: COUNTED_LOOP) is
+            let arrays = _arrays!
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+            let hashes_array = arrays.array_of(lookup.get_array_type(lookup.get_int_type()))!
+
+            let check = _new_block()
+            let test = _new_block()
+            let skip = _new_block()
+            let done = _new_block()
+
+            _current.branch(check)
+
+            _start(check)
+            let at = _current.load(Types.i32, loop.index!, 0)
+            _current.branch(_current.compare(IntegerPredicate.SLT, at, _current.load(Types.i32, loop.count!, 0)), test, done)
+
+            _start(test)
+            let hash = arrays.load(_current, hashes_array, _current.load(Types.pointer, loop.hashes!, 0), at)
+            _current.branch(_current.compare(IntegerPredicate.SLT, hash, _i32(0)), skip, done)
+
+            _start(skip)
+            _current.store(_current.binary(BinaryOperator.ADD, IntegerFlags.NONE, at, _i32(1)), loop.index!, 0)
+            _current.branch(check)
+
+            _start(done)
+        si
+
+        // A key and value pair of `type` holding `key` and `element`.
+        _pair(type: Type?, key: LLVM.Value, element: LLVM.Value) -> LLVM.Value is
+            let objects = _objects!
+            let pair = objects.class_of(_specialize(type))
+            let held = _held(type)
+
+            if !pair? \/ !held? then
+                _report("a map entry")
+                return key
+            fi
+
+            let key_field = pair.definition.find_direct("_key")
+            let value_field = pair.definition.find_direct("_value")
+
+            if let key_symbol = key_field, value_symbol = value_field, key_at = objects.field_position(key_symbol), value_at = objects.field_position(value_symbol) then
+                let with_key = _insert_member(LLVM_TYPES.zero(held!), key, key_at, pair.specialize(key_symbol.type))
+
+                return _insert_member(with_key, element, value_at, pair.specialize(value_symbol.type))
+            fi
+
+            _report("a map entry")
+            return key
         si
     si
 si
