@@ -1,0 +1,372 @@
+namespace IR.LLVMTarget is
+    use Collections.LIST
+    use Collections.MAP
+    use Collections.SET
+
+    use LLVM.BLOCK
+    use LLVM.FUNCTION
+    use LLVM.INSTRUCTION
+    use LLVM.MODULE
+    use LLVM.Operation
+    use LLVM.Value
+
+    /// Counts the allocations in a finished module whose object provably
+    /// never outlives the function that allocates it: the pointer is only
+    /// read through, written through, compared, kept in the function's own
+    /// local slots, or passed where the callee is proven not to let it
+    /// escape. Reports the counts; changes nothing.
+    class LLVM_ESCAPE_CENSUS is
+        _module: MODULE
+        _class_name: (string) -> string
+        _functions: MAP[string, FUNCTION]
+
+        // Per function, which parameters can escape. Starts optimistic and
+        // only ever gains escaping parameters.
+        _escaping: MAP[string, SET[int]]
+
+        _reasons: MAP[string, int]
+        _reason: string
+
+        init(module: MODULE, class_name: (string) -> string) is
+            _module = module
+            _class_name = class_name
+            _functions = MAP[string, FUNCTION]()
+            _escaping = MAP[string, SET[int]]()
+            _reasons = MAP[string, int]()
+            _reason = ""
+
+            for function in module.functions do
+                _functions[function.name] = function
+                _escaping[function.name] = SET[int]()
+            od
+        si
+
+        /// Writes the counts to standard error.
+        report() is
+            _solve_parameters()
+
+            let total mut = 0
+            let local mut = 0
+            let local_in_loop mut = 0
+            let by_class = MAP[string, int]()
+
+            for function in _module.functions do
+                if function.is_declaration then
+                    continue
+                fi
+
+                let defs = _definitions(function)
+                let in_loop = _blocks_in_loops(function)
+
+                for block in function.blocks do
+                    for instruction in block.instructions do
+                        if let name = _allocation(instruction) then
+                            total = total + 1
+
+                            if _escapes(function, defs, name) then
+                                let seen: int mut
+                                _reasons.try_get_value(_reason, seen ref)
+                                _reasons[_reason] = seen + 1
+                            else
+                                local = local + 1
+
+                                if in_loop.contains(block.name) then
+                                    local_in_loop = local_in_loop + 1
+                                fi
+
+                                let class_name = _class_name(_descriptor_stored(function, name) ?? "?")
+                                let seen: int mut
+                                by_class.try_get_value(class_name, seen ref)
+                                by_class[class_name] = seen + 1
+                            fi
+                        fi
+                    od
+                od
+            od
+
+            IO.Std.error.write_line("escape census: {total} allocation sites, {local} never escape, {local_in_loop} of them in a loop")
+
+            let ranked = LIST[(name: string, count: int)]()
+
+            for (name, count) in by_class do
+                ranked.add((name, count))
+            od
+
+            ranked.sort((a, b) => b.count - a.count)
+
+            let reasons = LIST[(name: string, count: int)]()
+
+            for (name, count) in _reasons do
+                reasons.add((name, count))
+            od
+
+            reasons.sort((a, b) => b.count - a.count)
+
+            for i in 0..Ghul.Math.min(15, reasons.count) do
+                IO.Std.error.write_line("  escapes: {reasons[i].count} {reasons[i].name}")
+            od
+
+            for i in 0..Ghul.Math.min(25, ranked.count) do
+                IO.Std.error.write_line("  {ranked[i].count} {ranked[i].name}")
+            od
+        si
+
+        _solve_parameters() is
+            let changed mut = true
+
+            while changed do
+                changed = false
+
+                for function in _module.functions do
+                    if function.is_declaration then
+                        continue
+                    fi
+
+                    let defs = _definitions(function)
+                    let escaping = _escaping[function.name]
+
+                    for i in 0..function.parameters.count do
+                        if !escaping.contains(i) /\ _escapes(function, defs, function.parameters[i].name) then
+                            escaping.add(i)
+                            changed = true
+                        fi
+                    od
+                od
+            od
+        si
+
+        // The instruction defining each local name in `function`.
+        _definitions(function: FUNCTION) -> MAP[string, INSTRUCTION] is
+            let result = MAP[string, INSTRUCTION]()
+
+            for block in function.blocks do
+                for instruction in block.instructions do
+                    if let (name, _): Value.LOCAL = instruction.result then
+                        result[name] = instruction
+                    fi
+                od
+            od
+
+            return result
+        si
+
+        _allocation(instruction: INSTRUCTION) -> string? is
+            if let call: Operation.CALL = instruction.operation, (callee, _): Value.GLOBAL = call.callee /\ (callee =~ "$ghul_alloc" \/ callee =~ "$ghul_alloc_atomic") then
+                return call.result
+            elif let call: Operation.INVOKE = instruction.operation, (callee, _): Value.GLOBAL = call.callee /\ (callee =~ "$ghul_alloc" \/ callee =~ "$ghul_alloc_atomic") then
+                return call.result
+            fi
+
+            return null
+        si
+
+        _descriptor_stored(function: FUNCTION, name: string) -> string? is
+            for block in function.blocks do
+                for instruction in block.instructions do
+                    if let store: Operation.STORE = instruction.operation, (pointer, _): Value.LOCAL = store.pointer, (stored, _): Value.GLOBAL = store.value /\ pointer =~ name /\ stored.starts_with("$ghul_descriptor") then
+                        return stored
+                    fi
+                od
+            od
+
+            return null
+        si
+
+        // Whether the object `start` names can outlive `function`.
+        _escapes(function: FUNCTION, defs: MAP[string, INSTRUCTION], start: string) -> bool is
+            let aliases = SET[string]()
+            let pending = LIST[string]()
+
+            aliases.add(start)
+            pending.add(start)
+
+            while pending.count > 0 do
+                let alias = pending[pending.count - 1]
+                pending.remove_at(pending.count - 1)
+
+                for block in function.blocks do
+                    for instruction in block.instructions do
+                        if let verdict = _use(function, defs, instruction, alias, aliases, pending) /\ verdict then
+                            return true
+                        fi
+                    od
+                od
+            od
+
+            return false
+        si
+
+        _is(value: Value?, name: string) -> bool =>
+            if let (n, _): Value.LOCAL = value then n =~ name else false fi
+
+        _add(aliases: SET[string], pending: LIST[string], name: string?) is
+            if let n = name /\ aliases.add(n) then
+                pending.add(n)
+            fi
+        si
+
+        // Whether `instruction`'s use of `alias` lets the object escape;
+        // null where it does not use it. Values that carry the pointer on
+        // are added to the aliases.
+        _use(function: FUNCTION, defs: MAP[string, INSTRUCTION], instruction: INSTRUCTION, alias: string, aliases: SET[string], pending: LIST[string]) -> bool? is
+            let operation = instruction.operation
+
+            if let load: Operation.LOAD = operation then
+                return if _is(load.pointer, alias) then false else null fi
+            elif let store: Operation.STORE = operation then
+                if _is(store.value, alias) then
+                    // Kept in one of the function's own slots, the pointer
+                    // comes back out wherever the slot is read.
+                    let definition: INSTRUCTION mut
+
+                    if let (slot, _): Value.LOCAL = store.pointer /\ defs.try_get_value(slot, definition ref) /\ isa Operation.ALLOCA(definition.operation) then
+                        _add(aliases, pending, slot)
+                        _add_slot_loads(function, slot, aliases, pending)
+                        return false
+                    fi
+
+                    _reason = "stored into memory"
+                    return true
+                fi
+
+                return if _is(store.pointer, alias) then false else null fi
+            elif let gep: Operation.GET_ELEMENT_POINTER = operation then
+                if _is(gep.pointer, alias) then
+                    _add(aliases, pending, gep.result)
+                    return false
+                fi
+
+                return null
+            elif let select: Operation.SELECT = operation then
+                if _is(select.if_true, alias) \/ _is(select.if_false, alias) then
+                    _add(aliases, pending, select.result)
+                    return false
+                fi
+
+                return null
+            elif let compare: Operation.INTEGER_COMPARE = operation then
+                return null
+            elif let call: Operation.CALL = operation then
+                return _call_use(call.callee, call.arguments, alias)
+            elif let call: Operation.INVOKE = operation then
+                return _call_use(call.callee, call.arguments, alias)
+            elif let ret: Operation.RETURN = operation then
+                if _is(ret.value, alias) then
+                    _reason = "returned"
+                    return true
+                fi
+
+                return null
+            elif let convert: Operation.CONVERT = operation then
+                if _is(convert.value, alias) then _reason = "converted" ; return true fi
+                return null
+            elif let insert: Operation.INSERT_VALUE = operation then
+                return if _is(insert.element, alias) \/ _is(insert.aggregate, alias) then true else null fi
+            elif let extract: Operation.EXTRACT_VALUE = operation then
+                return if _is(extract.aggregate, alias) then true else null fi
+            elif let resume: Operation.RESUME = operation then
+                return if _is(resume.value, alias) then true else null fi
+            fi
+
+            return null
+        si
+
+        _add_slot_loads(function: FUNCTION, slot: string, aliases: SET[string], pending: LIST[string]) is
+            for block in function.blocks do
+                for instruction in block.instructions do
+                    if let load: Operation.LOAD = instruction.operation /\ _is(load.pointer, slot) then
+                        _add(aliases, pending, load.result)
+                    fi
+                od
+            od
+        si
+
+        _call_use(callee: Value, arguments: (value: Value, attributes: LLVM.Attribute[])[], alias: string) -> bool? is
+            let used mut = false
+
+            for i in 0..arguments.count do
+                if _is(arguments[i].value, alias) then
+                    used = true
+
+                    if let (name, _): Value.GLOBAL = callee then
+                        if name.starts_with("llvm.memset") \/ name.starts_with("llvm.memcpy") \/ name.starts_with("llvm.lifetime") then
+                            continue
+                        fi
+
+                        let escaping: SET[int] mut
+
+                        if _functions.contains_key(name) /\ !_functions[name].is_declaration /\ _escaping.try_get_value(name, escaping ref) /\ !escaping.contains(i) then
+                            continue
+                        fi
+
+                        _reason = if _functions.contains_key(name) /\ _functions[name].is_declaration then "passed to runtime {name}" else "passed to a call whose argument escapes" fi
+                    else
+                        _reason = "passed to an indirect call"
+                    fi
+
+                    return true
+                fi
+            od
+
+            if _is(callee, alias) then
+                return true
+            fi
+
+            return if used then false else null fi
+        si
+
+        // The blocks of `function` inside a loop: those between a block
+        // and an earlier block it branches back to, in emission order.
+        _blocks_in_loops(function: FUNCTION) -> SET[string] is
+            let result = SET[string]()
+            let index = MAP[string, int]()
+            let blocks = function.blocks
+
+            for i in 0..blocks.count do
+                index[blocks[i].name] = i
+            od
+
+            for i in 0..blocks.count do
+                for target in _targets(blocks[i]) do
+                    let at: int mut
+
+                    if index.try_get_value(target, at ref) /\ at <= i then
+                        for j in at::i do
+                            result.add(blocks[j].name)
+                        od
+                    fi
+                od
+            od
+
+            return result
+        si
+
+        _targets(block: BLOCK) -> LIST[string] is
+            let result = LIST[string]()
+
+            if block.instructions.count == 0 then
+                return result
+            fi
+
+            let operation = block.last_instruction.operation
+
+            if let branch: Operation.BRANCH = operation then
+                result.add(branch.target)
+            elif let branch: Operation.CONDITIONAL_BRANCH = operation then
+                result.add(branch.if_true)
+                result.add(branch.if_false)
+            elif let switch: Operation.SWITCH = operation then
+                result.add(switch.otherwise)
+
+                for (_, target) in switch.cases do
+                    result.add(target)
+                od
+            elif let invoke: Operation.INVOKE = operation then
+                result.add(invoke.normal)
+                result.add(invoke.unwind)
+            fi
+
+            return result
+        si
+    si
+si
