@@ -74,6 +74,19 @@ export async function run(options = {}) {
         },
         flush(_stream) {},
 
+        // Constructed here rather than thrown by the module, so the
+        // exception records the stack it was thrown from.
+        throw(exception) {
+            const limit = Error.stackTraceLimit;
+            Error.stackTraceLimit = FRAME_LIMIT;
+
+            try {
+                throw new WebAssembly.Exception(instance.exports._exception, [exception], { traceStack: true });
+            } finally {
+                Error.stackTraceLimit = limit;
+            }
+        },
+
         identity_hash(value) {
             let hash = identities.get(value);
 
@@ -233,7 +246,7 @@ export async function run(options = {}) {
             return error.code;
         }
 
-        stderr(`Unhandled exception. ${describe(error, instance)}\n`);
+        stderr(`Unhandled exception. ${describe(error, instance)}\n${frames(error)}`);
 
         return UNHANDLED_EXCEPTION_EXIT_CODE;
     }
@@ -507,6 +520,28 @@ async function load(module) {
     const response = module instanceof Response ? module : await fetch(module);
 
     return response.arrayBuffer();
+}
+
+// How many frames an exception the program throws records.
+const FRAME_LIMIT = 100;
+
+// The module's frames the error was thrown through, innermost first, one
+// "   at <name>" line each, as the native target writes them. The engine's
+// own and the loader's frames, and _start, which calls the entry, are
+// left out.
+function frames(error) {
+    const stack = typeof error?.stack === "string" ? error.stack : "";
+    let text = "";
+
+    for (const line of stack.split("\n")) {
+        const frame = /^\s*at (.*?) \(wasm:\/\/.*\)$/.exec(line) ?? /^\s*at (wasm:\/\/.*)$/.exec(line);
+
+        if (frame && frame[1] !== "_start") {
+            text += `   at ${frame[1]}\n`;
+        }
+    }
+
+    return text;
 }
 
 // The first line .NET prints for an unhandled exception, after its

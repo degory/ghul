@@ -2638,6 +2638,8 @@ A third target, `llvm`, is for a native executable. A build for it type-checks t
 
 Both the wasm and llvm targets behave as a .NET program configured for invariant globalization (`System.Globalization.Invariant`): strings compare and sort by code unit, and numbers and dates format the same way whatever the machine. A .NET program that wants the same behaviour sets `<InvariantGlobalization>true</InvariantGlobalization>` in its project.
 
+On both targets an exception nothing catches is reported with the frames it was thrown through, innermost first, one `   at <name>` line each after the `Unhandled exception.` line. On the llvm target a crash is reported the same way: a stack that runs out as `Stack overflow.`, and any other fault, a bus error, an arithmetic fault or an illegal instruction as `Fatal error.` and the signal, after the program's output is flushed, and the process then ends with the signal. A frame is named as the linker names the function, and a build with `--debug` adds its file and line; at the default optimisation level a function inlined into another does not appear as a frame of its own. A stack that the llvm optimiser has turned into a loop does not run out, and so is never reported.
+
 A `wasm` build loads no .NET assemblies. What they supply on .NET comes from two libraries compiled into the module from source: ghul-core, which gives the built-in types their members and declares the collections, and ghul-runtime, which supplies the pipes and the rest of `Ghul`. The `ghul` command-line tool builds a project for either target and fetches those libraries for a `wasm` build; a project lists the targets it builds for in its `ghul-project.json` manifest:
 
 ```sh
