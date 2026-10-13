@@ -51,6 +51,12 @@ namespace IR.LLVMTarget is
 
         _stack: LIST[LLVM.Value]
 
+        // Where each value with a known exact-class source came from.
+        _sources: MAP[LLVM.Value, EXACT_SOURCE]
+
+        // The values that are nulls the program wrote or defaults.
+        _nulls: Collections.SET[LLVM.Value]
+
         // The shallowest the stack has been since the innermost _value_of
         // began, so a value that reads an operand already on the stack, as
         // a member load reads its receiver, still counts as producing one.
@@ -160,6 +166,8 @@ namespace IR.LLVMTarget is
             _callee = callee
 
             _stack = LIST[LLVM.Value]()
+            _sources = MAP[LLVM.Value, EXACT_SOURCE](Collections.ReferenceEqualityComparer.instance)
+            _nulls = Collections.SET[LLVM.Value](Collections.ReferenceEqualityComparer.instance)
             _locals = MAP[LOCAL, (pointer: LLVM.Value, type: LLVM.Type)]()
             _arguments = LIST[(pointer: LLVM.Value, type: LLVM.Type, value_type: Type?)]()
             _labels = LIST[(node: Values.Breakable, is_loop_head: bool, target: BLOCK, result: LLVM.Value?, depth: int)]()
@@ -474,6 +482,8 @@ namespace IR.LLVMTarget is
         si
 
         _local_address(local: LOCAL) is
+            _note_store(local, null)
+
             if let (pointer, _) = _local(local) then
                 _push(pointer)
             fi
@@ -543,11 +553,21 @@ namespace IR.LLVMTarget is
 
         _load_local(local: LOCAL) is
             if let (pointer, type) = _local(local) then
-                _push(_widen(_current.load(type, pointer, 0), local.type))
+                let value = _widen(_current.load(type, pointer, 0), local.type)
+
+                if let instance = _instance then
+                    _sources[value] = EXACT_SOURCE(null, instance, local)
+                fi
+
+                _push(value)
             fi
         si
 
         _store_local(local: LOCAL, value: LLVM.Value?) is
+            if !_is_null(value) then
+                _note_store(local, _source_of(value))
+            fi
+
             if let (pointer, _) = _local(local) /\ value? then
                 _current.store(_narrow(value, local.type), pointer, 0)
             fi
@@ -589,13 +609,44 @@ namespace IR.LLVMTarget is
             fi
         si
 
+        // Where a value came from, as far as its exact class goes, or null
+        // where nothing is known of it.
+        _source_of(value: LLVM.Value?) -> EXACT_SOURCE? is
+            let source: EXACT_SOURCE mut
+
+            if let v = value /\ _sources.try_get_value(v, source ref) then
+                return source
+            fi
+
+            return null
+        si
+
+        // Records, while discovering, what is stored in `local`: a value
+        // from `source`, or anything at all where it is null.
+        _note_store(local: LOCAL, source: EXACT_SOURCE?) is
+            if let objects = _objects, instance = _instance /\ !objects.is_built then
+                objects.exact.note_store(instance, local, source)
+            fi
+        si
+
+        _is_null(value: LLVM.Value?) -> bool => if let v = value then _nulls.contains(v) else false fi
+
+        // The exact class of `value`, where it is known to be one class.
+        _exact_class(value: LLVM.Value) -> CLASS_INSTANCE? =>
+            if let objects = _objects then objects.exact.exact(_source_of(value)) else null fi
+
         // Returns the value on the stack, or the default value of the result
         // where the stack is empty.
         _return() is
             if LLVM_TYPES.is_void(_return_type) then
                 _current.return_void()
             elif let type = _held(_return_type) then
+                let is_default = _stack.count == 0
                 let value = if _stack.count > 0 then _pop()! else LLVM_TYPES.zero(type) fi
+
+                if let objects = _objects, instance = _instance /\ !objects.is_built /\ !is_default /\ !_is_null(value) then
+                    objects.exact.note_return(instance, _source_of(value))
+                fi
 
                 _current.return_value(_normalise_for(value, _return_type))
             else
@@ -1474,6 +1525,13 @@ namespace IR.LLVMTarget is
 
         visit(default_return: Values.DEFAULT_RETURN) is
             _default(default_return.type)
+            _mark_null_top()
+        si
+
+        _mark_null_top() is
+            if _stack.count > 0 then
+                _nulls.add(_stack[_stack.count - 1])
+            fi
         si
 
         visit(size_of: Values.SIZE_OF) is
@@ -1487,6 +1545,7 @@ namespace IR.LLVMTarget is
 
         visit(default_value: Values.DEFAULT) is
             _default(default_value.type)
+            _mark_null_top()
         si
 
         _default(type: Type?) is
@@ -1576,7 +1635,15 @@ namespace IR.LLVMTarget is
         si
 
         visit(null_value: Values.NULL) is
-            _push(LLVM.Values.null_pointer)
+            _push_null(LLVM.Values.null_pointer)
+        si
+
+        // Pushes `value`, a null the program wrote or a default it falls
+        // back on. A null reaches a call as a null receiver whatever class
+        // the call is bound to, so it says nothing against exactness.
+        _push_null(value: LLVM.Value) is
+            _nulls.add(value)
+            _push(value)
         si
         /// A scalar is boxed in an object carrying its box's descriptor, so a
         /// boxed int and a boxed long answer type tests differently. A
@@ -2807,6 +2874,7 @@ namespace IR.LLVMTarget is
             od
 
             if let result = _emit_call(callee, values.to_array()) then
+                _sources[result] = EXACT_SOURCE(null, _instance_of(function), null)
                 _push(result)
             fi
         si
@@ -3752,6 +3820,8 @@ namespace IR.LLVMTarget is
             let object =
                 _strings!.allocate_object(_current, LLVM.Values.global(objects.descriptor_name(type)), LLVM.Values.i64(cast long(objects.size_of(type))), true)
 
+            _sources[object] = EXACT_SOURCE(type, null, null)
+
             if let c = callee then
                 values.insert(0, object)
 
@@ -3844,13 +3914,29 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
+            if let receiver = _value_of(call.from) then
+                _call_direct_on(call, instance, receiver)
+            fi
+        si
+
+        // Calls `instance` directly on `receiver`, the call's receiver
+        // already lowered.
+        _call_direct_on(call: Values.Call.INSTANCE, instance: FUNCTION_INSTANCE, receiver: LLVM.Value) is
+            let callee = _callee(instance)
+
+            if !callee? then
+                _report("a call to {instance.definition.name}")
+                return
+            fi
+
+            if let values = _arguments_for(call.function, call.arguments) then
 
                 _check_receiver(call.from, if call.from.is_value_type then null else receiver fi)
 
                 values.insert(0, _receiver_for(instance, call.from, receiver))
 
                 if let result = _emit_call(callee, values.to_array()) then
+                    _sources[result] = EXACT_SOURCE(null, instance, null)
                     _push(result)
                 fi
             fi
@@ -3904,7 +3990,7 @@ namespace IR.LLVMTarget is
         // While discovering, a call through a vtable or the trait table is
         // followed only for what its receiver and arguments reach, and
         // stands for a value of its result type.
-        _discover_dispatched_call(call: Values.Call.INSTANCE) is
+        _discover_dispatched_call(call: Values.Call.INSTANCE, targets: (() -> Collections.Iterable[FUNCTION_INSTANCE]?)?) is
             gen(call.from)
 
             for argument in call.arguments do
@@ -3912,7 +3998,21 @@ namespace IR.LLVMTarget is
             od
 
             if let result = _held(call.type) /\ !LLVM_TYPES.is_void(call.type) then
-                _push(LLVM_TYPES.zero(result))
+                let value = LLVM_TYPES.zero(result)
+
+                if let t = targets then
+                    _sources[value] = EXACT_SOURCE(t)
+                fi
+
+                _push(value)
+            fi
+        si
+
+        // Marks the value a dispatched call left on the stack as coming from
+        // whichever of `targets` it ran.
+        _note_dispatched_result(depth: int, targets: (() -> Collections.Iterable[FUNCTION_INSTANCE]?)?) is
+            if let t = targets /\ _stack.count > depth then
+                _sources[_stack[_stack.count - 1]] = EXACT_SOURCE(t)
             fi
         si
 
@@ -3940,13 +4040,16 @@ namespace IR.LLVMTarget is
         _call_virtual(call: Values.Call.INSTANCE) is
             let objects = _objects!
 
+            let method = _instance_of(call.function)
+            let targets = () -> Collections.Iterable[FUNCTION_INSTANCE]? => objects.slot_targets(method)
+
             if !objects.is_built then
                 objects.note_dispatched(call.function)
-                _discover_dispatched_call(call)
+                _discover_dispatched_call(call, targets)
                 return
             fi
 
-            let slot = objects.slot_of(_instance_of(call.function))
+            let slot = objects.slot_of(method)
 
             if !slot? then
                 _report("a virtual call to {call.function.name}")
@@ -3961,14 +4064,29 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(call.function, call.arguments) then
+            let receiver = _value_of(call.from)
+
+            if !receiver? then
+                return
+            fi
+
+            // A receiver whose exact class is known runs that class's own
+            // entry for the slot.
+            if let type = _exact_class(receiver), exact = objects.exact_slot_implementation(slot, type) /\ _callee(exact)? then
+                _call_direct_on(call, exact, receiver)
+                return
+            fi
+
+            if let values = _arguments_for(call.function, call.arguments) then
 
                 _check_receiver(call.from, receiver)
 
                 let descriptor = _strings!.load_descriptor(_current, receiver)
                 let entry = _current.element_pointer(Types.i8, descriptor, [_i32(LLVM_OBJECTS.DESCRIPTOR_VTABLE + 8 * slot.index)], true)
+                let depth = _stack.count
 
                 _call_through(call, receiver, values, entry)
+                _note_dispatched_result(depth, targets)
             fi
         si
 
@@ -3997,6 +4115,13 @@ namespace IR.LLVMTarget is
 
             let generic_arguments = DISPATCH_PLAN.own_type_arguments(_instance_of(function))
 
+            let targets: (() -> Collections.Iterable[FUNCTION_INSTANCE]?)? =
+                if let t = trait_type /\ !generic_arguments? then
+                    () -> Collections.Iterable[FUNCTION_INSTANCE]? => objects.trait_targets(root, t)
+                else
+                    null
+                fi
+
             if !objects.is_built then
                 if let arguments = generic_arguments, t = trait_type then
                     objects.note_generic_call(root, t, arguments)
@@ -4011,7 +4136,7 @@ namespace IR.LLVMTarget is
                 // A trait nothing implements is called by throwing, below.
                 _reach_exception(Semantic.Lookups.RuntimeException.NULL_REFERENCE)
 
-                _discover_dispatched_call(call)
+                _discover_dispatched_call(call, targets)
                 return
             fi
 
@@ -4039,7 +4164,18 @@ namespace IR.LLVMTarget is
                 return
             fi
 
-            if let receiver = _value_of(call.from), values = _arguments_for(function, call.arguments) then
+            let receiver = _value_of(call.from)
+
+            if !receiver? then
+                return
+            fi
+
+            if let type = _exact_class(receiver), exact = objects.exact_implementation(selector, type) /\ _callee(exact)? then
+                _call_direct_on(call, exact, receiver)
+                return
+            fi
+
+            if let values = _arguments_for(function, call.arguments) then
 
                 _check_receiver(call.from, receiver)
 
@@ -4047,8 +4183,10 @@ namespace IR.LLVMTarget is
                 let class_id = _current.load(Types.i32, descriptor, 8)
                 let index = _current.binary(BinaryOperator.ADD, IntegerFlags.NONE, class_id, _i32(selector.offset))
                 let entry = _current.element_pointer(Types.pointer, LLVM.Values.global(LLVM_OBJECTS.TRAIT_TABLE_NAME), [index], true)
+                let depth = _stack.count
 
                 _call_through(call, receiver, values, entry)
+                _note_dispatched_result(depth, targets)
             fi
         si
 
