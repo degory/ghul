@@ -47,9 +47,11 @@ done | sort > "$output/sources.rsp"
     echo 'namespace IR.WasmGC is'
     echo '    @IF.not.dotnet()'
     echo '    class WASMGC_LOADER_TEXT is'
-    printf '        text: string? static => "'
-    awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\{/, "{{"); gsub(/\}/, "}}"); gsub(/\t/, "\\t"); printf "%s\\n", $0 }' "$root/src/ir/wasmgc/loader.mjs"
-    echo '"'
+    echo '        text: string? static =>'
+    # One literal for each line, which run together into one string: a
+    # single literal of the whole file would be longer than the compiler
+    # reads as one token.
+    awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\{/, "{{"); gsub(/\}/, "}}"); gsub(/\t/, "\\t"); printf "            \"%s\\n\"\n", $0 }' "$root/src/ir/wasmgc/loader.mjs"
     echo '    si'
     echo 'si'
 } > "$output/wasmgc_loader_text.ghul"
