@@ -117,20 +117,23 @@ namespace IR.LLVMTarget is
             fi
 
             let route: CountedRoute mut
-            let list: CLASS_INSTANCE? mut = null
+            let family = Collections.LIST[CLASS_INSTANCE]()
 
             if let array = arrays.array_of(receiver_type) then
                 route = CountedRoute.ARRAY
                 loop.array = array
             else
-                list = if let t = lookup.get_list_type(element) then objects.class_of(t) else null fi
-                loop.array = arrays.array_of(lookup.get_array_type(element))
+                let list = if let t = lookup.get_list_type(element) then objects.class_of(t) else null fi
 
-                if !list? \/ !loop.array? \/ !objects.is_allocated(list!) then
+                if !list? then
                     return false
                 fi
 
-                if !(objects.class_of(receiver_type)? /\ objects.class_of(receiver_type)! =~ list!) /\ !objects.trait_of(receiver_type)? then
+                _list_family(receiver_type, element, list!, family)
+
+                loop.array = arrays.array_of(lookup.get_array_type(element)) ?? arrays.array_of(lookup.get_array_type(lookup.get_object_type()))
+
+                if family.count == 0 \/ family.count > COUNTED_FAMILY_LIMIT \/ !loop.array? then
                     return false
                 fi
 
@@ -143,12 +146,16 @@ namespace IR.LLVMTarget is
                 return true
             fi
 
+            let layout_class: CLASS_INSTANCE? mut = if family.count > 0 then family[0] else null fi
+
             if route == CountedRoute.GUARDED then
-                if let exact = _exact_class(receiver!) /\ exact =~ list! then
+                if let exact = _exact_class(receiver!) /\ _contains(family, exact) then
                     route = CountedRoute.EXACT
-                elif let static_class = objects.class_of(receiver_type) /\ static_class =~ list! /\ objects.has_no_subclasses(list!) then
+                    layout_class = exact
+                elif let static_class = objects.class_of(receiver_type) /\ _contains(family, static_class) /\ objects.has_no_subclasses(static_class) then
                     route = CountedRoute.EXACT
-                elif !_only_list_implements(receiver_type, list!) then
+                    layout_class = static_class
+                elif !_only_list_implements(receiver_type, family) then
                     COUNTED_LOOP_STATISTICS.declined = COUNTED_LOOP_STATISTICS.declined + 1
 
                     _preevaluated[call.from] = receiver!
@@ -180,7 +187,7 @@ namespace IR.LLVMTarget is
                 COUNTED_LOOP_STATISTICS.exact = COUNTED_LOOP_STATISTICS.exact + 1
 
                 _check_dereference(receiver!)
-                _load_list_storage(list!, receiver!, storage, count)
+                _load_list_storage(layout_class!, receiver!, storage, count)
                 _push(LLVM.Values.null_pointer)
             else
                 COUNTED_LOOP_STATISTICS.guarded = COUNTED_LOOP_STATISTICS.guarded + 1
@@ -199,11 +206,17 @@ namespace IR.LLVMTarget is
 
                 _start(check)
                 let descriptor = _strings!.load_descriptor(_current, receiver!)
-                _current.branch(_current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(list!))), is_list, other)
+                let matches mut = _current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(family[0])))
+
+                for i in 1..family.count do
+                    matches = _current.binary(BinaryOperator.OR, IntegerFlags.NONE, matches, _current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(family[i]))))
+                od
+
+                _current.branch(matches, is_list, other)
 
                 _start(is_list)
                 _current.store(LLVM.Values.boolean(true), flag, 0)
-                _load_list_storage(list!, receiver!, storage, count)
+                _load_list_storage(layout_class!, receiver!, storage, count)
                 _current.branch(join)
 
                 _start(other)
@@ -311,14 +324,65 @@ namespace IR.LLVMTarget is
             return header
         si
 
-        // Whether `list` is the only class the program allocates that is a
-        // `receiver_type`, arrays aside.
-        _only_list_implements(receiver_type: Type, list: CLASS_INSTANCE) -> bool is
+        // A guarded loop tests the receiver against at most this many list
+        // classes.
+        COUNTED_FAMILY_LIMIT: int static => 8
+
+        // The list classes a loop over `receiver_type`, whose elements are
+        // `element`, can walk the storage of: `list` itself, and where the
+        // elements are references every list of references the program
+        // allocates that is a `receiver_type`, since all of those hold their
+        // elements the same way.
+        _list_family(receiver_type: Type, element: Type, list: CLASS_INSTANCE, family: Collections.LIST[CLASS_INSTANCE]) is
+            let objects = _objects!
+
+            if let static_class = objects.class_of(receiver_type) then
+                if static_class =~ list then
+                    family.add(list)
+                fi
+
+                return
+            fi
+
+            if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
+                for implementor in implementors do
+                    if objects.is_allocated(implementor) /\ implementor.definition == list.definition then
+                        if implementor =~ list \/ (!element.is_value_type /\ _holds_references(implementor)) then
+                            family.add(implementor)
+                        fi
+                    fi
+                od
+            fi
+        si
+
+        _holds_references(list: CLASS_INSTANCE) -> bool is
+            for (_, argument) in list.type_map do
+                if argument.is_value_type then
+                    return false
+                fi
+            od
+
+            return true
+        si
+
+        _contains(family: Collections.LIST[CLASS_INSTANCE], type: CLASS_INSTANCE) -> bool is
+            for member in family do
+                if member =~ type then
+                    return true
+                fi
+            od
+
+            return false
+        si
+
+        // Whether every class the program allocates that is a
+        // `receiver_type` is one of `family`, arrays aside.
+        _only_list_implements(receiver_type: Type, family: Collections.LIST[CLASS_INSTANCE]) -> bool is
             let objects = _objects!
 
             if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
                 for implementor in implementors do
-                    if objects.is_allocated(implementor) /\ !(implementor =~ list) /\ !objects.is_array(implementor) then
+                    if objects.is_allocated(implementor) /\ !_contains(family, implementor) /\ !objects.is_array(implementor) then
                         if System.Environment.get_environment_variable("GHUL_LLVM_LOOP_STATS")? then
                             let blockers = COUNTED_LOOP_STATISTICS.blockers ?? MAP[string, int]()
                             COUNTED_LOOP_STATISTICS.blockers = blockers
