@@ -1,0 +1,161 @@
+namespace IR.LLVMTarget is
+    use IR.Program
+
+    use Semantic.Symbols.Function
+
+    use LLVM.IntegerPredicate
+    use LLVM.Types
+
+    use Values.Value
+
+    partial LLVM_LOWERING is
+        // Set while a list access is lowered through the trait table as the
+        // fallback of its own fast path.
+        _in_list_fallback: bool
+
+        // Lowers a read of a list's count, or of one of its elements by
+        // index, through a receiver typed by a trait: where the receiver is
+        // one of the lists or arrays the program allocates, the count or the
+        // element is read from its storage, and otherwise, or for an index
+        // out of range, the trait's method is called as before. Answers
+        // whether it lowered the call.
+        _lower_list_access(call: Values.Call.INSTANCE) -> bool is
+            if _in_list_fallback then
+                return false
+            fi
+
+            let objects = _objects!
+            let lookup = IoC.CONTAINER.instance.innate_symbol_lookup
+            let root = cast Function?(call.function.root_specialized_from)
+
+            if !root? \/ !objects.is_built \/ call.from.is_value_type then
+                return false
+            fi
+
+            let is_count = if let bag = lookup.get_bag_trait(), count = CORE_LIBRARY.find_getter(bag, "count") then root == count else false fi
+            let is_index =
+                if let list = lookup.get_list_trait(), indexer = cast Semantic.Symbols.Property?(list.find_direct(Semantic.Symbols.INDEXER_NAMES.property_name)) then
+                    root == indexer.read_function
+                else
+                    false
+                fi
+
+            if !is_count /\ !is_index then
+                return false
+            fi
+
+            let receiver_type = _specialize(call.from.type)
+            let result_type = _held(call.type)
+
+            if !receiver_type? \/ !result_type? then
+                return false
+            fi
+
+            let family = Collections.LIST[(type: CLASS_INSTANCE, kind: StorageKind)]()
+
+            if let trait_type = objects.trait_of(receiver_type), implementors = objects.implementors(trait_type) then
+                for implementor in implementors do
+                    if let kind = _storage_kind(implementor) /\ objects.is_allocated(implementor) /\ (kind == StorageKind.LIST \/ kind == StorageKind.ARRAY) then
+                        family.add((implementor, kind))
+                    fi
+                od
+            fi
+
+            if family.count == 0 \/ family.count > COUNTED_FAMILY_LIMIT then
+                return false
+            fi
+
+            let element_array =
+                if is_index then
+                    let arrays = _arrays!
+                    let element = _specialize(call.type)!
+
+                    arrays.array_of(lookup.get_array_type(element)) ?? (if element.is_value_type then null else arrays.array_of(lookup.get_array_type(lookup.get_object_type())) fi)
+                else
+                    null
+                fi
+
+            if is_index /\ !element_array? then
+                return false
+            fi
+
+            let receiver = _value_of(call.from)
+            let index = if is_index then _value_of(call.arguments[0]) else null fi
+
+            if !receiver? \/ (is_index /\ !index?) then
+                return true
+            fi
+
+            let result = _slot(result_type!)
+            let check = _new_block()
+            let other = _new_block()
+            let join = _new_block()
+
+            _current.branch(_current.compare(IntegerPredicate.NE, receiver!, LLVM.Values.null_pointer), check, other)
+
+            _start(check)
+            let descriptor = _strings!.load_descriptor(_current, receiver!)
+
+            for member in family do
+                let matched = _new_block()
+                let next = _new_block()
+
+                _current.branch(_current.compare(IntegerPredicate.EQ, descriptor, LLVM.Values.global(objects.descriptor_name(member.type))), matched, next)
+
+                _start(matched)
+
+                let count =
+                    if member.kind == StorageKind.ARRAY then
+                        _arrays!.count(_current, receiver!)
+                    else
+                        _load_field(member.type, receiver!, "_count", Types.i32)!
+                    fi
+
+                if is_count then
+                    _current.store(count, result, 0)
+                    _current.branch(join)
+                else
+                    let in_range = _new_block()
+
+                    // An unsigned compare is below the count only for an
+                    // index from zero up to it.
+                    _current.branch(_current.compare(IntegerPredicate.ULT, index!, count), in_range, other)
+
+                    _start(in_range)
+
+                    let storage = if member.kind == StorageKind.ARRAY then receiver! else _load_field(member.type, receiver!, "_items", Types.pointer)! fi
+
+                    _current.store(_arrays!.load(_current, element_array!, storage, index!), result, 0)
+                    _current.branch(join)
+                fi
+
+                _start(next)
+            od
+
+            _current.branch(other)
+
+            _start(other)
+
+            _preevaluated[call.from] = receiver!
+
+            if let i = index then
+                _preevaluated[call.arguments[0]] = i
+            fi
+
+            _in_list_fallback = true
+            _call_interface(call)
+            _in_list_fallback = false
+
+            if let made = _pop() then
+                _current.store(made, result, 0)
+            fi
+
+            _current.branch(join)
+
+            _start(join)
+            _push(_current.load(result_type!, result, 0))
+
+            return true
+        si
+    si
+si
