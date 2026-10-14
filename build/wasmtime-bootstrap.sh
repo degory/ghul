@@ -69,6 +69,10 @@ build pass-1 dotnet "$compiler"
 build pass-2 "$embedder" "$work/pass-1/ghul.wasm"
 build pass-3 "$embedder" "$work/pass-2/ghul.wasm"
 
+if [ -n "${WASMTIME_BOOTSTRAP_DRY_RUN:-}" ]; then
+    exit 0
+fi
+
 status=0
 
 for file in ghul.wasm ghul.mjs; do
