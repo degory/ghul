@@ -1329,6 +1329,13 @@ A generic function returning `T?` can be called at a `T` that is itself optional
 
 The `??` operator is *null-coalescing*: `a ?? b` returns `a` when it is present, otherwise evaluates and returns `b`. The right operand is evaluated only when needed. `??` is right-associative, so `a ?? b ?? c ?? d` parses as `a ?? (b ?? (c ?? d))`; each intermediate result stays optional until the chain is closed by a non-optional fallback. The result type is the LUB of the left's underlying type and the right's type, kept optional iff the right is itself optional — so a chain that ends in a plain `T` returns `T`, and a chain that stays all-optional returns `T?`. `??` works across all three optional lowerings — reference `T?`, value-type `T?` (`Nullable[T]`), and the unconstrained-`T?` carrier `MAYBE[T]` — including mixed-kind operands: the result's optional kind is derived from the LUB of the inner types, and each side coerces to it. A `bool?` plugged with `?? false` reads as absent-means-false in condition position.
 
+A `??` whose left operand holds the runtime's `Result[T, E]` union unwraps the result instead of coalescing: a present OK contributes its payload, and an absent one — an ERROR — is replaced by the right operand. The right operand's type is the answer's exactly, so `Result[T, E] ?? Result[T, F]` gives a `Result[T, F]`, with the OK payload rebuilt at the right's instantiation and the left's error type discarded, and `Result[T, E] ?? T` gives a `T`. The left's error never survives: it is discarded with its payload when the right operand replaces it, and an error the answer ends up holding is the right operand's, there because the fallback failed too — `failed_a() ?? failed_b()` is `failed_b()`'s error value. A chain folds right-associatively to the rightmost fallback's type. The right operand has to fit: itself a Result, or assignable to the OK payload. The operator reads a value as a Result only when the build's runtime declares the union.
+
+```ghul
+let port: int = parse(text) ?? 80
+let later: Result[int, string] = first() ?? second()
+```
+
 ```ghul
 let name: string? = lookup();
 let greeting = "hello, {name ?? "stranger"}";   // string
