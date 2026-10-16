@@ -2721,6 +2721,14 @@ namespace Syntax.Process is
             // — degrade to just emitting `left` instead, matching how
             // `?.` falls back to `.` when the receiver is non-optional.
             if !left_type.is_optional then
+                if let result_union = IR.Program.CORE_LIBRARY.result_union_class() then
+                    _build_result_coalesce(binary, left_value, right_value, result_union)
+
+                    if binary.compile_expressions_state.value? then
+                        return
+                    fi
+                fi
+
                 binary.compile_expressions_state.value = left_value
                 return
             fi
@@ -2810,6 +2818,176 @@ namespace Syntax.Process is
                     absent_arm,
                     result_type
                 )
+        si
+
+        // Builds the collapse lowering for `??` whose left operand
+        // holds the runtime's Result union: a present default variant
+        // contributes its payload, an absent one is replaced by the
+        // right operand, and the right operand's type is the answer's
+        // exactly — the error variant is discarded and nothing widens.
+        // Handles the two shapes — Result[T, E] ?? Result[X, F] and
+        // Result[T, E] ?? U with the payload fitting U — and reports
+        // the shape error when the right operand fits neither. Returns
+        // without building anything when the left is not the runtime's
+        // Result union, or the union declares no default variant,
+        // leaving the ordinary coalesce to handle the operands.
+        _build_result_coalesce(
+            binary: Trees.Expressions.BINARY,
+            left_value: Value,
+            right_value: Value,
+            result_union: Semantic.Symbols.Classy
+        ) is
+            let union_classy = cast Semantic.Symbols.UNION?(result_union)
+
+            if !union_classy? then
+                return
+            fi
+
+            let default_variant = union_classy.default_variant
+
+            if !default_variant? then
+                return
+            fi
+
+            let left_classy = _condition_analyzer.get_classy_for_narrowing(left_value.type!)
+
+            if !left_classy? \/ left_classy != result_union then
+                return
+            fi
+
+            let left_type = left_value.type!
+            let right_type = right_value.type!
+            let access = _visitor.compile_access
+            let bool_type = _innate_symbol_lookup.get_bool_type()
+
+            let variant_type = _condition_analyzer.try_get_variant_type_for_classy(
+                left_type,
+                default_variant
+            )
+
+            if !variant_type? then
+                return
+            fi
+
+            let presence_test = access.build_default_variant_isa(
+                binary.left.location,
+                IR.Values.STACK_TOP(left_type),
+                default_variant,
+                bool_type
+            )
+
+            let value_extract = access.build_default_variant_unwrap(
+                binary.left.location,
+                IR.Values.STACK_TOP(left_type),
+                result_union,
+                default_variant
+            )
+
+            let payload_type = value_extract.type
+
+            if !payload_type? then
+                return
+            fi
+
+            let payload_local = IR.LOCAL(".result.payload.{IR.TEMP.get_next_id()}", payload_type)
+
+            let right_classy =
+                if !right_type.is_optional then
+                    _condition_analyzer.get_classy_for_narrowing(right_type)
+                else
+                    null
+                fi
+
+            if right_classy? /\ right_classy == result_union then
+                // Result[T, E] ?? Result[X, F] → Result[X, F]: the
+                // present payload is rebuilt as the right's OK, its
+                // error argument discarded.
+                let right_union = cast Semantic.Symbols.UNION?(right_classy)
+
+                if !right_union? then
+                    return
+                fi
+
+                let right_variant = right_union.default_variant
+
+                if !right_variant? then
+                    _logger.error(binary.location, "right operand has no default variant")
+                    binary.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), binary.location)
+
+                    return
+                fi
+
+                let right_ok_type = _condition_analyzer.try_get_variant_type_for_classy(
+                    right_type,
+                    right_variant
+                )
+
+                if !right_ok_type? then
+                    return
+                fi
+
+                let init_group = cast Semantic.Symbols.FUNCTION_GROUP?(right_ok_type.find_member("init"))
+
+                if !init_group? then
+                    return
+                fi
+
+                let argument_types = Collections.LIST[Type]()
+                argument_types.add(payload_type)
+
+                let resolved = _overload_resolver.resolve(
+                    binary.left.location,
+                    init_group,
+                    argument_types,
+                    false,
+                    true,
+                    true
+                )
+
+                if !resolved? then
+                    _logger.error(binary.location, "the right operand's OK cannot hold the left's payload {payload_type}")
+                    binary.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), binary.location)
+
+                    return
+                fi
+
+                let arguments = Collections.LIST[IR.Values.Value]()
+                arguments.add(payload_local.load())
+
+                let present_arm = _function_caller.call_constructor(resolved.function, arguments, right_ok_type)
+
+                binary.compile_expressions_state.value = IR.Values.RESULT_COALESCE(
+                    left_value,
+                    presence_test,
+                    value_extract,
+                    present_arm,
+                    right_value,
+                    payload_local,
+                    right_type
+                )
+            else
+                // Result[T, E] ?? U → U, where the payload fits U.
+                if !right_type.is_assignable_from(payload_type) then
+                    _logger.error(binary.location, "right operand of ?? over {left_type} must fit the OK payload {payload_type} or be a Result")
+                    binary.compile_expressions_state.value = DUMMY(Semantic.Types.ERROR(), binary.location)
+
+                    return
+                fi
+
+                let present_arm = _coerce_coalesce_arm(payload_local.load(), right_type)
+
+                binary.compile_expressions_state.value = IR.Values.RESULT_COALESCE(
+                    left_value,
+                    presence_test,
+                    value_extract,
+                    present_arm,
+                    right_value,
+                    payload_local,
+                    right_type
+                )
+            fi
+
+            return
         si
 
         // Bring one arm of `??` to the result type: T → T? wrapping
