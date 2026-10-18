@@ -16,6 +16,8 @@ const is_node = typeof process !== "undefined" && process.versions?.node !== und
 
 const node_fs = is_node ? await import("node:fs") : null;
 const node_path = is_node ? await import("node:path") : null;
+const node_child_process = is_node ? await import("node:child_process") : null;
+const node_os = is_node ? await import("node:os") : null;
 
 class Exit extends Error {
     constructor(code) {
@@ -60,6 +62,7 @@ export async function run(options = {}) {
     const input = input_reader(options.stdin);
     const input_files = Object.entries(options.files ?? {}).map(([path, content]) => [path, file_bytes(content)]);
     const files = (options.file_system ?? (options.files === undefined && options.onfile === undefined)) && is_node ? node_files() : no_files;
+    const processes = is_node ? node_processes() : no_processes;
 
     const started = performance.now();
 
@@ -108,6 +111,7 @@ export async function run(options = {}) {
         },
 
         ...files,
+        ...processes,
 
         input_file_count: () => input_files.length,
         input_file_path: (index) => input_files[index][0],
@@ -565,6 +569,61 @@ function node_files() {
         directory_entry: (index) => entries[index],
     };
 }
+
+// The host's process operations, as libghul's are: a program is named, its
+// arguments added one at a time, and then run to completion sharing this
+// process's standard input, its output and error captured. A run answers
+// the exit status, a program killed by a signal 128 plus its number, or -1
+// where it could not be started, process_failure then saying why: 1 for
+// no such program, 2 for anything else.
+function node_processes() {
+    let file = "";
+    let args = [];
+    let result = null;
+    let failure = 0;
+
+    return {
+        process_begin(file_name) {
+            file = String(file_name);
+            args = [];
+            result = null;
+            failure = 0;
+        },
+
+        process_add_argument(argument) {
+            args.push(String(argument));
+        },
+
+        process_run() {
+            result = node_child_process.spawnSync(file, args, { stdio: ["inherit", "pipe", "pipe"], maxBuffer: 1 << 30 });
+
+            if (result.error !== undefined) {
+                failure = result.error.code === "ENOENT" ? 1 : 2;
+                return -1;
+            }
+
+            if (result.status === null) {
+                return 128 + (node_os.constants.signals[result.signal] ?? 0);
+            }
+
+            return result.status;
+        },
+
+        process_failure: () => failure,
+        process_output: () => result?.stdout?.toString("utf8") ?? null,
+        process_error: () => result?.stderr?.toString("utf8") ?? null,
+    };
+}
+
+// What a program that cannot start another one is told: that it could not.
+const no_processes = {
+    process_begin: () => {},
+    process_add_argument: () => {},
+    process_run: () => -1,
+    process_failure: () => 2,
+    process_output: () => null,
+    process_error: () => null,
+};
 
 // What a program that reads no real file system is told: that there is
 // none to read. Core asks before using any other operation, but the module
