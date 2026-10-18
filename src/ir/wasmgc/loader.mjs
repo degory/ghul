@@ -16,6 +16,8 @@ const is_node = typeof process !== "undefined" && process.versions?.node !== und
 
 const node_fs = is_node ? await import("node:fs") : null;
 const node_path = is_node ? await import("node:path") : null;
+const node_child_process = is_node ? await import("node:child_process") : null;
+const node_os = is_node ? await import("node:os") : null;
 
 class Exit extends Error {
     constructor(code) {
@@ -60,6 +62,7 @@ export async function run(options = {}) {
     const input = input_reader(options.stdin);
     const input_files = Object.entries(options.files ?? {}).map(([path, content]) => [path, file_bytes(content)]);
     const files = (options.file_system ?? (options.files === undefined && options.onfile === undefined)) && is_node ? node_files() : no_files;
+    const processes = is_node ? node_processes() : no_processes;
 
     const started = performance.now();
 
@@ -108,6 +111,7 @@ export async function run(options = {}) {
         },
 
         ...files,
+        ...processes,
 
         input_file_count: () => input_files.length,
         input_file_path: (index) => input_files[index][0],
@@ -541,6 +545,19 @@ function node_files() {
         },
 
         file_rename: (from, to) => attempt(String(from), () => node_fs.renameSync(String(from), String(to))),
+
+        // When `path` was last written, in milliseconds since the Unix
+        // epoch, or -1 where there is nothing there.
+        file_modified_milliseconds: (path) => node_fs.statSync(String(path), { throwIfNoEntry: false })?.mtimeMs ?? -1,
+
+        // The permission bits of `path`, or -1 where there is nothing there.
+        file_mode: (path) => {
+            const status = node_fs.statSync(String(path), { throwIfNoEntry: false });
+
+            return status === undefined ? -1 : status.mode & 0o7777;
+        },
+
+        file_set_mode: (path, mode) => attempt(String(path), () => node_fs.chmodSync(String(path), mode & 0o7777)),
         directory_set_current: (path) => attempt(String(path), () => process.chdir(String(path))),
         directory_create: (path) => attempt(String(path), () => node_fs.mkdirSync(String(path), { recursive: true })),
 
@@ -566,6 +583,77 @@ function node_files() {
     };
 }
 
+// The host's process operations, as libghul's are: a program is named, its
+// arguments added one at a time, and then run to completion sharing this
+// process's standard input, its output and error captured. A run answers
+// the exit status, a program killed by a signal 128 plus its number, or -1
+// where it could not be started, process_failure then saying why: 1 for
+// no such program, 2 for anything else.
+function node_processes() {
+    let file = "";
+    let args = [];
+    let result = null;
+    let failure = 0;
+
+    return {
+        process_begin(file_name) {
+            file = String(file_name);
+            args = [];
+            result = null;
+            failure = 0;
+        },
+
+        process_add_argument(argument) {
+            args.push(String(argument));
+        },
+
+        process_run() {
+            result = node_child_process.spawnSync(file, args, { stdio: ["inherit", "pipe", "pipe"], maxBuffer: 1 << 30 });
+
+            if (result.error !== undefined) {
+                failure = result.error.code === "ENOENT" ? 1 : 2;
+                return -1;
+            }
+
+            if (result.status === null) {
+                return 128 + (node_os.constants.signals[result.signal] ?? 0);
+            }
+
+            return result.status;
+        },
+
+        process_failure: () => failure,
+        process_output: () => result?.stdout?.toString("utf8") ?? null,
+        process_error: () => result?.stderr?.toString("utf8") ?? null,
+
+        // The machine in Node's own words: `linux`, `darwin` or `win32`,
+        // and `x64` or `arm64`.
+        os_platform: () => process.platform,
+        os_architecture: () => process.arch,
+        process_id: () => process.pid,
+        home_directory: () => node_os.homedir(),
+
+        // Blocks the program for `milliseconds`, as Thread.Sleep does.
+        sleep: (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, milliseconds)),
+    };
+}
+
+// What a program that cannot start another one is told: that it could not.
+// The machine's name for itself is the engine's, since a page has no other.
+const no_processes = {
+    process_begin: () => {},
+    process_add_argument: () => {},
+    process_run: () => -1,
+    process_failure: () => 2,
+    process_output: () => null,
+    process_error: () => null,
+    os_platform: () => "browser",
+    os_architecture: () => "wasm",
+    process_id: () => 0,
+    home_directory: () => "/",
+    sleep: () => {},
+};
+
 // What a program that reads no real file system is told: that there is
 // none to read. Core asks before using any other operation, but the module
 // imports each one it can reach, so each is here, failing.
@@ -578,6 +666,9 @@ const no_files = {
     file_write_text: () => 4,
     file_delete: () => 4,
     file_rename: () => 4,
+    file_modified_milliseconds: () => -1,
+    file_mode: () => -1,
+    file_set_mode: () => 4,
     directory_set_current: () => 4,
     directory_create: () => 4,
     directory_delete: () => 4,
