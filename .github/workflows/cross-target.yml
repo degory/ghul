@@ -1,0 +1,181 @@
+name: Cross-target tests
+
+# Every execution test built and run for wasm and for llvm, whatever targets
+# the test lists, and reported against the tests each target is known to
+# pass (build/cross-target/<target>-passing.txt). Started by hand: the run
+# costs about two hours of runner time, so it stays off the pull request and
+# merge queue paths.
+#
+# The report is the run's summary page: per target, the listed tests that
+# failed, then the tests that passed without being listed, then the counts.
+# build/cross-target-update.sh <run-id> brings the lists, and the times the
+# shards are planned from, up to date with a run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which targets to test
+        type: choice
+        options: [both, wasm, llvm]
+        default: both
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  SHARDS: 6
+
+jobs:
+  # The compiler built from this commit by the latest published one, the
+  # library releases it would be used with, and each target's tests divided
+  # into shards of about equal time.
+  prepare:
+    name: Build and plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      core: ${{ steps.libraries.outputs.core }}
+      runtime: ${{ steps.libraries.outputs.runtime }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Build the compiler
+      run: |
+        dotnet tool restore
+        dotnet tool update --local ghul.compiler
+        dotnet publish --output publish/
+
+    - name: Choose the library releases
+      id: libraries
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "core=$(build/library-tag.sh ghul-core main)" >> "$GITHUB_OUTPUT"
+        echo "runtime=$(build/library-tag.sh ghul-runtime main)" >> "$GITHUB_OUTPUT"
+
+    - name: Plan the shards
+      id: plan
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ inputs.target }}" in
+          wasm) targets="wasm" ;;
+          llvm) targets="llvm" ;;
+          *) targets="wasm llvm" ;;
+        esac
+        include=""
+        for target in $targets; do
+          build/cross-target-shards.sh "$target" "$SHARDS" shards
+          for shard in $(seq 1 "$SHARDS"); do
+            include="$include{\"target\":\"$target\",\"shard\":$shard},"
+          done
+        done
+        echo "matrix={\"include\":[${include%,}]}" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: cross-target-build
+        path: |
+          publish/
+          shards/
+
+  test:
+    needs: prepare
+    name: ${{ matrix.target }} ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up .NET 10
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+
+    - uses: actions/download-artifact@v8
+      with:
+        name: cross-target-build
+
+    - name: Restore local .NET tools
+      run: dotnet tool restore
+
+    - name: Checkout ghul-core
+      uses: actions/checkout@v7
+      with:
+        repository: ghul-lang/ghul-core
+        path: libraries/ghul-core
+        ref: ${{ needs.prepare.outputs.core }}
+
+    - name: Checkout ghul-runtime
+      uses: actions/checkout@v7
+      with:
+        repository: ghul-lang/ghul-runtime
+        path: libraries/ghul-runtime
+        ref: ${{ needs.prepare.outputs.runtime }}
+
+    - name: Fetch ghul-llvm
+      if: matrix.target == 'llvm'
+      run: |
+        ghul_llvm="$(build/ghul-llvm.sh "$RUNNER_TEMP/ghul-llvm")"
+        test -x "$ghul_llvm"
+        dirname "$ghul_llvm" >> "$GITHUB_PATH"
+
+    # A failing test is what the report is for, so the shard's own status
+    # says only whether ghul-test ran. Its events log is kept for the
+    # per-test times the next run's shards are planned from.
+    - name: Run the shard's tests
+      shell: bash
+      env:
+        XDG_RUNTIME_DIR: ${{ runner.temp }}/xdg
+      run: |
+        set -uo pipefail
+        mkdir -p "$XDG_RUNTIME_DIR" results
+        dotnet ghul-test --config cross-${{ matrix.target }} $(cat shards/${{ matrix.target }}-${{ matrix.shard }}.txt) | tee results/results.txt
+        cat "$XDG_RUNTIME_DIR"/ghul-test/*.events > results/events.txt 2>/dev/null || true
+        grep -q "tests discovered" results/results.txt
+
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: results-${{ matrix.target }}-${{ matrix.shard }}
+        path: results/
+
+  report:
+    needs: [prepare, test]
+    if: always() && needs.prepare.result == 'success'
+    name: Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: results-*
+        path: results
+
+    - name: Write the report
+      shell: bash
+      run: build/cross-target-report.sh results ${{ github.run_id }} >> "$GITHUB_STEP_SUMMARY"
