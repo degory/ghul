@@ -38,11 +38,7 @@ namespace IR.WasmGC is
                 return
             fi
 
-            let described = LIST[CLASS_INSTANCE](_registry.classes_and_arrays)
-
-            described.add_range(_registry.descriptor_only)
-
-            for type in described do
+            for type in plan.described(_registry.classes_and_arrays) do
                 if let body = _body(plan, type, numbering, strings) then
                     let signature = _registry.display_signature
 
@@ -89,14 +85,29 @@ namespace IR.WasmGC is
                     body.add(Wasm.I32_CONSTANT(if property.read_is_public then 1 else 0 fi))
                     body.add_range(_optional_function_value(_property_setter(call.method, property.assign, numbering)))
                     body.add(Wasm.I32_CONSTANT(if property.assign_is_public then 1 else 0 fi))
-                elif let constructor: RTTI_CALL.CONSTRUCTOR = call then
-                    let made = _constructor(type, constructor.constructor, numbering)
+                elif let member: RTTI_CALL.ENUM_MEMBER = call then
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(member.name)))
+                    body.add(Wasm.I32_CONSTANT(int(member.value)))
+                    body.add(Wasm.I64_CONSTANT(member.value))
+                elif let attribute: RTTI_CALL.ATTRIBUTE = call then
+                    let made = _constructor(attribute.type, call.method, attribute.constructor, numbering)
 
                     if !made? then
                         return null
                     fi
 
                     body.add_range(_function_value(made))
+                elif let parameter: RTTI_CALL.PARAMETER = call then
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(parameter.name)))
+                elif let constructor: RTTI_CALL.CONSTRUCTOR = call then
+                    let made = _constructor(type, call.method, constructor.constructor, numbering)
+
+                    if !made? then
+                        return null
+                    fi
+
+                    body.add_range(_function_value(made))
+                    body.add(Wasm.I32_CONSTANT(if constructor.is_public then 1 else 0 fi))
                 fi
 
                 body.add(INDEX_INSTRUCTION(Opcode.CALL, method))
@@ -205,23 +216,62 @@ namespace IR.WasmGC is
             return null
         si
 
-        // `() -> object`, making an instance of `type` with every field at
-        // its default and calling its parameterless constructor on it;
-        // null where the constructor was not compiled.
-        _constructor(type: CLASS_INSTANCE, constructor: FUNCTION_INSTANCE, numbering: WASMGC_FUNCTION_NUMBERING) -> int? is
-            if let index = numbering.indexed(constructor) then
-                let instance = VALUE_TYPE.of_type_index(_registry.type_index(type)!, true)
-                let body = LIST[INSTRUCTION]()
+        // `(object?[]) -> object`, making an instance of `type` with every
+        // field at its default and calling `constructor` on it with the
+        // array's elements, each unboxed to the parameter's type; null
+        // where the constructor was not compiled.
+        _constructor(type: CLASS_INSTANCE, method: FUNCTION_INSTANCE, constructor: FUNCTION_INSTANCE, numbering: WASMGC_FUNCTION_NUMBERING) -> int? is
+            let index = numbering.indexed(constructor)
+            let make = method.specialize(method.definition.arguments[0])
+            let arguments_array = if let m = make /\ m.arguments.count > 0 then _registry.array_of(m.arguments[0]) else null fi
 
-                body.add_range(_registry.new_instance(type))
-                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, 1))
-                body.add(INDEX_INSTRUCTION(Opcode.CALL, index))
-                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
-
-                return numbering.reserve(() -> FUNCTION => FUNCTION(_registry.clone_signature, [instance], body))
+            if !index? \/ !make? \/ !arguments_array? then
+                return null
             fi
 
-            return null
+            let storage = _registry.array_storage(arguments_array)
+            let instance = VALUE_TYPE.of_type_index(_registry.type_index(type)!, true)
+            let body = LIST[INSTRUCTION]()
+
+            body.add_range(_registry.new_instance(type))
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, 2))
+
+            let definition = constructor.definition
+
+            for i in 0..definition.arguments.count do
+                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(storage.struct_index)))
+                body.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, storage.struct_index, 1))
+                body.add(Wasm.I32_CONSTANT(i))
+                body.add(TYPE_INSTRUCTION(Opcode.ARRAY_GET, storage.data_index))
+
+                _unbox(body, constructor.specialize(definition.arguments[i]))
+            od
+
+            body.add(INDEX_INSTRUCTION(Opcode.CALL, index))
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 2))
+
+            let signature = _registry.closure_signature(make)!
+
+            return numbering.reserve(() -> FUNCTION => FUNCTION(signature, [instance], body))
+        si
+
+        // Converts the reference on the stack, held as the root, to a value
+        // of `type`: a scalar's or a struct's from its box, a value-type
+        // optional as its box or null, and a reference cast to its own type.
+        _unbox(body: LIST[INSTRUCTION], type: Type?) is
+            if !type? then
+                return
+            fi
+
+            if let index = _registry.box_index(type) then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(index)))
+                body.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BOX_VALUE))
+            elif let held = _registry.struct_of(type) then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(_registry.type_index(held)!)))
+            elif let value_type = _registry.value_type(type) then
+                _cast_from_root(body, value_type)
+            fi
         si
 
         // Loads the object a function value was given as its first
