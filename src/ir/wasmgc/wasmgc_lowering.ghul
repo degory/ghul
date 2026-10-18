@@ -115,7 +115,7 @@ namespace IR.WasmGC is
         // The struct-typed locals the body declared, and the scalar locals
         // that live in cells, each of which holds a default box from the
         // start, as a .NET local holds a zeroed value.
-        _struct_locals: LIST[(index: int, type: CLASS_INSTANCE)]
+        _struct_locals: LIST[(index: int, type: CLASS_INSTANCE, shareable: bool)]
         // The reference-typed locals that live in cells, each of which
         // holds an empty cell from the start.
         _reference_cell_locals: LIST[int]
@@ -223,7 +223,7 @@ namespace IR.WasmGC is
             _await_structures = MAP[Values.AWAIT_SUSPEND, Values.REGION]()
             _folded_dispatches = LIST[Values.DISPATCH]()
             _unsupported = LIST[string]()
-            _struct_locals = LIST[(index: int, type: CLASS_INSTANCE)]()
+            _struct_locals = LIST[(index: int, type: CLASS_INSTANCE, shareable: bool)]()
             _reference_cell_locals = LIST[int]()
         si
 
@@ -244,8 +244,8 @@ namespace IR.WasmGC is
 
             let result = LIST[INSTRUCTION]()
 
-            for (index, type) in _struct_locals do
-                result.add_range(_registry.new_instance(type))
+            for (index, type, shareable) in _struct_locals do
+                result.add_range(if shareable then _registry.default_instance(type) else _registry.new_instance(type) fi)
                 result.add(INDEX_INSTRUCTION(Opcode.LOCAL_SET, index))
             od
 
@@ -308,10 +308,14 @@ namespace IR.WasmGC is
         // never be absent. Null otherwise.
         _boxed_present_value(value: Value) -> Value? is
             let inner mut = value
+            let to_object mut = false
 
             while true do
                 if let checked: Values.CAST = inner then
+                    to_object = to_object \/ _is_object_or_optional_object(checked.type)
                     inner = checked.value
+                elif let wrapper: Values.WRAPPER = inner /\ wrapper.value? then
+                    inner = wrapper.value
                 else
                     break
                 fi
@@ -321,7 +325,27 @@ namespace IR.WasmGC is
                 return box.value
             fi
 
+            // A value of a type parameter cast to object boxes there once the
+            // parameter stands for a value type, which the cast cannot fail
+            // on.
+            if let type = _specialize(inner.type) /\ to_object /\ type.is_value_type /\ !type.is_optional then
+                return inner
+            fi
+
             return null
+        si
+
+        _is_object_or_optional_object(type: Type?) -> bool is
+            let specialized = _specialize(type)
+
+            if !specialized? then
+                return false
+            fi
+
+            let target = if specialized.is_optional then specialized.optional_inner_type else specialized fi
+            let object = IoC.CONTAINER.instance.innate_symbol_lookup.get_object_type()
+
+            return target?.symbol == object.symbol
         si
 
 
@@ -396,6 +420,23 @@ namespace IR.WasmGC is
 
             _emit(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, index))
         si
+
+        // The receiver of a field read or a non-constructor call, which
+        // cannot change it. A read-only struct's box is shared, so it is
+        // read as it is held rather than copied for an address that
+        // nothing writes through.
+        _reading_receiver(from: Value) is
+            if let address: Values.ADDRESS = from /\ _is_read_only_struct(address.value.type) then
+                gen(address.value)
+            elif _is_read_only_struct(from.type) then
+                gen(from)
+            else
+                _struct_receiver(from)
+            fi
+        si
+
+        _is_read_only_struct(type: Type?) -> bool =>
+            if let held = _struct_of(type) then _registry.is_read_only(held) else false fi
 
         // The receiver of a field access or call on a struct is its box,
         // read in place where the value has an address.
@@ -706,7 +747,7 @@ namespace IR.WasmGC is
 
             if let cell = _cell_index(local) then
                 _local_types.add(VALUE_TYPE.of_type_index(cell, true))
-                _struct_locals.add((index, _registry.box_type(_specialize(local.type))!))
+                _struct_locals.add((index, _registry.box_type(_specialize(local.type))!, false))
             elif _reference_cell_of(local)? then
                 _local_types.add(VALUE_TYPE.of_type_index(_registry.reference_cell_type_index, true))
                 _reference_cell_locals.add(index)
@@ -714,7 +755,7 @@ namespace IR.WasmGC is
                 _local_types.add(type)
 
                 if let held = _struct_of(local.type) then
-                    _struct_locals.add((index, held))
+                    _struct_locals.add((index, held, true))
                 fi
             else
                 _report("a local of type {local.type}")
@@ -731,7 +772,7 @@ namespace IR.WasmGC is
         // any struct or array slot accepts.
         _zero(type: Type?) is
             if let held = _struct_of(type) then
-                _emit_all(_registry.new_instance(held))
+                _emit_all(_registry.default_instance(held))
             elif let value_type = _value_type(type) then
                 _emit(WASMGC_TYPE_REGISTRY.default_value(value_type))
             elif type?.is_null ?? false then
@@ -893,7 +934,7 @@ namespace IR.WasmGC is
 
         _field_get(load: Values.Load.INSTANCE_FIELD) is
             if let `field = _instance_field(load.from, load.symbol) then
-                _struct_receiver(load.from!)
+                _reading_receiver(load.from!)
                 _coerce_top(VALUE_TYPE.of_type_index(`field.type_index, true))
 
                 if _is_null_checked(load.from) then
@@ -4584,7 +4625,11 @@ namespace IR.WasmGC is
                     return
                 fi
 
-                gen(call.from)
+                if function.is_constructor then
+                    gen(call.from)
+                else
+                    _reading_receiver(call.from)
+                fi
                 _coerce_top(_local_type_of_receiver(instance))
 
                 _lower_arguments(function, call.arguments)
