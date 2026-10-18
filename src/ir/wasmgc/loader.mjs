@@ -451,9 +451,14 @@ function input_reader(source) {
 // answers whether a complete line is already buffered, and wait reads
 // until one is, or until the input ends.
 //
-// If the worker dies, the input ends: the main thread writes the end of
-// input into the ring and reports why on standard error, since the bytes
-// the worker had already taken from the descriptor cannot be put back.
+// If the worker fails, the input ends: the worker writes the end of input
+// into the ring itself on every failure it can see, and beats a heart in
+// shared memory for the ones it cannot. A loop here that waits on the ring
+// checks the heart, and treats a silent worker as the end of the input,
+// since the bytes the worker had already taken from the descriptor cannot
+// be put back. Events from the worker (error, exit) are not relied on:
+// the program waits inside one synchronous call and never reaches its
+// event loop.
 function stdin_pump(reader, source, report) {
     const threaded = is_node && source?.process_stdin === true;
 
@@ -472,6 +477,7 @@ function stdin_pump(reader, source, report) {
     const COUNT = 3;
     const ENDED = 4;
     const WAKE = 5;
+    const HEART = 6;
     const END_MARKER = 0xffffffff;
 
     // A line longer than this goes into the ring in pieces, each counted
@@ -485,6 +491,34 @@ function stdin_pump(reader, source, report) {
     let decoder = null;
     let reading = null;
     let handoff = "";
+    let heart = 0;
+    let heart_at = 0;
+
+    // Whether the worker is still beating. A worker that has died, or is
+    // wedged, would otherwise leave a waiting loop here waiting for ever,
+    // and the events that report a dead worker never reach a thread that
+    // is inside a wasm call.
+    const HEART_TIMEOUT_MS = 5000;
+
+    const alive = () => {
+        const now = Date.now();
+        const beat = Atomics.load(view, HEART);
+
+        if (beat !== heart || heart_at === 0) {
+            heart = beat;
+            heart_at = now;
+
+            return true;
+        }
+
+        if (now - heart_at > HEART_TIMEOUT_MS && Atomics.load(view, ENDED) === 0) {
+            end_input("it stopped responding");
+
+            return false;
+        }
+
+        return true;
+    };
 
     // Copies `source` into the ring at `offset`, wrapping, and answers the
     // offset after it.
@@ -573,6 +607,7 @@ function stdin_pump(reader, source, report) {
             }
 
             Atomics.wait(view, WAKE, Atomics.load(view, WAKE), 50);
+            alive();
         }
     };
 
@@ -633,6 +668,7 @@ function stdin_pump(reader, source, report) {
                 const COUNT = ${COUNT};
                 const ENDED = ${ENDED};
                 const WAKE = ${WAKE};
+                const HEART = ${HEART};
                 const HEADER = ${HEADER};
                 const DATA = ${DATA};
                 const END_MARKER = ${END_MARKER};
@@ -820,42 +856,73 @@ function stdin_pump(reader, source, report) {
                     flushing = false;
                 }
 
-                // The stream a descriptor needs: a terminal, a pipe or
-                // socket, or a file, as Node's own standard input chooses.
-                if (tty.isatty(0)) {
-                    stream = new tty.ReadStream(0);
-                } else {
-                    const stat = fs.fstatSync(0);
+                // The program's thread cannot be told about a failure here
+                // by an event while it is waiting on the ring - it runs
+                // inside one synchronous call and never reaches its event
+                // loop - so this thread ends the input itself on every way
+                // out it can see, and beats a heart for the ones it cannot.
+                let stopped = false;
 
-                    stream = stat.isFIFO() || stat.isSocket()
-                        ? new net.Socket({ fd: 0, readable: true, writable: false })
-                        : fs.createReadStream(null, { fd: 0, autoClose: false });
-                }
-
-                stream.on("data", (chunk) => {
-                    consume(chunk);
-
-                    if (queued > HIGH_WATER) {
-                        stream.pause();
+                function stop(why) {
+                    if (stopped) {
+                        return;
                     }
 
-                    flush();
-                });
+                    stopped = true;
 
-                stream.on("end", () => {
+                    if (why !== null) {
+                        try {
+                            fs.writeSync(2, "ghūl: the stdin watcher stopped: " + why + "\\n");
+                        } catch {}
+                    }
+
                     finish();
                     flush();
-                });
+                }
 
-                // A pipe closed from the other end reads as the end.
-                stream.on("error", (error) => {
-                    if (error.code === "EOF" || error.code === "EPIPE" || error.code === "ECONNRESET") {
-                        finish();
-                        flush();
-                    } else {
-                        throw error;
+                const heart = setInterval(() => {
+                    Atomics.add(view, HEART, 1);
+
+                    if (Atomics.load(view, ENDED) === 1) {
+                        clearInterval(heart);
                     }
-                });
+                }, 500);
+
+                process.on("uncaughtException", (error) => stop(error.message));
+
+                try {
+                    // The stream a descriptor needs: a terminal, a pipe or
+                    // socket, or a file, as Node's own standard input
+                    // chooses.
+                    if (tty.isatty(0)) {
+                        stream = new tty.ReadStream(0);
+                    } else {
+                        const stat = fs.fstatSync(0);
+
+                        stream = stat.isFIFO() || stat.isSocket()
+                            ? new net.Socket({ fd: 0, readable: true, writable: false })
+                            : fs.createReadStream(null, { fd: 0, autoClose: false });
+                    }
+
+                    stream.on("data", (chunk) => {
+                        consume(chunk);
+
+                        if (queued > HIGH_WATER) {
+                            stream.pause();
+                        }
+
+                        flush();
+                    });
+
+                    stream.on("end", () => stop(null));
+
+                    // A pipe closed from the other end reads as the end.
+                    stream.on("error", (error) => {
+                        stop(error.code === "EOF" || error.code === "EPIPE" || error.code === "ECONNRESET" ? null : error.message);
+                    });
+                } catch (error) {
+                    stop(error.message);
+                }
             })();
         `;
 
@@ -872,6 +939,7 @@ function stdin_pump(reader, source, report) {
         });
 
         worker.unref();
+        heart_at = Date.now();
 
         handoff = reader.rest();
         reading = input_reader(pull);
@@ -921,6 +989,7 @@ function stdin_pump(reader, source, report) {
                 }
 
                 Atomics.wait(view, WAKE, Atomics.load(view, WAKE), slice);
+                alive();
             }
         },
 
