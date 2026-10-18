@@ -1,0 +1,307 @@
+namespace IR.WasmGC is
+    use IR.Program
+
+    use Wasm.FUNCTION
+    use Wasm.INSTRUCTION
+    use Wasm.SIMPLE_INSTRUCTION
+    use Wasm.INDEX_INSTRUCTION
+    use Wasm.HEAP_TYPE_INSTRUCTION
+    use Wasm.TYPE_INSTRUCTION
+    use Wasm.TYPE_FIELD_INSTRUCTION
+    use Wasm.HEAP_TYPE
+    use Wasm.VALUE_TYPE
+    use Wasm.Opcode
+
+    use Collections.LIST
+
+    use Semantic.Types.Type
+
+    /// The describers: for each type, where the program describes its types
+    /// for reflection, a function that tells the core library's description
+    /// builder what the type is, passing the fields' and properties'
+    /// accessors and the constructor as function values. Each is reached
+    /// through its type's descriptor, and called the first time the
+    /// program reflects on the type.
+    class WASMGC_RTTI is
+        _registry: WASMGC_TYPE_REGISTRY
+
+        init(registry: WASMGC_TYPE_REGISTRY) is
+            _registry = registry
+        si
+
+        /// Reserves the describer of each type, once the walk has numbered
+        /// everything they call, and records it in the type's descriptor.
+        reserve(numbering: WASMGC_FUNCTION_NUMBERING, strings: WASMGC_STRINGS?) is
+            let plan = _registry.rtti_plan
+
+            if !plan? \/ !strings? then
+                return
+            fi
+
+            // Every function value has one type, described as a class with no
+            // members.
+            if let kind = plan.kind_method, index = numbering.indexed(kind) then
+                let builder = HEAP_TYPE.of_type_index(_registry.type_index(plan.description)!)
+
+                let body = LIST[INSTRUCTION]([
+                    INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1),
+                    HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, builder),
+                    Wasm.I32_CONSTANT(1),
+                    INDEX_INSTRUCTION(Opcode.CALL, index)
+                ]: INSTRUCTION)
+
+                let signature = _registry.display_signature
+
+                _registry.set_closure_describer(numbering.reserve(() -> FUNCTION => FUNCTION(signature, [], body)))
+            fi
+
+            for type in plan.described(_registry.classes_and_arrays) do
+                if let body = _body(plan, type, numbering, strings) then
+                    let signature = _registry.display_signature
+
+                    _registry.set_describer(
+                        type,
+                        numbering.reserve(() -> FUNCTION => FUNCTION(signature, [], body)))
+                fi
+            od
+        si
+
+        // The describer of `type`, taking the description builder, or
+        // null where something it calls was not compiled.
+        _body(plan: RTTI_PLAN, type: CLASS_INSTANCE, numbering: WASMGC_FUNCTION_NUMBERING, strings: WASMGC_STRINGS) -> LIST[INSTRUCTION]? is
+            let body = LIST[INSTRUCTION]()
+
+            let builder = HEAP_TYPE.of_type_index(_registry.type_index(plan.description)!)
+
+            for call in plan.calls(type) do
+                let method = numbering.indexed(call.method)
+
+                if !method? then
+                    return null
+                fi
+
+                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, builder))
+
+                if let kind: RTTI_CALL.KIND = call then
+                    body.add(Wasm.I32_CONSTANT(kind.flags))
+                elif let `field: RTTI_CALL.FIELD = call then
+                    let location = _registry.field_of(`field.`field, type)
+
+                    if !location? then
+                        return null
+                    fi
+
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(`field.name)))
+                    body.add(Wasm.I32_CONSTANT(if `field.is_public then 1 else 0 fi))
+                    body.add_range(_function_value(_field_getter(call.method, location, numbering)))
+                    body.add_range(_function_value(_field_setter(call.method, location, numbering)))
+                elif let property: RTTI_CALL.PROPERTY = call then
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(property.name)))
+                    body.add_range(_optional_function_value(_property_getter(call.method, property.read, numbering)))
+                    body.add(Wasm.I32_CONSTANT(if property.read_is_public then 1 else 0 fi))
+                    body.add_range(_optional_function_value(_property_setter(call.method, property.assign, numbering)))
+                    body.add(Wasm.I32_CONSTANT(if property.assign_is_public then 1 else 0 fi))
+                elif let member: RTTI_CALL.ENUM_MEMBER = call then
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(member.name)))
+                    body.add(Wasm.I32_CONSTANT(int(member.value)))
+                    body.add(Wasm.I64_CONSTANT(member.value))
+                elif let attribute: RTTI_CALL.ATTRIBUTE = call then
+                    let made = _constructor(attribute.type, call.method, attribute.constructor, numbering)
+
+                    if !made? then
+                        return null
+                    fi
+
+                    body.add_range(_function_value(made))
+                elif let parameter: RTTI_CALL.PARAMETER = call then
+                    body.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, strings.literal(parameter.name)))
+                elif let constructor: RTTI_CALL.CONSTRUCTOR = call then
+                    let made = _constructor(type, call.method, constructor.constructor, numbering)
+
+                    if !made? then
+                        return null
+                    fi
+
+                    body.add_range(_function_value(made))
+                    body.add(Wasm.I32_CONSTANT(if constructor.is_public then 1 else 0 fi))
+                fi
+
+                body.add(INDEX_INSTRUCTION(Opcode.CALL, method))
+            od
+
+            return body
+        si
+
+        // A function value holding the function numbered `index`, with no
+        // frame.
+        _function_value(index: int) -> LIST[INSTRUCTION] is
+            _registry.note_function_value(index)
+
+            return LIST[INSTRUCTION]([
+                INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.closure_descriptor_global),
+                INDEX_INSTRUCTION(Opcode.REF_FUNC, index),
+                HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, _registry.object_reference.heap_type()!),
+                TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _registry.closure_type_index)
+            ]: INSTRUCTION)
+        si
+
+        // As `_function_value`, or an absent function value where there is
+        // no function.
+        _optional_function_value(index: int?) -> LIST[INSTRUCTION] =>
+            if let i = index then
+                _function_value(i)
+            else
+                LIST[INSTRUCTION]([HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_type_index(_registry.closure_type_index))]: INSTRUCTION)
+            fi
+
+        // The signature of a function value passed as the builder method's
+        // argument at `position`.
+        _signature_of(method: FUNCTION_INSTANCE, position: int) -> int? is
+            if let parameter = method.specialize(method.definition.arguments[position]) then
+                if let function_type = if parameter.is_optional then parameter.optional_inner_type else parameter fi then
+                    return _registry.closure_signature(function_type)
+                fi
+            fi
+
+            return null
+        si
+
+        // `(object) -> T`, reading the field at `location`.
+        _field_getter(method: FUNCTION_INSTANCE, location: WASMGC_FIELD, numbering: WASMGC_FUNCTION_NUMBERING) -> int =>
+            numbering.reserve(() -> FUNCTION =>
+                FUNCTION(
+                    _signature_of(method, 2)!,
+                    [],
+                    [
+                        INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1),
+                        HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, HEAP_TYPE.of_type_index(location.type_index)),
+                        TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, location.type_index, location.field_index)
+                    ]: INSTRUCTION))
+
+        // `(object, T) -> void`, writing the field at `location`.
+        _field_setter(method: FUNCTION_INSTANCE, location: WASMGC_FIELD, numbering: WASMGC_FUNCTION_NUMBERING) -> int is
+            let body = LIST[INSTRUCTION]()
+
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
+            body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, HEAP_TYPE.of_type_index(location.type_index)))
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 2))
+            _cast_from_root(body, location.value_type)
+            body.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_SET, location.type_index, location.field_index))
+
+            return numbering.reserve(() -> FUNCTION => FUNCTION(_signature_of(method, 3)!, [], body))
+        si
+
+        // `(object) -> T`, calling the property's read accessor on the
+        // object; null where it has none, or it was not compiled.
+        _property_getter(method: FUNCTION_INSTANCE, read: FUNCTION_INSTANCE?, numbering: WASMGC_FUNCTION_NUMBERING) -> int? is
+            if let getter = read, index = numbering.indexed(getter) then
+                let body = LIST[INSTRUCTION]()
+
+                _receiver(body, getter)
+                body.add(INDEX_INSTRUCTION(Opcode.CALL, index))
+
+                return numbering.reserve(() -> FUNCTION => FUNCTION(_signature_of(method, 1)!, [], body))
+            fi
+
+            return null
+        si
+
+        // `(object, T) -> void`, calling the property's assign accessor on
+        // the object; null where it has none, or it was not compiled.
+        _property_setter(method: FUNCTION_INSTANCE, assign: FUNCTION_INSTANCE?, numbering: WASMGC_FUNCTION_NUMBERING) -> int? is
+            if let setter = assign, index = numbering.indexed(setter) then
+                let body = LIST[INSTRUCTION]()
+
+                _receiver(body, setter)
+                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 2))
+
+                if let value_type = _registry.value_type(setter.specialize(setter.definition.arguments[0])) then
+                    _cast_from_root(body, value_type)
+                fi
+
+                body.add(INDEX_INSTRUCTION(Opcode.CALL, index))
+
+                return numbering.reserve(() -> FUNCTION => FUNCTION(_signature_of(method, 3)!, [], body))
+            fi
+
+            return null
+        si
+
+        // `(object?[]) -> object`, making an instance of `type` with every
+        // field at its default and calling `constructor` on it with the
+        // array's elements, each unboxed to the parameter's type; null
+        // where the constructor was not compiled.
+        _constructor(type: CLASS_INSTANCE, method: FUNCTION_INSTANCE, constructor: FUNCTION_INSTANCE, numbering: WASMGC_FUNCTION_NUMBERING) -> int? is
+            let index = numbering.indexed(constructor)
+            let make = method.specialize(method.definition.arguments[0])
+            let arguments_array = if let m = make /\ m.arguments.count > 0 then _registry.array_of(m.arguments[0]) else null fi
+
+            if !index? \/ !make? \/ !arguments_array? then
+                return null
+            fi
+
+            let storage = _registry.array_storage(arguments_array)
+            let instance = VALUE_TYPE.of_type_index(_registry.type_index(type)!, true)
+            let body = LIST[INSTRUCTION]()
+
+            body.add_range(_registry.new_instance(type))
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_TEE, 2))
+
+            let definition = constructor.definition
+
+            for i in 0..definition.arguments.count do
+                body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(storage.struct_index)))
+                body.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, storage.struct_index, 1))
+                body.add(Wasm.I32_CONSTANT(i))
+                body.add(TYPE_INSTRUCTION(Opcode.ARRAY_GET, storage.data_index))
+
+                _unbox(body, constructor.specialize(definition.arguments[i]))
+            od
+
+            body.add(INDEX_INSTRUCTION(Opcode.CALL, index))
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 2))
+
+            let signature = _registry.closure_signature(make)!
+
+            return numbering.reserve(() -> FUNCTION => FUNCTION(signature, [instance], body))
+        si
+
+        // Converts the reference on the stack, held as the root, to a value
+        // of `type`: a scalar's or a struct's from its box, a value-type
+        // optional as its box or null, and a reference cast to its own type.
+        _unbox(body: LIST[INSTRUCTION], type: Type?) is
+            if !type? then
+                return
+            fi
+
+            if let index = _registry.box_index(type) then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(index)))
+                body.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, index, WASMGC_TYPE_REGISTRY.BOX_VALUE))
+            elif let held = _registry.struct_of(type) then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(_registry.type_index(held)!)))
+            elif let value_type = _registry.value_type(type) then
+                _cast_from_root(body, value_type)
+            fi
+        si
+
+        // Loads the object a function value was given as its first
+        // argument, cast to the type `accessor` takes its receiver as.
+        _receiver(body: LIST[INSTRUCTION], accessor: FUNCTION_INSTANCE) is
+            body.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, 1))
+
+            if let receiver = _registry.receiver_type(accessor)?.heap_type() then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, receiver))
+            fi
+        si
+
+        // A function value holds a reference as the root; casts the one on
+        // the stack to `expected` where that is narrower.
+        _cast_from_root(body: LIST[INSTRUCTION], expected: VALUE_TYPE) is
+            if let heap_type = expected.heap_type() /\ !heap_type.matches(_registry.object_reference.heap_type()!) then
+                body.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST_NULL, heap_type))
+            fi
+        si
+    si
+si

@@ -2910,13 +2910,13 @@ namespace IR.WasmGC is
                 return
             fi
 
-            let target = _registry.type_index(_specialize(conversion.type)) ?? _optional_box_index(conversion.type)
+            let target = _registry.type_index(_specialize(conversion.type)) ?? _optional_box_index(conversion.type) ?? _closure_index_of(conversion.type)
 
             if !target? then
-                if _is_unchecked_widening(conversion.type) then
+                if _is_unchecked_widening(_specialize(conversion.type) ?? conversion.type) then
                     gen(value)
                 else
-                    _report("a cast to {conversion.type}")
+                    _report("a cast to {_specialize(conversion.type) ?? conversion.type}")
                 fi
 
                 return
@@ -3115,11 +3115,14 @@ namespace IR.WasmGC is
         // The numbers of the classes implementing `type`, where it is a
         // trait that is not generic.
         _trait_class_ids(type: Type?) -> Collections.List[int]? is
-            if !type? \/ !type.is_trait then
+            // A reference optional is held as the reference itself.
+            let tested = if let t = type /\ t.is_optional then t.optional_inner_type else type fi
+
+            if !tested? \/ !tested.is_trait then
                 return null
             fi
 
-            if let trait_type = _registry.dispatch.trait_of(_specialize(type)!) then
+            if let trait_type = _registry.dispatch.trait_of(_specialize(tested)!) then
                 let ids = LIST[int]()
 
                 if let implementors = _registry.dispatch.implementors(trait_type) then
@@ -3211,15 +3214,38 @@ namespace IR.WasmGC is
             return null
         si
 
-        // A cast to `object`: every reference is held as one already.
+        // The struct type every function value is held in, where `type` is a
+        // function type or its optional; null otherwise.
+        _closure_index_of(type: Type?) -> int? is
+            let function_type = if let t = _specialize(type) then (if t.is_optional then t.optional_inner_type else t fi) else null fi
+
+            if let f = function_type /\ (f.is_function \/ f.is_action) then
+                return _registry.closure_type_index
+            fi
+
+            return null
+        si
+
+        // A cast to `object`: every reference is held as one already. So is a
+        // cast to a trait the dispatch plan knows no implementors of, which
+        // is left unchecked.
         _is_unchecked_widening(to: Type?) -> bool =>
-            if let to_class: Semantic.Symbols.Classy = to?.symbol then to_class.is_object else false fi
+            if let target = to then
+                (if target.is_optional then target.optional_inner_type?.is_trait ?? false else target.is_trait fi) \/
+                (if let to_class: Semantic.Symbols.Classy = target.symbol then to_class.is_object else false fi)
+            else
+                false
+            fi
         visit(type_of: Values.TYPEOF) is
-            if let held = _registry.descriptor_class_of(_specialize(type_of.typeof_type)) then
+            if let function_type = _specialize(type_of.typeof_type) /\ (function_type.is_function \/ function_type.is_action) then
+                // Every function value shares one descriptor.
+                _emit(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.closure_descriptor_global))
+                _type_object()
+            elif let held = _registry.descriptor_class_of(_specialize(type_of.typeof_type)) then
                 _emit(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.descriptor_global(held)))
                 _type_object()
             else
-                _report("typeof {type_of.typeof_type}")
+                _report("typeof {_specialize(type_of.typeof_type) ?? type_of.typeof_type}")
             fi
         si
         // A tuple is a read-only struct built from its elements in order.
@@ -3324,7 +3350,12 @@ namespace IR.WasmGC is
             let string_type = IoC.CONTAINER.instance.innate_symbol_lookup.get_string_type()
 
             if _registry.discovering then
-                _construct(type, constructor, [WASMGC_LOCAL_VALUE(0, string_type)]: Value)
+                if let describing = _describing_type_object_constructor(type) then
+                    _construct(type, describing, [WASMGC_LOCAL_VALUE(0, string_type), WASMGC_LOCAL_VALUE(0, describing.arguments[1])]: Value)
+                else
+                    _construct(type, constructor, [WASMGC_LOCAL_VALUE(0, string_type)]: Value)
+                fi
+
                 return
             fi
 
@@ -3346,7 +3377,15 @@ namespace IR.WasmGC is
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, descriptor_type, WASMGC_TYPE_REGISTRY.DESCRIPTOR_NAME))
             _emit(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _strings!.string_type_index))
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, name))
-            _construct(type, constructor, [WASMGC_LOCAL_VALUE(name, string_type)]: Value)
+
+            if let describing = _describing_type_object_constructor(type) then
+                let describe = _describe_value(descriptor)
+
+                _construct(type, describing, [WASMGC_LOCAL_VALUE(name, string_type), WASMGC_LOCAL_VALUE(describe, describing.arguments[1])]: Value)
+            else
+                _construct(type, constructor, [WASMGC_LOCAL_VALUE(name, string_type)]: Value)
+            fi
+
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, made))
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, descriptor))
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, made))
@@ -3358,6 +3397,40 @@ namespace IR.WasmGC is
             _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, descriptor))
             _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, descriptor_type, cache))
             _emit(HEAP_TYPE_INSTRUCTION(Opcode.REF_CAST, HEAP_TYPE.of_type_index(type_index)))
+        si
+
+        // The core library type object's constructor taking a description,
+        // where the build describes the program's types for reflection.
+        _describing_type_object_constructor(type: CLASS_INSTANCE) -> Function? =>
+            if _registry.rtti_plan? then CORE_LIBRARY.constructor(type.definition, 2) else null fi
+
+        // A local holding the function value that describes the type whose
+        // descriptor is in `descriptor`, or an absent one where the type has
+        // no describer.
+        _describe_value(descriptor: int) -> int is
+            let closure_type = VALUE_TYPE.of_type_index(_registry.closure_type_index, true)
+            let describe = _temp(closure_type)
+            let descriptor_type = WASMGC_TYPE_REGISTRY.DESCRIPTOR_TYPE_INDEX
+
+            let absent = LIST[INSTRUCTION]()
+
+            absent.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_type_index(_registry.closure_type_index)))
+
+            let present = LIST[INSTRUCTION]()
+
+            present.add(INDEX_INSTRUCTION(Opcode.GLOBAL_GET, _registry.closure_descriptor_global))
+            present.add(INDEX_INSTRUCTION(Opcode.LOCAL_GET, descriptor))
+            present.add(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, descriptor_type, WASMGC_TYPE_REGISTRY.DESCRIPTOR_DESCRIBE))
+            present.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, _registry.object_reference.heap_type()!))
+            present.add(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, _registry.closure_type_index))
+
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_GET, descriptor))
+            _emit(TYPE_FIELD_INSTRUCTION(Opcode.STRUCT_GET, descriptor_type, WASMGC_TYPE_REGISTRY.DESCRIPTOR_DESCRIBE))
+            _emit(Opcode.REF_IS_NULL)
+            _emit(IF_INSTRUCTION(BLOCK_TYPE.of_value(closure_type), absent, present))
+            _emit(INDEX_INSTRUCTION(Opcode.LOCAL_SET, describe))
+
+            return describe
         si
 
         // Whether a call to `function` asks for its receiver's type object,

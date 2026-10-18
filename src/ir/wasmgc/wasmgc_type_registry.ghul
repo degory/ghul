@@ -128,6 +128,11 @@ namespace IR.WasmGC is
         /// of the class, null where nothing the program reaches copies one.
         DESCRIPTOR_CLONE: int static => 7
 
+        /// The descriptor field holding the function that describes the
+        /// type for reflection, null where it has none. Present only where
+        /// the build describes the program's types.
+        DESCRIPTOR_DESCRIBE: int static => 8
+
         /// The closure field holding the function to call.
         CLOSURE_FUNCTION: int static => 1
 
@@ -208,6 +213,15 @@ namespace IR.WasmGC is
         _clones_wanted: bool
         _clone_signature: int?
         _cloners: MAP[CLASS_INSTANCE, int]
+        _describers: MAP[CLASS_INSTANCE, int]
+        _closure_describer: int?
+
+        // Types a value is never an instance of but `typeof` can name: the
+        // traits, each with a descriptor of its own.
+        _descriptor_only: LIST[CLASS_INSTANCE]
+        _descriptor_only_set: Collections.SET[CLASS_INSTANCE]
+        _rtti_plan: RTTI_PLAN?
+        _rtti_planned: bool
         _boxes_made: Collections.SET[CLASS_INSTANCE]
 
         /// The constructs the program declares that the object model cannot
@@ -275,6 +289,9 @@ namespace IR.WasmGC is
 
             _displayers = MAP[CLASS_INSTANCE, int]()
             _cloners = MAP[CLASS_INSTANCE, int]()
+            _describers = MAP[CLASS_INSTANCE, int]()
+            _descriptor_only = LIST[CLASS_INSTANCE]()
+            _descriptor_only_set = Collections.SET[CLASS_INSTANCE]()
             _boxes_made = Collections.SET[CLASS_INSTANCE]()
             _cells = Collections.SET[IR.LOCAL]()
             _static_constructors = MAP[CLASS_INSTANCE, (constructor: FUNCTION_INSTANCE, initialised: int)]()
@@ -468,6 +485,10 @@ namespace IR.WasmGC is
                 _add_descriptor_global(array)
             od
 
+            for type in _descriptor_only do
+                _add_descriptor_global(type)
+            od
+
             _closure_descriptor = LIST[INSTRUCTION]()
             _closure_descriptor_global =
                 _module.add_global(
@@ -504,6 +525,10 @@ namespace IR.WasmGC is
                 _fill_array_descriptor(array, element)
             od
 
+            for type in _descriptor_only do
+                _fill_descriptor_only(type)
+            od
+
             // A function value is numbered after every class and array type,
             // so no class or trait test matches one.
             let closure_id = _class_set.numbering.last_descendant(_object!) + 1
@@ -519,7 +544,11 @@ namespace IR.WasmGC is
             else
                 _closure_descriptor.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.STRUCT)))
             fi
-            _end_descriptor(_closure_descriptor, _no_displayer, _no_displayer)
+            _end_descriptor(
+                _closure_descriptor,
+                _no_displayer,
+                _no_displayer,
+                if let describer = _closure_describer then INDEX_INSTRUCTION(Opcode.REF_FUNC, describer) else _no_displayer fi)
         si
 
         /// Records that the program renders values for display, through
@@ -616,6 +645,52 @@ namespace IR.WasmGC is
 
         _cloner_reference(type: CLASS_INSTANCE) -> INSTRUCTION =>
             if let index = cloner_of(type) then INDEX_INSTRUCTION(Opcode.REF_FUNC, index) else _no_displayer fi
+
+        /// What each type's description calls, where the build describes
+        /// the program's types for reflection and the core library's type
+        /// object takes a description; null otherwise.
+        rtti_plan: RTTI_PLAN? is
+            if !_rtti_planned then
+                _rtti_planned = true
+
+                if IoC.CONTAINER.instance.build_flags.want_rtti then
+                    if let description = RTTI_PLAN.description_class(t => class_of(t)) then
+                        _rtti_plan = RTTI_PLAN(self, description, () -> Collections.Iterable[CLASS_INSTANCE] => _descriptor_only)
+                    fi
+                fi
+            fi
+
+            return _rtti_plan
+        si
+
+        /// Makes the function numbered `index` the describer of `type`.
+        set_describer(type: CLASS_INSTANCE, index: int) is
+            _describers[type] = index
+            _closure_thunks.add(index)
+        si
+
+        /// Makes the function numbered `index` the describer every function
+        /// value's type shares.
+        set_closure_describer(index: int) is
+            _closure_describer = index
+            _closure_thunks.add(index)
+        si
+
+        /// Records that the function numbered `index` is referenced as a
+        /// function value, which a module has to declare.
+        note_function_value(index: int) is
+            _closure_thunks.add(index)
+        si
+
+        _describer_of(type: CLASS_INSTANCE) -> INSTRUCTION is
+            let index mut = 0
+
+            if _describers.try_get_value(type, index ref) then
+                return INDEX_INSTRUCTION(Opcode.REF_FUNC, index)
+            fi
+
+            return _no_displayer
+        si
 
         // A function value: its descriptor, the function to call, and the
         // receiver or captured frame it is called with, null for none.
@@ -1072,7 +1147,22 @@ namespace IR.WasmGC is
                 initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.STRUCT)))
             fi
 
-            _end_descriptor(initialiser, _displayer_of(array), _no_displayer)
+            _end_descriptor(initialiser, _displayer_of(array), _no_displayer, _describer_of(array))
+        si
+
+        // A descriptor-only type has no class number a value could carry, no
+        // superclass and no vtable: its descriptor serves `typeof` and
+        // reflection only.
+        _fill_descriptor_only(type: CLASS_INSTANCE) is
+            let initialiser = _initialisers[type]
+
+            initialiser.add(I32_CONSTANT(-1))
+            initialiser.add(I32_CONSTANT(-2))
+            initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_type_index(DESCRIPTOR_TYPE_INDEX)))
+            initialiser.add_range(chars_of(display_name(type)))
+            initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.STRUCT)))
+
+            _end_descriptor(initialiser, _no_displayer, _no_displayer, _describer_of(type))
         si
 
         /// The global holding the descriptor of the class the elements of
@@ -1101,12 +1191,17 @@ namespace IR.WasmGC is
         superclass_of(type: CLASS_INSTANCE) -> CLASS_INSTANCE? => _class_set.superclass_of(type)
 
         // A descriptor's type object is made the first time one is asked
-        // for, so every descriptor starts without one; its displayer and its
-        // cloner are known when the descriptor is built.
-        _end_descriptor(initialiser: LIST[INSTRUCTION], displayer: INSTRUCTION, cloner: INSTRUCTION) is
+        // for, so every descriptor starts without one; its displayer, its
+        // cloner and its describer are known when the descriptor is built.
+        _end_descriptor(initialiser: LIST[INSTRUCTION], displayer: INSTRUCTION, cloner: INSTRUCTION, describer: INSTRUCTION) is
             initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.STRUCT)))
             initialiser.add(displayer)
             initialiser.add(cloner)
+
+            if _describes_types then
+                initialiser.add(describer)
+            fi
+
             initialiser.add(TYPE_INSTRUCTION(Opcode.STRUCT_NEW, DESCRIPTOR_TYPE_INDEX))
         si
 
@@ -1118,8 +1213,11 @@ namespace IR.WasmGC is
         _display_name(type: Type) -> string =>
             TYPE_NAMES.name_of(type, _class_set, _string, t => WASMGC_TYPES.scalar(t), t => WASMGC_TYPES.is_string(t))
 
-        _descriptor_struct() -> STRUCT_TYPE =>
-            STRUCT_TYPE([
+        // A descriptor holds its describer only where the build describes
+        // the program's types, so a build without --rtti is laid out as
+        // before.
+        _descriptor_struct() -> STRUCT_TYPE is
+            let fields = LIST[FIELD_TYPE]([
                 FIELD_TYPE(NumericType.I32, false),
                 FIELD_TYPE(NumericType.I32, false),
                 FIELD_TYPE.of_reference(VALUE_TYPE.of_type_index(DESCRIPTOR_TYPE_INDEX, true), false),
@@ -1128,7 +1226,16 @@ namespace IR.WasmGC is
                 FIELD_TYPE.of_reference(VALUE_TYPE.of_abstract(AbstractHeapType.STRUCT), true),
                 FIELD_TYPE.of_reference(VALUE_TYPE.of_abstract(AbstractHeapType.FUNC), false),
                 FIELD_TYPE.of_reference(VALUE_TYPE.of_abstract(AbstractHeapType.FUNC), false)
-            ])
+            ]: FIELD_TYPE)
+
+            if _describes_types then
+                fields.add(FIELD_TYPE.of_reference(VALUE_TYPE.of_abstract(AbstractHeapType.FUNC), false))
+            fi
+
+            return STRUCT_TYPE(fields.to_array())
+        si
+
+        _describes_types: bool => IoC.CONTAINER.instance.build_flags.want_rtti
 
         // Every scalar a program can box: a box is a final struct holding
         // the descriptor of the scalar's type and the value.
@@ -1294,7 +1401,7 @@ namespace IR.WasmGC is
                 initialiser.add(HEAP_TYPE_INSTRUCTION(Opcode.REF_NULL, HEAP_TYPE.of_abstract(AbstractHeapType.STRUCT)))
             fi
 
-            _end_descriptor(initialiser, _displayer_of(type), _cloner_reference(type))
+            _end_descriptor(initialiser, _displayer_of(type), _cloner_reference(type), _describer_of(type))
         si
 
         // A class's static fields are globals, each instantiation of a
@@ -1824,10 +1931,58 @@ namespace IR.WasmGC is
                 return array
             elif let held = class_of(type) /\ (is_object(held) \/ is_object_type(held)) then
                 return held
+            elif let descriptor_only = _descriptor_only_instance(type) then
+                return descriptor_only
             fi
 
             return null
         si
+
+        // The trait or value-type optional `type` is, as a type with a
+        // descriptor of its own, added while discovering; null where `type`
+        // is neither. No value is an instance of either: a trait's values
+        // are its implementors', and a value-type optional is held as its
+        // value's box.
+        _descriptor_only_instance(type: Type?) -> CLASS_INSTANCE? is
+            if !type? \/ !(type.is_trait \/ (type.is_optional /\ type.is_value_type /\ !type.is_maybe)) then
+                return null
+            fi
+
+            let definition =
+                if let generic: GENERIC = type.symbol then cast Classy?(generic.unspecialized_symbol) else cast Classy?(type.symbol) fi
+
+            if !definition? then
+                return null
+            fi
+
+            let map = MAP[Symbol, Type]()
+
+            if let generic: GENERIC = type.symbol then
+                for (parameter, argument) in generic.type_map do
+                    if parameter.owner == definition then
+                        map[parameter] = argument
+                    fi
+                od
+            fi
+
+            let key = CLASS_INSTANCE(definition, type.arguments, map)
+
+            if _descriptor_only_set.contains(key) then
+                return key
+            fi
+
+            if !discovering then
+                return null
+            fi
+
+            _descriptor_only_set.add(key)
+            _descriptor_only.add(key)
+
+            return key
+        si
+
+        /// The types with descriptors that no value is an instance of.
+        descriptor_only: Collections.List[CLASS_INSTANCE] => _descriptor_only
 
         /// The box a value of the scalar `type` is held in, or null where
         /// `type` is not a scalar.
