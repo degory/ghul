@@ -545,6 +545,19 @@ function node_files() {
         },
 
         file_rename: (from, to) => attempt(String(from), () => node_fs.renameSync(String(from), String(to))),
+
+        // When `path` was last written, in milliseconds since the Unix
+        // epoch, or -1 where there is nothing there.
+        file_modified_milliseconds: (path) => node_fs.statSync(String(path), { throwIfNoEntry: false })?.mtimeMs ?? -1,
+
+        // The permission bits of `path`, or -1 where there is nothing there.
+        file_mode: (path) => {
+            const status = node_fs.statSync(String(path), { throwIfNoEntry: false });
+
+            return status === undefined ? -1 : status.mode & 0o7777;
+        },
+
+        file_set_mode: (path, mode) => attempt(String(path), () => node_fs.chmodSync(String(path), mode & 0o7777)),
         directory_set_current: (path) => attempt(String(path), () => process.chdir(String(path))),
         directory_create: (path) => attempt(String(path), () => node_fs.mkdirSync(String(path), { recursive: true })),
 
@@ -612,10 +625,21 @@ function node_processes() {
         process_failure: () => failure,
         process_output: () => result?.stdout?.toString("utf8") ?? null,
         process_error: () => result?.stderr?.toString("utf8") ?? null,
+
+        // The machine in Node's own words: `linux`, `darwin` or `win32`,
+        // and `x64` or `arm64`.
+        os_platform: () => process.platform,
+        os_architecture: () => process.arch,
+        process_id: () => process.pid,
+        home_directory: () => node_os.homedir(),
+
+        // Blocks the program for `milliseconds`, as Thread.Sleep does.
+        sleep: (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, milliseconds)),
     };
 }
 
 // What a program that cannot start another one is told: that it could not.
+// The machine's name for itself is the engine's, since a page has no other.
 const no_processes = {
     process_begin: () => {},
     process_add_argument: () => {},
@@ -623,6 +647,11 @@ const no_processes = {
     process_failure: () => 2,
     process_output: () => null,
     process_error: () => null,
+    os_platform: () => "browser",
+    os_architecture: () => "wasm",
+    process_id: () => 0,
+    home_directory: () => "/",
+    sleep: () => {},
 };
 
 // What a program that reads no real file system is told: that there is
@@ -637,6 +666,9 @@ const no_files = {
     file_write_text: () => 4,
     file_delete: () => 4,
     file_rename: () => 4,
+    file_modified_milliseconds: () => -1,
+    file_mode: () => -1,
+    file_set_mode: () => 4,
     directory_set_current: () => 4,
     directory_create: () => 4,
     directory_delete: () => 4,
