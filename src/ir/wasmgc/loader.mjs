@@ -491,6 +491,7 @@ function stdin_pump(reader, source, report) {
     let decoder = null;
     let reading = null;
     let handoff = "";
+    let input_ended = false;
     let heart = 0;
     let heart_at = 0;
 
@@ -588,11 +589,21 @@ function stdin_pump(reader, source, report) {
             return text;
         }
 
+        // Once the end has been taken, nothing more arrives: answer the
+        // end every time rather than waiting on the ring. The flushed
+        // remainder of a truncated multi-byte sequence is itself text, so
+        // the end has to be remembered across the call that returns it.
+        if (input_ended) {
+            return null;
+        }
+
         for (;;) {
             const entry = take_entry();
 
             if (entry !== null) {
                 if (entry.bytes === null) {
+                    input_ended = true;
+
                     const rest = decoder.decode();
                     return rest.length > 0 ? rest : null;
                 }
