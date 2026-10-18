@@ -80,6 +80,12 @@ namespace Driver is
         version: string static => "$GHUL_NATIVE_VERSION"
 
         requirements: string static => "$requirements"
+
+        @IF.wasm()
+        host: string static => "wasm"
+
+        @IF.llvm()
+        host: string static => "llvm"
     si
 si
 EOF
