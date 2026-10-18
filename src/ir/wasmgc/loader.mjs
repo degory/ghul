@@ -17,7 +17,10 @@ const is_node = typeof process !== "undefined" && process.versions?.node !== und
 const node_fs = is_node ? await import("node:fs") : null;
 const node_path = is_node ? await import("node:path") : null;
 const node_child_process = is_node ? await import("node:child_process") : null;
+const node_worker_threads = is_node ? await import("node:worker_threads") : null;
 const node_os = is_node ? await import("node:os") : null;
+const node_v8 = is_node ? await import("node:v8") : null;
+const node_vm = is_node ? await import("node:vm") : null;
 
 class Exit extends Error {
     constructor(code) {
@@ -60,6 +63,7 @@ export async function run(options = {}) {
     const sinks = [null, stdout, stderr];
     const onfile = options.onfile ?? (is_node ? node_file_writer(stderr) : () => {});
     const input = input_reader(options.stdin);
+    const pump = stdin_pump(input, options.stdin);
     const input_files = Object.entries(options.files ?? {}).map(([path, content]) => [path, file_bytes(content)]);
     const files = (options.file_system ?? (options.files === undefined && options.onfile === undefined)) && is_node ? node_files() : no_files;
     const processes = is_node ? node_processes() : no_processes;
@@ -117,10 +121,15 @@ export async function run(options = {}) {
         input_file_path: (index) => input_files[index][0],
         input_file_content: (index) => byte_text(input_files[index][1]),
 
-        stdin_read_line: () => input.read_line(),
-        stdin_read: () => input.read(),
-        stdin_peek: () => input.peek(),
-        stdin_read_to_end: () => input.read_to_end(),
+        stdin_read_line: () => pump.reader().read_line(),
+        stdin_read: () => pump.reader().read(),
+        stdin_peek: () => pump.reader().peek(),
+        stdin_read_to_end: () => pump.reader().read_to_end(),
+
+        stdin_pending: () => pump.pending(),
+        stdin_wait: (ms) => pump.wait(ms),
+
+        heap_bytes: (force) => heap_bytes(force),
 
         argument_count: () => args.length,
         argument: (index) => args[index],
@@ -384,6 +393,384 @@ function input_reader(source) {
             return rest;
         },
     };
+}
+
+// Standard input watched from another thread, for a program that asks
+// whether input is waiting rather than only reading it - the analyser,
+// which polls for requests while a compile runs and waits for one while
+// it is idle.
+//
+// Started by the first pending() or wait() call. On Node a worker thread
+// reads the real standard input - the file descriptor the process was
+// given, which a worker shares - and pushes each complete line into a
+// ring held in shared memory; from then on every read takes its text
+// from that ring, so the watcher and the program read the same stream
+// without racing over the descriptor. The worker blocks while the ring
+// has no room for the line it has read, so input a program has not
+// reached yet waits in the pipe rather than being dropped.
+//
+// Anywhere else - a page supplying text through the loader's stdin
+// option - there is no second thread to watch with, so pending and wait
+// answer that nothing is waiting; such a host has no analysing to do.
+function stdin_pump(reader, source) {
+    const RING_BYTES = 16 * 1024 * 1024;
+
+    // The ring's layout: one Int32 per header cell, then the line bytes.
+    // WRITE and READ are offsets into the data region; COUNT is the lines
+    // waiting; ENDED says the input is over; WAKE is the cell the worker
+    // sleeps on while the ring has no room for the line it has read, and
+    // the one the reader nudges each time it takes a line out.
+    const WRITE = 0;
+    const READ = 1;
+    const COUNT = 2;
+    const ENDED = 3;
+    const WAKE = 4;
+    const HEADER = 32;
+    const END_MARKER = 0xffffffff;
+
+    let started = false;
+    let ring = null;
+    let view = null;
+    let bytes = null;
+    let decoder = null;
+    let worker = null;
+
+    const start = () => {
+        if (started) {
+            return;
+        }
+
+        started = true;
+
+        if (!is_node) {
+            return;
+        }
+
+        ring = new SharedArrayBuffer(RING_BYTES);
+        view = new Int32Array(ring);
+        bytes = new Uint8Array(ring);
+        decoder = new TextDecoder();
+
+        const worker_source = `
+            // Written as an async IIFE importing what it needs: an eval
+            // worker takes its module format from the nearest
+            // package.json to the loader's directory, so neither the
+            // CommonJS nor the module spelling can be relied on alone.
+            (async () => {
+                const fs = await import("node:fs");
+                const { workerData } = await import("node:worker_threads");
+
+                const ring = workerData.ring;
+                const view = new Int32Array(ring);
+                const bytes = new Uint8Array(ring);
+                const WRITE = ${WRITE};
+                const READ = ${READ};
+                const COUNT = ${COUNT};
+                const ENDED = ${ENDED};
+                const WAKE = ${WAKE};
+                const HEADER = ${HEADER};
+                const END_MARKER = ${END_MARKER};
+                const DATA = ring.byteLength - HEADER;
+
+            const after = (from, length) => (from + 4 + length) % DATA;
+
+            // Whether a line of that many bytes fits in the ring: when the
+            // write end is at or past the read end the free space runs in
+            // one or two spans, wrapping; when it is before, the span runs
+            // up to the read end. A line is written in one piece, so a
+            // span too short for it means waiting for the reader.
+            function fits(length) {
+                const write = view[WRITE];
+                const read = view[READ];
+
+                if (write >= read) {
+                    return DATA - write >= 4 + length || read >= 4 + length;
+                }
+
+                return read - write >= 4 + length;
+            }
+
+            function push(line) {
+                while (!fits(line.length)) {
+                    Atomics.wait(view, WAKE, view[WAKE], 50);
+                }
+
+                const write = view[WRITE];
+
+                new DataView(ring, HEADER + write, 4).setUint32(0, line.length, true);
+                bytes.set(line, HEADER + write + 4);
+
+                view[WRITE] = after(write, line.length);
+                Atomics.add(view, COUNT, 1);
+            }
+
+            // Writes the end-of-input marker: a header the reader reads as
+            // the end rather than as a line of no bytes.
+            function push_end() {
+                while (!fits(0)) {
+                    Atomics.wait(view, WAKE, view[WAKE], 50);
+                }
+
+                const write = view[WRITE];
+
+                new DataView(ring, HEADER + write, 4).setUint32(0, END_MARKER, true);
+
+                view[WRITE] = after(write, 0);
+                Atomics.add(view, COUNT, 1);
+            }
+
+            // Reads standard input to the next line break and answers the
+            // bytes of the line WITH the break that ended it, or null at
+            // the end of the input. Keeping the break is what lets the
+            // reader on the other side of the ring tell a complete line
+            // from the input's last piece, which has none. A lone \\r ends
+            // a line the way .NET's ReadLine ends one, and a \\r at the
+            // end of a read may be the first half of a \\r\\n, so the byte
+            // after it decides.
+            //
+            // A read carries the starts of later lines as well as the line
+            // it was asked for, and a pipe cannot be unread, so what a
+            // break leaves behind is kept for the next call.
+            let leftover = null;
+
+            function read_line() {
+                const line = [];
+
+                for (;;) {
+                    // A fresh buffer per read: the pieces a line
+                    // accumulates are views into it, and the next read
+                    // would otherwise overwrite bytes the line still
+                    // refers to.
+                    const piece = Buffer.alloc(4096);
+                    let read = 0;
+                    let from = 0;
+
+                    if (leftover !== null) {
+                        piece.set(leftover, 0);
+                        read = leftover.length;
+                        leftover = null;
+                    } else {
+                        try {
+                            read = fs.readSync(0, piece, 0, piece.length, null);
+                        } catch (error) {
+                            if (error.code === "EAGAIN") {
+                                Atomics.wait(view, WAKE, view[WAKE], 5);
+                                continue;
+                            }
+
+                            return null;
+                        }
+
+                        if (read <= 0) {
+                            return line.length > 0 ? Buffer.concat(line) : null;
+                        }
+                    }
+
+                    let break_at = -1;
+
+                    for (let i = from; i < read; i++) {
+                        const c = piece[i];
+
+                        if (c === 10 || c === 13) {
+                            break_at = i;
+                            break;
+                        }
+                    }
+
+                    if (break_at < 0) {
+                        line.push(piece.subarray(0, read));
+                        continue;
+                    }
+
+                    let rest_from = break_at + 1;
+
+                    if (piece[break_at] === 13) {
+                        if (break_at + 1 === read) {
+                            // The \\r is the read's last byte, so whether a
+                            // \\n follows it is one more read away.
+                            const next = Buffer.alloc(1);
+                            const extra = fs.readSync(0, next, 0, 1, null);
+
+                            if (extra > 0 && next[0] === 10) {
+                                rest_from = break_at + 2;
+                            } else {
+                                if (extra > 0) {
+                                    leftover = Buffer.from(next.subarray(0, extra));
+                                }
+                            }
+                        } else if (piece[break_at + 1] === 10) {
+                            rest_from = break_at + 2;
+                        }
+                    }
+
+                    line.push(piece.subarray(from, rest_from));
+
+                    if (rest_from < read) {
+                        leftover = Buffer.from(piece.subarray(rest_from, read));
+                    }
+
+                    return Buffer.concat(line);
+                }
+            }
+
+            for (;;) {
+                const line = read_line();
+
+                if (line === null) {
+                    Atomics.store(view, ENDED, 1);
+                    push_end();
+                    Atomics.notify(view, WAKE);
+                    break;
+                }
+
+                push(line);
+                Atomics.notify(view, WAKE);
+            }
+            })().catch((error) => {
+                // A watcher that cannot start leaves the reads on the plain
+                // input reader's path: the program still reads, it just
+                // never sees input as pending.
+                console.error("ghūl: the stdin watcher stopped: " + error.message);
+            });
+        `;
+
+        worker = new node_worker_threads.Worker(worker_source, {
+            eval: true,
+            workerData: { ring },
+        });
+
+        // A watcher that cannot start leaves the reads on the plain input
+        // reader's path: the program still reads, it just never sees input
+        // as pending.
+        worker.on("error", (error) => {
+            stderr("ghūl: the stdin watcher stopped: " + error.message);
+        });
+
+        worker.unref();
+    };
+
+    // The offset one past where a line of `length` bytes starting at
+    // `from` finishes.
+    const after = (from, length) => (from + 4 + length) % (RING_BYTES - HEADER);
+
+    // Takes one line out of the ring: null when none waits, and the pair
+    // of its bytes and whether it is the end of the input otherwise.
+    const take_line = () => {
+        if (Atomics.load(view, COUNT) <= 0) {
+            return null;
+        }
+
+        const read = view[READ];
+        const length = new DataView(ring, HEADER + read, 4).getUint32(0, true);
+
+        view[READ] = after(read, length === END_MARKER ? 0 : length);
+        Atomics.sub(view, COUNT, 1);
+        Atomics.notify(view, WAKE);
+
+        if (length === END_MARKER) {
+            return { bytes: null, ended: true };
+        }
+
+        return { bytes: bytes.slice(HEADER + read + 4, HEADER + read + 4 + length), ended: false };
+    };
+
+    // Hands the ring's lines to the plain input reader as the chunks it
+    // already knows how to read: each a complete line with the break that
+    // ended it, or the input's final piece without one, then null for the
+    // end of the input.
+    const pull = () => {
+        const taken = take_line();
+
+        if (taken === null) {
+            return "";
+        }
+
+        if (taken.ended) {
+            return null;
+        }
+
+        return decoder.decode(taken.bytes);
+    };
+
+    // Once the pump is running, standard input is read from the ring, so
+    // the reader the program holds is one over the pumped chunks.
+    let reading = null;
+
+    return {
+        pending() {
+            start();
+
+            return view !== null && Atomics.load(view, COUNT) > 0;
+        },
+
+        wait(ms) {
+            start();
+
+            if (view === null) {
+                return false;
+            }
+
+            const deadline = Date.now() + (ms > 0 ? ms : 3600000000);
+
+            for (;;) {
+                if (Atomics.load(view, COUNT) > 0 || Atomics.load(view, ENDED)) {
+                    return true;
+                }
+
+                const slice = Math.min(deadline - Date.now(), 5);
+
+                if (slice <= 0) {
+                    return false;
+                }
+
+                Atomics.wait(view, WAKE, view[WAKE], slice);
+            }
+        },
+
+        reader() {
+            start();
+
+            if (view === null) {
+                return reader;
+            }
+
+            if (reading === null) {
+                reading = input_reader(pull);
+            }
+
+            return reading;
+        },
+    };
+}
+// The bytes the engine reports in use on its heap, which is where
+// WasmGC objects live. With `force`, a full collection runs first so the
+// answer is what is live rather than what has not been reclaimed yet,
+// as .NET's GC.GetTotalMemory(true) answers. Node does not expose its
+// collector to a program unless asked at start-up, so the collector is
+// obtained from a fresh context after switching the flag on; where that
+// fails the answer is simply the unforced figure. Answers 0 where there
+// is no process to ask, which a heap watchdog reads as under any limit.
+let collect = undefined;
+
+function heap_bytes(force) {
+    if (!is_node) {
+        return 0;
+    }
+
+    if (force) {
+        if (collect === undefined) {
+            try {
+                node_v8.setFlagsFromString("--expose-gc");
+                collect = node_vm.runInNewContext("gc");
+            } catch {
+                collect = null;
+            }
+        }
+
+        collect?.();
+    }
+
+    return process.memoryUsage().heapUsed;
 }
 
 // The double a bigint converts to, as .NET converts one: the magnitude
