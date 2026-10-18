@@ -154,9 +154,9 @@ PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
     dotnet ghul-test --config llvm integration-tests
 ```
 
-`build/ghul-llvm.sh` fetches the release the tests are run with, the one
-`build/requirements.json` names, as a user's build fetches it, and prints where
-its executable is. The CI job runs the tests in an image with no C compiler,
+`build/ghul-llvm.sh` fetches the latest ghul-llvm release, as a user's build
+fetches it, and prints where its executable is. `build/requirements.json` names
+only the oldest release the compiler works with, the floor. The CI job runs the tests in an image with no C compiler,
 linker or C library, and then runs each program again in an empty image with
 `build/llvm-programs.sh`, which fails any program that is not fully static.
 
