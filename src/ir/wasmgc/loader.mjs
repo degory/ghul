@@ -613,8 +613,15 @@ function stdin_pump(reader, source, report) {
             // worker takes its module format from the nearest
             // package.json to the loader's directory, so neither the
             // CommonJS nor the module spelling can be relied on alone.
+            //
+            // Standard input is read as a stream on this thread's event
+            // loop rather than with a blocking read: a thread stuck in a
+            // read cannot be stopped, and the process would then not exit
+            // until the client closed its end of the pipe.
             (async () => {
                 const fs = await import("node:fs");
+                const net = await import("node:net");
+                const tty = await import("node:tty");
                 const { workerData } = await import("node:worker_threads");
 
                 const ring = workerData.ring;
@@ -630,6 +637,7 @@ function stdin_pump(reader, source, report) {
                 const DATA = ${DATA};
                 const END_MARKER = ${END_MARKER};
                 const MAX_ENTRY = ${MAX_ENTRY};
+                const HIGH_WATER = 8 * 1024 * 1024;
 
                 const put = (offset, source) => {
                     const first = Math.min(source.length, DATA - offset);
@@ -651,17 +659,15 @@ function stdin_pump(reader, source, report) {
                     return cell;
                 };
 
-                // Writes one entry once the ring has room for it.
-                function push(length, payload) {
+                // Writes one entry if the ring has room for it.
+                function try_push(length, payload) {
                     const used = 4 + (payload === null ? 0 : payload.length);
 
-                    while (DATA - Atomics.load(view, USED) < used) {
-                        Atomics.wait(view, WAKE, Atomics.load(view, WAKE), 50);
+                    if (DATA - Atomics.load(view, USED) < used) {
+                        return false;
                     }
 
-                    let write = view[WRITE];
-
-                    write = put(write, header_of(length));
+                    let write = put(view[WRITE], header_of(length));
 
                     if (payload !== null) {
                         write = put(write, payload);
@@ -671,116 +677,185 @@ function stdin_pump(reader, source, report) {
                     Atomics.add(view, USED, used);
                     Atomics.add(view, COUNT, 1);
                     Atomics.notify(view, WAKE);
+
+                    return true;
                 }
 
-                // Reads standard input to the next line break and answers
-                // the bytes of the line WITH the break that ended it, or
-                // null at the end of the input. Keeping the break is what
-                // lets the reader on the other side tell a complete line
-                // from the input's last piece, which has none. A lone
-                // carriage return ends a line the way .NET's ReadLine
-                // ends one, and one at the end of a read may be the first
-                // half of a carriage return and line feed, so the byte
-                // after it decides.
-                //
-                // A read carries the starts of later lines as well as the
-                // line it was asked for, and a pipe cannot be unread, so
-                // what a break leaves behind is kept for the next call.
-                let leftover = null;
+                // Resolves when the reader has taken something out of the
+                // ring, or after a short while.
+                function room() {
+                    const waiting = Atomics.waitAsync(view, WAKE, Atomics.load(view, WAKE), 50);
 
-                function read_line() {
-                    const line = [];
+                    return waiting.async ? waiting.value : Promise.resolve();
+                }
 
-                    for (;;) {
-                        // A fresh buffer per read: the pieces a line
-                        // accumulates are views into it, and the next read
-                        // would otherwise overwrite bytes the line still
-                        // refers to.
-                        const piece = Buffer.alloc(4096);
-                        let read = 0;
+                // Complete lines, each with the break that ended it, in the
+                // order read, then null for the end of the input. Keeping
+                // the break is what lets the reader on the other side tell
+                // a complete line from the input's last piece, which has
+                // none. A lone carriage return ends a line the way .NET's
+                // ReadLine ends one, and one at the end of a read may be
+                // the first half of a carriage return and line feed, so
+                // the byte after it decides.
+                const lines = [];
+                let queued = 0;
+                let parts = [];
+                let held = null;
 
-                        if (leftover !== null) {
-                            piece.set(leftover, 0);
-                            read = leftover.length;
-                            leftover = null;
+                function emit(buffer) {
+                    lines.push(buffer);
+                    queued += buffer.length;
+                }
+
+                function consume(chunk) {
+                    const length = chunk.length;
+                    let from = 0;
+                    let i = 0;
+
+                    if (held !== null && length > 0) {
+                        if (chunk[0] === 10) {
+                            emit(Buffer.concat([held, chunk.subarray(0, 1)]));
+                            from = 1;
+                            i = 1;
                         } else {
-                            try {
-                                read = fs.readSync(0, piece, 0, piece.length, null);
-                            } catch (error) {
-                                if (error.code === "EAGAIN") {
-                                    Atomics.wait(view, WAKE, Atomics.load(view, WAKE), 5);
-                                    continue;
-                                }
-
-                                if (error.code === "EOF") {
-                                    read = 0;
-                                } else {
-                                    throw error;
-                                }
-                            }
-
-                            if (read <= 0) {
-                                return line.length > 0 ? Buffer.concat(line) : null;
-                            }
+                            emit(held);
                         }
 
-                        let break_at = -1;
+                        held = null;
+                    }
 
-                        for (let i = 0; i < read; i++) {
-                            if (piece[i] === 10 || piece[i] === 13) {
-                                break_at = i;
+                    for (; i < length; i++) {
+                        const c = chunk[i];
+                        let end;
+
+                        if (c === 10) {
+                            end = i + 1;
+                        } else if (c === 13) {
+                            if (i + 1 < length) {
+                                end = chunk[i + 1] === 10 ? i + 2 : i + 1;
+                            } else {
+                                held = Buffer.concat([...parts, Buffer.from(chunk.subarray(from, i + 1))]);
+                                parts = [];
+                                from = length;
                                 break;
                             }
-                        }
-
-                        if (break_at < 0) {
-                            line.push(piece.subarray(0, read));
+                        } else {
                             continue;
                         }
 
-                        let rest_from = break_at + 1;
+                        emit(Buffer.concat([...parts, Buffer.from(chunk.subarray(from, end))]));
+                        parts = [];
+                        from = end;
+                        i = end - 1;
+                    }
 
-                        if (piece[break_at] === 13) {
-                            if (break_at + 1 === read) {
-                                const next = Buffer.alloc(1);
-                                const extra = fs.readSync(0, next, 0, 1, null);
+                    if (from < length) {
+                        parts.push(Buffer.from(chunk.subarray(from)));
+                    }
+                }
 
-                                if (extra > 0 && next[0] === 10) {
-                                    rest_from = break_at + 2;
-                                } else if (extra > 0) {
-                                    leftover = Buffer.from(next.subarray(0, extra));
-                                }
-                            } else if (piece[break_at + 1] === 10) {
-                                rest_from = break_at + 2;
+                function finish() {
+                    if (held !== null) {
+                        emit(held);
+                        held = null;
+                    }
+
+                    if (parts.length > 0) {
+                        emit(Buffer.concat(parts));
+                        parts = [];
+                    }
+
+                    lines.push(null);
+                }
+
+                // Moves lines into the ring as it has room, pausing the
+                // stream while a lot is waiting so a fast writer does not
+                // grow this thread's memory without bound.
+                let flushing = false;
+                let stream = null;
+
+                async function flush() {
+                    if (flushing) {
+                        return;
+                    }
+
+                    flushing = true;
+
+                    while (lines.length > 0) {
+                        const line = lines[0];
+
+                        if (line === null) {
+                            if (!try_push(END_MARKER, null)) {
+                                await room();
+                                continue;
                             }
+
+                            Atomics.store(view, ENDED, 1);
+                            Atomics.notify(view, WAKE);
+                            lines.shift();
+                            break;
                         }
 
-                        line.push(piece.subarray(0, rest_from));
+                        let done = 0;
 
-                        if (rest_from < read) {
-                            leftover = Buffer.from(piece.subarray(rest_from, read));
+                        while (done < line.length) {
+                            const piece = line.subarray(done, done + MAX_ENTRY);
+
+                            if (!try_push(piece.length, piece)) {
+                                await room();
+                                continue;
+                            }
+
+                            done += piece.length;
                         }
 
-                        return Buffer.concat(line);
+                        queued -= line.length;
+                        lines.shift();
+
+                        if (queued < HIGH_WATER / 2) {
+                            stream?.resume();
+                        }
                     }
+
+                    flushing = false;
                 }
 
-                for (;;) {
-                    const line = read_line();
+                // The stream a descriptor needs: a terminal, a pipe or
+                // socket, or a file, as Node's own standard input chooses.
+                if (tty.isatty(0)) {
+                    stream = new tty.ReadStream(0);
+                } else {
+                    const stat = fs.fstatSync(0);
 
-                    if (line === null) {
-                        push(END_MARKER, null);
-                        Atomics.store(view, ENDED, 1);
-                        Atomics.notify(view, WAKE);
-                        break;
-                    }
-
-                    for (let from = 0; from < line.length; from += MAX_ENTRY) {
-                        const piece = line.subarray(from, from + MAX_ENTRY);
-
-                        push(piece.length, piece);
-                    }
+                    stream = stat.isFIFO() || stat.isSocket()
+                        ? new net.Socket({ fd: 0, readable: true, writable: false })
+                        : fs.createReadStream(null, { fd: 0, autoClose: false });
                 }
+
+                stream.on("data", (chunk) => {
+                    consume(chunk);
+
+                    if (queued > HIGH_WATER) {
+                        stream.pause();
+                    }
+
+                    flush();
+                });
+
+                stream.on("end", () => {
+                    finish();
+                    flush();
+                });
+
+                // A pipe closed from the other end reads as the end.
+                stream.on("error", (error) => {
+                    if (error.code === "EOF" || error.code === "EPIPE" || error.code === "ECONNRESET") {
+                        finish();
+                        flush();
+                    } else {
+                        throw error;
+                    }
+                });
             })();
         `;
 
