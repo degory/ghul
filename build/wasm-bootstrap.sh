@@ -121,4 +121,18 @@ fi
 
 exec 3>&-
 
+# A client that closes its end of the pipe, as the editor does on shutdown,
+# ends the analyser rather than leaving it waiting for input.
+printf '%s\n' '{"kind":"set_open_files","paths":["a.ghul"]}' \
+    | timeout 60 node "$work/pass-2/ghul.mjs" --target wasm --analyse @"$work/libraries.rsp" \
+    > "$work/closed.json" 2> "$work/closed.log" && closed=0 || closed=$?
+
+if [ "$closed" -eq 0 ]; then
+    echo "analysis mode exits when its input closes"
+else
+    cat "$work/closed.log"
+    echo "analysis mode did not exit when its input closed (status $closed)"
+    status=1
+fi
+
 exit $status
