@@ -56,16 +56,50 @@ namespace Analysis is
 
         // Whether a frame can arrive in the queue while the despatcher is
         // busy, which is what answering a query or seeing an edit mid-compile
-        // depends on.
+        // depends on. On .NET the reader thread fills the queue whatever the
+        // despatcher is doing. On wasm the queue is filled by draining the
+        // input the host has already received, at the safe points below, and
+        // the host answers whether a line is waiting; on llvm there is no
+        // analysis mode to serve.
         @IF.dotnet()
         reads_while_compiling: bool static => true
 
-        @IF.not.dotnet()
+        @IF.wasm()
+        reads_while_compiling: bool static => true
+
+        @IF.llvm()
         reads_while_compiling: bool static => false
 
         _read_loop() is
             while _read_one() do od
         si
+
+        // Takes whatever complete lines the host is holding onto the queue,
+        // without waiting for any. The host answers has_pending_input only
+        // for a line it holds in full, so a frame the client is still
+        // writing stays on the wire until its last byte arrives.
+        //
+        // Called at the points a compile can pause - the per-file
+        // boundaries the queries are served at - and before every wait, in
+        // place of the reader thread .NET runs.
+        @IF.wasm()
+        _drain_available() is
+            if _ended then
+                return
+            fi
+
+            while IO.Std.has_pending_input() do
+                if !_read_one() then
+                    return
+                fi
+            od
+        si
+
+        // Whether the input has ended. Once it has, every later drain
+        // stops: END_OF_INPUT is answered to every later take as well as
+        // to the one that reached it, and the host has nothing more to
+        // give.
+        _ended: bool
 
         // Read the next non-blank line and queue it, or END_OF_INPUT where
         // there is none; false once the input has ended.
@@ -82,6 +116,7 @@ namespace Analysis is
                 yrt
 
                 if !line? then
+                    _ended = true
                     _push(QueuedFrame.END_OF_INPUT)
 
                     return false
@@ -146,8 +181,31 @@ namespace Analysis is
         @IF.not.dotnet()
         _pulse() is si
 
-        // Read the next frame where it is, however long that takes.
-        @IF.not.dotnet()
+        // Wait for the host to hold a complete line, giving up after
+        // timeout_ms; false where it gave up. Zero or less waits for as
+        // long as it takes. What arrives is queued before returning, so the
+        // caller's loop sees a frame rather than waiting again for a line
+        // that is already here; at the end of the input the host answers
+        // true as well, and the read below queues END_OF_INPUT.
+        @IF.wasm()
+        _wait(timeout_ms: int) -> bool is
+            if !IO.Std.wait_for_input(timeout_ms) then
+                return false
+            fi
+
+            _drain_available()
+
+            // The host also answers true at the end of the input, where it
+            // holds no line to drain: read once so END_OF_INPUT is queued
+            // rather than waited for again.
+            if _frames.count == 0 /\ !_ended then
+                _read_one()
+            fi
+
+            return true
+        si
+
+        @IF.llvm()
         _wait(timeout_ms: int) -> bool is
             _read_one()
 
@@ -164,6 +222,9 @@ namespace Analysis is
             _enter()
 
             try
+                @IF.wasm()
+                _drain_available()
+
                 while _frames.count == 0 do
                     if !_wait(timeout_ms) then
                         return QueuedFrame.TIMED_OUT
@@ -193,6 +254,9 @@ namespace Analysis is
             _enter()
 
             try
+                @IF.wasm()
+                _drain_available()
+
                 if _frames.count == 0 then
                     return null
                 fi
@@ -219,6 +283,9 @@ namespace Analysis is
             _enter()
 
             try
+                @IF.wasm()
+                _drain_available()
+
                 for frame in _frames do
                     if let queued: QueuedFrame.REQUEST = frame /\ wanted(queued.request) then
                         return true

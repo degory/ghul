@@ -32,6 +32,8 @@ Only the expressions-only walk is abandoned this way. Stopping part-way through 
 
 Clients must not write an edit during a compile without seeing the `compile-abort` capability in the `listen` frame. An analyser without it reads the edit only once the compile it should have interrupted has finished, so the client pays the wait it was trying to avoid *and* holds no edit back to shorten the next one.
 
+The idle exit is advertised as the `idle-exit` capability in the `listen` frame. An analyser that cannot wait with a timeout waits for the next request however long it takes and does not advertise it, so a client must not expect an `exit` frame from one that lacks it. The paragraph below describes an analyser that has it.
+
 The analyser also exits when it has been left alone. `--analysis-idle-timeout <seconds>` (default 1800, `0` to disable) bounds how long it will wait for a request before writing an `exit` frame and exiting **0**. A warm analyser retains the whole symbol table, so an editor window left open overnight holds hundreds of megabytes to answer nothing; the cold rebuild the next request pays is the cheaper side of that trade.
 
 The timeout is armed only while waiting for a request — `read_request_or_timeout` in `protocol/` — so it can neither interrupt a response mid-frame nor be tripped by a slow compile, however long the compile takes. That leaves one race: a request that lands between the wait expiring and the process going is lost, which reaches the client as a request answered by the pipe closing. Clients handle that case already, for crashes and recycles.
