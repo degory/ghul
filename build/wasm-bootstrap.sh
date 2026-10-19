@@ -82,4 +82,43 @@ else
     status=1
 fi
 
+# The analyser reads requests while it compiles, so it says so, and it exits
+# when left idle - with the client's end of the pipe still open, which is
+# the case a worker blocked in a read once made hang.
+for capability in mid-compile-queries compile-abort idle-exit; do
+    if ! grep -q "\"$capability\"" "$work/analysis.json"; then
+        echo "analysis mode does not advertise $capability"
+        status=1
+    fi
+done
+
+mkfifo "$work/idle.in"
+
+node "$work/pass-2/ghul.mjs" --target wasm --analyse --analysis-idle-timeout 2 @"$work/libraries.rsp" \
+    < "$work/idle.in" > "$work/idle.json" 2> "$work/idle.log" &
+analyser=$!
+
+# Held open until the analyser has had time to exit by itself.
+exec 3> "$work/idle.in"
+printf '%s\n' '{"kind":"set_open_files","paths":["a.ghul"]}' >&3
+
+for _ in $(seq 1 150); do
+    kill -0 "$analyser" 2>/dev/null || break
+    sleep 0.2
+done
+
+if kill -0 "$analyser" 2>/dev/null; then
+    kill "$analyser" 2>/dev/null || true
+    echo "analysis mode did not exit when idle"
+    status=1
+elif grep -q '"kind":"exit"' "$work/idle.json"; then
+    echo "analysis mode exits when idle"
+else
+    cat "$work/idle.json" "$work/idle.log"
+    echo "analysis mode exited without saying why"
+    status=1
+fi
+
+exec 3>&-
+
 exit $status
