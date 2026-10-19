@@ -16,7 +16,7 @@ ghūl keywords are lowercase. Identifiers follow a convention that the compiler 
 
 An exception class, `Exception` itself or one that derives from it directly or through other classes, is `PascalCase` whether or not it is abstract: it is named where it is thrown and where it is caught, which is where naming the concrete type is right, and every exception imported from .NET is spelled that way already.
 
-A `static` field or property reads as a named constant, so it accepts either `snake_case` or `UPPER_SNAKE_CASE`.
+A `static` field or property reads as a named constant, so it accepts either `snake_case` or `UPPER_SNAKE_CASE`. So does a property declared as an expression-bodied getter with no setter (`NAME: string => "x"`); one with a block getter or a setter keeps the `snake_case` rule.
 
 A leading underscore (`_name`) marks a declaration as non-public — there are no `public`/`private` keywords, the naming convention carries that information. Whatever it is attached to, an underscore-prefixed name is **private to the assembly it is declared in**: another assembly cannot see it at all, and a reference to one from outside is a compile error.
 
