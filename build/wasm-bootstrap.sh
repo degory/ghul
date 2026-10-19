@@ -135,4 +135,18 @@ else
     status=1
 fi
 
+# A function declared extern is an import the program's caller supplies, by
+# name. The program is built by the wasm-built compiler and run with them.
+mkdir -p "$work/extern"
+
+if node "$work/pass-2/ghul.mjs" --target wasm -o "$work/extern/program" @"$work/libraries.rsp" "$root/build/wasm-externs/test.ghul" > "$work/extern.log" 2>&1 &&
+    node "$root/build/wasm-externs/run.mjs" "$work/extern/program.mjs" > "$work/extern.out" 2>> "$work/extern.log" &&
+    cmp -s "$work/extern.out" "$root/build/wasm-externs/expected.txt"; then
+    echo "extern functions are supplied by the caller"
+else
+    cat "$work/extern.log" "$work/extern.out" 2>/dev/null
+    echo "extern functions were not supplied by the caller"
+    status=1
+fi
+
 exit $status
