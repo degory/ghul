@@ -61,7 +61,7 @@ echo "$output/wasmgc_loader_text.ghul" >> "$output/sources.rsp.tmp"
 mv "$output/sources.rsp.tmp" "$output/sources.rsp"
 
 # A native build of the compiler reports the version GHUL_NATIVE_VERSION
-# names, and the requirements beside this script, through a copy of
+# names, through a copy of
 # src/driver/native_build.ghul compiled in place of the committed one.
 if [ -n "${GHUL_NATIVE_VERSION:-}" ]; then
     case "$GHUL_NATIVE_VERSION" in
@@ -71,15 +71,11 @@ if [ -n "${GHUL_NATIVE_VERSION:-}" ]; then
             ;;
     esac
 
-    requirements=$(sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/{/{{/g' -e 's/}/}}/g' "$root/build/requirements.json" | awk '{ printf "%s\\n", $0 }')
-
     cat > "$output/native_build.ghul" <<EOF
 namespace Driver is
     @IF.not.dotnet()
     class NATIVE_BUILD is
         version: string static => "$GHUL_NATIVE_VERSION"
-
-        requirements: string static => "$requirements"
 
         @IF.wasm()
         host: string static => "wasm"
