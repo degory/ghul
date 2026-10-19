@@ -49,7 +49,8 @@ namespace Syntax.Process is
             name =~ "equality" \/
             name =~ "intrinsic" \/
             name =~ "trusted_store_free" \/
-            name =~ "finalizer"
+            name =~ "finalizer" \/
+            name =~ "extern"
 
         resolve(pragma: Trees.Pragmas.PRAGMA, target: Semantic.Symbols.Symbol?) is
             let name = pragma.name.to_string()
@@ -128,6 +129,11 @@ namespace Syntax.Process is
 
             if name =~ "finalizer" then
                 _resolve_finalizer(pragma, target)
+                return
+            fi
+
+            if name =~ "extern" then
+                _resolve_extern(pragma, target)
                 return
             fi
 
@@ -322,6 +328,125 @@ namespace Syntax.Process is
                 _logger.error(pragma.name.location, "finalizer applies only to an instance method of a non-generic class, taking no arguments")
             fi
         si
+
+        // `extern(module, name)` declares a function the program is linked
+        // with rather than defines: the call is the foreign code's, so the
+        // declaration takes no body. What may cross, and what the module
+        // means, depends on the target; each is reported here, before any
+        // code is written.
+        _resolve_extern(pragma: Trees.Pragmas.PRAGMA, target: Semantic.Symbols.Symbol) is
+            let function = cast Semantic.Symbols.Function?(target)
+
+            if !function? \/ function.is_instance then
+                _logger.error(pragma.name.location, "extern applies only to a global function or a static method")
+                return
+            fi
+
+            if function.is_generic \/ (cast Semantic.Symbols.Classy?(function.owner)?.is_generic ?? false) then
+                _logger.error(pragma.name.location, "a function declared extern cannot be generic")
+                return
+            fi
+
+            if !function.is_declared_without_body then
+                _logger.error(pragma.name.location, "a function declared extern is the call into foreign code, so it takes no body of its own")
+                return
+            fi
+
+            let module = pragma.try_get_string_literal_at(0)
+            let name = pragma.try_get_string_literal_at(1)
+
+            if !module? \/ !name? \/ name.length == 0 then
+                _logger.error(pragma.name.location, "extern takes the module and the name to call, both strings")
+                return
+            fi
+
+            let build_target = IoC.CONTAINER.instance.build_flags.target
+
+            if build_target == Compiler.Target.DOTNET /\ module.length == 0 then
+                _logger.error(pragma.name.location, "the library to call into is missing from this extern")
+                return
+            fi
+
+            if build_target == Compiler.Target.WASM /\ module.length != 0 then
+                _logger.error(pragma.name.location, "extern on the wasm target names no library: the module must be empty")
+                return
+            fi
+
+            if build_target == Compiler.Target.LLVM /\ name.starts_with("llvm.") then
+                _logger.error(pragma.name.location, "extern cannot name {name}: LLVM reserves names beginning llvm.")
+                return
+            fi
+
+            let result = _extern_result(pragma)
+
+            if !result? then
+                return
+            fi
+
+            let signature = Semantic.PINVOKE_SIGNATURE(_innate_symbol_lookup)
+            let names = function.argument_names
+
+            for i in 0..function.arguments.count do
+                if !signature.can_take_on(function.arguments[i], build_target) then
+                    _logger.error(
+                        pragma.name.location,
+                        "{names[i]} is a {function.arguments[i]}, which cannot be passed to foreign code")
+
+                    return
+                fi
+            od
+
+            if !signature.can_return_on(function.return_type, build_target, result != Semantic.ExternResult.NONE) then
+                _logger.error(
+                    pragma.name.location,
+                    "{function.return_type} cannot be returned from foreign code")
+
+                return
+            fi
+
+            function.extern_import = Semantic.EXTERN_IMPORT(module, name, result)
+
+            _pin_extern_to_import(function, module, name)
+        si
+
+        // The ownership the declaration gives a string it answers with:
+        // `result = "copy"` for text the callee keeps, `result = "take"` for
+        // text the callee allocated with the C library's malloc.
+        _extern_result(pragma: Trees.Pragmas.PRAGMA) -> Semantic.ExternResult? is
+            let result mut = Semantic.ExternResult.NONE
+
+            if pragma.named_arguments? then
+                for argument in pragma.named_arguments do
+                    if argument.name.name !~ "result" then
+                        _logger.error(argument.name.location, "extern has no argument named {argument.name.name}")
+                        return null
+                    fi
+
+                    let text = argument.value.try_get_string_literal()
+
+                    if text? /\ text =~ "copy" then
+                        result = Semantic.ExternResult.COPY
+                    elif text? /\ text =~ "take" then
+                        result = Semantic.ExternResult.TAKE
+                    else
+                        _logger.error(argument.name.location, "result is \"copy\" or \"take\"")
+                        return null
+                    fi
+                od
+            fi
+
+            return result
+        si
+
+        // On .NET the declaration is the call `DllImport` names, so it is
+        // emitted as one.
+        @IF.dotnet()
+        _pin_extern_to_import(function: Semantic.Symbols.Function, module: string, name: string) is
+            function.pinvoke = Semantic.PINVOKE_IMPORT(module, name, cast System.Reflection.MethodImportAttributes(0))
+        si
+
+        @IF.not.dotnet()
+        _pin_extern_to_import(function: Semantic.Symbols.Function, module: string, name: string) is si
 
         // ObsoleteAttribute's arguments, in constructor order: a message,
         // then whether a use is an error. Either can be left out.
