@@ -2707,7 +2707,7 @@ On .NET an `@extern` is the `DllImport` it stands for, with the platform's defau
 
 What may cross is what the machine lays out the same way on both sides. The scalars `bool`, `char`, `byte`, `ubyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `word`, `uword`, `single` and `double` cross as the C types of the same width, and a `string` argument is a NUL-terminated UTF-8 copy made for the call and released after it. Pointers and `ref` arguments cross on .NET only. Anything else, such as a class, a tuple, an array or a function, is reported at the declaration. A foreign function that keeps the pointer it was given after it returns is in undefined behaviour, as with any marshalled call.
 
-A function answering a string says who owns the text with a named argument, and is otherwise rejected on .NET and llvm: `result = "copy"` copies text the callee keeps (as `getenv` answers), and `result = "take"` copies text the callee allocated with the C library's `malloc` and then releases it with `free`. A null answer is the absent string, so the return type is `string?`.
+A function answering a string says who owns the text with a named argument, on llvm; a string answer is rejected on .NET, and on wasm needs no argument: `result = "copy"` copies text the callee keeps (as `getenv` answers), and `result = "take"` copies text the callee allocated with the C library's `malloc` and then releases it with `free`. A null answer is the absent string, so the return type is `string?`.
 
 ```ghul
 @extern("libc", "getenv", result = "copy")
