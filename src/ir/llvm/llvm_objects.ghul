@@ -446,7 +446,11 @@ namespace IR.LLVMTarget is
                 return found
             fi
 
-            let name = names.unique("{names.type_label(type)}.{part}")
+            let label = "{names.type_label(type)}.{part}"
+
+            // Another cell must reach this global by the name it was given
+            // here, so the name is the label itself, not the first free one.
+            let name = if CELL_LINK.is_active /\ _class_linkage(type) != Linkage.INTERNAL then names.claim(label) else names.unique(label) fi
 
             _global_names[key] = name
 
@@ -521,6 +525,14 @@ namespace IR.LLVMTarget is
             return result
         si
 
+        // The name of the flag recording that `type`'s static constructor has
+        // run: shared by every cell, so the same in each.
+        _flag_name(type: CLASS_INSTANCE) -> string is
+            let label = "{names.type_label(type)}.$initialised"
+
+            return if CELL_LINK.is_active then names.claim(label) else names.unique(label) fi
+        si
+
         /// The static constructor of `type` and the name of the global flag
         /// recording that it has run, or null where `type` has none.
         static_constructor(type: CLASS_INSTANCE) -> (constructor: FUNCTION_INSTANCE, flag: string)? is
@@ -534,7 +546,7 @@ namespace IR.LLVMTarget is
 
             for method in SRM_MEMBER_ORDER.methods(SRM_EMITTED_TYPE(type.definition)) do
                 if method.is_static_constructor then
-                    result = (FUNCTION_INSTANCE(method, type.type_map), names.unique("{names.type_label(type)}.$initialised"))
+                    result = (FUNCTION_INSTANCE(method, type.type_map), _flag_name(type))
                 fi
             od
 
@@ -569,9 +581,28 @@ namespace IR.LLVMTarget is
             if !_is_built /\ reach? then
                 _note_trait_instances(type.definition, type.type_map)
 
+                // A cell loaded later can call any virtual method of this class,
+                // or of one it inherits from, through a descriptor this cell
+                // defines, so none can be left uncompiled.
+                if CELL_LINK.cell_of(type.definition)? then
+                    _reach_virtuals(type)
+                fi
+
                 for call in LIST[(method: Function, arguments: Collections.List[Type])](_generic_calls) do
                     _reach_generic(type, call.method, call.arguments)
                 od
+            fi
+        si
+
+        _reach_virtuals(type: CLASS_INSTANCE) is
+            for method in methods_of(type.definition) do
+                if DISPATCH_PLAN.is_dispatched(method) /\ !method.is_abstract then
+                    reach!(FUNCTION_INSTANCE(method, type.type_map))
+                fi
+            od
+
+            if let parent = _plan.parent(type) then
+                _reach_virtuals(parent)
             fi
         si
 
@@ -650,7 +681,9 @@ namespace IR.LLVMTarget is
         /// The one implementation a call to `selector` can run on a value
         /// that can exist, or null where there is more than one.
         only_implementation(selector: TRAIT_SELECTOR) -> FUNCTION_INSTANCE? =>
-            if _is_built then
+            if CELL_LINK.is_active then
+                null
+            elif _is_built then
                 _plan.only_implementation(selector, id => _can_exist_by_id(id)) ?? _plan.only_implementation(selector)
             else
                 _plan.only_implementation(selector)
@@ -682,7 +715,7 @@ namespace IR.LLVMTarget is
         /// The one implementation a call through `slot` can run on a value
         /// that can exist, or null where there is more than one.
         only_slot_implementation(slot: DISPATCH_SLOT) -> FUNCTION_INSTANCE? =>
-            if _is_built then _plan.only_slot_implementation(slot, type => _is_allocated(type)) else null fi
+            if CELL_LINK.is_active then null elif _is_built then _plan.only_slot_implementation(slot, type => _is_allocated(type)) else null fi
 
         _by_number: MAP[int, CLASS_INSTANCE]?
 
@@ -763,6 +796,16 @@ namespace IR.LLVMTarget is
 
             for type in LIST[CLASS_INSTANCE](_unit_variants) do
                 let layout = _layouts[type]
+
+                if CELL_LINK.is_active /\ CELL_LINK.is_prebuilt(type.definition) then
+                    let declaration = GLOBAL_VARIABLE(unit_variant_name(type), struct_type(type), null, false)
+
+                    declaration.linkage = Linkage.EXTERNAL
+
+                    _module.add_global(declaration)
+
+                    continue
+                fi
                 let values = LIST[LLVM.Value]()
 
                 values.add(Values.global(descriptor_name(type)))
@@ -774,15 +817,15 @@ namespace IR.LLVMTarget is
                 let struct_type = struct_type(type)
                 let global = GLOBAL_VARIABLE(unit_variant_name(type), struct_type, LLVM.Value.AGGREGATE(values.to_array(), struct_type), false)
 
-                global.linkage = Linkage.INTERNAL
+                global.linkage = _class_linkage(type)
                 global.alignment = 8
 
                 _module.add_global(global)
             od
 
-            for (_, constructor) in _static_constructors do
+            for (type, constructor) in _static_constructors do
                 if let (_, flag) = constructor then
-                    _add_global(flag, Types.i32)
+                    _add_class_global(type, flag, Types.i32)
                 fi
             od
         si
@@ -877,7 +920,43 @@ namespace IR.LLVMTarget is
 
             let global = GLOBAL_VARIABLE(name, type, LLVM_TYPES.zero(type), false)
 
-            global.linkage = if CELL_LINK.is_exported(symbol) then Linkage.EXTERNAL else Linkage.INTERNAL fi
+            global.linkage = if CELL_LINK.is_exported(symbol) then Linkage.EXTERNAL else Linkage.WEAK fi
+
+            _module.add_global(global)
+        si
+
+        // How a global of `type` is linked: a cell defines the classes it
+        // declares for the cells after it, names those an earlier cell
+        // defines, shares those a source library declares or a generic is
+        // instantiated for, and keeps the compiler's own to itself.
+        _class_linkage(type: CLASS_INSTANCE) -> Linkage is
+            if !CELL_LINK.is_active then
+                return Linkage.INTERNAL
+            fi
+
+            if CELL_LINK.is_prebuilt(type.definition) \/ CELL_LINK.is_exported(type.definition) then
+                return Linkage.EXTERNAL
+            fi
+
+            return if isa Semantic.Symbols.FRAME(type.definition) then Linkage.INTERNAL else Linkage.WEAK fi
+        si
+
+        // A global that belongs to a class: defined here, or only named
+        // here where an earlier cell defines the class.
+        _add_class_global(type: CLASS_INSTANCE, name: string, global_type: LLVM.Type) is
+            if CELL_LINK.is_active /\ CELL_LINK.is_prebuilt(type.definition) then
+                let declaration = GLOBAL_VARIABLE(name, global_type, null, false)
+
+                declaration.linkage = Linkage.EXTERNAL
+
+                _module.add_global(declaration)
+
+                return
+            fi
+
+            let global = GLOBAL_VARIABLE(name, global_type, LLVM_TYPES.zero(global_type), false)
+
+            global.linkage = _class_linkage(type)
 
             _module.add_global(global)
         si
@@ -892,6 +971,20 @@ namespace IR.LLVMTarget is
 
         _add_descriptor(type: CLASS_INSTANCE, strings: LLVM_STRINGS, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
             let entries = LIST[LLVM.Value]()
+
+            // An earlier cell defines this descriptor: only its type is needed
+            // here, which is the number of slots it has.
+            if CELL_LINK.is_active /\ CELL_LINK.is_prebuilt(type.definition) then
+                let slots = if _plan.has_slots(type) then _plan.slot_entries(type).count else 0 fi
+                let declaration_type = Types.structure([Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, LLVM.Type.ARRAY(slots, Types.pointer)])
+                let declaration = GLOBAL_VARIABLE(descriptor_name(type), declaration_type, null, false)
+
+                declaration.linkage = Linkage.EXTERNAL
+
+                _module.add_global(declaration)
+
+                return
+            fi
 
             if _plan.has_slots(type) then
                 for entry in _plan.slot_entries(type) do
@@ -939,7 +1032,7 @@ namespace IR.LLVMTarget is
 
             let global = GLOBAL_VARIABLE(descriptor_name(type), descriptor_type, initializer, true)
 
-            global.linkage = Linkage.INTERNAL
+            global.linkage = _class_linkage(type)
             global.alignment = 8
 
             _module.add_global(global)
