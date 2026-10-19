@@ -151,6 +151,8 @@ llvm job. A test author adding `llvm` to a `targets` file runs it that way:
 
 ```sh
 PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
+    build/llvm-test-objects.sh
+PATH="$(dirname "$(build/ghul-llvm.sh /tmp/ghul-llvm)"):$PATH" \
     dotnet ghul-test --config llvm integration-tests
 ```
 

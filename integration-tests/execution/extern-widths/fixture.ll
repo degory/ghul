@@ -3,7 +3,7 @@
 ; result is returned as the callee leaves it, with the upper bits of the
 ; register whatever the computation left there.
 ;
-; Rebuild with: ghul-llvm --emit=obj fixture.ll -o fixture.o
+; Built by build/llvm-test-objects.sh, which the llvm test runs need first.
 
 target triple = "x86_64-unknown-linux-musl"
 
