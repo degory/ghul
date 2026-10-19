@@ -52,6 +52,10 @@ class Exit extends Error {
 //   file system rather than files in memory; by default it does when run
 //   by Node with neither options.files nor options.onfile given, and never
 //   anywhere else, which has no file system to reach
+// - options.externs: the functions the program declares extern, as an object
+//   from the name each is declared with to the function that answers it; by
+//   default there are none, and a program that declares one cannot start.
+//   Numbers cross as numbers, a long as a BigInt, and a string as a string
 //
 // Answers the program's exit status.
 export async function run(options = {}) {
@@ -251,7 +255,7 @@ export async function run(options = {}) {
         },
     };
 
-    const imports = { "ghul:host": host };
+    const imports = { "ghul:host": host, "ghul:extern": options.externs ?? {} };
     const compile_options = { builtins: ["js-string"] };
 
     const source = await load(options.module ?? new URL(MODULE_FILE, import.meta.url));

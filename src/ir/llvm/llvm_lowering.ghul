@@ -2837,6 +2837,11 @@ namespace IR.LLVMTarget is
                 TYPE_MAPS.function_map(function, _type_map))
 
         _call(function: Function, arguments: Collections.List[Value]) is
+            if function.is_extern then
+                _call_extern(function, arguments)
+                return
+            fi
+
             // A constructor intrinsic is an ordinary method, called as one.
             if let operation = function.intrinsic_operation /\ !operation.starts_with("constructor.") then
                 if operation.starts_with("host.") then
@@ -3276,6 +3281,154 @@ namespace IR.LLVMTarget is
                     _push(answer)
                 fi
             fi
+        si
+
+        // A call to a function the program is linked with: the C symbol is
+        // declared as the signature says and called with the C ABI. A string
+        // argument is a NUL-terminated UTF-8 copy made for the call and
+        // released after it; a string answer is copied out, and released
+        // too where the declaration says the callee handed it over.
+        _call_extern(function: Function, arguments: Collections.List[Value]) is
+            let strings = _strings
+            let import = function.extern_import
+
+            if !strings? \/ !import? then
+                _report("a call to {function.name}")
+                return
+            fi
+
+            let result = _specialize(function.return_type)
+            let formals = function.arguments
+            let parameter_types = LIST[LLVM.Type]()
+            let parameter_attributes = LIST[LLVM.Attribute?]()
+            let values = LIST[LLVM.Value]()
+            let buffers = LIST[LLVM.Value]()
+
+            for i in 0..arguments.count do
+                let formal = if i < formals.count then formals[i] else arguments[i].type fi
+                let value = _value_of(arguments[i])
+
+                if !value? then
+                    return
+                fi
+
+                if let scalar = _scalar(formal) then
+                    parameter_types.add(_c_type(scalar))
+                    parameter_attributes.add(_c_extension(scalar))
+                    values.add(_to_c(value, scalar))
+                elif _is_string(_specialize(formal)) then
+                    let text = _current.select(_current.compare(IntegerPredicate.EQ, value, LLVM.Values.null_pointer), strings.literal(""), value)
+                    let buffer = _c_string(strings, text)
+
+                    parameter_types.add(Types.pointer)
+                    parameter_attributes.add(null)
+                    values.add(buffer)
+                    buffers.add(buffer)
+                else
+                    _report("a foreign function taking {formal}")
+                    return
+                fi
+            od
+
+            let result_scalar = if LLVM_TYPES.is_void(result) then null else _scalar(result) fi
+            let answers_string = !LLVM_TYPES.is_void(result) /\ !result_scalar? /\ _is_string(result)
+
+            let result_type =
+                if LLVM_TYPES.is_void(result) then
+                    LLVM.Type.VOID
+                elif let scalar = result_scalar then
+                    _c_type(scalar)
+                elif answers_string then
+                    Types.pointer
+                else
+                    null
+                fi
+
+            if !result_type? then
+                _report("a foreign function answering {result}")
+                return
+            fi
+
+            let callee = strings.runtime(import.name, result_type, parameter_types.to_array())
+
+            // A small argument is extended to a register, as clang does for
+            // the callee that relies on it. A small result is not marked
+            // extended: a callee built by another compiler may leave the
+            // upper bits of the register as they were, so the extension is
+            // made here from the bits the type says are meaningful.
+            for (i, attribute) in parameter_attributes |> Ghul.Pipes.index() do
+                if let a = attribute /\ callee.parameters[i].attributes.count == 0 then
+                    callee.parameters[i].attributes.add(a)
+                fi
+            od
+
+            let answer = _current.call(callee, values.to_array())
+
+            for buffer in buffers do
+                _current.call(strings.runtime("free", LLVM.Type.VOID, [Types.pointer]), [buffer])
+            od
+
+            if !answer? then
+                return
+            fi
+
+            if let scalar = result_scalar then
+                _push(_from_c(answer, scalar))
+            elif answers_string then
+                _push(_string_from_c(strings, answer, import.result == Semantic.ExternResult.TAKE))
+            fi
+        si
+
+        // `text` as NUL-terminated UTF-8 in memory from the C library's
+        // malloc, which the caller frees.
+        _c_string(strings: LLVM_STRINGS, text: LLVM.Value) -> LLVM.Value is
+            let length = strings.length(_current, text)
+            let wide = _current.convert(Conversion.ZERO_EXTEND, length, Types.i64)
+            let room = _current.binary(LLVM.BinaryOperator.ADD, LLVM.IntegerFlags.NONE, _current.binary(LLVM.BinaryOperator.MUL, LLVM.IntegerFlags.NONE, wide, LLVM.Values.i64(3L)), LLVM.Values.i64(4L))
+            let buffer = _current.call(strings.runtime("malloc", Types.pointer, [Types.i64]), [room])!
+            let pending = _slot(Types.i16)
+
+            _current.store(LLVM.Values.integer(Types.i16, 0n), pending, 2)
+            let size = _current.call(
+                strings.runtime("$libghul_utf8_encode", Types.i64, [Types.pointer, Types.i32, Types.pointer, Types.pointer]),
+                [strings.chars(_current, text), length, buffer, pending])!
+
+            _current.store(LLVM.Values.integer(Types.i8, 0n), _current.element_pointer(Types.i8, buffer, [size], true), 1)
+
+            return buffer
+        si
+
+        // A string made from the NUL-terminated UTF-8 at `address`, or the
+        // absent string for a null address; `release` frees the original
+        // with the C library's free once it is copied.
+        _string_from_c(strings: LLVM_STRINGS, address: LLVM.Value, release: bool) -> LLVM.Value is
+            let slot = _slot(Types.pointer)
+            let present = _new_block()
+            let join = _new_block()
+
+            _current.store(LLVM.Values.null_pointer, slot, 0)
+            _current.branch(_current.compare(IntegerPredicate.NE, address, LLVM.Values.null_pointer), present, join)
+
+            _start(present)
+
+            let text = _slot(Types.structure([Types.pointer, Types.i32, Types.i32]))
+            let length = _current.call(strings.runtime("strlen", Types.i64, [Types.pointer]), [address])!
+
+            _current.call(
+                strings.runtime("$libghul_utf8_decode", LLVM.Type.VOID, [Types.pointer, Types.i64, Types.pointer]),
+                [address, length, text])
+
+            _current.store(_current.call(strings.runtime("$libghul_utf16_make_string", Types.pointer, [Types.pointer]), [text])!, slot, 0)
+
+            if release then
+                _current.call(strings.runtime("free", LLVM.Type.VOID, [Types.pointer]), [address])
+            fi
+
+            _current.branch(join)
+
+            _start(join)
+
+            return _current.load(Types.pointer, slot, 0)
         si
 
         // The type a value of the kind has in a C prototype: a bool as an

@@ -2683,6 +2683,44 @@ target_name() -> string => "wasm"
 
 `--define <name>` turns any other name on, and a name nothing turns on is off. A `--define` of a target's name, or of `source_core`, has no effect: the target being built decides those. What is left out is never compiled, so it can name things the build does not have, a .NET API in a `@IF.dotnet()` declaration for instance. To leave a whole file out of one target, write the `@IF` on its namespace.
 
+### foreign functions
+
+`@extern(module, name)` written before a body-less global function or static method declares a function the program is linked with rather than defines. The ghūl signature is the whole declaration: no C prototype is read and there is no separate interface description. A call is a call into the named symbol, and a declaration may not have a body, be generic, or be an instance member.
+
+```ghul
+@extern("libc", "abs")
+absolute(value: int) -> int
+
+@extern("libc", "strlen")
+length_of(text: string) -> word
+```
+
+What the module and name mean depends on the target, so a declaration that differs between targets is written with `@IF.<target>()`:
+
+| target | module | name |
+|--------|--------|------|
+| dotnet | the library, as `DllImport` takes it | the entry point |
+| llvm | the library that supplies the symbol; empty for what the C library or libghul already holds | the C symbol, spelled exactly |
+| wasm | must be empty | a function the program's caller supplies |
+
+On .NET an `@extern` is the `DllImport` it stands for, with the platform's default marshalling. On llvm it is a C ABI call, and the program links statically against musl, so a library it names has to be available as a static archive built for musl. `--native-input <path>` adds an object file or archive to the link, `--native-library <name>` links `lib<name>.a`, and `--native-library-path <dir>` adds a directory to search for it; each can be repeated. A symbol the link cannot find is a link error, not a compile error, and a library that is named but never reached by a call is not linked.
+
+What may cross is what the machine lays out the same way on both sides. The scalars `bool`, `char`, `byte`, `ubyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`, `word`, `uword`, `single` and `double` cross as the C types of the same width, and a `string` argument is a NUL-terminated UTF-8 copy made for the call and released after it. Pointers and `ref` arguments cross on .NET only. Anything else, such as a class, a tuple, an array or a function, is reported at the declaration. A foreign function that keeps the pointer it was given after it returns is in undefined behaviour, as with any marshalled call.
+
+A function answering a string says who owns the text with a named argument, on llvm; a string answer is rejected on .NET, and on wasm needs no argument: `result = "copy"` copies text the callee keeps (as `getenv` answers), and `result = "take"` copies text the callee allocated with the C library's `malloc` and then releases it with `free`. A null answer is the absent string, so the return type is `string?`.
+
+```ghul
+@extern("libc", "getenv", result = "copy")
+environment_variable(name: string) -> string?
+
+@extern("libc", "strdup", result = "take")
+duplicate(text: string) -> string?
+```
+
+Foreign code allocates with the C library's own `malloc` and `free`, and the garbage collector neither sees nor scans that memory. A ghūl object can hold a pointer into it, and the program that does so owns the release. The reverse does not hold: memory a foreign library allocated cannot be relied on to keep a ghūl object alive, which is why no object or array crosses and nothing can be registered for the library to call back into.
+
+On wasm the module must be empty and the name is looked up in `options.externs`, the object the loader's `run` takes: each declared name must be a function in it, and a program that declares one the caller does not supply fails to start, naming it. Numbers cross as JavaScript numbers except `long` and `ulong`, which are BigInts, and a string crosses as a string, as a result as well as an argument. Every `@extern` function the program declares is imported, whether or not it is called.
+
 ### what differs on the wasm target
 
 A .NET API that the core library does not declare does not exist on the `wasm` target, so a program that calls one is told the name is not found, as it would be for any other missing name. A construct the `wasm` target cannot carry at all is reported where it is written: a pointer type as `pointer types not supported on the wasm target`, and an `IL.` pragma, which names a fact about an assembly, as `pragma IL.name not supported on the wasm target`. A construct the target will carry but cannot generate code for yet is reported at the function holding it, as `code generation for <construct> is not supported on the wasm target`.
