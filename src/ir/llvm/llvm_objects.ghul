@@ -99,8 +99,20 @@ namespace IR.LLVMTarget is
         /// The offset of an instance's size in bytes within a descriptor.
         DESCRIPTOR_SIZE: int static => 40
 
+        /// The type of a descriptor whose vtable has the type `vtable_type`.
+        descriptor_struct(vtable_type: LLVM.Type) -> LLVM.Type static =>
+            if CELL_LINK.is_active then
+                Types.structure([Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, Types.pointer, vtable_type])
+            else
+                Types.structure([Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, vtable_type])
+            fi
+
         /// The offset of the first vtable entry within a descriptor.
-        DESCRIPTOR_VTABLE: int static => 48
+        DESCRIPTOR_VTABLE: int static => if CELL_LINK.is_active then 56 else 48 fi
+
+        /// The offset within a descriptor of the table of the traits the class
+        /// implements, in a build whose cells are loaded into one process.
+        DESCRIPTOR_TRAITS: int static => 48
 
         /// The offset of the value within a box.
         BOX_VALUE_OFFSET: int static => 8
@@ -866,11 +878,19 @@ namespace IR.LLVMTarget is
         /// module, each function referred to by the LLVM function `callee`
         /// answers for it, null where the program never compiles it.
         finish(strings: LLVM_STRINGS, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
+            let wanted = _descriptors_wanted()
+
             for type in _classes.numbering.in_order() do
-                _add_descriptor(type, strings, callee)
+                if wanted.contains(type) then
+                    _add_descriptor(type, strings, callee)
+                else
+                    _declare_descriptor_weakly(type)
+                fi
             od
 
-            _add_trait_table(callee)
+            if !CELL_LINK.is_active then
+                _add_trait_table(callee)
+            fi
 
             for (_, globals) in _statics do
                 for (symbol, (name, type)) in globals do
@@ -1057,6 +1077,213 @@ namespace IR.LLVMTarget is
             _module.add_global(global)
         si
 
+        // The classes whose descriptors this module defines. In a build whose
+        // cells are loaded into one process a descriptor is shared by name, so
+        // it is defined complete wherever a class may be made, or inherited
+        // from, and left to whichever cell defines it otherwise.
+        _descriptors_wanted() -> Collections.SET[CLASS_INSTANCE] is
+            let result = Collections.SET[CLASS_INSTANCE]()
+
+            if !CELL_LINK.is_active then
+                for type in _classes.numbering.in_order() do
+                    result.add(type)
+                od
+
+                return result
+            fi
+
+            let made = LIST[CLASS_INSTANCE]()
+
+            for type in _classes.numbering.in_order() do
+                // A generic taken at its own type parameters is the shape of
+                // its body, not a class anything makes.
+                if type.arguments |> Ghul.Pipes.any(a => a.is_type_variable) then
+                    continue
+                fi
+
+                if CELL_LINK.is_exported(type.definition) \/ CELL_LINK.is_prebuilt(type.definition) \/ _found_instantiated.contains(type) \/ _allocated.contains(type) \/ _unit_variants.contains(type) \/ _boxes_made.contains(type) \/ _classes.is_array(type) \/ is_string(type) then
+                    made.add(type)
+                fi
+            od
+
+            for type in made do
+                let current: CLASS_INSTANCE? mut = type
+
+                while current? /\ result.add(current) do
+                    current = _plan.parent(current)
+                od
+            od
+
+            return result
+        si
+
+        // A class this module does not define the descriptor of: named, for the
+        // references to it, as a weak declaration that stays null if no cell
+        // defines it.
+        _declare_descriptor_weakly(type: CLASS_INSTANCE) is
+            let slots = if _plan.has_slots(type) then _plan.slot_entries(type).count else 0 fi
+            let declaration = GLOBAL_VARIABLE(descriptor_name(type), descriptor_struct(LLVM.Type.ARRAY(slots, Types.pointer)), null, false)
+
+            declaration.linkage = Linkage.EXTERN_WEAK
+
+            _module.add_global(declaration)
+        si
+
+        // A label for a global of `type`, in a build whose cells are loaded
+        // into one process: the label itself where another cell must reach
+        // the global by that name, and the first free name for what stays
+        // inside one cell.
+        _global_label(type: CLASS_INSTANCE, label: string) -> string =>
+            if _class_linkage(type) != Linkage.INTERNAL then names.claim(label) else names.unique(label) fi
+
+        _trait_ids: Collections.SET[string]?
+
+        // The name of the global whose address stands for the trait instance
+        // `trait_type` wherever it is tested for or called through, defined
+        // once however many cells use it.
+        _trait_id_name(trait_type: CLASS_INSTANCE) -> string is
+            let name = "{names.type_label(trait_type)}.$trait"
+            let ids mut = _trait_ids
+
+            if !ids? then
+                ids = Collections.SET[string]()
+
+                _trait_ids = ids
+            fi
+
+            if ids.add(name) then
+                let identity = GLOBAL_VARIABLE(name, Types.i8, LLVM_TYPES.zero(Types.i8), true)
+
+                identity.linkage = Linkage.WEAK
+
+                _module.add_global(identity)
+            fi
+
+            return name
+        si
+
+        /// The trait instance whose table a call to `method` on an instance of
+        /// `trait_type` reads, with the method's place in the table, or null.
+        table_slot_of(method: Function, trait_type: CLASS_INSTANCE) -> (trait_type: CLASS_INSTANCE, slot: int)? =>
+            _plan.table_slot_of(method, trait_type)
+
+        /// The global whose address stands for `trait_type`.
+        trait_id(trait_type: CLASS_INSTANCE) -> string => _trait_id_name(trait_type)
+
+        // The tables of the traits `type` implements, as a list of pairs, a
+        // trait\x27s identity and its table of the methods `type` runs, ended by a
+        // pair of nulls. A table lists the trait\x27s methods in the order every
+        // build lists them, so a call compiled before `type` existed finds its
+        // method by place.
+        _traits_value(type: CLASS_INSTANCE, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) -> LLVM.Value is
+            let traits = _plan.all_traits_of(type)
+
+            if traits.count == 0 then
+                return Values.null_pointer
+            fi
+
+            let pair_type = Types.structure([Types.pointer, Types.pointer])
+            let pairs = LIST[LLVM.Value]()
+
+            for trait_type in traits do
+                let methods = _plan.table_methods(trait_type)
+                let slots = LIST[LLVM.Value]()
+
+                for method in methods do
+                    if let implementation = _plan.implementation_in(type, method) /\ !implementation.definition.is_abstract then
+                        slots.add(_reference(implementation, callee, type))
+                    else
+                        slots.add(Values.null_pointer)
+                    fi
+                od
+
+                let table_type = LLVM.Type.ARRAY(methods.count, Types.pointer)
+                let table_name = _global_label(type, "{names.type_label(type)}.{names.type_label(trait_type)}.$methods")
+                let table = GLOBAL_VARIABLE(table_name, table_type, LLVM.Value.AGGREGATE(slots.to_array(), table_type), true)
+
+                table.linkage = _class_linkage(type)
+                _module.add_global(table)
+
+                pairs.add(LLVM.Value.AGGREGATE([Values.global(_trait_id_name(trait_type)), Values.global(table_name)], pair_type))
+            od
+
+            pairs.add(LLVM.Value.AGGREGATE([Values.null_pointer, Values.null_pointer], pair_type))
+
+            let list_type = LLVM.Type.ARRAY(pairs.count, pair_type)
+            let list_name = _global_label(type, "{names.type_label(type)}.$traits")
+            let list = GLOBAL_VARIABLE(list_name, list_type, LLVM.Value.AGGREGATE(pairs.to_array(), list_type), true)
+
+            list.linkage = _class_linkage(type)
+            _module.add_global(list)
+
+            return Values.global(list_name)
+        si
+
+        /// The name of the function that finds the table of a trait\x27s methods.
+        TRAIT_TABLE_FUNCTION: string static => "$trait_methods"
+
+        _trait_table: LLVM.FUNCTION?
+
+        /// The function `$trait_table(object, trait)`, defined in the module
+        /// the first time it is asked for: the table of the methods the
+        /// object\x27s class runs for the trait whose identity is `trait`, or
+        /// null where the class does not implement it.
+        trait_table_function() -> LLVM.FUNCTION is
+            if let found = _trait_table then
+                return found
+            fi
+
+            let object = LLVM.PARAMETER(Types.pointer, "object")
+            let wanted = LLVM.PARAMETER(Types.pointer, "wanted")
+            let function = LLVM.FUNCTION(TRAIT_TABLE_FUNCTION, Types.pointer, [object, wanted])
+            let entry = function.add_block("entry")
+            let test = function.add_block("test")
+            let compare = function.add_block("compare")
+            let next = function.add_block("next")
+            let yes = function.add_block("yes")
+            let no = function.add_block("no")
+
+            let start = function.add_block("start")
+            let cursor = entry.alloca(Types.pointer, 8)
+            let null_pointer = LLVM.Values.null_pointer
+            let prefix = Types.structure([Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, Types.pointer])
+            let pair_type = Types.structure([Types.pointer, Types.pointer])
+            entry.branch(entry.compare(LLVM.IntegerPredicate.EQ, object.value, null_pointer), no, start)
+
+            let descriptor = start.load(Types.pointer, object.value, 8)
+            let list_field = start.element_pointer(prefix, descriptor, [LLVM.Values.integer(Types.i32, bigint.zero), LLVM.Values.integer(Types.i32, bigint(7))], true)
+            let list = start.load(Types.pointer, list_field, 8)
+
+            start.store(list, cursor, 8)
+            start.branch(start.compare(LLVM.IntegerPredicate.EQ, list, null_pointer), no, test)
+
+            let current = test.load(Types.pointer, cursor, 8)
+            let identity = test.load(Types.pointer, current, 8)
+
+            test.branch(test.compare(LLVM.IntegerPredicate.EQ, identity, null_pointer), no, compare)
+
+            compare.branch(compare.compare(LLVM.IntegerPredicate.EQ, identity, wanted.value), yes, next)
+
+            let pair_pointer = next.load(Types.pointer, cursor, 8)
+
+            next.store(next.element_pointer(pair_type, pair_pointer, [LLVM.Values.integer(Types.i32, bigint.one)], true), cursor, 8)
+            next.branch(test)
+
+            let found = yes.load(Types.pointer, cursor, 8)
+            let table_field = yes.element_pointer(pair_type, found, [LLVM.Values.integer(Types.i32, bigint.zero), LLVM.Values.integer(Types.i32, bigint.one)], true)
+
+            yes.return_value(yes.load(Types.pointer, table_field, 8))
+            no.return_value(null_pointer)
+
+            function.linkage = Linkage.INTERNAL
+
+            _module.add_function(function)
+
+            _trait_table = function
+
+            return function
+        si
+
         _add_descriptor(type: CLASS_INSTANCE, strings: LLVM_STRINGS, callee: (FUNCTION_INSTANCE) -> LLVM.FUNCTION?) is
             let entries = LIST[LLVM.Value]()
 
@@ -1064,7 +1291,7 @@ namespace IR.LLVMTarget is
             // here, which is the number of slots it has.
             if CELL_LINK.is_active /\ CELL_LINK.is_prebuilt(type.definition) then
                 let slots = if _plan.has_slots(type) then _plan.slot_entries(type).count else 0 fi
-                let declaration_type = Types.structure([Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, LLVM.Type.ARRAY(slots, Types.pointer)])
+                let declaration_type = descriptor_struct(LLVM.Type.ARRAY(slots, Types.pointer))
                 let declaration = GLOBAL_VARIABLE(descriptor_name(type), declaration_type, null, false)
 
                 declaration.linkage = Linkage.EXTERNAL
@@ -1097,26 +1324,29 @@ namespace IR.LLVMTarget is
                     Values.null_pointer
                 fi
 
-            let descriptor_type =
-                Types.structure([
-                    Types.i32, Types.i32, Types.pointer, Types.pointer, Types.pointer, Types.pointer, Types.i64, vtable_type
-                ])
+            let descriptor_type = descriptor_struct(vtable_type)
 
             let name = strings.literal(TYPE_NAMES.name_of(type, _classes, null, t => LLVM_TYPES.scalar(t), t => LLVM_TYPES.is_string(t)))
 
-            let initializer =
-                LLVM.Value.AGGREGATE(
-                    [
-                        Values.i32(_classes.numbering.id(type)),
-                        Values.i32(_classes.numbering.last_descendant(type)),
-                        superclass,
-                        name,
-                        _displayer_reference(type),
-                        type_object(descriptor_name(type), name),
-                        Values.i64(cast long(size_of(type))),
-                        LLVM.Value.AGGREGATE(entries.to_array(), vtable_type)
-                    ],
-                    descriptor_type)
+            let fields = LIST[LLVM.Value](
+                [
+                    Values.i32(_classes.numbering.id(type)),
+                    Values.i32(_classes.numbering.last_descendant(type)),
+                    superclass,
+                    name,
+                    _displayer_reference(type),
+                    type_object(descriptor_name(type), name),
+                    Values.i64(cast long(size_of(type)))
+                ]
+            )
+
+            if CELL_LINK.is_active then
+                fields.add(_traits_value(type, callee))
+            fi
+
+            fields.add(LLVM.Value.AGGREGATE(entries.to_array(), vtable_type))
+
+            let initializer = LLVM.Value.AGGREGATE(fields.to_array(), descriptor_type)
 
             let global = GLOBAL_VARIABLE(descriptor_name(type), descriptor_type, initializer, true)
 
@@ -1208,7 +1438,72 @@ namespace IR.LLVMTarget is
                 return function.reference
             fi
 
+            // A function this cell does not compile may be defined by another
+            // that is loaded after it: the table points at a stub that calls
+            // it by name, which the loader resolves at the first call.
+            if CELL_LINK.is_active /\ instance? /\ !instance.definition.is_abstract then
+                return _lazy_reference(instance!)
+            fi
+
             return Values.null_pointer
+        si
+
+        /// Gives the function an instance of which no body is compiled here, as
+        /// a declaration another cell may define.
+        declare_external: ((FUNCTION_INSTANCE) -> LLVM.FUNCTION?)? public
+
+        _lazy: MAP[FUNCTION_INSTANCE, LLVM.Value]?
+
+        _lazy_reference(instance: FUNCTION_INSTANCE) -> LLVM.Value is
+            let stubs mut = _lazy
+
+            if !stubs? then
+                stubs = MAP[FUNCTION_INSTANCE, LLVM.Value]()
+
+                _lazy = stubs
+            fi
+
+            let found: LLVM.Value mut
+
+            if stubs.try_get_value(instance, found ref) then
+                return found
+            fi
+
+            let declare = declare_external
+
+            if !declare? then
+                return Values.null_pointer
+            fi
+
+            let target = declare(instance)
+
+            if !target? then
+                return Values.null_pointer
+            fi
+
+            let parameters = LIST[LLVM.PARAMETER]()
+
+            for (i, parameter) in target.parameters |> Ghul.Pipes.index() do
+                parameters.add(LLVM.PARAMETER(parameter.type, "a{i}"))
+            od
+
+            let stub = LLVM.FUNCTION(names.unique("{target.name}.\$lazy"), target.result, parameters.to_array())
+            let block = stub.add_block("entry")
+            let result = block.call(target, parameters |> Ghul.Pipes.map(p => p.value) |> Ghul.Pipes.collect())
+
+            if let value = result then
+                block.return_value(value)
+            else
+                block.return_void()
+            fi
+
+            stub.linkage = Linkage.INTERNAL
+
+            _module.add_function(stub)
+
+            stubs[instance] = stub.reference
+
+            return stub.reference
         si
 
         // Whether `instance` is the root's `get_hash_code`, which a box of a
