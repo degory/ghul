@@ -1312,8 +1312,24 @@ const no_processes = {
     os_architecture: () => "wasm",
     process_id: () => 0,
     home_directory: () => "/",
-    sleep: () => {},
+    sleep: sleep_in_page,
 };
+
+// Blocks for `milliseconds` where the engine lets the thread wait, which a
+// worker does and a page's main thread does not; there it spins instead, so
+// the program still waits as long as it asked to.
+function sleep_in_page(milliseconds) {
+    const wanted = Math.max(0, milliseconds);
+
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wanted);
+    } catch {
+        const until = performance.now() + wanted;
+
+        while (performance.now() < until) {
+        }
+    }
+}
 
 // What a program that reads no real file system is told: that there is
 // none to read. Core asks before using any other operation, but the module
