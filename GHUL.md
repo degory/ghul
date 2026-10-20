@@ -29,12 +29,12 @@ GHUL.md covers the language as ordinary programs use it. These files hold the de
 | file | covers | read it when |
 | --- | --- | --- |
 | [docs/narrowing.md](docs/narrowing.md) | how narrowing works in depth: heap facts and crossings, `pure` and `stable`, getters, closure-assigned locals, nested optionals and `Result` coalescing | reasoning about why a value is or is not narrowed, or changing the compiler's flow analysis |
-| [docs/generics.md](docs/generics.md) | argument packs, multiple bounds, variance, generic-math operator imports, open generics in `typeof`, `size_of` | writing generic library code |
+| [docs/generics.md](docs/generics.md) | argument packs, variance, generic-math operator imports, open generics in `typeof`, `size_of` | writing generic library code |
 | [docs/async.md](docs/async.md) | the awaiter pattern, task-like return types and their builders, asynchronous function literals | writing a coroutine library or a custom task type |
 | [docs/sessions.md](docs/sessions.md) | `--submission`, `--cells`, `--session` and `--cell-link`, and what they guard | working on the REPL, a notebook kernel or the playground |
-| [docs/dotnet.md](docs/dotnet.md) | name mapping and the core-type names, delegates, attributes and pragmas, `DllImport`, `StructLayout`, `IL.name`, nested types, operators reached from .NET types | calling .NET libraries beyond the common cases |
+| [docs/dotnet.md](docs/dotnet.md) | the core-type names, attributes and pragmas (`@intrinsic`, `@trusted_store_free()`, `@finalizer()`), `DllImport`, `StructLayout`, `IL.name`, operators reached from .NET types | calling .NET libraries beyond the common cases |
 | [docs/targets.md](docs/targets.md) | what each target supports, conditional compilation, what differs on wasm, `@extern` on each target, the llvm options | building for WebAssembly or native executables |
-| [docs/details.md](docs/details.md) | access policy flags, file-level pragmas, synthesised equality, `pure` types, primary-constructor splices, `partial` and `impl`, union internals, numeric literal edge cases | looking up a specific rule |
+| [docs/details.md](docs/details.md) | access policy flags, file-level pragmas, doc comment rules, `cast` target inference, synthesised equality and `@equality()`, `@Flags()` operators, `partial` and `impl` blocks, `@precedence`, `Displayable` | looking up a specific rule |
 
 ## naming conventions
 
@@ -145,6 +145,8 @@ The rules that decide where a line break ends a statement, most often met first:
 - In a parenthesised group, a top-level `,` commits the tuple reading and an inferred boundary commits the block reading, exactly as a written `;` does. A compound statement that ends a line is complete, so the boundary falls after it whatever opens the next line, and an operator there begins a new statement. The expression reading needs the operator on the same line: `(if c then 2 else 5 fi - 1)` is 1 when `c` is true, where the same tail written on its own line is a second statement and the group's value.
 - A postfix marker attaches on the same line as what it marks: a line-start modifier (`pure`, `static`, …) belongs to the next definition rather than the header above, and a line-start `rec` is the recursive self-reference call, never a rec-lambda marker.
 - An `else` opening the line after a bare `assert` is the assert's message clause when its line is indented at least as far as the assert's, and otherwise the `else` of the enclosing `if` or `case` arm. Only the indentation decides: an assert sharing its line with the `if` (`if c then assert x` / `else y fi`) takes an `else` written level with the `if` as its own; a `;` after the assert gives the `else` to the `if`.
+
+*More detail on this section: [language details](docs/details.md#statement-terminators).*
 
 ## variables
 
