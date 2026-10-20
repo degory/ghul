@@ -8,10 +8,10 @@ A third target, `llvm`, is for a native executable. A build for it type-checks t
 
 On the llvm target an exception nothing catches is reported with the frames it was thrown through, innermost first, one `   at <name>` line each after the `Unhandled exception.` line. The wasm target does the same in a build with `--debug`, where a throw goes through the loader so the exception records its stack; without it a throw stays inside the module, which is several times cheaper, and the report carries no frames. A trap the engine raises, such as an integer division by zero, has its frames either way. On the llvm target a crash is reported the same way: a stack that runs out as `Stack overflow.`, and any other fault, a bus error, an arithmetic fault or an illegal instruction as `Fatal error.` and the signal, after the program's output is flushed, and the process then ends with the signal. A frame is named as the linker names the function, and on the llvm target a build with `--debug` adds its file and line; at the default optimisation level a function inlined into another does not appear as a frame of its own. A stack that the llvm optimiser has turned into a loop does not run out, and so is never reported.
 
-A `wasm` build loads no .NET assemblies. What they supply on .NET comes from two libraries compiled into the module from source: ghul-core, which gives the built-in types their members and declares the collections, and ghul-runtime, which supplies the pipes and the rest of `Ghul`. The `ghul` command-line tool builds a project for either target and fetches those libraries for a `wasm` build; a project lists the targets it builds for in its `ghul-project.json` manifest:
+A `wasm` build loads no .NET assemblies. What they supply on .NET comes from two libraries compiled into the module from source: ghul-core, which gives the built-in types their members and declares the collections, and ghul-runtime, which supplies the pipes and the rest of `Ghul`. The `ghul` command-line tool builds a project for the `wasm` or `llvm` target, fetching those libraries for either; a project lists the targets it builds for in its `ghul-project.json` manifest, and a .NET project is built with the .NET SDK instead:
 
 ```sh
-ghul new hello --target dotnet,wasm
+ghul new hello --target llvm,wasm
 cd hello
 ghul run --target wasm
 ```
