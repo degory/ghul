@@ -500,12 +500,12 @@ In this case the file's top-level statements do not run instead. A program that 
 A formal parameter can be a tuple-destructure pattern instead of a plain name. It is still one parameter, of the written tuple type. On entry, the pattern is unpacked into its named elements, in the same way as a `let (a, b) = pair;` local:
 
 ```ghul
-add_pair((a: int, b: int): (int, int)) -> int => a + b;
+add_pair((a, b): (int, int)) -> int => a + b;
 
 add_pair((3, 4));    // 7
 ```
 
-Patterns can nest, and can be mixed with ordinary parameters: `f(x: int, (a: int, b: int): (int, int), y: int)`. A namespace-scope function's signature is always fully explicit, so the type of the whole pattern is required; there is no context to infer it from. Element types are optional, as in a `let (a, b) = pair;` local. The type of the whole pattern can be any type that can be destructured positionally: a tuple, or a type with a matching `deconstruct(...)` method. A formal argument list does not support the by-name group form (`(x = field, ...)`).
+Patterns can nest, and can be mixed with ordinary parameters: `f(x: int, (a, b): (int, int), y: int)`. A namespace-scope function's signature is always fully explicit, so the type of the whole pattern is required; there is no context to infer it from. The element types come from the type of the whole pattern, so write the elements as plain names. The type of the whole pattern can be any type that can be destructured positionally: a tuple, or a type with a matching `deconstruct(...)` method. A formal argument list does not support the by-name group form (`(x = field, ...)`).
 
 Functions are first-class values. A function literal has the same form as a function, without a name. The compiler usually *infers* its argument types and return type from the body and from the context of the literal, so they are usually written without annotations. Either can be written explicitly. A literal with one argument needs no parentheses around it. `A -> B` is the type of a function from `A` to `B`.
 
