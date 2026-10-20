@@ -15,6 +15,10 @@ keyboard.
 ## Before you start
 
 Read [GHUL.md](./GHUL.md) rather than working from what you remember of ghūl.
+Its index lists the topic files in [docs/](./docs/), which hold the detail that
+specialised work needs (narrowing, generics, asynchronous code, sessions, .NET
+interop, the targets, language details): read the one that matches the code you
+are changing before you change it.
 The syntax is unusual enough that a half-remembered version of it produces
 confident, wrong code, and you will not find out until the build fails. The
 compiler's own source under `src/` is the largest body of ghūl in existence and
