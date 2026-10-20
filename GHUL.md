@@ -1,6 +1,6 @@
 # ghūl language tutorial and reference
 
-ghūl is a statically typed, general-purpose programming language that targets .NET 10. It is a hobby project, but expressive enough for general-purpose work — the ghūl compiler is itself written in ghūl. It produces ordinary .NET assemblies and NuGet packages, and ghūl code can consume any .NET library.
+ghūl is a statically typed, general-purpose programming language that targets .NET 10, WebAssembly and native executables. It is a hobby project, but expressive enough for general-purpose work — the ghūl compiler is itself written in ghūl. On .NET it produces ordinary assemblies and NuGet packages, and ghūl code can consume any .NET library; the other two targets use ghūl's own libraries, and the [compilation targets](#compilation-targets) section says what each supports.
 
 Apart from a slightly quirky syntax, ghūl is a fairly conventional language. The syntax is influenced by ALGOL 68 and Pascal: blocks are delimited by keywords rather than braces or indentation, and the keywords come in pairs whose closing half mirrors the opening one — a class or function body runs `is` ... `si`, a conditional runs `if` ... `fi`, a `try` ends with `yrt`.
 
@@ -1208,6 +1208,8 @@ Precedence comes from the operator's first character rather than from anything w
 | boolean | `∧` `∨`, and `/\` and `\/` |
 
 The thread-first row is the two operators themselves rather than a first character: see [collections and pipes](#collections-and-pipes). An operator opening with `?` sits looser than all of those, and everything the table does not name sits between shift and bitwise. Associativity is left, except for an operator opening with `?`, which is right so that a chain of them stays open to the one after it.
+
+The unary `\` is the bitwise complement of an integer, and its result has the operand's own type: `\5` is `-6` for an `int`, `\0` is `-1`, and `\x` for a `ubyte` 5 is `250`. It is the unary counterpart of the binary `&`, `|` and `^`, and `!` is the logical not of a `bool`. The boolean operators `/\` and `\/` are single tokens.
 
 Where the first character does not say what is meant, a `@precedence` pragma places the operator explicitly. It takes the operator and a level: one of the eight `user-1` to `user-8`, which interleave with the levels above, or one of those levels by name. The pragma written before a definition covers that definition; the file-level `@@precedence` covers the rest of the file.
 
