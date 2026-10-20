@@ -1714,6 +1714,8 @@ The sequence combinators are global functions in `Ghul.Pipes`. Each one takes th
 
 `collect` produces an array, and `collect_mutable` produces a mutable `LIST`. The collecting terminals are function forms of the constructors above, and produce the same result: `collect` and `ARRAY(p)`, `collect_mutable` and `LIST(p)`, `collect_set` and `SET(p)`, `collect_mutable_map` and `MAP(p)`, `join` and `string(p, separator)`. `collect_map` is the exception: it returns the read-only `Map`.
 
+`++` joins two sequences, as `cat` does: `[1, 2] ++ [3] ++ [4, 5]` is the elements 1 to 5 in order. It reads each operand lazily, groups to the left, and binds more tightly than `|>`, so `xs |> map(f) ++ ys` appends `ys` to the mapped sequence. Both operands are sequences, so a single element goes in an array literal: `[x] ++ xs`.
+
 ```ghul
 let numbers = [1, 2, 3, 4, 5];
 let evens = numbers |> filter(x => x % 2 == 0);
