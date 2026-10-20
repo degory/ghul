@@ -42,12 +42,17 @@ namespace IR.LLVMTarget is
         // `--llvm-program-only` asks for.
         _program_functions: SET[FUNCTION]
 
+        // The functions an earlier cell of the session defines, which this
+        // build declares and does not compile.
+        _prebuilt: SET[Function]
+
         init() is
             _bodies = MAP[Function, LIST[Value]]()
             _order = LIST[Function]()
             _frame_members = LIST[(frame: Classy, method: Function)]()
             _enclosing = STACK[LIST[Value]?]()
             _program_functions = SET[FUNCTION]()
+            _prebuilt = SET[Function]()
         si
 
         /// Starts a module, discarding anything kept from an earlier one.
@@ -66,6 +71,7 @@ namespace IR.LLVMTarget is
             _entry_point = null
             _module = null
             _program_functions.clear()
+            _prebuilt.clear()
         si
 
         begin_assembly() is si
@@ -250,6 +256,10 @@ namespace IR.LLVMTarget is
             _entry_point = function
         si
 
+        declare_prebuilt(function: Function) is
+            _prebuilt.add(function)
+        si
+
         _report(location: Source.LOCATION, construct: string) is
             IoC.CONTAINER.instance.logger.error(
                 location,
@@ -265,7 +275,7 @@ namespace IR.LLVMTarget is
 
             _debug_info = if IoC.CONTAINER.instance.build_flags.want_debug then LLVM_DEBUG_INFO(module) else null fi
 
-            let worklist = FUNCTION_WORKLIST(f => _bodies.contains_key(f))
+            let worklist = FUNCTION_WORKLIST(f => _bodies.contains_key(f) \/ _prebuilt.contains(f))
             let declared = MAP[FUNCTION_INSTANCE, FUNCTION?]()
 
             let declare = (instance: FUNCTION_INSTANCE) -> FUNCTION? is
@@ -308,6 +318,25 @@ namespace IR.LLVMTarget is
                 if let constructor = LLVM_EXCEPTIONS.null_reference_constructor /\ _bodies.contains_key(constructor) then
                     declare(FUNCTION_INSTANCE.of(constructor))
                 fi
+
+                // A later cell may call anything this one defines, so it is
+                // all compiled, whether or not this cell calls it.
+                if CELL_LINK.is_active then
+                    for function in _order do
+                        if CELL_LINK.is_exported(function) then
+                            declare(FUNCTION_INSTANCE.of(function))
+                        fi
+                    od
+                fi
+            elif CELL_LINK.is_active then
+                // A cell with nothing to run still defines what a later cell
+                // calls, and nothing else: the whole library is not its to
+                // compile.
+                for function in _order do
+                    if CELL_LINK.is_exported(function) then
+                        declare(FUNCTION_INSTANCE.of(function))
+                    fi
+                od
             else
                 for function in _order do
                     if !FUNCTION_BODIES.is_generic(function) then
@@ -350,6 +379,8 @@ namespace IR.LLVMTarget is
 
             objects.reach = instance => declare(instance)
 
+            objects.declare_external = instance => _declare_external(module, names, instance)
+
             let discovery_module = MODULE()
             let discovery_strings = LLVM_STRINGS(discovery_module)
             let discovery_arrays = LLVM_ARRAYS(discovery_module, discovery_strings, classes, objects)
@@ -387,13 +418,14 @@ namespace IR.LLVMTarget is
 
             while let instance = worklist.next() do
                 if let function = callee(instance) then
-                    if !_want_library then
-                        function.linkage = LLVM.Linkage.INTERNAL
-                    fi
+                    function.linkage = _linkage_of(instance)
 
                     module.add_function(function)
 
-                    _lower(module, strings, arrays, objects, instance, function, callee)
+                    // An earlier cell defines it: only declared here.
+                    if !_prebuilt.contains(instance.definition) then
+                        _lower(module, strings, arrays, objects, instance, function, callee)
+                    fi
                 fi
             od
 
@@ -434,6 +466,53 @@ namespace IR.LLVMTarget is
             return module
         si
 
+        // Whether the function is written in a source library, as against one
+        // a program wrote or the compiler made.
+        _is_library_function(definition: Function) -> bool is
+            let location = PROGRAM_FUNCTIONS.source_location(definition)
+
+            if location.is_internal \/ location.is_reflected \/ location.is_unknown then
+                return false
+            fi
+
+            return !PROGRAM_FUNCTIONS.contains(definition)
+        si
+
+        // Declares `instance` as a function another cell defines, for a table
+        // that points at it before that cell is loaded.
+        _declare_external(module: MODULE, names: LLVM_NAMES, instance: FUNCTION_INSTANCE) -> FUNCTION? is
+            let function = _declare(instance, names.name_of(instance), true)
+
+            if let declared = function then
+                declared.linkage = LLVM.Linkage.EXTERNAL
+
+                module.add_function(declared)
+            fi
+
+            return function
+        si
+
+        // How `instance` is linked. An executable keeps its functions to itself,
+        // and a library exports them. A cell of a session exports the
+        // functions it defines for the cells after it, names those an
+        // earlier cell defines, and leaves what any cell may need, a generic
+        // instance or library code, to whichever is loaded first.
+        _linkage_of(instance: FUNCTION_INSTANCE) -> LLVM.Linkage is
+            let definition = instance.definition
+
+            if CELL_LINK.is_active then
+                if _prebuilt.contains(definition) \/ CELL_LINK.is_exported(definition) then
+                    return LLVM.Linkage.EXTERNAL
+                elif !definition.is_closure /\ (instance.type_map.count > 0 \/ _is_library_function(definition)) then
+                    return LLVM.Linkage.WEAK
+                fi
+
+                return LLVM.Linkage.INTERNAL
+            fi
+
+            return if _want_library then LLVM.Linkage.EXTERNAL else LLVM.Linkage.INTERNAL fi
+        si
+
         // Lowers `instance`'s body into a copy of its function in `module`,
         // which is thrown away, so every instance it calls is declared.
         _reach(
@@ -446,6 +525,10 @@ namespace IR.LLVMTarget is
         ) is
             // The plan adds implementations a dispatched call can reach without
             // naming them, so an instance can arrive here undeclared.
+            if _prebuilt.contains(instance.definition) then
+                return
+            fi
+
             if let found = declare(instance) then
                 let copy = FUNCTION(found.name, found.result, found.parameters |> Ghul.Pipes.collect())
 
@@ -507,7 +590,9 @@ namespace IR.LLVMTarget is
                 block = wrapper.blocks[wrapper.blocks.count - 1]
             fi
 
-            if let result = block.call(compiled, arguments.to_array()) then
+            // A cell's entry answers the value of its final expression, which
+            // is not an exit status.
+            if let result = block.call(compiled, arguments.to_array()) /\ !(CELL_LINK.is_active /\ compiled.result !~ LLVM.Types.i32) then
                 block.return_value(result)
             else
                 block.return_value(LLVM.Values.integer(LLVM.Types.i32, bigint.zero))
@@ -556,7 +641,11 @@ namespace IR.LLVMTarget is
         // The LLVM function an instance is compiled into, with no body yet,
         // or null, reported, where its signature has a type the target holds
         // no values of.
-        _declare(instance: FUNCTION_INSTANCE, name: string) -> FUNCTION? is
+        _declare(instance: FUNCTION_INSTANCE, name: string) -> FUNCTION? => _declare(instance, name, false)
+
+        // `is_quiet` leaves a signature the target holds no values of unreported,
+        // for a function declared only so a table can point at it.
+        _declare(instance: FUNCTION_INSTANCE, name: string, is_quiet: bool) -> FUNCTION? is
             let definition = instance.definition
 
             let parameters = LIST[PARAMETER]()
@@ -571,7 +660,10 @@ namespace IR.LLVMTarget is
                 if let type = _held(instance.specialize(argument)) then
                     parameters.add(PARAMETER(type, "a{i}"))
                 else
-                    _report(definition.location, "an argument of type {argument}")
+                    if !is_quiet then
+                        _report(definition.location, "an argument of type {argument}")
+                    fi
+
                     return null
                 fi
             od
@@ -580,7 +672,10 @@ namespace IR.LLVMTarget is
             let result = if LLVM_TYPES.is_void(return_type) then LLVM.Type.VOID else _held(return_type) fi
 
             if !result? then
-                _report(definition.location, "a result of type {definition.return_type}")
+                if !is_quiet then
+                    _report(definition.location, "a result of type {definition.return_type}")
+                fi
+
                 return null
             fi
 
