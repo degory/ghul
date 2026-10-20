@@ -541,7 +541,7 @@ let pairs = [(1, 2), (3, 4)];
 pairs |> map(((a, b)) => a + b);          // element types inferred from the sequence
 ```
 
-The single-parameter shorthand without parentheses (`x => …`) cannot have a pattern, and cannot have a type annotation. Both need the parentheses. Unlike in a named function, the compiler usually infers the type of the whole pattern, from the sequence or slot that the literal is passed to, or from how the parameter is used. Write the type explicitly when nothing gives it. As for a named function, the type can be any type that can be destructured positionally. Element types and the type of the whole pattern both accept the full type syntax:
+The single-parameter shorthand without parentheses (`x => …`) cannot have a pattern, and cannot have a type annotation. Both need the parentheses. Unlike in a named function, the compiler usually infers the type of the whole pattern, from the sequence or slot that the literal is passed to, or from how the parameter is used. Write the type explicitly when nothing gives it. As for a named function, the type can be any type that can be destructured positionally, and the elements are written as plain names. The type of the whole pattern accepts the full type syntax:
 
 ```ghul
 let add = ((a, b): (int, int)) => a + b;
