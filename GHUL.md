@@ -8,7 +8,7 @@ This file is a condensed single-file reference. The full documentation, with a p
 
 ## the mistakes most often made
 
-These cost the most rework. Each is explained in its own section below.
+These cost the most rework. Each is explained in its own section below, except the last, which is in the targets file.
 
 - **.NET members are `snake_case`.** `Math.sqrt(x)`, `Math.pi`, `s.length` and `list.count`, not `Math.Sqrt`, `Math.PI` or `list.Count`. The .NET names are converted, and `System.Math` is `Ghul.Math`.
 - **`write_line` has to be imported.** Write `use IO.Std.write_line` before the code that calls it, or start the file with `use default` for `write_line`, the pipes and the collections.
@@ -20,7 +20,7 @@ These cost the most rework. Each is explained in its own section below.
 - **A bare `let` is immutable.** `let count mut = 0` can be reassigned.
 - **An optional `T?` has to be narrowed before it is used as a `T`**: `if x?`, `if let v = x`, or `x!` to assert it is present.
 - **A semicolon ends nothing at the end of a line**; it separates two statements on one line.
-- **On WebAssembly and native, a .NET API the core library does not declare does not exist**, and `decimal` is not supported.
+- **On WebAssembly and native, a .NET API the core library does not declare does not exist**, and `decimal` is not supported. See [what differs on the wasm target](docs/targets.md#what-differs-on-the-wasm-target).
 
 ## the rest of the reference
 
