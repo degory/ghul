@@ -26,6 +26,13 @@ a runtime and importing the reference set: a first submission takes about as
 long as a batch compile, and each later one tens of milliseconds. It is the
 backend for an interactive session, where every cell is compiled on its own to
 a library assembly and later cells reference earlier ones.
+`--build-server` is the same idea for whole builds: each line read from standard
+input names a response file of compiler arguments, and the build runs in this
+process with a container of its own. Its diagnostics go to standard error as a
+process of its own would write them, followed by a line starting U+0001 that
+gives the exit status. It is how an interactive session on the llvm target
+builds each cell without paying for start-up and warm-up every time.
+
 
 The protocol is one JSON object per line each way. The first line out is
 `{"ready":true,...}`. Each request line carries the submission's `name`, either
