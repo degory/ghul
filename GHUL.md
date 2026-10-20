@@ -1856,4 +1856,4 @@ The compiler builds for a target chosen with `--target`: `dotnet`, the default, 
 
 Both the wasm and llvm targets behave as a .NET program configured for invariant globalization (`System.Globalization.Invariant`): strings compare and sort by code unit, and numbers and dates format the same way whatever the machine. A .NET program that wants the same behaviour sets `<InvariantGlobalization>true</InvariantGlobalization>` in its project.
 
-*More detail on this section: [compilation targets](docs/targets.md#compilation-targets).*
+*More detail on this section: [compilation targets](docs/targets.md#compilation-targets), [conditional compilation](docs/targets.md#conditional-compilation), [foreign functions](docs/targets.md#foreign-functions), [what differs on the wasm target](docs/targets.md#what-differs-on-the-wasm-target).*
