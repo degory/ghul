@@ -19,6 +19,7 @@ const node_path = is_node ? await import("node:path") : null;
 const node_child_process = is_node ? await import("node:child_process") : null;
 const node_worker_threads = is_node ? await import("node:worker_threads") : null;
 const node_os = is_node ? await import("node:os") : null;
+const node_tty = is_node ? await import("node:tty") : null;
 const node_v8 = is_node ? await import("node:v8") : null;
 const node_vm = is_node ? await import("node:vm") : null;
 
@@ -1296,6 +1297,9 @@ function node_processes() {
 
         // Blocks the program for `milliseconds`, as Thread.Sleep does.
         sleep: (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, milliseconds)),
+
+        // Whether standard stream 0, 1 or 2 is a terminal.
+        is_terminal: (stream) => stream >= 0 && stream <= 2 && node_tty.isatty(stream),
     };
 }
 
@@ -1313,6 +1317,7 @@ const no_processes = {
     process_id: () => 0,
     home_directory: () => "/",
     sleep: sleep_in_page,
+    is_terminal: () => false,
 };
 
 // Blocks for `milliseconds` where the engine lets the thread wait, which a
