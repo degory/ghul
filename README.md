@@ -13,15 +13,19 @@ This is the compiler for the [ghūl programming language](https://ghul.dev). It 
 
 ![ghūl logo icon small](https://raw.githubusercontent.com/degory/ghul-dev/035cc6d3997514d03cbbd7b15133c37bf2a79f4e/src/.vuepress/public/ghul-logo-icon-128.png)
 
+## Targets
+
+The compiler builds for three targets: .NET 10, WebAssembly and native executables through LLVM.
+
+- **.NET** builds standard assemblies and NuGet packages. The compiler is driven by MSBuild from a `.ghulproj` project file, and needs the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0), which provides both the runtime the compiler tool runs on and the reference assemblies your projects build against. A ghūl program can use any .NET library. This is the best target for a real project today.
+- **WebAssembly** builds a WasmGC module and a JavaScript loader. It runs under Node.js, or in a browser that supports WasmGC. It is built with the `ghul` command-line tool from the [ghul-cli](https://github.com/ghul-lang/ghul-cli) repository, from a `ghul-project.json` manifest, and needs no .NET SDK to build or run on Linux x64 and arm64.
+- **Native** builds a statically linked executable for Linux on x64 or arm64, linked with `ghul-llvm`. It is built with `ghul` and needs no .NET SDK or C compiler.
+
+The WebAssembly and native targets use ghūl's own libraries, [ghul-core](https://github.com/ghul-lang/ghul-core) and [ghul-runtime](https://github.com/ghul-lang/ghul-runtime), in place of the .NET libraries. They are enough to build the compiler itself and to run most of the Rosetta Code solutions, and they don't have everything: there are no regular expressions, no HTTP or sockets, no culture-aware formatting, and no `decimal` on WebAssembly, and a program can't call a library that already exists. Native programs can call C with `@extern`. See [WebAssembly](https://ghul.dev/webassembly.html) and [native executables](https://ghul.dev/native.html) for what each supports.
+
 ## Prerequisites
 
-The compiler requires the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0). It provides both the .NET 10 runtime the compiler tool itself runs on and the reference assemblies your projects build against.
-
-## Target
-
-The compiler produces standard .NET assemblies and packages targeting .NET 10.
-
-Two further targets are experimental: [WebAssembly](https://ghul.dev/webassembly.html), using WasmGC and built with the `ghul` command-line tool, and native executables through LLVM ([ghul-lang/ghul#3454](https://github.com/ghul-lang/ghul/issues/3454)). Both support less of the language and the core library than .NET does.
+For the .NET target, the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0). For the other two, only the `ghul` command, which installs as a native executable on Linux x64 and arm64 and as a .NET tool anywhere else, and Node.js to run WebAssembly programs (`ghul install node` fetches one).
 
 ## Getting the compiler
 
@@ -38,6 +42,19 @@ If you create a new GitHub repo from the [ghūl repository template](https://git
 ### Install the compiler as a local or global .NET tool
 
 You can manually install the compiler from the [ghūl compiler .NET tool package](https://www.nuget.org/packages/ghul.compiler/)
+
+### Build for WebAssembly or native with the `ghul` command
+
+The `ghul` command from [ghul-cli](https://github.com/ghul-lang/ghul-cli) builds ghūl projects for WebAssembly and native executables, and installs and updates its own compiler. On Linux x64 and arm64 it installs without .NET:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ghul-lang/ghul-cli/main/install.sh | sh
+ghul new hello
+cd hello
+ghul run
+```
+
+Elsewhere, install it as a .NET tool with `dotnet tool install -g ghul.cli`.
 
 ## Using the compiler
 
@@ -70,7 +87,7 @@ dotnet run
 
 ### Runtime dependencies for ghūl applications
 
-Applications written in ghūl require the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0).
+A .NET application written in ghūl requires the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0). A WebAssembly application requires Node.js or a WasmGC browser, and a native application requires nothing.
 
 ## Development environment
 
