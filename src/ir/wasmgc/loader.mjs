@@ -1,12 +1,23 @@
 // Runs a ghūl program compiled for the wasm target.
 //
-// The compiler writes this file beside the module it builds, naming the
-// module below. Run directly by Node (`node program.mjs args...`) it runs
-// the program with the process's arguments, environment and console, and
-// leaves the program's exit status as the process's. A web page imports
-// it and calls `run` with the same things as options.
+// The compiler writes this file, the same every time, beside the module it
+// builds: the module's name with the extension `.mjs`, loading the module
+// beside it with the extension `.wasm`. Run directly by Node
+// (`node program.mjs args...`) it runs the program with the process's
+// arguments, environment and console, and leaves the program's exit status
+// as the process's. A web page imports it and calls `run` with the same
+// things as options.
 
-const MODULE_FILE = "__GHUL_MODULE_FILE__";
+// The module this loader runs when it is not handed one: the file beside it
+// with the same name and the extension `.wasm`.
+function sibling_module() {
+    const url = new URL(import.meta.url);
+
+    url.pathname = url.pathname.replace(/\.mjs$/, ".wasm");
+
+    return url;
+}
+
 
 // .NET's exit status when a program ends on an unhandled exception: the
 // runtime aborts, which a shell sees as 128 + SIGABRT.
@@ -278,7 +289,7 @@ export async function run(options = {}) {
     const imports = { "ghul:host": host, "ghul:extern": options.externs ?? {} };
     const compile_options = { builtins: ["js-string"] };
 
-    const source = await load(options.module ?? new URL(MODULE_FILE, import.meta.url));
+    const source = await load(options.module ?? sibling_module());
     ({ instance } = await WebAssembly.instantiate(source, imports, compile_options));
 
     try {
