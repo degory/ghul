@@ -13,7 +13,7 @@ requirements on this page apply to them too.
 
 ## Reporting a bug
 
-Open an [issue](https://github.com/degory/ghul/issues/new/choose). The most
+Open an [issue](https://github.com/ghul-lang/ghul/issues/new/choose). The most
 useful bug report is a short program that shows the problem, plus what you
 expected to happen and what happened instead. A program that is a few lines long
 and compiles on its own is worth far more than a description of a problem inside
@@ -76,7 +76,7 @@ Nothing else is required - the compiler that builds this repository is itself a
 .NET tool, restored into the working tree:
 
 ```sh
-git clone https://github.com/degory/ghul.git
+git clone https://github.com/ghul-lang/ghul.git
 cd ghul
 dotnet tool restore
 dotnet build
@@ -295,7 +295,7 @@ fork, and open a pull request against `main` here.
 ```sh
 git clone https://github.com/<you>/ghul.git
 cd ghul
-git remote add upstream https://github.com/degory/ghul.git
+git remote add upstream https://github.com/ghul-lang/ghul.git
 dotnet tool restore
 git switch -c my-change
 ```

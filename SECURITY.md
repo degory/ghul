@@ -44,7 +44,7 @@ Some things are worth knowing about but are not vulnerabilities:
   the project file says. Treat compiling someone else's project the way you
   would treat running their build script, because that is what it is.
 - **A crash, a hang, or an internal error on malformed input** is an ordinary
-  bug. Please report it as a normal [issue](https://github.com/degory/ghul/issues) - 
+  bug. Please report it as a normal [issue](https://github.com/ghul-lang/ghul/issues) - 
   they are welcome, and public tracking gets them fixed sooner.
 - **Wrong code generation** is likewise an ordinary bug unless you can show it
   being triggered deliberately.

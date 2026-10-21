@@ -1,6 +1,6 @@
 # ghūl compiler integration tests
 
-The directories under `integration-tests` form the main test suite for the [ghūl compiler](https://github.com/degory/ghul). Tests are executed using the [`ghul-test`](https://github.com/degory/ghul-test) snapshot test runner which is installed as a local .NET tool.
+The directories under `integration-tests` form the main test suite for the [ghūl compiler](https://github.com/ghul-lang/ghul). Tests are executed using the [`ghul-test`](https://github.com/ghul-lang/ghul-test) snapshot test runner which is installed as a local .NET tool.
 
 ## Publishing the compiler
 

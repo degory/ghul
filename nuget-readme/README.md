@@ -1,17 +1,17 @@
 # ghūl compiler
 
-[![CI/CD](https://img.shields.io/github/actions/workflow/status/degory/ghul/ci.yml?branch=main)](https://github.com/degory/ghul/actions?query=workflow%3ACI)
+[![CI/CD](https://img.shields.io/github/actions/workflow/status/ghul-lang/ghul/ci.yml?branch=main)](https://github.com/ghul-lang/ghul/actions?query=workflow%3ACI)
 [![NuGet version (ghul.compiler)](https://img.shields.io/nuget/v/ghul.compiler.svg)](https://www.nuget.org/packages/ghul.compiler/)
-[![Release](https://img.shields.io/github/v/release/degory/ghul?label=release)](https://github.com/degory/ghul/releases)
-[![Release Date](https://img.shields.io/github/release-date/degory/ghul)](https://github.com/degory/ghul/releases)
-[![Issues](https://img.shields.io/github/issues/degory/ghul)](https://github.com/degory/ghul/issues) 
-[![License](https://img.shields.io/github/license/degory/ghul)](https://github.com/degory/ghul/blob/main/LICENSE)
+[![Release](https://img.shields.io/github/v/release/ghul-lang/ghul?label=release)](https://github.com/ghul-lang/ghul/releases)
+[![Release Date](https://img.shields.io/github/release-date/ghul-lang/ghul)](https://github.com/ghul-lang/ghul/releases)
+[![Issues](https://img.shields.io/github/issues/ghul-lang/ghul)](https://github.com/ghul-lang/ghul/issues) 
+[![License](https://img.shields.io/github/license/ghul-lang/ghul)](https://github.com/ghul-lang/ghul/blob/main/LICENSE)
 [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fghul-lang.github.io%2Fghul-coverage-report%2Fbadge.json)](https://ghul-lang.github.io/ghul-coverage-report/)
 [![ghūl](https://img.shields.io/badge/gh%C5%ABl-100%25!-information)](https://ghul.dev)
 
-This package contains the [ghūl programming language](https://ghul.dev) [compiler](https://github.com/degory/ghul) packaged as a [.NET tool](https://docs.microsoft.com/en-us/dotnet/core/tools/global-tools). It is a [self-hosting compiler](https://en.wikipedia.org/wiki/Self-hosting_(compilers)): the compiler itself is written entirely in ghūl.
+This package contains the [ghūl programming language](https://ghul.dev) [compiler](https://github.com/ghul-lang/ghul) packaged as a [.NET tool](https://docs.microsoft.com/en-us/dotnet/core/tools/global-tools). It is a [self-hosting compiler](https://en.wikipedia.org/wiki/Self-hosting_(compilers)): the compiler itself is written entirely in ghūl.
 
-![ghūl logo icon small](https://raw.githubusercontent.com/degory/ghul-dev/035cc6d3997514d03cbbd7b15133c37bf2a79f4e/src/.vuepress/public/ghul-logo-icon-128.png)
+![ghūl logo icon small](https://raw.githubusercontent.com/ghul-lang/ghul-dev/035cc6d3997514d03cbbd7b15133c37bf2a79f4e/src/.vuepress/public/ghul-logo-icon-128.png)
 
 ## Targets
 
@@ -37,7 +37,7 @@ If you initialize your project using one of the [ghūl .NET project templates](h
 
 ### Clone the ghūl GitHub repository template
 
-If you create a new GitHub repo from the [ghūl repository template](https://github.com/degory/ghul-repository-template), then the compiler will be pre-configured as a local .NET tool in your project folder - run `dotnet tool restore` to restore it.
+If you create a new GitHub repo from the [ghūl repository template](https://github.com/ghul-lang/ghul-repository-template), then the compiler will be pre-configured as a local .NET tool in your project folder - run `dotnet tool restore` to restore it.
 
 ### Use the ghūl development container image
 
@@ -52,7 +52,7 @@ If none of the above options suits, you can manually install the compiler from t
 ### Project file
 
 The compiler expects to be driven by MSBuild using a `.ghulproj` project file.
-See the [ghūl test](https://github.com/degory/ghul-test) project for
+See the [ghūl test](https://github.com/ghul-lang/ghul-test) project for
 a real-world example, or use one of the project templates to get started.
 
 ### Source files
@@ -92,7 +92,7 @@ Any container image with the .NET 10 SDK will do. Pin `ghul.compiler` in your pr
 
 ## Basic ghūl language tutorial
 
-For a short ghūl programming language tutorial and reference, see [GHUL.md](https://github.com/degory/ghul/blob/main/GHUL.md). For more ghūl language details, see the [the ghūl programming language website](https://ghul.dev)
+For a short ghūl programming language tutorial and reference, see [GHUL.md](https://github.com/ghul-lang/ghul/blob/main/GHUL.md). For more ghūl language details, see the [the ghūl programming language website](https://ghul.dev)
 
 ## Manual compiler install
 
@@ -124,8 +124,8 @@ ghul-compiler # run the compiler
 
 ## Gotchas
 
-The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. Like any compiler it has [bugs](https://github.com/degory/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug) - issue reports are welcome.
+The ghūl language is sufficiently expressive and the compiler is stable enough for the compiler itself to be written in ghūl. Like any compiler it has [bugs](https://github.com/ghul-lang/ghul/issues?q=is%3Aissue+is%3Aopen+label%3Abug) - issue reports are welcome.
 
 ## Contributing
 
-Bug reports, language questions, documentation fixes and code are all welcome. See [CONTRIBUTING.md](https://github.com/degory/ghul/blob/main/CONTRIBUTING.md) for how to build and test the compiler and how to raise a pull request, and [SECURITY.md](https://github.com/degory/ghul/blob/main/SECURITY.md) for how to report a suspected vulnerability.
+Bug reports, language questions, documentation fixes and code are all welcome. See [CONTRIBUTING.md](https://github.com/ghul-lang/ghul/blob/main/CONTRIBUTING.md) for how to build and test the compiler and how to raise a pull request, and [SECURITY.md](https://github.com/ghul-lang/ghul/blob/main/SECURITY.md) for how to report a suspected vulnerability.
