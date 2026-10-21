@@ -52,11 +52,11 @@ build() {
     local start=$(date +%s)
 
     if [ -n "${WASMTIME_BOOTSTRAP_DRY_RUN:-}" ]; then
-        echo "$name: $* --target wasm --underscore-access legacy -o $directory/ghul @$work/libraries.rsp @$work/sources.rsp"
+        echo "$name: $* --target wasm --wasm-loader $core/host/loader.mjs --underscore-access legacy -o $directory/ghul @$work/libraries.rsp @$work/sources.rsp"
         return
     fi
 
-    if ! "$@" --target wasm --underscore-access legacy -o "$directory/ghul" @"$work/libraries.rsp" @"$work/sources.rsp" > "$work/$name.log" 2>&1; then
+    if ! "$@" --target wasm --wasm-loader "$core/host/loader.mjs" --underscore-access legacy -o "$directory/ghul" @"$work/libraries.rsp" @"$work/sources.rsp" > "$work/$name.log" 2>&1; then
         grep -v ': warn: ' "$work/$name.log" || true
         echo "$name failed"
         exit 1
