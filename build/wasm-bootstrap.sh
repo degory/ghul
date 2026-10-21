@@ -33,7 +33,7 @@ fi
 cd "$root"
 
 # Builds the compiler into <directory>/ghul.wasm and ghul.mjs. Both passes
-# use the same names, since the loader names the module it loads.
+# use the same names, since the loader finds its module by its own name.
 build() {
     local name=$1
     local directory=$work/$name
@@ -43,7 +43,7 @@ build() {
 
     local start=$(date +%s)
 
-    if ! "$@" --target wasm --rtti --underscore-access legacy -o "$directory/ghul" @"$work/libraries.rsp" @"$work/sources.rsp" > "$work/$name.log" 2>&1; then
+    if ! "$@" --target wasm --wasm-loader "$core/host/loader.mjs" --rtti --underscore-access legacy -o "$directory/ghul" @"$work/libraries.rsp" @"$work/sources.rsp" > "$work/$name.log" 2>&1; then
         grep -v ': warn: ' "$work/$name.log" || true
         echo "$name failed"
         exit 1
@@ -139,7 +139,7 @@ fi
 # name. The program is built by the wasm-built compiler and run with them.
 mkdir -p "$work/extern"
 
-if node "$work/pass-2/ghul.mjs" --target wasm -o "$work/extern/program" @"$work/libraries.rsp" "$root/build/wasm-externs/test.ghul" > "$work/extern.log" 2>&1 &&
+if node "$work/pass-2/ghul.mjs" --target wasm --wasm-loader "$core/host/loader.mjs" -o "$work/extern/program" @"$work/libraries.rsp" "$root/build/wasm-externs/test.ghul" > "$work/extern.log" 2>&1 &&
     node "$root/build/wasm-externs/run.mjs" "$work/extern/program.mjs" > "$work/extern.out" 2>> "$work/extern.log" &&
     cmp -s "$work/extern.out" "$root/build/wasm-externs/expected.txt"; then
     echo "extern functions are supplied by the caller"
