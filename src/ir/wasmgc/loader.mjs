@@ -30,6 +30,8 @@ class Exit extends Error {
     }
 }
 
+const TERMINAL_STREAMS = ["stdin", "stdout", "stderr"];
+
 // Runs the program.
 //
 // - options.module: the module's bytes, a Response, or a URL to fetch;
@@ -57,6 +59,13 @@ class Exit extends Error {
 //   from the name each is declared with to the function that answers it; by
 //   default there are none, and a program that declares one cannot start.
 //   Numbers cross as numbers, a long as a BigInt, and a string as a string
+// - options.terminal: whether each of the program's standard streams is a
+//   terminal, as an object with a boolean for each of `stdin`, `stdout` and
+//   `stderr` it wants to say; this is what the program reads as
+//   `IO.Std.is_input_redirected` and the like. A stream left out is a
+//   terminal when run by Node and the process's own stream is one, and is not
+//   a terminal anywhere else: a page has no terminal, so an embedder whose
+//   input box and output pane stand in for one says so here
 //
 // Answers the program's exit status.
 export async function run(options = {}) {
@@ -90,6 +99,16 @@ export async function run(options = {}) {
             (sinks[stream] ?? stdout)(text === null ? "" : String(text));
         },
         flush(_stream) {},
+
+        // Whether standard stream 0, 1 or 2 is a terminal: what the embedder
+        // said, else the process's own stream under Node, else no.
+        is_terminal(stream) {
+            const said = options.terminal?.[TERMINAL_STREAMS[stream]];
+
+            if (said !== undefined) return said === true;
+
+            return is_node && stream >= 0 && stream <= 2 && node_tty.isatty(stream);
+        },
 
         // Constructed here rather than thrown by the module, so the
         // exception records the stack it was thrown from.
@@ -1298,8 +1317,6 @@ function node_processes() {
         // Blocks the program for `milliseconds`, as Thread.Sleep does.
         sleep: (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, milliseconds)),
 
-        // Whether standard stream 0, 1 or 2 is a terminal.
-        is_terminal: (stream) => stream >= 0 && stream <= 2 && node_tty.isatty(stream),
     };
 }
 
@@ -1317,7 +1334,6 @@ const no_processes = {
     process_id: () => 0,
     home_directory: () => "/",
     sleep: sleep_in_page,
-    is_terminal: () => false,
 };
 
 // Blocks for `milliseconds` where the engine lets the thread wait, which a
