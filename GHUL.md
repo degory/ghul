@@ -1464,6 +1464,35 @@ When a guard fails, control goes to the next arm, exactly as when the pattern do
 
 An arm narrows in the same way as `if let`. `when v: T` narrows the scrutinee to `T` inside the arm body. A test in a guard, such as a `?` presence test or an `isa`, also narrows inside the body. Narrowing in an arm is local to that arm. Nothing that an arm proves applies in another arm, or after the `case`.
 
+### sequence patterns
+
+A pattern in square brackets matches a `List[T]` or an array by its length and binds its elements by position. It is accepted anywhere a destructure pattern is: `let`, `if let` and `while let`, a `case` arm's `when`, a `for` loop variable, a formal argument, and the left side of an assignment.
+
+```ghul
+let [a, b] = pair;                  // exactly two elements
+let [first, ..rest] = items;        // one or more: `rest` is the remainder
+[x, y] = [y, x];                    // assignment, here swapping two variables
+
+if let [head, ..tail] = items then
+    write_line("{head} then {tail.count} more");
+fi
+
+describe(xs: List[int]) -> string =>
+    case xs
+    when [] then "empty"
+    when [x] then "one: {x}"
+    when [x, ..more] then "{x} and {more.count} more"
+    esac
+```
+
+`..name` as the last element binds everything after the leading ones. The rest is a `List[T]` view onto the source, not a copy, so a later change to a mutable source shows through it. A bare `..` or `.._` matches the remainder without binding it. Leading elements may be any pattern, nested patterns and `_` discards included. Only a final rest element is supported, and at most one.
+
+Without a rest element the pattern needs exactly that many elements; with one, at least that many. Where the pattern is refutable (`if let`, `while let`, a `case` arm) a mismatch fails the match. Everywhere else it throws `Ghul.AssertFailedException`.
+
+A `case` over a list is checked for exhaustiveness: `[]` and `[x, ..rest]` together cover every list, and a missing length is reported, as in `missing [_, _, ..]`.
+
+`..` means a rest element only inside a sequence pattern; a rest element in a tuple pattern is an error. A sequence pattern cannot be a lambda parameter: destructure the argument at the start of the body instead, as in `xs => (let [x, ..r] = xs in x)`.
+
 ### block expressions
 
 A parenthesised block `(statement; ...; value)` runs a sequence of statements, and its value is the value of the last one. Use it in any position that accepts an expression: a `let` initializer, a function argument, a `=>` body, and so on.
