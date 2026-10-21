@@ -165,6 +165,7 @@ export async function run(options = {}) {
         stdin_wait: (ms) => pump.wait(ms),
 
         heap_bytes: (force) => heap_bytes(force),
+        working_set_bytes: () => working_set_bytes(),
 
         argument_count: () => args.length,
         argument: (index) => args[index],
@@ -1056,6 +1057,13 @@ function stdin_pump(reader, source, report) {
 // fails the answer is simply the unforced figure. Answers 0 where there
 // is no process to ask, which a heap watchdog reads as under any limit.
 let collect = undefined;
+
+// The bytes of memory the process occupies, as Node counts the resident set,
+// which is read without collecting. Answers 0 where there is no process to
+// ask.
+function working_set_bytes() {
+    return is_node ? process.memoryUsage.rss() : 0;
+}
 
 function heap_bytes(force) {
     if (!is_node) {
