@@ -10,7 +10,7 @@
 # instead, since they call into the compiler directly rather than spawning
 # it. This script only captures — it writes each suite's Cobertura report
 # to coverage/ and stops there. Turning that into the HTML report is
-# degory/ghul-coverage-report's job: its own scheduled workflow checks out
+# ghul-lang/ghul-coverage-report's job: its own scheduled workflow checks out
 # this repo, runs this script, and builds+deploys the report.
 #
 # Coverage is attributed to .ghul files, so any tool that reads Cobertura
@@ -229,6 +229,6 @@ for report in "${reports[@]}"; do
     echo "  $report"
 done
 echo
-echo "Turning these into the HTML report is degory/ghul-coverage-report's job"
+echo "Turning these into the HTML report is ghul-lang/ghul-coverage-report's job"
 echo "(its own scheduled workflow checks out this repo, runs this script, and"
-echo "builds+deploys the report) - see https://github.com/degory/ghul-coverage-report."
+echo "builds+deploys the report) - see https://github.com/ghul-lang/ghul-coverage-report."
