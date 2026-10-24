@@ -27,6 +27,8 @@ The naming conventions use Unicode case. A character that has an upper-case and 
 
 The compiler puts the definitions of a source file with no namespace declarations in a namespace that it synthesises, private to that file. This suits small programs and tests. `--global-namespace` instead puts the definitions of every such file into one unnamed global namespace, shared across the project, so a global defined in one file is visible in the others. When a file declares any namespace, every definition in the file must be inside a namespace.
 
+A whole-file namespace (`namespace N` with no `is` ... `si` body) is one instance of its namespace like a namespace block is: instances of the same name across files combine. It must be the first declaration in the file, after any `@@` pragmas, and cannot be nested inside a namespace block. A second whole-file namespace declaration later in the file nests, so `namespace A` and then `namespace B` puts everything after the second declaration in `A.B`. A file with a whole-file namespace can carry top-level statements; a file with a namespace block cannot.
+
 The compiler collects a file's top-level statements into a synthesised entry-point function.
 
 - The entry point has the two signatures that the runtime can give an entry point (see [functions](../GHUL.md#functions)). The statements can read the command-line arguments as `args` and the process environment as `env`. A private `_entry(args: string[])` wrapper passes them in.

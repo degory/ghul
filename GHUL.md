@@ -76,7 +76,25 @@ si
 
 Namespaces nest. A dotted name (`namespace Outer.Inner is ... si`) is shorthand for one namespace nested in another. A namespace definition is one *instance* of its namespace. The compiler combines all instances of a namespace across every source file. So a definition in one file's `namespace Example` block is visible, without qualification, in every other `namespace Example` block in the project.
 
-A file with no namespace definition can contain statements at the top level of the file. These top-level statements run in source order as the program's entry point, so a short program needs no `entry` function. Top-level statements can be mixed with global definitions. A global definition is visible everywhere in the file, wherever it appears. A file with top-level statements cannot declare a namespace.
+A namespace can cover a whole file. Write `namespace` and the name with no `is` ... `si` body, and everything after it in the file is inside the namespace:
+
+```ghul
+namespace MyApp.Utilities
+
+use IO.Std.write_line
+
+class HELPER is
+    ...
+si
+
+entry() is
+    write_line("ready")
+si
+```
+
+A whole-file namespace must be the first declaration in the file, after any `@@` pragmas. It cannot be nested inside a namespace block. An `is` after the name still opens a namespace block, whether it is on the same line or a later one. A `use` written after a whole-file namespace declaration applies to the rest of the file.
+
+A file with no namespace declaration can contain statements at the top level of the file, and so can a file whose namespace is a whole-file namespace. These top-level statements run in source order as the program's entry point, so a short program needs no `entry` function. Top-level statements can be mixed with global definitions. A global definition is visible everywhere in the file, wherever it appears. A file with top-level statements cannot declare a namespace block.
 
 A `use` statement brings names into scope, so code can refer to them without qualification. A `use` of a namespace imports every public symbol in it. A `use` of a single symbol imports that symbol:
 
