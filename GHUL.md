@@ -92,7 +92,7 @@ entry() is
 si
 ```
 
-A whole-file namespace must be the first declaration in the file, after any `@@` pragmas. It cannot be nested inside a namespace block. An `is` after the name still opens a namespace block, whether it is on the same line or a later one. A `use` written after a whole-file namespace declaration applies to the rest of the file.
+A whole-file namespace must be the first declaration in the file, after any `@@` pragmas. It cannot be nested inside another namespace. An `is` after the name still opens a namespace block, whether it is on the same line or a later one. A `use` written after a whole-file namespace declaration applies to the rest of the file.
 
 A file with no namespace declaration can contain statements at the top level of the file, and so can a file whose namespace is a whole-file namespace. These top-level statements run in source order as the program's entry point, so a short program needs no `entry` function. Top-level statements can be mixed with global definitions. A global definition is visible everywhere in the file, wherever it appears. A file with top-level statements cannot declare a namespace block.
 
