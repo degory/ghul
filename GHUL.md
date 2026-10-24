@@ -1493,6 +1493,8 @@ A sequence pattern also matches over a lazy sequence - anything that is an `Iter
 
 A rest element over a lazy sequence is a lazy sequence of its own: the elements the pull took past the ones the pattern matched, followed by the remainder of the iterator. Reading it twice replays what the first read pulled.
 
+A string is a lazy sequence of its chars to a sequence pattern, so `case word when [first, ..rest]` matches its first char and binds the rest as a sequence of chars rather than a string.
+
 A source that is its own iterator is driven through a copy, so a range matches without being consumed. A `while let` test does not support a lazy sequence pattern: every test would read the sequence from its beginning again. A guard does not follow a pattern that matches over a lazy sequence, a lazy sequence group nested inside a `case` pattern is not matched yet, and neither is a destructuring assignment over a lazy source.
 
 A `case` over a list is checked for exhaustiveness: `[]` and `[x, ..rest]` together cover every list, and a missing length is reported, as in `missing [_, _, ..]`. A `case` over a lazy sequence is checked the same way.
