@@ -1491,7 +1491,7 @@ Without a rest element the pattern needs exactly that many elements; with one, a
 
 A sequence pattern also matches over a lazy sequence - anything that is an `Iterable[T]` but not a list or an array, such as a pipe or a generator's result. The match pulls elements from the sequence's iterator into locals, and every arm of the matching statement tests against the one pull, so a single-pass source is read once however many arms test it. An exact-length pattern sees one element past its head, to tell "exactly this many" from "at least this many".
 
-A rest element over a lazy sequence is a lazy sequence of its own: the elements the pull took past the ones the pattern matched, followed by the remainder of the iterator. Reading it twice replays what the first read pulled.
+A rest element over a lazy sequence is a lazy sequence of its own: the elements the pull took past the ones the pattern matched, followed by what remained of the iterator. The first read continues the pull's iterator, so a source with side effects runs its matched head once per match; every later read takes a fresh iterator from the source and skips the matched elements, so it replays what the first read saw without holding any of it.
 
 A string is a lazy sequence of its chars to a sequence pattern, so `case word when [first, ..rest]` matches its first char and binds the rest as a sequence of chars rather than a string.
 
